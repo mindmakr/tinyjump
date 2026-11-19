@@ -18,10 +18,13 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Reply = Sender<Result<Json, String>>;
 
+/// A realtime event: the object it concerns and its server-sent-event text.
+pub type Event = (String, String);
+
 enum Msg {
     Input(Input, Option<Reply>),
     EffectDone(u32, Result<Json, String>),
-    Subscribe(Sender<String>),
+    Subscribe(Sender<Event>),
     Reload(String),
 }
 
@@ -39,7 +42,7 @@ fn boot(source: &str, data: &Path, render: bool) -> Result<(Runtime, Vec<Output>
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let store = FileStore::open(data).map_err(|e| format!("cannot open data dir {}: {e}", data.display()))?;
     let seed = now_ms() as u64;
-    Runtime::boot(program, Box::new(store), Options { now: now_ms(), seed, render }).map_err(|e| format!("boot failed: {e}"))
+    Runtime::boot(program, Box::new(store), Options { now: now_ms(), seed, render, server: true }).map_err(|e| format!("boot failed: {e}"))
 }
 
 impl Engine {
@@ -78,8 +81,8 @@ impl Engine {
         })?
     }
 
-    /// Realtime stream of server-sent-event messages (`emit` and `changed`).
-    pub fn subscribe(&self) -> Receiver<String> {
+    /// Realtime stream of `emit` and `changed` events.
+    pub fn subscribe(&self) -> Receiver<Event> {
         let (t, r) = channel();
         let _ = self.tx.send(Msg::Subscribe(t));
         r
@@ -98,14 +101,14 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Tick => {}
     }
 }
 
 struct Dispatch {
     replies: HashMap<u64, Reply>,
     next_reply: u64,
-    subscribers: Vec<Sender<String>>,
+    subscribers: Vec<Sender<Event>>,
     effects: Sender<(u32, Effect)>,
 }
 
@@ -172,8 +175,8 @@ impl Dispatch {
                 Output::Effect { id, effect } => {
                     let _ = self.effects.send((id, effect));
                 }
-                Output::Emit { object, name, data } => self.broadcast("emit", &json!({ "object": object, "name": name, "data": data })),
-                Output::Changed { object, state } => self.broadcast("changed", &json!({ "object": object, "state": state })),
+                Output::Emit { object, name, data } => self.broadcast("emit", &object, &json!({ "object": object, "name": name, "data": data })),
+                Output::Changed { object, state } => self.broadcast("changed", &object, &json!({ "object": object, "state": state })),
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
                 Output::Error { message, trace } => {
                     eprintln!("[app] error: {message}");
@@ -181,14 +184,15 @@ impl Dispatch {
                         eprintln!("    {t}");
                     }
                 }
-                Output::Patch { .. } | Output::Wake { .. } => {}
+                // The server owns its objects, so it never subscribes to replicas or draws UI.
+                Output::Patch { .. } | Output::Wake { .. } | Output::Subscribe { .. } => {}
             }
         }
     }
 
-    fn broadcast(&mut self, event: &str, data: &Json) {
+    fn broadcast(&mut self, event: &str, object: &str, data: &Json) {
         let msg = format!("event: {event}\ndata: {data}\n\n");
-        self.subscribers.retain(|s| s.send(msg.clone()).is_ok());
+        self.subscribers.retain(|s| s.send((object.to_string(), msg.clone())).is_ok());
     }
 }
 
@@ -214,7 +218,9 @@ fn effect_pool(back: Sender<Msg>) -> Sender<(u32, Effect)> {
 }
 
 fn perform(agent: &ureq::Agent, effect: Effect) -> Result<Json, String> {
-    let Effect::Http { url, method, headers, body } = effect;
+    let Effect::Http { url, method, headers, body } = effect else {
+        return Err("server objects live here; there is no server to call".into());
+    };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("only http(s) URLs can be fetched: {url}"));
     }

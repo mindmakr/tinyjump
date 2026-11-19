@@ -1,0 +1,68 @@
+// Realtime chat. `Room` lives on the server; every device holds a live replica of it.
+// The composer is local to each device.
+
+type Message = { author: string, text: string, at: number }
+
+@server object Room {
+  messages: Message[] = []
+
+  post(author: string, text: string) {
+    const name = author.trim()
+    const body = text.trim()
+    if (name === "" || body === "") { throw new Error("name and message are required") }
+    this.messages.push({ author: name, text: body, at: Date.now() })
+    if (this.messages.length > 100) { this.messages.shift() }
+  }
+}
+
+object Composer {
+  name: string = ""
+  draft: string = ""
+  error: string = ""
+
+  setName(name: string) { this.name = name }
+  setDraft(text: string) { this.draft = text }
+
+  async send() {
+    const text = this.draft
+    if (text.trim() === "") { return }
+    this.draft = ""
+    try {
+      await Room.get("lobby").post(this.name, text)
+      this.error = ""
+    } catch (e) {
+      this.draft = text
+      this.error = `Not sent: ${e.message}`
+    }
+  }
+}
+
+function clock(ms: number): string {
+  const s = Math.floor(ms / 1000) % 86400
+  const two = (n: number) => String(n).padStart(2, "0")
+  return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}`
+}
+
+function App() {
+  const room = Room.get("lobby")
+  const me = Composer.get("me")
+
+  return <Column padding={24} gap={12}>
+    <Text size={24} weight="bold">Lobby</Text>
+    <Input id="name" value={me.name} placeholder="Your name" onChange={(t) => me.setName(t)} />
+    <Scroll height={280} gap={6}>
+      {room.messages.map((m, i) => <Row key={i} gap={8}>
+        <Text weight="bold">{m.author}</Text>
+        <Text grow={1}>{m.text}</Text>
+        <Text color="#999">{clock(m.at)} UTC</Text>
+      </Row>)}
+      {room.messages.length === 0 && <Text color="#999">No messages yet.</Text>}
+    </Scroll>
+    <Row gap={8}>
+      <Input id="draft" grow={1} value={me.draft} placeholder="Message"
+        onChange={(t) => me.setDraft(t)} onSubmit={() => me.send()} />
+      <Button id="send" onPress={() => me.send()} disabled={me.name.trim() === ""}>Send</Button>
+    </Row>
+    {me.error !== "" && <Text id="error" color="#c00">{me.error}</Text>}
+  </Column>
+}

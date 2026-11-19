@@ -29,6 +29,8 @@ pub struct Options {
     pub seed: u64,
     /// Render `App` into patches. Servers usually turn this off.
     pub render: bool,
+    /// This runtime is the server: `@server` objects live here instead of being replicas.
+    pub server: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +104,7 @@ pub struct Runtime {
     waiting: HashMap<u32, (Fiber, Option<u64>)>,
     tree: Tree,
     render: bool,
+    server: bool,
     ran_code: bool,
     now: f64,
     rng: u64,
@@ -138,6 +141,7 @@ impl Runtime {
             waiting: HashMap::new(),
             tree: Tree::default(),
             render: opts.render,
+            server: opts.server,
             ran_code: false,
             now: opts.now,
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
@@ -195,6 +199,11 @@ impl Runtime {
                         }
                     };
                     self.settle(f, reply, r);
+                }
+            }
+            Input::Sync { object, state } => {
+                if let Err(e) = self.sync(&object, &state) {
+                    self.reply(None, Err(e));
                 }
             }
             Input::Tick => {}

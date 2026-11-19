@@ -1,6 +1,6 @@
 //! Durable objects: loading, field access rules, events, alarms and persistence.
 
-use super::protocol::Output;
+use super::protocol::{Effect, Output};
 use super::{BootError, Runtime, TimerKind};
 use crate::vm::interp::Fiber;
 use crate::vm::value::{Closure, Exc, ObjRef, Record, Value};
@@ -14,6 +14,8 @@ const MAX_ID_LEN: usize = 128;
 
 pub(crate) struct Instance {
     handle: Rc<ObjRef>,
+    /// A device-side replica of an `@server` object: methods run on the server.
+    remote: bool,
     state: Rc<RefCell<Record>>,
     alarms: Vec<Alarm>,
     /// The last persisted record, to skip unchanged writes.
@@ -68,19 +70,63 @@ impl Runtime {
             alarms = stored.alarms;
             saved = text;
         }
-        for (name, m) in &def.methods {
-            if let Some(interval) = m.every {
-                let kind = TimerKind::Every { obj: handle.clone(), method: name.clone(), interval };
-                self.push_timer(self.now + interval, kind);
+        let remote = def.server && !self.server;
+        if remote {
+            // Timers and alarms of a replica run on the server, not here.
+            alarms.clear();
+            self.outputs.push(Output::Subscribe { object: handle.key() });
+        } else {
+            for (name, m) in &def.methods {
+                if let Some(interval) = m.every {
+                    let kind = TimerKind::Every { obj: handle.clone(), method: name.clone(), interval };
+                    self.push_timer(self.now + interval, kind);
+                }
+            }
+            for a in &mut alarms {
+                self.next_alarm += 1;
+                a.id = self.next_alarm;
+                self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
             }
         }
-        for a in &mut alarms {
-            self.next_alarm += 1;
-            a.id = self.next_alarm;
-            self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
-        }
-        self.instances.insert(key, Instance { handle: handle.clone(), state, alarms, saved });
+        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, saved });
         Ok(handle)
+    }
+
+    pub(crate) fn is_remote(&self, o: &ObjRef) -> bool {
+        self.inst(o).remote
+    }
+
+    /// Calls a method of a replica on the server: returns a promise for the result.
+    pub(crate) fn remote_call(&mut self, o: &ObjRef, method: &str, args: &[Value]) -> Result<Value, Exc> {
+        let (_, private) = self.method(o.class, method)?;
+        if private {
+            return Err(Exc::msg(format!("'{method}' is private to {}", o.class_name)));
+        }
+        let args = args.iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("arguments to a server call must be data: {e}")))?;
+        self.next_effect += 1;
+        let id = self.next_effect;
+        self.outputs.push(Output::Effect { id, effect: Effect::Call { object: o.key(), method: method.to_string(), args } });
+        Ok(Value::Promise(id))
+    }
+
+    /// Applies the server's state to a replica; it is cached locally and re-rendered.
+    pub(crate) fn sync(&mut self, key: &str, state: &Json) -> Result<(), String> {
+        let o = self.resolve_object(key)?;
+        if !self.is_remote(&o) {
+            return Err(format!("{key} is not a replica of a server object"));
+        }
+        let Json::Object(fields) = state else { return Err(format!("state for {key} must be a record")) };
+        let inst = self.inst(&o);
+        let mut s = inst.state.borrow_mut();
+        for (k, v) in fields {
+            if let Some(slot) = s.get_mut(k.as_str()) {
+                *slot = Value::from_json(v);
+            }
+        }
+        drop(s);
+        self.touch(&o);
+        self.ran_code = true;
+        Ok(())
     }
 
     /// Parses `"Class/id"` and loads the instance.
@@ -113,6 +159,9 @@ impl Runtime {
         let (closure, private) = self.method(obj.class, name)?;
         if external && private {
             return Err(Exc::msg(format!("'{name}' is private to {}", obj.class_name)));
+        }
+        if self.is_remote(&obj) {
+            return Err(Exc::msg(format!("{} lives on the server; call it there", obj.key())));
         }
         self.touch(&obj);
         let mut f = Fiber::default();

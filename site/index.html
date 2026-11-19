@@ -95,7 +95,7 @@
     <div class="grid">
       <div class="cell"><h3>Durable objects</h3><p>State, <code>@every</code> timers, scheduled alarms and realtime events live on objects. They persist and survive restarts.</p></div>
       <div class="cell"><h3>Native UI</h3><p>The runtime owns the view tree and sends small patches. Hosts draw real widgets: DOM and Android Views today, iOS next.</p></div>
-      <div class="cell"><h3>Backend included</h3><p>Every public method is an HTTP endpoint. State changes stream as server-sent events. Same code, same objects.</p></div>
+      <div class="cell"><h3>Backend included</h3><p>Every public method is an HTTP endpoint. Mark an object <code>@server</code> and every device gets a live, offline-cached replica of it. Same code, same objects.</p></div>
       <div class="cell"><h3>Built for agents</h3><p>A language agents already know, with one way to do each thing. It is type-checked, and errors say how to fix them: <code>'txt' is not a field of Todo, did you mean 'text'?</code></p></div>
       <div class="cell"><h3>Automation built in</h3><p>Every host exposes the semantic tree, bounds, visibility, object state and a controllable clock. Agents can drive and check apps.</p></div>
       <div class="cell"><h3>Tiny</h3><p>A Rust core with no async runtime. The browser runtime, compiler included, is about half a megabyte. Old devices are in scope.</p></div>
@@ -107,6 +107,7 @@
         <p class="note">Updated as each host lands. Old devices are in scope: Android 5.0+, 32-bit ARM, browsers without WebGPU.</p>
         <h2 style="margin-top:36px">Latest</h2>
         <ul class="log">
+          <li><b>Server objects.</b> <code>@server object Room</code> lives on the server; browsers and phones hold live, offline-cached replicas. Tested with a chat between a browser and an Android phone.</li>
           <li><b>Type checker.</b> TypeScript-style checks with "did you mean" fixes; unannotated code stays <code>any</code>.</li>
           <li><b>Linux on ARM.</b> Fully static binaries for 64-bit and 32-bit ARM, about 3.5 MB.</li>
           <li><b>C ABI for Apple and desktop hosts.</b> The runtime builds for iOS and macOS today; the UIKit host is next.</li>

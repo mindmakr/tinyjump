@@ -56,6 +56,8 @@ impl Pattern {
 
 #[derive(Debug, Clone)]
 pub struct ObjectDecl {
+    /// `@server` and future object-level decorators.
+    pub decorators: Vec<Decorator>,
     pub name: String,
     pub fields: Vec<Field>,
     pub methods: Vec<Method>,

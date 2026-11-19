@@ -24,6 +24,7 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 | `get` | `object` | state |
 | `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
 | `effectDone` | `id`, and either `ok` or `error` | — |
+| `sync` | `object`, `state`: the server's latest state for a replica | — |
 | `tick` | — | — |
 | `inspect` | — | `{ tree, objects, wake }` |
 
@@ -35,7 +36,8 @@ id and it fails, the runtime reports the failure as an `error` output.
 | type | meaning |
 |---|---|
 | `patch` | `ops` to apply to the native view tree (below) |
-| `effect` | `{ id, effect: { kind: "http", url, method, headers, body } }`. Perform it, then send `effectDone` with `ok: { status, headers, body }` or `error: "message"` |
+| `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }`. For `{ kind: "call", object, method, args }`, `POST /api/{object}/{method}` with `args` and answer with its `ok`. Failures are `error: "message"` |
+| `subscribe` | `{ object }`: keep this replica of an `@server` object current. Fetch `GET /api/{object}` now, listen on `/api/events?object=…`, and send `sync` for every `changed` event and after every reconnect |
 | `emit` | `{ object, name, data }`: realtime event |
 | `changed` | `{ object, state }`: state after a persisted change |
 | `reply` | `{ reply, ok }` or `{ reply, error }` |

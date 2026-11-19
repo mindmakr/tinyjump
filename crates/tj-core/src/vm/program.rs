@@ -141,6 +141,8 @@ pub struct ObjectDef {
     /// Builds the default state record.
     pub init: u32,
     pub methods: IndexMap<Rc<str>, MethodDef>,
+    /// `@server`: lives on the server; device runtimes hold a synced replica.
+    pub server: bool,
 }
 
 pub struct Program {

@@ -17,7 +17,8 @@
 
     async function main() {
       const source = await (await fetch('app.tj', { cache: 'no-store' })).text();
-      await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), devOverlay: true });
+      // The dev server is also the backend for `@server` objects.
+      await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), server: '', devOverlay: true });
       // Dev server: reload when the app source changes. Objects keep their state.
       if (window.EventSource) new EventSource('_tj/reload').addEventListener('reload', () => location.reload());
     }

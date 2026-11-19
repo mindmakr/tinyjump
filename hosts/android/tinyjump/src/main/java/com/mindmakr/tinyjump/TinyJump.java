@@ -38,6 +38,7 @@ public final class TinyJump {
     final Handler main = new Handler(Looper.getMainLooper());
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final Renderer renderer;
+    private final Sync sync;
     private final Map<Long, Reply> pending = new HashMap<>();
     private long nextReply = 1;
     private Automation automation;
@@ -48,14 +49,23 @@ public final class TinyJump {
         }
     };
 
-    private TinyJump(Context context, ViewGroup root) {
+    private TinyJump(Context context, ViewGroup root, String server) {
         renderer = new Renderer(context, root, this);
+        sync = new Sync(this, server);
     }
 
     /** Boots {@code source} into {@code root}. Throws with the compiler's message if it does not compile. */
     public static TinyJump start(Context context, ViewGroup root, String source) {
+        return start(context, root, source, null);
+    }
+
+    /**
+     * Like {@link #start(Context, ViewGroup, String)}, with the base URL of a `tj serve` backend
+     * that hosts the app's `@server` objects (null for none).
+     */
+    public static TinyJump start(Context context, ViewGroup root, String source, String server) {
         assertMain();
-        TinyJump tj = new TinyJump(context, root);
+        TinyJump tj = new TinyJump(context, root, server);
         FileStore store = new FileStore(new File(context.getFilesDir(), "tinyjump"));
         int code = Native.boot(store, source, now(), System.nanoTime(), true);
         String out = Native.out();
@@ -74,6 +84,7 @@ public final class TinyJump {
 
     public void stop() {
         main.removeCallbacks(tick);
+        sync.stop();
         io.shutdownNow();
         if (automation != null) automation.stop();
     }
@@ -144,6 +155,9 @@ public final class TinyJump {
                     case "effect":
                         runEffect(o.getInt("id"), o.getJSONObject("effect"));
                         break;
+                    case "subscribe":
+                        sync.subscribe(o.getString("object"));
+                        break;
                     case "wake":
                         main.removeCallbacks(tick);
                         if (!o.isNull("at")) main.postDelayed(tick, Math.max(0, (long) (o.getDouble("at") - now())));
@@ -176,17 +190,17 @@ public final class TinyJump {
         io.execute(new Runnable() {
             @Override
             public void run() {
-                JSONObject ok = null;
+                Object ok = null;
                 String error = null;
                 try {
-                    ok = http(effect);
+                    ok = "call".equals(effect.optString("kind")) ? sync.call(effect) : http(effect);
                 } catch (Exception e) {
                     error = String.valueOf(e.getMessage() != null ? e.getMessage() : e);
                 }
                 final JSONObject done = input("effectDone");
                 try {
                     done.put("id", id);
-                    if (ok != null) done.put("ok", ok); else done.put("error", error);
+                    if (error == null) done.put("ok", ok == null ? JSONObject.NULL : ok); else done.put("error", error);
                 } catch (JSONException e) {
                     throw new IllegalStateException(e);
                 }

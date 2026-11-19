@@ -185,7 +185,7 @@ impl Compiler {
                 }
                 Item::Object(o) => {
                     if self.check_top_name(&o.name, o.span) {
-                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new() });
+                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false });
                         self.add_global(&o.name, false, GKind::Object);
                     }
                 }
@@ -241,6 +241,13 @@ impl Compiler {
     }
 
     fn object(&mut self, o: &ObjectDecl, class: usize) {
+        let mut server = false;
+        for d in &o.decorators {
+            match (d.name.as_str(), d.args.is_empty()) {
+                ("server", true) => server = true,
+                _ => self.error(Diagnostic::new(format!("unknown object decorator @{}", d.name), d.span).hint("supported: @server (the object lives on the server; devices hold a synced replica)")),
+            }
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut fields = Vec::new();
         for f in &o.fields {
@@ -295,6 +302,7 @@ impl Compiler {
         def.fields = fields;
         def.init = init;
         def.methods = methods;
+        def.server = server;
     }
 
     // ---------- functions and scopes ----------

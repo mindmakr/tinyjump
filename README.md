@@ -30,7 +30,11 @@ curl localhost:4700/api/Todos/main
 curl -N localhost:4700/api/events          # realtime: emit + changed
 ```
 
-Other commands: `tj check app.tj` (compile errors with fix hints) and `tj serve app.tj`
+Realtime across devices: `cargo tj dev examples/chat/app.tj`, then open it in two
+browsers. `Room` is an `@server` object: it lives on the server, and each device holds a
+live, offline-cached replica of it.
+
+Other commands: `tj check app.tj` (compile errors with fix hints and types) and `tj serve app.tj`
 (backend only; add `--host 0.0.0.0` to expose it).
 
 ### Android
@@ -45,7 +49,10 @@ adb forward tcp:4701 tcp:4701              # debug builds serve automation
 curl localhost:4701/_tj/inspect
 ```
 
-The demo app runs `examples/todo/app.tj` with native Android widgets. The APK is about
+Run the chat against the dev server with
+`adb shell am start -n com.mindmakr.tinyjump.demo/.MainActivity --es example chat --es server http://10.0.2.2:4700`.
+
+The demo app runs any `examples/<name>/app.tj` (todo by default) with native Android widgets. The APK is about
 1.7 MB with all four ABIs.
 
 ### Linux binaries

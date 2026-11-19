@@ -33,7 +33,8 @@ impl JsonHost {
                 return (INVALID, Json::Array(list).to_string());
             }
         };
-        match Runtime::boot(program, store, Options { now, seed, render }) {
+        // Foreign-language hosts are devices: `@server` objects are replicas.
+        match Runtime::boot(program, store, Options { now, seed, render, server: false }) {
             Ok((rt, outputs)) => {
                 self.runtime = Some(rt);
                 (OK, to_json(&outputs))

@@ -56,6 +56,31 @@ object Cart {
 - If a device sleeps through several `@every` beats, the timer fires once and carries on.
   It does not fire a burst of catch-up calls.
 
+## Server objects
+
+```tsx
+@server object Room {
+  messages: Message[] = []
+  post(author: string, text: string) { this.messages.push({ author, text, at: Date.now() }) }
+}
+```
+
+An `@server` object lives on the server (`tj serve` / `tj dev`). Each device holds a
+replica of it:
+
+- **Reads** (`room.messages`) come from the replica. It's cached on the device, so it also
+  shows while offline.
+- **Method calls** run on the server and return a promise. `await room.post(...)` gives you
+  the result, and a failure (offline, or the method throws) arrives as an exception you can
+  catch.
+- **Changes** from any device stream back over realtime, and every replica re-renders.
+
+The server is the single authority, so there are no conflicts to resolve. Timers on
+`@server` objects run on the server only.
+
+Plain objects (no decorator) live wherever the code runs: device-local state on a device,
+and backend state on the server.
+
 ## Values
 
 `number`, `string`, `boolean`, `null`, arrays, records (`{ a: 1 }`), functions,

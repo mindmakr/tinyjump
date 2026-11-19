@@ -9,7 +9,11 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 
-/** Runs examples/todo/app.tj. Debug builds serve automation on port 4701. */
+/**
+ * Runs one of the repo's example apps. Launch extras: {@code example} (default "todo") and
+ * {@code server} (a `tj serve`/`tj dev` URL for @server objects, e.g. http://10.0.2.2:4700).
+ * Debug builds serve automation on port 4701.
+ */
 public final class MainActivity extends Activity {
     private static final int AUTOMATION_PORT = 4701;
     private TinyJump app;
@@ -20,7 +24,9 @@ public final class MainActivity extends Activity {
         FrameLayout root = new FrameLayout(this);
         root.setFitsSystemWindows(true);
         setContentView(root);
-        app = TinyJump.start(this, root, asset("app.tj"));
+        String example = getIntent().getStringExtra("example");
+        String source = asset((example == null ? "todo" : example) + "/app.tj");
+        app = TinyJump.start(this, root, source, getIntent().getStringExtra("server"));
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) app.enableAutomation(AUTOMATION_PORT);
     }
 

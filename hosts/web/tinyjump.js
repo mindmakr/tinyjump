@@ -46,7 +46,8 @@ function localStore(prefix) {
 
 /**
  * Boots an app.
- * @param {{wasm: string, source: string, root: HTMLElement, store?: object, seed?: number, devOverlay?: boolean}} opts
+ * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean}} opts
+ *   server: base URL of a `tj serve` backend for `@server` objects ('' = same origin).
  */
 export async function start(opts) {
   const store = opts.store || localStore('tj:');
@@ -137,6 +138,7 @@ export async function start(opts) {
       switch (o.type) {
         case 'patch': o.ops.forEach(patch); break;
         case 'effect': runEffect(o.id, o.effect); break;
+        case 'subscribe': subscribe(o.object); break;
         case 'wake': wake(o.at); break;
         case 'reply': {
           const p = pending.get(o.reply);
@@ -156,7 +158,60 @@ export async function start(opts) {
     wakeTimer = setTimeout(() => send({ type: 'tick' }), Math.min(MAX_TIMEOUT, Math.max(0, at - Date.now())));
   }
 
+  // ---------- server objects ----------
+
+  const server = opts.server; // base URL of `tj serve`/`tj dev`; '' = same origin; undefined = none
+  const replicas = new Set();
+  let events = null;
+  let reconnect = null;
+
+  const objectUrl = (key) => server + '/api/' + key.split('/').map(encodeURIComponent).join('/');
+
+  function refresh(key) {
+    fetch(objectUrl(key)).then((r) => r.json()).then((j) => {
+      if ('ok' in j) send({ type: 'sync', object: key, state: j.ok });
+    }).catch(() => { /* offline: keep the cached replica */ });
+  }
+
+  // One realtime stream for all replicas; reopened when the set changes.
+  function connectRealtime() {
+    if (events) events.close();
+    const query = Array.from(replicas).map((k) => 'object=' + encodeURIComponent(k)).join('&');
+    events = new EventSource(server + '/api/events?' + query);
+    events.addEventListener('open', () => replicas.forEach(refresh)); // catch up after reconnects
+    events.addEventListener('changed', (e) => {
+      const d = JSON.parse(e.data);
+      if (replicas.has(d.object)) send({ type: 'sync', object: d.object, state: d.state });
+    });
+  }
+
+  function subscribe(key) {
+    if (server === undefined || replicas.has(key)) return;
+    replicas.add(key);
+    clearTimeout(reconnect);
+    reconnect = setTimeout(connectRealtime, 0);
+  }
+
+  function serverCall(id, effect) {
+    if (server === undefined) {
+      send({ type: 'effectDone', id, error: 'no server configured for ' + effect.object });
+      return;
+    }
+    fetch(objectUrl(effect.object) + '/' + encodeURIComponent(effect.method), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(effect.args),
+    })
+      .then((r) => r.json())
+      .then((j) => send(j.error ? { type: 'effectDone', id, error: j.error } : { type: 'effectDone', id, ok: j.ok }))
+      .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e) }));
+  }
+
   function runEffect(id, effect) {
+    if (effect.kind === 'call') {
+      serverCall(id, effect);
+      return;
+    }
     if (effect.kind !== 'http') {
       send({ type: 'effectDone', id, error: 'unsupported effect ' + effect.kind });
       return;

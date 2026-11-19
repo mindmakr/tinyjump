@@ -19,7 +19,8 @@ and the same agents can drive and inspect the running app.
 4. **Built-in automation.** Every host exposes the same semantic tree (nodes, props,
    events, bounds), object state, a controllable clock and an input channel.
 5. **Backend too.** The same runtime serves HTTP: every public object method is an API,
-   and changes stream to clients in realtime.
+   and changes stream to clients in realtime. `@server` objects live on the server, and
+   every device holds a live, offline-cached replica of them (the server is the authority).
 6. **Talk to the world.** `fetch` for REST from any host. More transports later.
 7. **Agent loop as a building block** (after the hosts are solid).
 8. **GPU graphics and 3D as an optional module** (`tj-gfx`, after the web host). One Rust renderer

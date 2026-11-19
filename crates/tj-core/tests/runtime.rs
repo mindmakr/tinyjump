@@ -23,8 +23,12 @@ impl Store for Shared {
 }
 
 fn boot_with(src: &str, store: Shared, now: f64) -> (Runtime, Vec<Output>) {
+    boot_as(src, store, now, false)
+}
+
+fn boot_as(src: &str, store: Shared, now: f64, server: bool) -> (Runtime, Vec<Output>) {
     let program = compile(src).unwrap_or_else(|errs| panic!("{}", errs.iter().map(|e| e.render("test.tj", src)).collect::<Vec<_>>().join("\n")));
-    Runtime::boot(program, Box::new(store), Options { now, seed: 7, render: true }).unwrap_or_else(|e| panic!("boot: {e}"))
+    Runtime::boot(program, Box::new(store), Options { now, seed: 7, render: !server, server }).unwrap_or_else(|e| panic!("boot: {e}"))
 }
 
 fn boot(src: &str) -> Runtime {
@@ -311,4 +315,70 @@ fn random_is_deterministic_per_seed() {
     let a = call(&mut boot(src), 0.0, "R/r", "roll", json!([])).unwrap();
     let b = call(&mut boot(src), 0.0, "R/r", "roll", json!([])).unwrap();
     assert_eq!(a, b);
+}
+
+const CHAT: &str = r#"
+type Msg = { author: string, text: string }
+
+@server object Room {
+  messages: Msg[] = []
+  post(author: string, text: string): number {
+    this.messages.push({ author, text })
+    return this.messages.length
+  }
+  private clear() { this.messages = [] }
+}
+
+object Me { name = "ana" }
+
+function App() {
+  const room = Room.get("lobby")
+  return <Column>
+    {room.messages.map((m, i) => <Text key={i}>{m.author}: {m.text}</Text>)}
+    <Button id="send" onPress={() => room.post(Me.get("me").name, "hi")}>Send</Button>
+  </Column>
+}
+"#;
+
+#[test]
+fn server_objects_replicate_to_devices() {
+    let (mut server, _) = boot_as(CHAT, Shared::default(), 0.0, true);
+    let device_store = Shared::default();
+    let (mut device, out) = boot_as(CHAT, device_store.clone(), 0.0, false);
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object } if object == "Room/lobby")));
+
+    // Pressing the button asks the host to call the server instead of running the method here.
+    let out = device.handle(1.0, Input::Ui { target: Target::Id { id: "send".into() }, event: "onPress".into(), value: Json::Null, reply: None });
+    let (id, (object, method, args)) = out
+        .iter()
+        .find_map(|o| match o {
+            Output::Effect { id, effect: Effect::Call { object, method, args } } => Some((*id, (object.clone(), method.clone(), args.clone()))),
+            _ => None,
+        })
+        .expect("a server call");
+    assert_eq!((object.as_str(), method.as_str(), &args), ("Room/lobby", "post", &vec![json!("ana"), json!("hi")]));
+
+    // The server runs it, persists it, and reports the change.
+    let out = server.handle(2.0, Input::Call { object, method, args, reply: Some(1) });
+    assert_eq!(reply(&out).unwrap(), json!(1));
+    let state = out
+        .iter()
+        .find_map(|o| match o {
+            Output::Changed { object, state } if object == "Room/lobby" => Some(state.clone()),
+            _ => None,
+        })
+        .expect("a change to broadcast");
+
+    // The host relays the result and the change; the device re-renders from its replica.
+    device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None });
+    let out = device.handle(3.0, Input::Sync { object: "Room/lobby".into(), state });
+    assert!(patches(&out).iter().any(|op| matches!(op, PatchOp::Create { props, .. } if props.get("text") == Some(&json!("ana: hi")))));
+
+    // Replicas never run methods locally.
+    assert!(call(&mut device, 4.0, "Room/lobby", "post", json!(["x", "y"])).unwrap_err().contains("lives on the server"));
+
+    // The replica is cached, so the device shows it when it starts offline.
+    let (mut again, _) = boot_as(CHAT, device_store, 5.0, false);
+    let cached = reply(&again.handle(5.0, Input::Get { object: "Room/lobby".into(), reply: Some(1) })).unwrap();
+    assert_eq!(cached["messages"][0]["text"], json!("hi"));
 }

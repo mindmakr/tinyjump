@@ -40,6 +40,8 @@ pub enum Input {
         #[serde(default)]
         error: Option<String>,
     },
+    /// The server's latest state of an `@server` object this device subscribed to.
+    Sync { object: String, state: Json },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -70,6 +72,9 @@ pub enum Output {
     Emit { object: String, name: String, data: Json },
     /// An object's state changed (already persisted).
     Changed { object: String, state: Json },
+    /// Keep this device's replica of an `@server` object current: fetch its state now and
+    /// send [`Input::Sync`] whenever the server reports a change.
+    Subscribe { object: String },
     Reply {
         reply: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,6 +100,8 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
     },
+    /// Call a method of an `@server` object on the server; answer with its result.
+    Call { object: String, method: String, args: Vec<Json> },
 }
 
 /// One change to the native view tree. Node 0 is the host's root container.

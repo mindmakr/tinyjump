@@ -496,6 +496,13 @@ impl Runtime {
                         f.stack.push(Value::Null);
                         Ok(())
                     }
+                    _ if self.is_remote(o) => {
+                        let args = f.stack.split_off(pos + 1);
+                        f.stack.truncate(pos);
+                        let promise = self.remote_call(o, name, &args)?;
+                        f.stack.push(promise);
+                        Ok(())
+                    }
                     _ => {
                         let (closure, private) = self.method(o.class, name)?;
                         if private && !own {

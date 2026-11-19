@@ -181,7 +181,14 @@ impl<'a> Parser<'a> {
         let start = self.cur.span;
         match self.cur.tok {
             Tok::Function | Tok::Async => Ok(Item::Function(Rc::new(self.fn_decl()?))),
-            Tok::Object => self.object_decl().map(Item::Object),
+            Tok::Object => self.object_decl(Vec::new()).map(Item::Object),
+            Tok::At => {
+                let decorators = self.decorators()?;
+                if !self.at(&Tok::Object) {
+                    return Err(self.unexpected("'object'").hint("only objects take decorators here, e.g. `@server object Room { ... }`"));
+                }
+                self.object_decl(decorators).map(Item::Object)
+            }
             Tok::Type => {
                 self.bump()?;
                 let (name, _) = self.ident("a type name")?;
@@ -283,20 +290,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn object_decl(&mut self) -> PResult<ObjectDecl> {
-        let start = self.bump()?.span;
+    fn decorators(&mut self) -> PResult<Vec<Decorator>> {
+        let mut out = Vec::new();
+        while self.at(&Tok::At) {
+            let s = self.bump()?.span;
+            let (name, _) = self.ident("a decorator name")?;
+            let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
+            out.push(Decorator { name, args, span: self.since(s) });
+        }
+        Ok(out)
+    }
+
+    fn object_decl(&mut self, decorators: Vec<Decorator>) -> PResult<ObjectDecl> {
+        let start = decorators.first().map_or(self.cur.span, |d| d.span);
+        self.bump()?;
         let (name, _) = self.ident("an object name")?;
         self.expect(&Tok::LBrace, "'{'")?;
         let mut fields = Vec::new();
         let mut methods = Vec::new();
         while !self.at(&Tok::RBrace) {
-            let mut decorators = Vec::new();
-            while self.at(&Tok::At) {
-                let s = self.bump()?.span;
-                let (dname, _) = self.ident("a decorator name")?;
-                let args = if self.at(&Tok::LParen) { self.args()? } else { Vec::new() };
-                decorators.push(Decorator { name: dname, args, span: self.since(s) });
-            }
+            let member_decorators = self.decorators()?;
             let private_span = self.cur.span;
             let private = self.eat(&Tok::Private)?;
             self.eat(&Tok::Async)?;
@@ -304,10 +317,10 @@ impl<'a> Parser<'a> {
             if self.at(&Tok::LParen) || self.at(&Tok::Lt) {
                 let generics = self.generics()?;
                 let func = Rc::new(self.fn_rest(mname, generics, mspan)?);
-                methods.push(Method { decorators, private, func });
+                methods.push(Method { decorators: member_decorators, private, func });
                 continue;
             }
-            if let Some(d) = decorators.first() {
+            if let Some(d) = member_decorators.first() {
                 return Err(Diagnostic::new("decorators are only allowed on methods", d.span));
             }
             if private {
@@ -322,7 +335,7 @@ impl<'a> Parser<'a> {
             fields.push(Field { name: mname, ty, init, span: mspan });
         }
         self.bump()?;
-        Ok(ObjectDecl { name, fields, methods, span: self.since(start) })
+        Ok(ObjectDecl { decorators, name, fields, methods, span: self.since(start) })
     }
 
     // ---------- types (parsed and kept, not yet checked) ----------

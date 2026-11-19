@@ -10,7 +10,7 @@
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
 //! plus `/_tj/reload` (SSE) for live reload.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, Event};
 use serde_json::{json, Value as Json};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -31,13 +31,13 @@ pub struct Dev {
     pub source: PathBuf,
     pub web_dir: PathBuf,
     pub wasm: PathBuf,
-    pub reload: Mutex<Vec<Sender<String>>>,
+    pub reload: Mutex<Vec<Sender<Event>>>,
 }
 
 impl Dev {
     pub fn notify_reload(&self) {
         if let Ok(mut subs) = self.reload.lock() {
-            subs.retain(|s| s.send("event: reload\ndata: {}\n\n".into()).is_ok());
+            subs.retain(|s| s.send((String::new(), "event: reload\ndata: {}\n\n".into())).is_ok());
         }
     }
 }
@@ -116,7 +116,10 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let method = req.method().clone();
     let response = match (&method, segs.as_slice()) {
-        (Method::Get, ["api", "events"]) => return sse(req, engine.subscribe()),
+        (Method::Get, ["api", "events"]) => {
+            let only = query_values(req.url(), "object");
+            return sse(req, engine.subscribe(), only);
+        }
         (Method::Get, ["api", class, id]) => result_response(engine.request(Input::Get { object: format!("{class}/{id}"), reply: None })),
         (Method::Post, ["api", class, id, name]) => match read_json(&mut req) {
             Ok(Json::Null) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None })),
@@ -141,7 +144,7 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
                     if let Ok(mut subs) = dev.reload.lock() {
                         subs.push(t);
                     }
-                    return sse(req, r);
+                    return sse(req, r, Vec::new());
                 }
                 _ => json_response(404, &json!({ "error": "not found" })),
             }
@@ -158,8 +161,14 @@ fn file(path: PathBuf, content_type: &str) -> Response<std::io::Cursor<Vec<u8>>>
     }
 }
 
-/// Streams server-sent events until the client goes away.
-fn sse(req: Request, rx: Receiver<String>) {
+/// All values of a query parameter, percent-decoded.
+fn query_values(url: &str, name: &str) -> Vec<String> {
+    let Some((_, query)) = url.split_once('?') else { return Vec::new() };
+    query.split('&').filter_map(|pair| pair.split_once('=')).filter(|(k, _)| *k == name).filter_map(|(_, v)| percent_decode(&v.replace('+', " "))).collect()
+}
+
+/// Streams server-sent events until the client goes away; `only` limits them to those objects.
+fn sse(req: Request, rx: Receiver<Event>, only: Vec<String>) {
     let mut w = req.into_writer();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     if w.write_all(head.as_bytes()).and_then(|()| w.flush()).is_err() {
@@ -167,7 +176,8 @@ fn sse(req: Request, rx: Receiver<String>) {
     }
     loop {
         let chunk = match rx.recv_timeout(SSE_KEEPALIVE) {
-            Ok(msg) => msg,
+            Ok((object, _)) if !only.is_empty() && !only.contains(&object) => continue,
+            Ok((_, msg)) => msg,
             Err(RecvTimeoutError::Timeout) => ":\n\n".to_string(),
             Err(RecvTimeoutError::Disconnected) => return,
         };
