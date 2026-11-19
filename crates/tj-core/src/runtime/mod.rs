@@ -55,6 +55,17 @@ impl From<Failure> for BootError {
     }
 }
 
+/// Work counters for performance tests. Counted, not timed, so they are the same on every run.
+#[derive(Default, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Metrics {
+    pub inputs: u64,
+    pub renders: u64,
+    pub patch_ops: u64,
+    /// Bytecode instructions executed.
+    pub vm_steps: u64,
+}
+
 struct Timer {
     at: f64,
     seq: u64,
@@ -109,6 +120,7 @@ pub struct Runtime {
     now: f64,
     rng: u64,
     outputs: Vec<Output>,
+    pub(crate) metrics: Metrics,
 }
 
 impl Runtime {
@@ -146,6 +158,7 @@ impl Runtime {
             now: opts.now,
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
             outputs: Vec::new(),
+            metrics: Metrics::default(),
         };
         for &main in &program.main {
             let closure = Rc::new(Closure { proto: main, upvals: Vec::new(), this: None });
@@ -166,6 +179,7 @@ impl Runtime {
         if now > self.now {
             self.now = now;
         }
+        self.metrics.inputs += 1;
         match input {
             Input::Call { object, method, args, reply } => {
                 let args = args.iter().map(Value::from_json).collect();
@@ -176,6 +190,11 @@ impl Runtime {
             }
             Input::Get { object, reply } => {
                 let state = self.resolve_object(&object).and_then(|o| self.object_state(&o));
+                if state.is_ok() {
+                    // Reading is an event too: subscribers learn who is looking. It never changes
+                    // state, so a replica fetching state cannot start a change/fetch loop.
+                    self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                }
                 self.reply(reply, state);
             }
             Input::Ui { target, event, value, reply } => {

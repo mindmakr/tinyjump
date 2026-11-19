@@ -537,6 +537,24 @@ final class Renderer {
 
     // ---------- automation ----------
 
+    /** The window size in dp, for overflow checks. */
+    JSONObject viewport() throws JSONException {
+        View window = nodes.get(0).view.getRootView();
+        return new JSONObject().put("w", Math.round(window.getWidth() / density)).put("h", Math.round(window.getHeight() / density));
+    }
+
+    /** The window as PNG, for visual tests; null before the first layout. */
+    byte[] screenshot() {
+        View window = nodes.get(0).view.getRootView();
+        if (window.getWidth() == 0 || window.getHeight() == 0) return null;
+        Bitmap bitmap = Bitmap.createBitmap(window.getWidth(), window.getHeight(), Bitmap.Config.ARGB_8888);
+        window.draw(new android.graphics.Canvas(bitmap));
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
+        bitmap.recycle();
+        return out.toByteArray();
+    }
+
     /** Adds bounds (dp, on screen) and visibility to an inspect tree, like the web host does. */
     void addBounds(JSONArray tree) throws JSONException {
         for (int i = 0; i < tree.length(); i++) {

@@ -1,7 +1,9 @@
-//! `tj` â€” the tinyjump command line.
+//! `tj`: the tinyjump command line.
 
 mod engine;
 mod http;
+mod mcp;
+mod review;
 mod store;
 
 use engine::Engine;
@@ -13,34 +15,44 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 const USAGE: &str = "\
-tj â€” tinyjump
+tj: tinyjump
 
 USAGE:
   tj check <app.tj>              compile and report errors
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
+  tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
+  tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
 
 OPTIONS:
   --port <n>      port to listen on (default 4700)
   --host <addr>   address to bind (default 127.0.0.1; use 0.0.0.0 to expose)
   --data <dir>    where objects are stored (default: .tj-data next to the app)
   --wasm <file>   web runtime for `dev` (default: the workspace's `cargo web` output)
+  --target <url>  app automation endpoint (default http://127.0.0.1:4700; Android/iOS debug: :4701)
 ";
 
 struct Args {
     command: String,
-    file: PathBuf,
+    file: Option<PathBuf>,
     port: u16,
     host: String,
     data: Option<PathBuf>,
     wasm: Option<PathBuf>,
+    target: String,
+}
+
+impl Args {
+    fn file(&self) -> Result<&Path, String> {
+        self.file.as_deref().ok_or_else(|| format!("`tj {}` needs an app file", self.command))
+    }
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
-    let file = PathBuf::from(it.next().ok_or("missing app file")?);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None };
+    let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into() };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -48,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
             "--host" => args.host = value()?,
             "--data" => args.data = Some(PathBuf::from(value()?)),
             "--wasm" => args.wasm = Some(PathBuf::from(value()?)),
+            "--target" => args.target = value()?,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -63,9 +76,11 @@ fn main() -> ExitCode {
         }
     };
     let result = match args.command.as_str() {
-        "check" => check(&args.file),
+        "check" => args.file().and_then(check),
         "serve" => serve(&args, false),
         "dev" => serve(&args, true),
+        "review" => review(&args.target),
+        "mcp" => mcp::run(&args.target),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     match result {
@@ -75,6 +90,20 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints the review of a running app; fails if it found errors, so CI can gate on it.
+fn review(target: &str) -> Result<(), String> {
+    let url = format!("{}/_tj/inspect", target.trim_end_matches('/'));
+    let body = ureq::get(&url).call().map_err(|e| format!("cannot reach {url}: {e}"))?.into_string().map_err(|e| e.to_string())?;
+    let reply: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("bad reply from {url}: {e}"))?;
+    let snapshot = &reply["ok"];
+    let findings = review::review(snapshot);
+    print!("{}", review::report(snapshot, &findings));
+    if findings.iter().any(|f| f.severity == review::Severity::Error) {
+        return Err("review found errors".into());
+    }
+    Ok(())
 }
 
 fn read_source(file: &Path) -> Result<String, String> {
@@ -98,8 +127,9 @@ fn workspace_dir() -> PathBuf {
 }
 
 fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
-    let source = read_source(&args.file)?;
-    let data = args.data.clone().unwrap_or_else(|| args.file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
+    let file = args.file()?;
+    let source = read_source(file)?;
+    let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
     // In dev mode the browser runs the UI; the server keeps the backend objects.
     let engine = Engine::start(source, data.clone(), false)?;
     let addr = format!("{}:{}", args.host, args.port);
@@ -108,8 +138,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         if !wasm.exists() {
             return Err(format!("web runtime not found at {}\nbuild it with: cargo web", wasm.display()));
         }
-        let dev = Arc::new(Dev { source: args.file.clone(), web_dir: workspace_dir().join("hosts/web"), wasm, reload: Mutex::new(Vec::new()) });
-        watch(args.file.clone(), engine.clone(), dev.clone());
+        let dev = Arc::new(Dev { source: file.to_path_buf(), web_dir: workspace_dir().join("hosts/web"), wasm, reload: Mutex::new(Vec::new()) });
+        watch(file.to_path_buf(), engine.clone(), dev.clone());
         Some(dev)
     } else {
         None

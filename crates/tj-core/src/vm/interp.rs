@@ -66,8 +66,14 @@ impl Runtime {
 
     /// Runs the fiber until it finishes, suspends or fails.
     pub(crate) fn run(&mut self, f: &mut Fiber) -> Result<Run, Failure> {
-        let prog = self.program.clone();
         let mut budget = STEP_BUDGET;
+        let r = self.run_steps(f, &mut budget);
+        self.metrics.vm_steps += STEP_BUDGET - budget;
+        r
+    }
+
+    fn run_steps(&mut self, f: &mut Fiber, budget: &mut u64) -> Result<Run, Failure> {
+        let prog = self.program.clone();
         'frames: loop {
             let fi = f.frames.len() - 1;
             let (closure, mut ip, base) = {
@@ -114,8 +120,8 @@ impl Runtime {
             }
 
             loop {
-                budget -= 1;
-                if budget == 0 {
+                *budget -= 1;
+                if *budget == 0 {
                     f.frames[fi].ip = ip;
                     return Err(self.failure(f, "the program ran too long without finishing (an endless loop?)".into()));
                 }

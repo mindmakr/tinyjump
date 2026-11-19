@@ -183,6 +183,8 @@ export async function start(opts) {
       const d = JSON.parse(e.data);
       if (replicas.has(d.object)) send({ type: 'sync', object: d.object, state: d.state });
     });
+    // Server-side events (emit, read) reach the page like local ones.
+    events.addEventListener('emit', (e) => window.dispatchEvent(new CustomEvent('tinyjump:emit', { detail: JSON.parse(e.data) })));
   }
 
   function subscribe(key) {

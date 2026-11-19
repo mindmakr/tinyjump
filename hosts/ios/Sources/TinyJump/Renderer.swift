@@ -37,8 +37,12 @@ final class Renderer {
         /// True while the renderer itself changes a control, so its events stay quiet.
         var quiet = false
         var size: [NSLayoutConstraint] = []
+        /// Weak "prefer zero" main-axis size for views without content (Spacer, the filler),
+        /// so Auto Layout knows which view takes the free space.
+        var flex: NSLayoutConstraint?
         /// Takes up the free space at the end of a stack, so children keep their size.
         let filler = UIView()
+        var fillerFlex: NSLayoutConstraint?
 
         init(id: Int, kind: String, view: UIView, container: UIStackView?) {
             self.id = id
@@ -328,15 +332,32 @@ final class Renderer {
         for (i, v) in want.enumerated() where stack.arrangedSubviews.firstIndex(of: v) != i {
             stack.insertArrangedSubview(v, at: i)
         }
-        // Growing children take free space first, then the filler; others keep their size.
+        // Growing children take free space first (hugging 1), then the filler (2); others keep
+        // their size (750). Views with no content of their own get a weak zero-size preference.
         let axis: NSLayoutConstraint.Axis = vertical ? .vertical : .horizontal
+        func preferZero(_ v: UIView, _ priority: Float) -> NSLayoutConstraint {
+            let c = (vertical ? v.heightAnchor : v.widthAnchor).constraint(equalToConstant: 0)
+            c.priority = UILayoutPriority(priority)
+            c.isActive = true
+            return c
+        }
         for id in p.children {
             guard let c = nodes[id] else { continue }
             let grow = ((c.props["grow"] as? Double) ?? (c.kind == "Spacer" ? 1 : 0)) > 0
             c.view.setContentHuggingPriority(UILayoutPriority(grow ? 1 : 750), for: axis)
             c.view.setContentCompressionResistancePriority(UILayoutPriority(grow ? 250 : 750), for: axis)
+            c.flex?.isActive = false
+            c.flex = c.kind == "Spacer" ? preferZero(c.view, 1) : nil
         }
         p.filler.setContentHuggingPriority(UILayoutPriority(2), for: axis)
+        p.fillerFlex?.isActive = false
+        p.fillerFlex = preferZero(p.filler, 2)
+    }
+
+    /// The window size in points, for overflow checks.
+    func viewport() -> [String: Int] {
+        let size = nodes[0]?.view.window?.bounds.size ?? .zero
+        return ["w": Int(size.width), "h": Int(size.height)]
     }
 
     // ---------- automation ----------

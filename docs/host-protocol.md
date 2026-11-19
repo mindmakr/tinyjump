@@ -101,10 +101,31 @@ Imports (module `env`): `tj_host_load(key, len, out_ptr) -> len | -1`,
 For `load` and `keys`, the host allocates the result with `tj_alloc`, writes its pointer
 to `out_ptr` and returns its length. Rust then owns that memory.
 
+## Read events
+
+A successful `get` also emits `{ object, name: "read" }`, so subscribers learn when an
+object is looked at through the API. Reads never change state, and reads made by rendering
+don't count.
+
 ## Automation
 
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
 `window.tinyjump` and adds `bounds` and `visible` to each node. The CLI, and Android debug
-builds (port 4701, via `adb forward`), serve it over HTTP at `/_tj/inspect` and
-`/_tj/input`. Android bounds are in dp.
+builds (port 4701, via `adb forward`), and iOS debug builds (port 4701 on the Simulator),
+serve it over HTTP at `/_tj/inspect` and `/_tj/input`. Android and iOS also serve
+`/_tj/screenshot` (PNG), and add `viewport` to the snapshot. Bounds are in CSS px on the
+web, dp on Android and points on iOS.
+
+Every snapshot carries `metrics`: `inputs`, `renders`, `patchOps`, `vmSteps`, `nodes` and
+`objects`. These are work counters, not timings, so they are the same on every run and make
+reliable performance tests.
+
+Two tools build on this:
+
+- **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
+  touch targets under 44×44, unlabelled controls and text contrast below WCAG AA. It prints
+  the metrics, and exits non-zero on errors, so CI can gate on it.
+- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `inspect`, `act`,
+  `call`, `get`, `screenshot`, `review` and `input`, so any coding agent can drive and test
+  a running app.

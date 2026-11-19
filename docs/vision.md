@@ -74,7 +74,7 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 |---|---|
 | Web (WASM + DOM) | working |
 | Android (Views, minSdk 21; arm64, armv7, x86, x86_64) | working |
-| iOS (UIKit, iOS 13+) | UIKit host in progress, built and tested on a macOS CI runner |
+| iOS (UIKit, iOS 13+) | working: built and driven on the iOS Simulator in CI |
 | macOS | runtime and CLI tested on macOS CI; AppKit host after iOS |
 | Linux (server/CLI, static: x86_64, aarch64, armv7) | working |
 | Linux desktop UI | after mobile |

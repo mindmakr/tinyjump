@@ -64,6 +64,9 @@ expect() { # expect <url> <text>
   return 1
 }
 
+cargo build --release -p tj-cli
+tj=target/release/tj
+
 echo "== todo: native widgets, local objects, automation"
 xcrun simctl launch "$udid" "$bundle" -example todo
 wait_up
@@ -72,12 +75,12 @@ input '{"type":"ui","target":{"id":"add"},"event":"onPress"}'
 expect "$api/_tj/inspect" 'Hello from iOS'
 curl -sf "$api/_tj/inspect" >"$out/todo-inspect.json"
 curl -sf "$api/_tj/screenshot" -o "$out/todo.png"
+"$tj" review --target "$api" # fails on layout errors; prints warnings
 xcrun simctl terminate "$udid" "$bundle"
 
 echo "== chat: @server objects against tj serve"
-cargo build --release -p tj-cli
 rm -rf "$out/chat-data"
-target/release/tj serve examples/chat/app.tj --data "$out/chat-data" &
+"$tj" serve examples/chat/app.tj --data "$out/chat-data" &
 server=$!
 trap 'kill $server 2>/dev/null || true' EXIT
 xcrun simctl launch "$udid" "$bundle" -example chat -server http://127.0.0.1:4700
@@ -89,4 +92,5 @@ expect http://127.0.0.1:4700/api/Room/lobby 'Hello from iOS'
 curl -sf -X POST http://127.0.0.1:4700/api/Room/lobby/post -d '["server","hi phone"]' >/dev/null
 expect "$api/_tj/inspect" 'hi phone'
 curl -sf "$api/_tj/screenshot" -o "$out/chat.png"
+"$tj" review --target "$api"
 echo "iOS tests passed"

@@ -382,3 +382,64 @@ fn server_objects_replicate_to_devices() {
     let cached = reply(&again.handle(5.0, Input::Get { object: "Room/lobby".into(), reply: Some(1) })).unwrap();
     assert_eq!(cached["messages"][0]["text"], json!("hi"));
 }
+
+/// The source of an example app in examples/<name>/app.tj.
+fn example(name: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name).join("app.tj");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn state(rt: &mut Runtime, now: f64, object: &str) -> Json {
+    reply(&rt.handle(now, Input::Get { object: object.into(), reply: Some(1) })).unwrap()
+}
+
+#[test]
+fn durable_cart_holds_stock_and_the_backend_releases_it() {
+    let (mut server, _) = boot_as(&example("durable-cart"), Shared::default(), 0.0, true);
+    for _ in 0..2 {
+        call(&mut server, 1.0, "Cart/demo", "add", json!(["pot", "ana"])).unwrap();
+    }
+    assert!(call(&mut server, 2.0, "Cart/demo", "add", json!(["pot", "ana"])).unwrap_err().contains("out of stock"));
+    let cart = state(&mut server, 2.0, "Cart/demo");
+    assert_eq!((cart["total"].clone(), cart["changedBy"].clone()), (json!(96), json!("ana")));
+
+    // Left alone, the hold expires on the backend and the stock goes back on the shelf.
+    server.handle(11.0 * 60_000.0, Input::Tick);
+    let cart = state(&mut server, 11.0 * 60_000.0, "Cart/demo");
+    assert_eq!((cart["status"].clone(), cart["lines"].clone(), cart["changedBy"].clone()), (json!("released"), json!([]), json!("backend")));
+    let shelf = state(&mut server, 11.0 * 60_000.0, "Shelf/main");
+    assert!(shelf["products"][2]["stock"].as_f64().unwrap() >= 2.0, "held pots returned: {shelf}");
+
+    // A released cart takes no changes until it starts over; checking out reports the total.
+    assert!(call(&mut server, 700_000.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap_err().contains("released"));
+    call(&mut server, 700_000.0, "Cart/demo", "startOver", json!(["bo"])).unwrap();
+    call(&mut server, 700_001.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap();
+    let out = server.handle(700_002.0, Input::Call { object: "Cart/demo".into(), method: "checkout".into(), args: vec![json!("bo")], reply: Some(1) });
+    assert_eq!(reply(&out).unwrap(), json!(4.5));
+    assert!(out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "checkedOut")));
+}
+
+#[test]
+fn smart_meter_workflow_moves_through_states() {
+    let (mut meter, _) = boot_as(&example("smart-meter"), Shared::default(), 0.0, true);
+    // With a 1 kW limit every simulated sample is over the limit.
+    call(&mut meter, 1.0, "Meter/home", "setLimit", json!([1, "test"])).unwrap();
+    call(&mut meter, 2.0, "Meter/home", "record", json!([9, "gateway"])).unwrap();
+    assert_eq!(state(&mut meter, 2.0, "Meter/home")["state"], json!("high"));
+
+    // Timer samples keep it high; the confirmation alarm turns it into an alert.
+    for t in [5_000.0, 10_000.0, 15_000.0, 16_000.0] {
+        meter.handle(t, Input::Tick);
+    }
+    let s = state(&mut meter, 16_000.0, "Meter/home");
+    assert_eq!((s["state"].clone(), s["acknowledged"].clone()), (json!("alert"), json!(false)));
+
+    call(&mut meter, 17_000.0, "Meter/home", "acknowledge", json!(["ops"])).unwrap();
+    let s = state(&mut meter, 17_000.0, "Meter/home");
+    assert_eq!(s["acknowledged"], json!(true));
+    assert!(s["notices"][0]["text"].as_str().unwrap().contains("ops acknowledged"));
+
+    // Reading the meter is an event too.
+    let out = meter.handle(18_000.0, Input::Get { object: "Meter/home".into(), reply: Some(1) });
+    assert!(out.iter().any(|o| matches!(o, Output::Emit { object, name, .. } if object == "Meter/home" && name == "read")));
+}

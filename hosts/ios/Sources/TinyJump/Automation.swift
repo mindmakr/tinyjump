@@ -90,6 +90,7 @@ final class Automation {
             tj.request(["type": "inspect"]) { ok, error in
                 guard var snapshot = ok as? [String: Any] else { return finish(ok, error) }
                 snapshot["tree"] = tj.renderer.addBounds(snapshot["tree"] as? [[String: Any]] ?? [])
+                snapshot["viewport"] = tj.renderer.viewport()
                 finish(snapshot, nil)
             }
         case ("GET", "/_tj/screenshot"):

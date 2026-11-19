@@ -1,0 +1,186 @@
+// A durable cart shared by every device, the backend, the HTTP API and AI agents.
+// Change it from any of them and every subscribed screen updates at once.
+//
+//   UI:      any browser, Android or iOS device running this app
+//   API:     curl -X POST localhost:4700/api/Cart/demo/add -d '["tea", "curl"]'
+//   Agent:   tj mcp, then call Cart/demo add ["mug", "agent"]
+//   Backend: held stock returns to the shelf when a cart is left alone,
+//            and the shelf restocks itself every minute
+
+type Product = { sku: string, name: string, price: number, stock: number }
+type Line = { sku: string, name: string, price: number, qty: number }
+
+const HOLD_MS = 10 * 60 * 1000
+
+@server object Shelf {
+  products: Product[] = [
+    { sku: "tea", name: "Green tea", price: 4.5, stock: 12 },
+    { sku: "mug", name: "Stone mug", price: 12, stock: 5 },
+    { sku: "pot", name: "Cast-iron pot", price: 48, stock: 2 },
+  ]
+
+  /// Holds one unit for a cart; false when none are left.
+  take(sku: string): boolean {
+    const p = this.products.find(p => p.sku === sku)
+    if (p === null || p.stock === 0) { return false }
+    p.stock -= 1
+    return true
+  }
+
+  give(sku: string, qty: number) {
+    const p = this.products.find(p => p.sku === sku)
+    if (p !== null) { p.stock += qty }
+  }
+
+  // The backend changes things too: one unit of anything running low, every minute.
+  @every("1m") restock() {
+    for (const p of this.products) {
+      if (p.stock < 2) { p.stock += 1 }
+    }
+  }
+}
+
+@server object Cart {
+  lines: Line[] = []
+  status: "open" | "checked out" | "released" = "open"
+  total: number = 0
+  changedBy: string = ""
+  changedAt: number = 0
+
+  add(sku: string, by: string) {
+    this.mustBeOpen()
+    const shelf = Shelf.get("main")
+    const product = shelf.products.find(p => p.sku === sku)
+    if (product === null) { throw new Error(`no product '${sku}'`) }
+    if (!shelf.take(sku)) { throw new Error(`${product.name} is out of stock`) }
+    const line = this.lines.find(l => l.sku === sku)
+    if (line === null) {
+      this.lines.push({ sku, name: product.name, price: product.price, qty: 1 })
+    } else {
+      line.qty += 1
+    }
+    this.changed(by)
+  }
+
+  remove(sku: string, by: string) {
+    this.mustBeOpen()
+    const line = this.lines.find(l => l.sku === sku)
+    if (line === null) { return }
+    line.qty -= 1
+    if (line.qty === 0) { this.lines = this.lines.filter(l => l.sku !== sku) }
+    Shelf.get("main").give(sku, 1)
+    this.changed(by)
+  }
+
+  checkout(by: string): number {
+    this.mustBeOpen()
+    if (this.lines.length === 0) { throw new Error("the cart is empty") }
+    this.status = "checked out"
+    this.changed(by)
+    this.emit("checkedOut", { total: this.total, by })
+    return this.total
+  }
+
+  startOver(by: string) {
+    this.release()
+    this.status = "open"
+    this.changed(by)
+  }
+
+  private mustBeOpen() {
+    if (this.status !== "open") { throw new Error(`the cart is ${this.status}; start a new one`) }
+  }
+
+  private changed(by: string) {
+    this.total = this.lines.reduce((sum, l) => sum + l.price * l.qty, 0)
+    this.changedBy = by
+    this.changedAt = Date.now()
+    // A durable timer: if nobody touches the cart, its held stock goes back on the shelf.
+    if (this.status === "open" && this.lines.length > 0) { this.schedule(HOLD_MS, "expire", this.changedAt) }
+  }
+
+  private expire(stamp: number) {
+    if (this.status !== "open" || this.changedAt !== stamp) { return }
+    this.release()
+    this.status = "released"
+    this.changed("backend")
+  }
+
+  private release() {
+    if (this.status === "open") {
+      for (const l of this.lines) { Shelf.get("main").give(l.sku, l.qty) }
+    }
+    this.lines = []
+  }
+}
+
+/// This device's shopper: their name and the last error, kept locally.
+object Shopper {
+  name: string = ""
+  error: string = ""
+
+  rename(name: string) { this.name = name }
+
+  async add(sku: string) { await this.attempt(() => Cart.get("demo").add(sku, this.who())) }
+  async remove(sku: string) { await this.attempt(() => Cart.get("demo").remove(sku, this.who())) }
+  async checkout() { await this.attempt(() => Cart.get("demo").checkout(this.who())) }
+  async startOver() { await this.attempt(() => Cart.get("demo").startOver(this.who())) }
+
+  private who(): string {
+    const name = this.name.trim()
+    return name === "" ? "a shopper" : name
+  }
+
+  private async attempt(action: () => any) {
+    try {
+      await action()
+      this.error = ""
+    } catch (e) {
+      this.error = e.message
+    }
+  }
+}
+
+function money(n: number): string {
+  return `$${n.toFixed(2)}`
+}
+
+function App() {
+  const shelf = Shelf.get("main")
+  const cart = Cart.get("demo")
+  const me = Shopper.get("me")
+  const open = cart.status === "open"
+
+  return <Column padding={20} gap={14}>
+    <Row justify="between">
+      <Text size={24} weight="bold">Durable cart</Text>
+      <Text id="status" color="#555">{cart.status}</Text>
+    </Row>
+    <Input id="name" value={me.name} placeholder="Your name" onChange={(t) => me.rename(t)} />
+
+    <Text weight="bold">Shelf</Text>
+    {shelf.products.map(p => <Row key={p.sku} gap={10}>
+      <Text grow={1}>{p.name}</Text>
+      <Text color="#555">{money(p.price)}</Text>
+      <Text color="#555" id={`stock-${p.sku}`}>{p.stock} left</Text>
+      <Button id={`add-${p.sku}`} disabled={!open || p.stock === 0} onPress={() => me.add(p.sku)}>Add</Button>
+    </Row>)}
+
+    <Text weight="bold">Cart</Text>
+    {cart.lines.map(l => <Row key={l.sku} gap={10}>
+      <Text grow={1}>{l.qty} × {l.name}</Text>
+      <Text>{money(l.price * l.qty)}</Text>
+      <Button id={`remove-${l.sku}`} disabled={!open} onPress={() => me.remove(l.sku)}>Remove</Button>
+    </Row>)}
+    {cart.lines.length === 0 && <Text color="#555">Nothing in the cart.</Text>}
+
+    <Row justify="between">
+      <Text id="total" size={20} weight="bold">{money(cart.total)}</Text>
+      {open
+        ? <Button id="checkout" disabled={cart.lines.length === 0} onPress={() => me.checkout()}>Check out</Button>
+        : <Button id="start-over" onPress={() => me.startOver()}>New cart</Button>}
+    </Row>
+    {cart.changedBy !== "" && <Text id="changed-by" color="#555">Last change by {cart.changedBy}</Text>}
+    {me.error !== "" && <Text id="error" color="#b00020">{me.error}</Text>}
+  </Column>
+}

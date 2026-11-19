@@ -1,0 +1,170 @@
+// A smart meter as an event-driven workflow with durable state.
+//
+// Events that drive it:
+//   timer    @every("5s") the meter samples its load
+//   action   a person (or agent) records a reading, changes the limit or acknowledges an alert
+//   API      a gateway posts readings: curl -X POST localhost:4700/api/Meter/home/record -d '[7.2, "gateway"]'
+//   alarm    durable timers: "still high after 15s?" and "nobody acknowledged after 30s?"
+//   read     every API read of the meter is published to subscribers as a `read` event
+//
+// Every transition is stored, survives restarts, and reaches every subscribed screen.
+
+type Reading = { at: number, kw: number, source: string }
+type Notice = { at: number, level: "info" | "warning" | "alert", text: string }
+type State = "normal" | "high" | "alert"
+
+const CONFIRM_MS = 15000
+const ESCALATE_MS = 30000
+
+@server object Meter {
+  state: State = "normal"
+  limitKw: number = 5
+  readings: Reading[] = []
+  notices: Notice[] = []
+  acknowledged: boolean = true
+  escalations: number = 0
+
+  // Timer: a simulated sensor; spikes now and then.
+  @every("5s") sample() {
+    const base = 1.5 + Math.random() * 2
+    const spike = Math.random() < 0.2 ? 3 + Math.random() * 4 : 0
+    this.record(Math.round((base + spike) * 100) / 100, "sensor")
+  }
+
+  // Action or API: a reading from anywhere.
+  record(kw: number, source: string) {
+    this.readings.push({ at: Date.now(), kw, source })
+    if (this.readings.length > 24) { this.readings.shift() }
+    this.step(kw)
+  }
+
+  setLimit(kw: number, by: string) {
+    if (kw <= 0) { throw new Error("the limit must be above 0 kW") }
+    this.limitKw = kw
+    this.notify("info", `${by} set the limit to ${kw} kW`)
+  }
+
+  acknowledge(by: string) {
+    if (this.acknowledged) { return }
+    this.acknowledged = true
+    this.escalations = 0
+    this.notify("info", `${by} acknowledged the alert`)
+  }
+
+  // The workflow: each reading may move the meter between states.
+  private step(kw: number) {
+    if (this.state === "normal" && kw > this.limitKw) {
+      this.state = "high"
+      this.notify("warning", `High load: ${kw} kW (limit ${this.limitKw})`)
+      this.schedule(CONFIRM_MS, "confirm")
+    } else if (this.state !== "normal" && this.average(3) <= this.limitKw) {
+      this.state = "normal"
+      this.notify("info", "Load is back to normal")
+    }
+  }
+
+  // Alarm: still high after the confirmation window means a real alert.
+  private confirm() {
+    if (this.state !== "high" || this.average(3) <= this.limitKw) { return }
+    this.state = "alert"
+    this.acknowledged = false
+    this.notify("alert", `Sustained high load: ${this.average(3)} kW`)
+    this.schedule(ESCALATE_MS, "escalate")
+  }
+
+  // Alarm: alerts nobody acknowledged keep escalating.
+  private escalate() {
+    if (this.acknowledged || this.state !== "alert") { return }
+    this.escalations += 1
+    this.notify("alert", `Alert not acknowledged (escalation ${this.escalations})`)
+    this.schedule(ESCALATE_MS, "escalate")
+  }
+
+  private average(n: number): number {
+    const last = this.readings.slice(-n)
+    if (last.length === 0) { return 0 }
+    return Math.round(last.reduce((sum, r) => sum + r.kw, 0) / last.length * 100) / 100
+  }
+
+  private notify(level: "info" | "warning" | "alert", text: string) {
+    this.notices.unshift({ at: Date.now(), level, text })
+    if (this.notices.length > 12) { this.notices.pop() }
+    // Realtime notification for anything subscribed, besides the state change itself.
+    this.emit("notice", { level, text })
+  }
+}
+
+object Operator {
+  name: string = ""
+  error: string = ""
+
+  rename(name: string) { this.name = name }
+
+  async limit(delta: number) {
+    const meter = Meter.get("home")
+    await this.attempt(() => meter.setLimit(meter.limitKw + delta, this.who()))
+  }
+  async acknowledge() { await this.attempt(() => Meter.get("home").acknowledge(this.who())) }
+  async spike() { await this.attempt(() => Meter.get("home").record(9.5, this.who())) }
+
+  private who(): string {
+    const name = this.name.trim()
+    return name === "" ? "an operator" : name
+  }
+
+  private async attempt(action: () => any) {
+    try {
+      await action()
+      this.error = ""
+    } catch (e) {
+      this.error = e.message
+    }
+  }
+}
+
+function clock(ms: number): string {
+  const s = Math.floor(ms / 1000) % 86400
+  const two = (n: number) => String(n).padStart(2, "0")
+  return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}:${two(s % 60)}`
+}
+
+const STATE_COLOR = { normal: "#1b7f3b", high: "#a15c00", alert: "#b00020" }
+
+function App() {
+  const meter = Meter.get("home")
+  const me = Operator.get("me")
+  const latest = meter.readings.length === 0 ? 0 : meter.readings[meter.readings.length - 1].kw
+
+  return <Column padding={20} gap={14}>
+    <Row justify="between">
+      <Text size={24} weight="bold">Smart meter</Text>
+      <Text id="state" weight="bold" color={STATE_COLOR[meter.state]}>{meter.state.toUpperCase()}</Text>
+    </Row>
+    <Row gap={16}>
+      <Text id="load" size={32} weight="bold">{latest} kW</Text>
+      <Text color="#555">limit {meter.limitKw} kW</Text>
+    </Row>
+
+    <Row gap={2} height={60} align="end">
+      {meter.readings.map((r, i) => <Column key={i} width={10}
+        height={Math.max(2, Math.min(60, r.kw * 6))}
+        background={r.kw > meter.limitKw ? "#d9480f" : "#4c6ef5"} />)}
+    </Row>
+
+    <Input id="name" value={me.name} placeholder="Your name" onChange={(t) => me.rename(t)} />
+    <Row gap={8}>
+      <Button id="limit-down" onPress={() => me.limit(-1)}>Limit −1</Button>
+      <Button id="limit-up" onPress={() => me.limit(1)}>Limit +1</Button>
+      <Button id="spike" onPress={() => me.spike()}>Report a spike</Button>
+    </Row>
+    {!meter.acknowledged && <Button id="acknowledge" onPress={() => me.acknowledge()}>Acknowledge alert</Button>}
+    {me.error !== "" && <Text id="error" color="#b00020">{me.error}</Text>}
+
+    <Text weight="bold">Notifications</Text>
+    {meter.notices.map((n, i) => <Row key={i} gap={8}>
+      <Text color="#555">{clock(n.at)}</Text>
+      <Text color={n.level === "alert" ? "#b00020" : n.level === "warning" ? "#a15c00" : "#333"}>{n.text}</Text>
+    </Row>)}
+    {meter.notices.length === 0 && <Text color="#555">No notifications yet.</Text>}
+  </Column>
+}
