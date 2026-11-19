@@ -33,8 +33,9 @@ and the same agents can drive and inspect the running app.
 |---|---|
 | Web (WASM + DOM) | working |
 | Android (Views, minSdk 21; arm64, armv7, x86, x86_64) | working |
-| iOS (UIKit, iOS 12+) | next (needs a Mac to build) |
-| Linux (server/CLI: x86_64 glibc and static musl working; aarch64, armv7 next) | first-class |
+| iOS (UIKit, iOS 12+) | runtime builds for iOS; UIKit host next (needs a Mac) |
+| macOS | runtime builds for macOS; host after iOS |
+| Linux (server/CLI, static: x86_64, aarch64, armv7) | working |
 | Linux desktop UI | after mobile |
 | Microcontrollers | out of scope for now |
 

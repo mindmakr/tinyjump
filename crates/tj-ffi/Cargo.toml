@@ -1,0 +1,17 @@
+[package]
+name = "tj-ffi"
+description = "tinyjump runtime behind a C ABI, for iOS, macOS and desktop hosts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+# staticlib for Apple hosts (and any C/Swift/C++ host); rlib so the ABI is testable in Rust.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+tj-core.workspace = true

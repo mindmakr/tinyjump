@@ -8,7 +8,17 @@ cargo web
 out=target/site
 rm -rf "$out"
 mkdir -p "$out/demo"
-cp site/index.html "$out/"
+# The platform table comes from docs/vision.md, so the site never drifts from it.
+ROWS=$(awk '
+  /^## Platforms/ { inside = 1; next }
+  /^## / { inside = 0 }
+  inside && /^\|/ && !/^\|---/ && !/^\| Target/ {
+    split($0, c, "|"); t = c[2]; s = c[3]
+    gsub(/^ +| +$/, "", t); gsub(/^ +| +$/, "", s)
+    printf "<tr><td>%s</td><td class=\"%s\">%s</td></tr>\n", t, (s ~ /^working/ ? "ok" : "next"), s
+  }' docs/vision.md)
+[[ -n "$ROWS" ]] || { echo "no platform table found in docs/vision.md" >&2; exit 1; }
+ROWS="$ROWS" awk '{ if (index($0, "<!-- PLATFORMS -->")) { sub(/<!-- PLATFORMS -->/, ENVIRON["ROWS"]) } print }' site/index.html > "$out/index.html"
 cp site/demo/index.html "$out/demo/"
 cp hosts/web/tinyjump.js "$out/demo/"
 cp target/wasm32-unknown-unknown/small/tj_wasm.wasm "$out/demo/tinyjump.wasm"

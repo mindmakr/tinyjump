@@ -40,6 +40,14 @@
     h2 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 18px; font-weight: 600; }
     .two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; }
     .note { color: var(--muted); font-size: 16px; }
+    .status { width: 100%; border-collapse: collapse; font-size: 15px; }
+    .status td { padding: 12px 8px 12px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .status td:last-child { color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+    .status td.ok { color: var(--fg); }
+    .status td.ok::before { content: "● "; color: var(--accent); }
+    .log { padding-left: 18px; margin: 0; color: var(--muted); font-size: 16px; }
+    .log li { margin-bottom: 8px; }
+    .log b { color: var(--fg); font-weight: 600; }
     footer { margin-top: 72px; padding: 28px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 15px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
     @media (max-width: 820px) { .hero, .two { grid-template-columns: 1fr; } .grid { grid-template-columns: 1fr; } nav a { margin-left: 12px; } }
   </style>
@@ -92,6 +100,21 @@
       <div class="cell"><h3>Automation built in</h3><p>Every host exposes the semantic tree, bounds, visibility, object state and a controllable clock. Agents can drive and check apps.</p></div>
       <div class="cell"><h3>Tiny</h3><p>A Rust core with no async runtime. The browser runtime, compiler included, is about half a megabyte. Old devices are in scope.</p></div>
     </div>
+
+    <section class="two">
+      <div>
+        <h2>Where it runs</h2>
+        <p class="note">Updated as each host lands. Old devices are in scope: Android 5.0+, 32-bit ARM, browsers without WebGPU.</p>
+        <h2 style="margin-top:36px">Latest</h2>
+        <ul class="log">
+          <li><b>Linux on ARM.</b> Fully static binaries for 64-bit and 32-bit ARM, about 3.5 MB.</li>
+          <li><b>C ABI for Apple and desktop hosts.</b> The runtime builds for iOS and macOS today; the UIKit host is next.</li>
+          <li><b>Android host.</b> Native Views, minSdk 21, four ABIs, a 1.7 MB APK, automation over adb.</li>
+          <li><b>Web host and live demo.</b> The runtime in WebAssembly, drawing native DOM.</li>
+        </ul>
+      </div>
+      <table class="status"><!-- PLATFORMS --></table>
+    </section>
 
     <section class="two">
       <div>

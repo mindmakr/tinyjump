@@ -71,6 +71,14 @@ differs from what the widget already shows, so typing is never interrupted.
 (0 = outputs array, 1 = compile errors or bad input, 2 = boot error) and a JSON payload.
 The WASM and JNI crates are thin shims over it.
 
+### C ABI (`crates/tj-ffi`, for Swift, C and C++)
+
+The header is `crates/tj-ffi/include/tinyjump.h`. Use `tj_new(store)`, then `tj_boot`,
+`tj_handle` and `tj_out`, and finally `tj_free`. Storage goes through the `TjStore`
+callbacks, which return data by copying it into a Rust-owned buffer with `tj_buf_set`, so
+no memory is ever freed across allocators. Build the static library with
+`cargo build -p tj-ffi --profile small --target aarch64-apple-ios` (or any other target).
+
 ### JNI (`crates/tj-android`)
 
 `com.mindmakr.tinyjump.Native`: `int boot(FileStore, String source, double now, long seed,

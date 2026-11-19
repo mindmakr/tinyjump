@@ -618,6 +618,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tj-ffi"
+version = "0.1.0"
+dependencies = [
+ "tj-core",
+]
+
+[[package]]
 name = "tj-wasm"
 version = "0.1.0"
 dependencies = [

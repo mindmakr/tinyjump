@@ -48,6 +48,12 @@ curl localhost:4701/_tj/inspect
 The demo app runs `examples/todo/app.tj` with native Android widgets. The APK is about
 1.7 MB with all four ABIs.
 
+### Linux binaries
+
+`bash scripts/linux-release.sh` builds fully static `tj` binaries for x86_64, 64-bit ARM
+and 32-bit ARM (about 3–5 MB each, no glibc version requirement). It needs zig and
+`cargo-zigbuild`.
+
 ## Layout
 
 ```
@@ -55,6 +61,7 @@ crates/tj-core   language (syntax, compiler), VM, I/O-free runtime, UI catalog +
 crates/tj-cli    `tj`: check / serve / dev — HTTP API, realtime SSE, file store, effects
 crates/tj-wasm   the runtime as a WebAssembly module with a JSON C ABI
 crates/tj-android  the runtime as a JNI library for Android
+crates/tj-ffi    the runtime behind a C ABI (static library) for iOS, macOS and desktop
 hosts/web        web host: native DOM widgets, localStorage, automation (plain ES2017)
 hosts/android    Android host (Java, no dependencies) + demo app
 site/            GitHub Pages: landing page and live demo (scripts/site.sh)

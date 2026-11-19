@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tj-core", "crates/tj-cli", "crates/tj-wasm", "crates/tj-android"]
+members = ["crates/tj-core", "crates/tj-cli", "crates/tj-wasm", "crates/tj-android", "crates/tj-ffi"]
 
 [workspace.package]
 version = "0.1.0"
