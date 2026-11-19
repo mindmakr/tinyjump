@@ -10,6 +10,9 @@ mod review;
 mod store;
 
 use engine::Engine;
+
+/// The language reference (docs/language.md), for agents: `tj docs` and the MCP `language` tool.
+pub const LANGUAGE: &str = include_str!("../../../docs/language.md");
 use http::Dev;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -21,6 +24,7 @@ const USAGE: &str = "\
 tj: tinyjump
 
 USAGE:
+  tj docs                        print the language reference: load it before writing app code
   tj check <app.tj>              compile and report errors
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
@@ -85,6 +89,10 @@ fn main() -> ExitCode {
         }
     };
     let result = match args.command.as_str() {
+        "docs" => {
+            print!("{LANGUAGE}");
+            Ok(())
+        }
         "check" => args.file().and_then(check),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),

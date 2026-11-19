@@ -201,6 +201,6 @@ Two tools build on this:
 - **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
   touch targets under 44×44, unlabelled controls and text contrast below WCAG AA. It prints
   the metrics, and exits non-zero on errors, so CI can gate on it.
-- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `inspect`, `act`,
-  `call`, `get`, `screenshot`, `review` and `input`, so any coding agent can drive and test
-  a running app.
+- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
+  language reference, to load before writing code), `inspect`, `act`, `call`, `get`,
+  `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.

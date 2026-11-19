@@ -31,6 +31,7 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo web                                # build hosts' WASM runtime
 cargo tj dev examples/todo/app.tj        # http://127.0.0.1:4700
+cargo tj docs                            # the language reference agents load before writing apps
 cargo tj check examples/todo/app.tj
 cargo tj bench examples/todo/app.tj      # compile, boot and tick timings, VM steps, patches
 bash scripts/budget.sh                   # size and speed budget; run before merging

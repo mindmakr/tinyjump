@@ -38,6 +38,7 @@ pub fn run(target: &str) -> Result<(), String> {
 fn tools() -> Json {
     let none = json!({ "type": "object", "properties": {} });
     json!([
+        { "name": "language", "description": "The tinyjump language reference: everything that differs from TypeScript and React, the UI components and the built-ins. Load it before writing or changing app code.", "inputSchema": none },
         { "name": "inspect", "description": "The app's screen as an outline ([node] kind \"text\" #id @x,y wxh on:events), plus object state and work counters.", "inputSchema": none },
         { "name": "act", "description": "Fire a UI event like a person would: press a button, type into an input, flip a toggle.",
           "inputSchema": { "type": "object", "required": ["target", "event"], "properties": {
@@ -79,7 +80,7 @@ impl Client {
                 "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "tinyjump", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": format!("Drives the tinyjump app at {}. Start with `inspect`, act with `act`, check with `review` and `screenshot`.", self.target),
+                "instructions": format!("Drives the tinyjump app at {}. Before writing app code, load `language` (the language reference). Start with `inspect`, act with `act`, check with `review` and `screenshot`.", self.target),
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -98,6 +99,7 @@ impl Client {
     fn tool(&self, name: &str, a: &Json) -> Result<Json, String> {
         let text = |s: String| Ok(json!([{ "type": "text", "text": s }]));
         match name {
+            "language" => text(crate::LANGUAGE.to_string()),
             "inspect" => {
                 let s = self.inspect()?;
                 let objects = serde_json::to_string_pretty(&s["objects"]).unwrap_or_default();
@@ -209,7 +211,10 @@ mod tests {
         let init = c.handle("initialize", &json!({ "protocolVersion": "2025-06-18" })).unwrap();
         assert_eq!(init["capabilities"]["tools"], json!({}));
         let names: Vec<String> = c.handle("tools/list", &json!({})).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["inspect", "act", "call", "get", "screenshot", "review", "input"]);
+        assert_eq!(names, ["language", "inspect", "act", "call", "get", "screenshot", "review", "input"]);
+        // The language reference works without an app: agents load it before writing code.
+        let docs = c.handle("tools/call", &json!({ "name": "language", "arguments": {} })).unwrap();
+        assert!(docs["content"][0]["text"].as_str().unwrap().starts_with("# The tinyjump language"));
         let call = c.handle("tools/call", &json!({ "name": "inspect", "arguments": {} })).unwrap();
         assert_eq!(call["isError"], json!(true));
         assert!(call["content"][0]["text"].as_str().unwrap().contains("cannot reach the app"));
