@@ -107,6 +107,10 @@
         <p class="note">Updated as each host lands. Old devices are in scope: Android 5.0+, 32-bit ARM, browsers without WebGPU.</p>
         <h2 style="margin-top:36px">Latest</h2>
         <ul class="log">
+          <li><b>Apps in several files.</b> <code>import { Cart } from "./cart"</code>, the TypeScript way, with errors that say which import to add. The durable cart is now three files.</li>
+          <li><b>Calls that survive outages.</b> Server calls made offline wait in a durable outbox and run exactly once when the server is back. Replicas resume their change stream instead of refetching, and slow clients never build a backlog.</li>
+          <li><b>Numbers to optimise.</b> <code>tj bench</code> times boot and rendering and counts the work; a size and speed budget fails any change that makes things worse. The server reports its latency and realtime fan-out lag.</li>
+          <li><b>One reference for agents.</b> <code>tj docs</code> and the MCP <code>language</code> tool hand an agent the whole language in one call.</li>
           <li><b>Right-to-left.</b> Arabic, Urdu and Hebrew layouts mirror on every host: the core flips rows on Android and iOS, the browser follows <code>dir</code> on the web.</li>
           <li><b>One layout engine.</b> CSS flexbox computed once in the core for Android and iOS, matching the browser. A screen lays out the same everywhere and can be tested without a device.</li>
           <li><b>iOS host.</b> Native UIKit, built and driven on the iOS Simulator in CI for every pull request.</li>
