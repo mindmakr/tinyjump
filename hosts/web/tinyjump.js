@@ -6,6 +6,7 @@
 const ALIGN = { start: 'flex-start', center: 'center', end: 'flex-end', stretch: 'stretch' };
 const JUSTIFY = { start: 'flex-start', center: 'center', end: 'flex-end', between: 'space-between', around: 'space-around' };
 const MAX_TIMEOUT = 2147483647;
+const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ku'];
 
 const CSS = [
   '.tj-column,.tj-row,.tj-scroll{display:flex;box-sizing:border-box;min-width:0}',
@@ -48,6 +49,7 @@ function localStore(prefix) {
  * Boots an app.
  * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean}} opts
  *   server: base URL of a `tj serve` backend for `@server` objects ('' = same origin).
+ *   dir: 'ltr' or 'rtl'; defaults to the page's dir, then the browser language.
  */
 export async function start(opts) {
   const store = opts.store || localStore('tj:');
@@ -89,6 +91,8 @@ export async function start(opts) {
 
   const result = () => JSON.parse(readStr(ex.tj_out_ptr(), ex.tj_out_len()));
   const root = opts.root;
+  // Right-to-left locales mirror the layout; the browser's flexbox follows `dir`.
+  root.setAttribute('dir', opts.dir || document.documentElement.dir || (RTL_LANGUAGES.indexOf((navigator.language || '').split('-')[0]) >= 0 ? 'rtl' : 'ltr'));
   const nodes = new Map([[0, root]]);
   const pending = new Map();
   let nextReply = 1;

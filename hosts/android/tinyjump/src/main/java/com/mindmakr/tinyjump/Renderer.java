@@ -257,6 +257,7 @@ final class Renderer {
             }
             case "Input": {
                 final EditText e = new EditText(ctx);
+                e.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
                 final boolean multiline = props.optBoolean("multiline", false);
                 e.setInputType(InputType.TYPE_CLASS_TEXT | (multiline ? InputType.TYPE_TEXT_FLAG_MULTI_LINE : 0));
                 if (!multiline) {
@@ -305,8 +306,12 @@ final class Renderer {
                 img.setAdjustViewBounds(true);
                 return new Node(id, kind, img, null);
             }
-            case "Text":
-                return new Node(id, kind, new TextView(ctx), null);
+            case "Text": {
+                TextView t = new TextView(ctx);
+                // Align to the layout's start (right in RTL), like the web, not to the text's own direction.
+                t.setTextAlignment(View.TEXT_ALIGNMENT_VIEW_START);
+                return new Node(id, kind, t, null);
+            }
             default: // Spacer
                 return new Node(id, kind, new View(ctx), null);
         }

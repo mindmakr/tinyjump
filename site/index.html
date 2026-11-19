@@ -107,6 +107,8 @@
         <p class="note">Updated as each host lands. Old devices are in scope: Android 5.0+, 32-bit ARM, browsers without WebGPU.</p>
         <h2 style="margin-top:36px">Latest</h2>
         <ul class="log">
+          <li><b>Right-to-left.</b> Arabic, Urdu and Hebrew layouts mirror on every host: the core flips rows on Android and iOS, the browser follows <code>dir</code> on the web.</li>
+          <li><b>One layout engine.</b> CSS flexbox computed once in the core for Android and iOS, matching the browser. A screen lays out the same everywhere and can be tested without a device.</li>
           <li><b>iOS host.</b> Native UIKit, built and driven on the iOS Simulator in CI for every pull request.</li>
           <li><b>Durable cart and smart meter.</b> One cart changed from the UI, the backend, the API and an AI agent, live on every screen. A meter workflow driven by timers, alarms, actions and API events.</li>
           <li><b>Testing for agents.</b> <code>tj review</code> catches overflow, overlap, tiny touch targets, missing labels and low contrast. <code>tj mcp</code> lets any coding agent inspect, drive, screenshot and review apps.</li>

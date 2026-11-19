@@ -121,12 +121,13 @@ public final class TinyJump {
         apply(out);
     }
 
-    /** Asks the core to lay the screen out at the root's current size. */
+    /** Asks the core to lay the screen out at the root's current size, mirrored for RTL locales. */
     void layout() {
         float[] size = renderer.viewportDp();
         if (size == null) return;
+        boolean rtl = renderer.root.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
         try {
-            send(input("layout").put("width", size[0]).put("height", size[1]));
+            send(input("layout").put("width", size[0]).put("height", size[1]).put("rtl", rtl));
         } catch (JSONException e) {
             throw new IllegalStateException(e);
         }

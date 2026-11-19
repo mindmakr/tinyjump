@@ -7,7 +7,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use taffy::prelude::*;
-use taffy::{compute_leaf_layout, AlignContent, AlignItems, LayoutInput, LayoutOutput, Overflow, Point as TPoint};
+use taffy::{compute_leaf_layout, AlignContent, AlignItems, Direction, LayoutInput, LayoutOutput, Overflow, Point as TPoint};
 
 struct Leaf {
     id: u32,
@@ -38,10 +38,10 @@ fn dimension(props: &Map<String, Json>, key: &str) -> Dimension {
     }
 }
 
-fn style(n: &Node) -> Style {
+fn style(n: &Node, direction: Direction) -> Style {
     let p = &n.props;
     let kind = &*n.kind;
-    let mut s = Style { size: Size { width: dimension(p, "width"), height: dimension(p, "height") }, ..Style::default() };
+    let mut s = Style { direction, size: Size { width: dimension(p, "width"), height: dimension(p, "height") }, ..Style::default() };
     s.flex_direction = if kind == "Row" { FlexDirection::Row } else { FlexDirection::Column };
     s.align_items = match p.get("align").and_then(Json::as_str) {
         Some("start") => AlignItems::FLEX_START,
@@ -92,12 +92,15 @@ fn fingerprint(props: &Map<String, Json>) -> u64 {
 
 impl Layout {
     /// Lays the tree out in a `width` x `height` viewport and returns the frames that changed.
-    pub fn compute(&mut self, tree: &Tree, width: f32, height: f32, measure: &mut dyn Measure) -> Vec<Frame> {
+    /// Right-to-left locales (`rtl`) mirror it: rows run from the right, start and end swap.
+    pub fn compute(&mut self, tree: &Tree, width: f32, height: f32, rtl: bool, measure: &mut dyn Measure) -> Vec<Frame> {
+        let direction = if rtl { Direction::Rtl } else { Direction::Ltr };
         let mut t: TaffyTree<Leaf> = TaffyTree::new();
         let mut ids: Vec<(NodeId, u32, bool)> = Vec::new();
-        let roots: Vec<NodeId> = tree.roots().iter().map(|n| build(&mut t, n, &mut ids)).collect();
+        let roots: Vec<NodeId> = tree.roots().iter().map(|n| build(&mut t, n, &mut ids, direction)).collect();
         // Like the web host's root: a full-width column at least as tall as the screen.
         let root_style = Style {
+            direction,
             flex_direction: FlexDirection::Column,
             size: Size { width: Dimension::length(width), height: Dimension::auto() },
             min_size: Size { width: LengthPercentageAuto::auto(), height: LengthPercentageAuto::length(height) },
@@ -148,12 +151,12 @@ impl Layout {
     }
 }
 
-fn build(t: &mut TaffyTree<Leaf>, n: &Node, ids: &mut Vec<(NodeId, u32, bool)>) -> NodeId {
-    let s = style(n);
+fn build(t: &mut TaffyTree<Leaf>, n: &Node, ids: &mut Vec<(NodeId, u32, bool)>, direction: Direction) -> NodeId {
+    let s = style(n, direction);
     let node = if is_leaf(&n.kind) {
         t.new_leaf_with_context(s, Leaf { id: n.id, props: fingerprint(&n.props) })
     } else {
-        let children: Vec<NodeId> = n.children.iter().map(|c| build(t, c, ids)).collect();
+        let children: Vec<NodeId> = n.children.iter().map(|c| build(t, c, ids, direction)).collect();
         t.new_with_children(s, &children)
     }
     .expect("taffy accepts new nodes");
@@ -210,7 +213,7 @@ mod tests {
             }
         }
         collect(tree.roots(), &mut texts);
-        let mut frames = Layout::default().compute(&tree, 300.0, 600.0, &mut Fake(texts));
+        let mut frames = Layout::default().compute(&tree, 300.0, 600.0, false, &mut Fake(texts));
         frames.sort_by_key(|f| f.id);
         frames
     }
@@ -270,10 +273,25 @@ mod tests {
         tree.update(vec![v("Scroll", json!({ "height": 100 }), items)]);
         let mut layout = Layout::default();
         let mut fake = Fake(HashMap::new());
-        let first = layout.compute(&tree, 300.0, 600.0, &mut fake);
+        let first = layout.compute(&tree, 300.0, 600.0, false, &mut fake);
         let scroll = first.iter().find(|f| f.content.is_some()).unwrap();
         assert_eq!((scroll.h, scroll.content), (100.0, Some(200.0)));
-        assert!(layout.compute(&tree, 300.0, 600.0, &mut fake).is_empty(), "nothing moved");
-        assert!(!layout.compute(&tree, 320.0, 600.0, &mut fake).is_empty(), "a resize moves things");
+        assert!(layout.compute(&tree, 300.0, 600.0, false, &mut fake).is_empty(), "nothing moved");
+        assert!(!layout.compute(&tree, 320.0, 600.0, false, &mut fake).is_empty(), "a resize moves things");
+    }
+
+    #[test]
+    fn rtl_mirrors_rows() {
+        let mut tree = Tree::default();
+        tree.update(vec![v("Row", json!({ "gap": 10 }), vec![text("first", json!({})), text("second", json!({}))])]);
+        let texts: HashMap<u32, String> = [(2, "first".to_string()), (3, "second".to_string())].into_iter().collect();
+        let ltr = Layout::default().compute(&tree, 300.0, 600.0, false, &mut Fake(texts.clone()));
+        let rtl = Layout::default().compute(&tree, 300.0, 600.0, true, &mut Fake(texts));
+        let x = |frames: &[Frame], id: u32| frames.iter().find(|f| f.id == id).map(|f| (f.x, f.w)).unwrap();
+        assert_eq!(x(&ltr, 2), (0.0, 40.0), "left to right: the first item starts at the left");
+        let (fx, fw) = x(&rtl, 2);
+        assert_eq!(fx + fw, 300.0, "right to left: the first item starts at the right");
+        let (sx, sw) = x(&rtl, 3);
+        assert_eq!(sx + sw + 10.0, fx, "the second item follows it leftwards");
     }
 }

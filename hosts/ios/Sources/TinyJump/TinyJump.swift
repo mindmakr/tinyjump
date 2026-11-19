@@ -73,10 +73,11 @@ public final class TinyJump {
         apply(out)
     }
 
-    /// Asks the core to lay the screen out at the root's current size.
+    /// Asks the core to lay the screen out at the root's current size, mirrored for RTL locales.
     func layout() {
         guard let size = renderer.viewportSize() else { return }
-        send(["type": "layout", "width": Double(size.width), "height": Double(size.height)])
+        let rtl = UIView.userInterfaceLayoutDirection(for: renderer.root.semanticContentAttribute) == .rightToLeft
+        send(["type": "layout", "width": Double(size.width), "height": Double(size.height), "rtl": rtl])
     }
 
     static func now() -> Double {

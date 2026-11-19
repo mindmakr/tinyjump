@@ -42,6 +42,27 @@ and apply the frames, and the web host uses the browser's own flexbox, which fol
 same rules. Layout is identical everywhere and testable without a device
 (`ui/layout.rs` tests).
 
+## Languages and locales (planned)
+
+Apps must work in any language, including Chinese, Arabic, Urdu and the European
+languages, with local time, number and currency formats.
+
+- **Scripts and input** come from the platform: native widgets shape and render complex
+  scripts (Urdu Nastaliq, Arabic, CJK) and handle input methods. Hosts measure text, so
+  layout stays correct.
+- **Right-to-left (done):** the shared layout engine mirrors layout for RTL locales (rows
+  reverse, start and end swap), so every host mirrors identically. The web host sets `dir`.
+- **Translations:** a built-in `t("key", { count })` with per-locale message files, plural
+  rules and fallback to a base locale. Keys are type-checked, so a missing key is a compile
+  error.
+- **Dates, numbers and currencies** are formatted by the host (Intl on the web, system
+  formatters on iOS and Android, ICU on servers). The data stays accurate and the core stays
+  tiny; bundling ICU data would add megabytes. Tests use a fixed formatter, so results are
+  deterministic. Time zones come from the host, and timestamps stay UTC milliseconds.
+- **Testing:** `tj review` checks for truncation and overflow in every locale, missing
+  translations and RTL mirroring, and runs a pseudo-locale (long, accented text) to catch
+  layout breaks early.
+
 ## Reliable messaging (built in, scoped to objects)
 
 Apps should not have to build their own delivery plumbing. Planned, in this order:
