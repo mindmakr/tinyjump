@@ -7,8 +7,8 @@ built-in **automation**, so AI agents can write, run and check apps in one loop.
 
 **[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/)
 
-> Status: early. The language, VM, runtime, web host and Linux/Windows/macOS server work.
-> Android and iOS hosts are next. See [docs/vision.md](docs/vision.md).
+> Status: early. The language, VM, runtime, web host, Android host and the
+> Linux/Windows/macOS server work. iOS is next. See [docs/vision.md](docs/vision.md).
 
 ## Try it
 
@@ -33,13 +33,31 @@ curl -N localhost:4700/api/events          # realtime: emit + changed
 Other commands: `tj check app.tj` (compile errors with fix hints) and `tj serve app.tj`
 (backend only; add `--host 0.0.0.0` to expose it).
 
+### Android
+
+You need the Android SDK and NDK, plus `cargo install cargo-ndk` and
+`rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android`.
+
+```sh
+cd hosts/android
+./gradlew :demo:installDebug               # builds the Rust runtime for 4 ABIs, minSdk 21
+adb forward tcp:4701 tcp:4701              # debug builds serve automation
+curl localhost:4701/_tj/inspect
+```
+
+The demo app runs `examples/todo/app.tj` with native Android widgets. The APK is about
+1.7 MB with all four ABIs.
+
 ## Layout
 
 ```
 crates/tj-core   language (syntax, compiler), VM, I/O-free runtime, UI catalog + diff
 crates/tj-cli    `tj`: check / serve / dev — HTTP API, realtime SSE, file store, effects
 crates/tj-wasm   the runtime as a WebAssembly module with a JSON C ABI
+crates/tj-android  the runtime as a JNI library for Android
 hosts/web        web host: native DOM widgets, localStorage, automation (plain ES2017)
+hosts/android    Android host (Java, no dependencies) + demo app
+site/            GitHub Pages: landing page and live demo (scripts/site.sh)
 examples/        sample apps
 docs/            vision, language, host protocol
 ```

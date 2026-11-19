@@ -48,7 +48,7 @@ function App() {
   const clock = Clock.get("main")
   const left = todos.items.filter(t => !t.done).length
 
-  return <Column padding={24} gap={12} width={420}>
+  return <Column padding={24} gap={12}>
     <Row justify="between">
       <Text size={24} weight="bold">Todos</Text>
       <Text id="clock" color="#666">{time(clock.now)}</Text>

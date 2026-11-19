@@ -1,0 +1,17 @@
+[package]
+name = "tj-android"
+description = "tinyjump runtime for Android: a JNI shim over the JSON host boundary"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+tj-core.workspace = true
+jni = { version = "0.21", default-features = false }

@@ -65,7 +65,21 @@ differs from what the widget already shows, so typing is never interrupted.
 `Class/id` plus `tj:alarms`. The CLI uses one file per key, and the web host uses
 `localStorage`.
 
-## The WASM ABI (`crates/tj-wasm`)
+## Foreign-language hosts
+
+`tj_core::host::JsonHost` is the shared boundary: `boot` and `handle` each return a status
+(0 = outputs array, 1 = compile errors or bad input, 2 = boot error) and a JSON payload.
+The WASM and JNI crates are thin shims over it.
+
+### JNI (`crates/tj-android`)
+
+`com.mindmakr.tinyjump.Native`: `int boot(FileStore, String source, double now, long seed,
+boolean render)`, `int handle(double now, String input)` and `String out()`. Calls must
+come from the main thread. Rust calls back into `FileStore`, by name, through
+`String load(String)`, `boolean save(String, String)` and `String keys(String)` (a JSON
+array).
+
+### The WASM ABI (`crates/tj-wasm`)
 
 Exports: `tj_alloc(len) -> ptr`, `tj_free(ptr, len)`,
 `tj_boot(src, len, now, seed, render) -> 0|1|2`, `tj_handle(now, input, len) -> 0|1`,
@@ -81,5 +95,6 @@ to `out_ptr` and returns its length. Rust then owns that memory.
 
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
-`window.tinyjump` and adds `bounds` and `visible` to each node. The CLI serves it at
-`/_tj/inspect` and `/_tj/input`.
+`window.tinyjump` and adds `bounds` and `visible` to each node. The CLI, and Android debug
+builds (port 4701, via `adb forward`), serve it over HTTP at `/_tj/inspect` and
+`/_tj/input`. Android bounds are in dp.

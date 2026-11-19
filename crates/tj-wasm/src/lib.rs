@@ -1,14 +1,15 @@
-//! The web host's view of the runtime. Messages cross the boundary as UTF-8 JSON:
-//! the host writes into memory from `tj_alloc`, calls an entry point, then reads the
-//! result from `tj_out_ptr`/`tj_out_len`. Storage calls go back to the host through imports.
+//! The runtime as a WebAssembly module for the web host. A thin C ABI over
+//! [`tj_core::host::JsonHost`]: the host writes UTF-8 JSON into memory from `tj_alloc`,
+//! calls an entry point, then reads the result from `tj_out_ptr`/`tj_out_len`.
+//! Storage calls go back to the host through imports.
 //!
 //! Only meaningful on `wasm32`; on other targets this crate is empty so the workspace
 //! still builds everywhere.
 #![cfg(target_family = "wasm")]
 
-use serde_json::{json, Value as Json};
 use std::cell::RefCell;
-use tj_core::{compile, Input, Options, Runtime, Store};
+use tj_core::host::{JsonHost, INVALID};
+use tj_core::Store;
 
 #[link(wasm_import_module = "env")]
 extern "C" {
@@ -21,8 +22,8 @@ extern "C" {
 }
 
 thread_local! {
-    static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
-    static OUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static HOST: RefCell<JsonHost> = RefCell::new(JsonHost::default());
+    static OUT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 struct HostStore;
@@ -57,16 +58,16 @@ impl Store for HostStore {
         let mut out = std::ptr::null_mut();
         // SAFETY: as in `load`.
         let len = unsafe { tj_host_keys(prefix.as_ptr(), prefix.len(), &mut out) };
-        take_host_string(out, len).and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        take_host_string(out, len).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default()
     }
 }
 
-fn set_out(j: &Json) {
-    OUT.with(|o| *o.borrow_mut() = serde_json::to_vec(j).expect("JSON serializes"));
+fn finish((code, body): (i32, String)) -> i32 {
+    OUT.with(|o| *o.borrow_mut() = body);
+    code
 }
 
-/// # Safety
-/// The caller must treat the pointer as an exclusive buffer of `len` bytes and give it back with [`tj_free`].
+/// Allocates `len` bytes for the host to fill; release with [`tj_free`].
 #[no_mangle]
 pub extern "C" fn tj_alloc(len: usize) -> *mut u8 {
     let mut v = Vec::<u8>::with_capacity(len);
@@ -92,73 +93,36 @@ pub extern "C" fn tj_out_len() -> usize {
     OUT.with(|o| o.borrow().len())
 }
 
-unsafe fn read_str<'a>(ptr: *const u8, len: usize) -> Result<&'a str, Json> {
-    std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).map_err(|_| json!({ "message": "input is not UTF-8" }))
+/// # Safety
+/// `ptr` must point to `len` readable bytes.
+unsafe fn read_str<'a>(ptr: *const u8, len: usize) -> Option<&'a str> {
+    std::str::from_utf8(std::slice::from_raw_parts(ptr, len)).ok()
 }
 
-/// Compiles and boots `src`. Returns 0 with the outputs array, 1 with compile errors, 2 with a boot error.
+fn not_utf8() -> i32 {
+    finish((INVALID, r#"{"message":"input is not UTF-8"}"#.into()))
+}
+
+/// Compiles and boots `src`. Status codes are those of [`tj_core::host`].
 ///
 /// # Safety
 /// `src` must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn tj_boot(src: *const u8, len: usize, now: f64, seed: f64, render: i32) -> i32 {
-    let src = match read_str(src, len) {
-        Ok(s) => s,
-        Err(e) => {
-            set_out(&json!([e]));
-            return 1;
-        }
-    };
-    let program = match compile(src) {
-        Ok(p) => p,
-        Err(errs) => {
-            let list: Vec<Json> = errs
-                .iter()
-                .map(|d| {
-                    let (line, col) = tj_core::syntax::line_col(src, d.span.start as usize);
-                    json!({ "message": d.message, "hint": d.hint, "line": line, "col": col, "text": d.render("app.tj", src) })
-                })
-                .collect();
-            set_out(&Json::Array(list));
-            return 1;
-        }
-    };
-    match Runtime::boot(program, Box::new(HostStore), Options { now, seed: seed as u64, render: render != 0 }) {
-        Ok((rt, outputs)) => {
-            RUNTIME.with(|r| *r.borrow_mut() = Some(rt));
-            set_out(&serde_json::to_value(outputs).expect("outputs serialize"));
-            0
-        }
-        Err(e) => {
-            set_out(&json!({ "message": e.message, "trace": e.trace }));
-            2
-        }
+    match read_str(src, len) {
+        Some(src) => finish(HOST.with(|h| h.borrow_mut().boot(src, Box::new(HostStore), now, seed as u64, render != 0))),
+        None => not_utf8(),
     }
 }
 
-/// Handles one JSON [`Input`]. Returns 0 with the outputs array, 1 with an error.
+/// Handles one JSON input. Status codes are those of [`tj_core::host`].
 ///
 /// # Safety
 /// `input` must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn tj_handle(now: f64, input: *const u8, len: usize) -> i32 {
-    let parsed = read_str(input, len).and_then(|s| serde_json::from_str::<Input>(s).map_err(|e| json!({ "message": format!("bad input: {e}") })));
-    let input = match parsed {
-        Ok(i) => i,
-        Err(e) => {
-            set_out(&e);
-            return 1;
-        }
-    };
-    RUNTIME.with(|r| match r.borrow_mut().as_mut() {
-        Some(rt) => {
-            let outputs = rt.handle(now, input);
-            set_out(&serde_json::to_value(outputs).expect("outputs serialize"));
-            0
-        }
-        None => {
-            set_out(&json!({ "message": "not booted" }));
-            1
-        }
-    })
+    match read_str(input, len) {
+        Some(input) => finish(HOST.with(|h| h.borrow_mut().handle(now, input))),
+        None => not_utf8(),
+    }
 }

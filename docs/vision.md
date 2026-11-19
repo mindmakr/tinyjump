@@ -31,10 +31,10 @@ and the same agents can drive and inspect the running app.
 
 | Target | Status |
 |---|---|
-| Web (WASM + DOM) | first |
-| Android (Views, minSdk 21) | next |
+| Web (WASM + DOM) | working |
+| Android (Views, minSdk 21; arm64, armv7, x86, x86_64) | working |
 | iOS (UIKit, iOS 12+) | next (needs a Mac to build) |
-| Linux (server/CLI: x86_64, aarch64, armv7, static musl) | first-class, now |
+| Linux (server/CLI: x86_64 glibc and static musl working; aarch64, armv7 next) | first-class |
 | Linux desktop UI | after mobile |
 | Microcontrollers | out of scope for now |
 

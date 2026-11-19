@@ -1,3 +1,6 @@
 /target
 .tj-data/
 .playwright-mcp/
+hosts/android/.gradle/
+hosts/android/local.properties
+hosts/android/**/build/

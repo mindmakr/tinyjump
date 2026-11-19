@@ -5,6 +5,7 @@
 //! wake up later). Every host — web, Android, iOS, Linux server — embeds this crate.
 
 pub mod compile;
+pub mod host;
 pub mod runtime;
 pub mod syntax;
 pub mod ui;
