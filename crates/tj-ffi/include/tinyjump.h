@@ -15,7 +15,8 @@ extern "C" {
 typedef struct TjBuf TjBuf;
 void tj_buf_set(TjBuf *buf, const uint8_t *data, size_t len);
 
-typedef struct TjStore {
+/* Storage and measurement, implemented by the host. */
+typedef struct TjHost {
     void *ctx;
     /* Fill `out` and return 1 if the key exists, else return 0. */
     int (*load)(void *ctx, const uint8_t *key, size_t key_len, TjBuf *out);
@@ -23,11 +24,13 @@ typedef struct TjStore {
     int (*save)(void *ctx, const uint8_t *key, size_t key_len, const uint8_t *value, size_t value_len);
     /* Fill `out` with a JSON array of the keys that start with `prefix`. */
     void (*keys)(void *ctx, const uint8_t *prefix, size_t prefix_len, TjBuf *out);
-} TjStore;
+    /* Natural size of a leaf widget (points), wrapping text at max_width; max_width < 0 means unbounded. */
+    void (*measure)(void *ctx, uint32_t node, float max_width, float *width, float *height);
+} TjHost;
 
 typedef struct TjRuntime TjRuntime;
 
-TjRuntime *tj_new(TjStore store);
+TjRuntime *tj_new(TjHost host);
 int tj_boot(TjRuntime *rt, const uint8_t *source, size_t len, double now_ms, uint64_t seed, int render);
 int tj_handle(TjRuntime *rt, double now_ms, const uint8_t *input, size_t len);
 /* The JSON payload of the last call; valid until the next call on this runtime. */

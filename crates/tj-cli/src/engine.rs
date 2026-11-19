@@ -101,7 +101,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Tick => {}
     }
 }
 
@@ -185,7 +185,7 @@ impl Dispatch {
                     }
                 }
                 // The server owns its objects, so it never subscribes to replicas or draws UI.
-                Output::Patch { .. } | Output::Wake { .. } | Output::Subscribe { .. } => {}
+                Output::Patch { .. } | Output::Frames { .. } | Output::Wake { .. } | Output::Subscribe { .. } => {}
             }
         }
     }

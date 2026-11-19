@@ -19,17 +19,19 @@ public final class TinyJump {
     private var wake: DispatchWorkItem?
     private var automation: Automation?
 
-    private init(root: UIView, store: FileStore) {
-        native = NativeRuntime(store: store)
-        renderer = Renderer(root: root)
+    private init(root: UIView, bridge: HostBridge) {
+        native = NativeRuntime(bridge: bridge)
+        renderer = Renderer(host: root)
+        bridge.renderer = renderer
     }
 
     /// Boots `source` into `root`. `server` is the base URL of a `tj serve` backend for `@server` objects.
     public static func start(root: UIView, source: String, server: String? = nil) throws -> TinyJump {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("tinyjump")
-        let tj = TinyJump(root: root, store: FileStore(dir: dir))
+        let tj = TinyJump(root: root, bridge: HostBridge(store: FileStore(dir: dir)))
         tj.sync = Sync(tj: tj, server: server)
         tj.renderer.tj = tj
+        tj.renderer.root.onResize = { [weak tj] in tj?.layout() }
         let (code, out) = tj.native.boot(source: source, now: now(), seed: UInt64(now()))
         guard code == 0 else { throw BootError(description: describeFailure(code, out)) }
         tj.apply(out)
@@ -71,6 +73,12 @@ public final class TinyJump {
         apply(out)
     }
 
+    /// Asks the core to lay the screen out at the root's current size.
+    func layout() {
+        guard let size = renderer.viewportSize() else { return }
+        send(["type": "layout", "width": Double(size.width), "height": Double(size.height)])
+    }
+
     static func now() -> Double {
         Date().timeIntervalSince1970 * 1000
     }
@@ -92,10 +100,13 @@ public final class TinyJump {
             NSLog("tinyjump: bad output from runtime")
             return
         }
+        var relayout = false
         for o in list {
             switch o["type"] as? String ?? "" {
             case "patch":
-                renderer.apply(o["ops"] as? [[String: Any]] ?? [])
+                relayout = renderer.apply(o["ops"] as? [[String: Any]] ?? []) || relayout
+            case "frames":
+                renderer.frames(o["frames"] as? [[String: Any]] ?? [])
             case "effect":
                 runEffect(id: o["id"] as? Int ?? 0, effect: o["effect"] as? [String: Any] ?? [:])
             case "subscribe":
@@ -115,6 +126,7 @@ public final class TinyJump {
                 break // emit / changed: no listeners on this host yet
             }
         }
+        if relayout { layout() }
     }
 
     private func schedule(at: Double?) {

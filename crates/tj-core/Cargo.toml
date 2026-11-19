@@ -12,3 +12,10 @@ rust-version.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# CSS flexbox layout for native hosts; the browser does the same layout natively.
+taffy = { version = "0.15", default-features = false, features = ["std", "flexbox", "taffy_tree", "content_size"], optional = true }
+
+[features]
+default = ["layout"]
+# The flexbox layout engine, for native hosts. The web build leaves it out.
+layout = ["dep:taffy"]

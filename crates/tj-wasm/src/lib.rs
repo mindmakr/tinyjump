@@ -110,7 +110,7 @@ fn not_utf8() -> i32 {
 #[no_mangle]
 pub unsafe extern "C" fn tj_boot(src: *const u8, len: usize, now: f64, seed: f64, render: i32) -> i32 {
     match read_str(src, len) {
-        Some(src) => finish(HOST.with(|h| h.borrow_mut().boot(src, Box::new(HostStore), now, seed as u64, render != 0))),
+        Some(src) => finish(HOST.with(|h| h.borrow_mut().boot(src, Box::new(HostStore), None, now, seed as u64, render != 0))),
         None => not_utf8(),
     }
 }

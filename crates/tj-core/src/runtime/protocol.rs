@@ -42,6 +42,9 @@ pub enum Input {
     },
     /// The server's latest state of an `@server` object this device subscribed to.
     Sync { object: String, state: Json },
+    /// Native hosts: lay the screen out in this viewport (points/dp) after applying patches
+    /// or when the screen size changes. Answered with [`Output::Frames`].
+    Layout { width: f32, height: f32 },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -66,6 +69,8 @@ pub enum Target {
 pub enum Output {
     /// Apply these changes to the native view tree.
     Patch { ops: Vec<PatchOp> },
+    /// Position these nodes (only the ones that moved), relative to their parent.
+    Frames { frames: Vec<crate::ui::layout::Frame> },
     /// Perform an effect and answer with [`Input::EffectDone`].
     Effect { id: u32, effect: Effect },
     /// An object emitted an event (realtime channel `object`).

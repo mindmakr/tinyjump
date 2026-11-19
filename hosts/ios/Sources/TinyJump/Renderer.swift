@@ -18,33 +18,82 @@ final class EventTarget: NSObject, UITextFieldDelegate {
     }
 }
 
-/// Applies view-tree patches to UIKit views. Mirrors crates/tj-core/src/ui/catalog.rs.
+/// The app's root: reports size changes so the core can lay the screen out again.
+final class RootView: UIView {
+    var onResize: (() -> Void)?
+    private var last = CGSize.zero
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.size != last {
+            last = bounds.size
+            onResize?()
+        }
+    }
+}
+
+/// A label that draws its own padding (leaf padding is part of a leaf's measured size).
+final class PaddedLabel: UILabel {
+    var insets = UIEdgeInsets.zero
+
+    override func drawText(in rect: CGRect) {
+        super.drawText(in: rect.inset(by: insets))
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        let inner = CGSize(width: max(0, size.width - insets.left - insets.right), height: max(0, size.height - insets.top - insets.bottom))
+        let s = super.sizeThatFits(inner)
+        return CGSize(width: s.width + insets.left + insets.right, height: s.height + insets.top + insets.bottom)
+    }
+}
+
+/// A switch with a label beside it, measured and laid out as one widget.
+final class ToggleView: UIView {
+    let toggle = UISwitch()
+    let label = UILabel()
+    private let spacing: CGFloat = 8
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        label.numberOfLines = 0
+        addSubview(toggle)
+        addSubview(label)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("not used from storyboards")
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        let sw = toggle.intrinsicContentSize
+        let l = label.sizeThatFits(CGSize(width: max(0, size.width - sw.width - spacing), height: .greatestFiniteMagnitude))
+        return CGSize(width: sw.width + spacing + l.width, height: max(sw.height, l.height))
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let sw = toggle.intrinsicContentSize
+        toggle.frame = CGRect(x: 0, y: (bounds.height - sw.height) / 2, width: sw.width, height: sw.height)
+        label.frame = CGRect(x: sw.width + spacing, y: 0, width: max(0, bounds.width - sw.width - spacing), height: bounds.height)
+    }
+}
+
+/// Applies view-tree patches to UIKit views and places them where the core's layout says
+/// (crates/tj-core/src/ui/layout.rs). Mirrors the catalog in crates/tj-core/src/ui/catalog.rs.
 final class Renderer {
     final class Node {
         let id: Int
         let kind: String
         let view: UIView
         /// Where children go; nil for leaf widgets.
-        let container: UIStackView?
-        /// The label and switch of a Toggle.
-        var label: UILabel?
-        var toggle: UISwitch?
+        let container: UIView?
         var target: EventTarget?
         var props: [String: Any] = [:]
         var events: [String] = []
-        var children: [Int] = []
-        var parent = -1
         /// True while the renderer itself changes a control, so its events stay quiet.
         var quiet = false
-        var size: [NSLayoutConstraint] = []
-        /// Weak "prefer zero" main-axis size for views without content (Spacer, the filler),
-        /// so Auto Layout knows which view takes the free space.
-        var flex: NSLayoutConstraint?
-        /// Takes up the free space at the end of a stack, so children keep their size.
-        let filler = UIView()
-        var fillerFlex: NSLayoutConstraint?
 
-        init(id: Int, kind: String, view: UIView, container: UIStackView?) {
+        init(id: Int, kind: String, view: UIView, container: UIView?) {
             self.id = id
             self.kind = kind
             self.view = view
@@ -53,26 +102,24 @@ final class Renderer {
     }
 
     weak var tj: TinyJump?
+    let root = RootView()
     private var nodes: [Int: Node] = [:]
 
-    init(root: UIView) {
-        let stack = UIStackView()
-        stack.axis = .vertical
-        stack.alignment = .fill
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(stack)
-        let safe = root.safeAreaLayoutGuide
+    init(host: UIView) {
+        root.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(root)
+        let safe = host.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: safe.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: safe.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: safe.trailingAnchor),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: safe.bottomAnchor),
+            root.topAnchor.constraint(equalTo: safe.topAnchor),
+            root.leadingAnchor.constraint(equalTo: safe.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: safe.trailingAnchor),
+            root.bottomAnchor.constraint(equalTo: safe.bottomAnchor),
         ])
-        nodes[0] = Node(id: 0, kind: "Root", view: stack, container: stack)
+        nodes[0] = Node(id: 0, kind: "Root", view: root, container: root)
     }
 
-    func apply(_ ops: [[String: Any]]) {
-        var rearrange: [Int] = []
+    /// Applies a patch; true if anything changed, so the screen needs a new layout.
+    func apply(_ ops: [[String: Any]]) -> Bool {
         for op in ops {
             guard let id = op["id"] as? Int else { continue }
             switch op["op"] as? String ?? "" {
@@ -84,25 +131,48 @@ final class Renderer {
                 setProps(n, props)
             case "update":
                 guard let n = nodes[id] else { continue }
-                let props = op["props"] as? [String: Any] ?? [:]
-                setProps(n, props)
+                setProps(n, op["props"] as? [String: Any] ?? [:])
                 if let events = op["events"] as? [String] { n.events = events }
-                if props.keys.contains(where: { ["width", "height", "grow"].contains($0) }) { rearrange.append(n.parent) }
-                if props.keys.contains(where: { ["gap", "align", "justify", "padding"].contains($0) }) { rearrange.append(id) }
             case "children":
-                guard let p = nodes[id] else { continue }
-                p.children = op["ids"] as? [Int] ?? []
-                for c in p.children { nodes[c]?.parent = id }
-                rearrange.append(id)
+                guard let box = nodes[id]?.container else { continue }
+                let views = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0]?.view }
+                for v in box.subviews where !views.contains(v) { v.removeFromSuperview() }
+                for (i, v) in views.enumerated() where box.subviews.firstIndex(of: v) != i { box.insertSubview(v, at: i) }
             case "remove":
                 if let n = nodes.removeValue(forKey: id) { n.view.removeFromSuperview() }
             default:
                 break
             }
         }
-        for id in rearrange {
-            if let n = nodes[id] { arrange(n) }
+        return !ops.isEmpty
+    }
+
+    /// Places nodes at the frames the core computed (points, relative to their parent).
+    func frames(_ list: [[String: Any]]) {
+        for f in list {
+            guard let id = f["id"] as? Int, let n = nodes[id] else { continue }
+            let num = { (k: String) in CGFloat((f[k] as? Double) ?? 0) }
+            n.view.frame = CGRect(x: num("x"), y: num("y"), width: num("w"), height: num("h"))
+            if let content = f["content"] as? Double, let scroll = n.view as? UIScrollView, let box = n.container {
+                box.frame = CGRect(x: 0, y: 0, width: num("w"), height: CGFloat(content))
+                scroll.contentSize = box.frame.size
+            }
         }
+    }
+
+    /// The natural size of a leaf in points, wrapping at `maxWidth`.
+    func measure(node: Int, maxWidth: CGFloat?) -> CGSize {
+        guard let view = nodes[node]?.view else { return .zero }
+        let s = view.sizeThatFits(CGSize(width: maxWidth ?? .greatestFiniteMagnitude, height: .greatestFiniteMagnitude))
+        let width = maxWidth.map { min(s.width, $0) } ?? s.width
+        // Round up, with a point of slack: layout snaps to whole points, and text a fraction
+        // too narrow would wrap its last word onto a line nobody sees.
+        return CGSize(width: ceil(width) + 1, height: ceil(s.height))
+    }
+
+    /// The root's size in points, or nil before it has one.
+    func viewportSize() -> CGSize? {
+        root.bounds.width > 0 && root.bounds.height > 0 ? root.bounds.size : nil
     }
 
     // ---------- widgets ----------
@@ -110,29 +180,17 @@ final class Renderer {
     private func create(id: Int, kind: String, props: [String: Any]) -> Node {
         switch kind {
         case "Column", "Row":
-            let s = UIStackView()
-            s.axis = kind == "Row" ? .horizontal : .vertical
-            s.alignment = kind == "Row" ? .center : .fill
-            return Node(id: id, kind: kind, view: s, container: s)
+            let box = UIView()
+            return Node(id: id, kind: kind, view: box, container: box)
         case "Scroll":
             let scroll = UIScrollView()
-            let s = UIStackView()
-            s.axis = .vertical
-            s.translatesAutoresizingMaskIntoConstraints = false
-            scroll.addSubview(s)
-            NSLayoutConstraint.activate([
-                s.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
-                s.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
-                s.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
-                s.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
-                s.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
-            ])
-            return Node(id: id, kind: kind, view: scroll, container: s)
+            let content = UIView()
+            scroll.addSubview(content)
+            return Node(id: id, kind: kind, view: scroll, container: content)
         case "Button":
             let b = UIButton(type: .system)
             let n = Node(id: id, kind: kind, view: b, container: nil)
-            let t = target(for: n)
-            b.addTarget(t, action: #selector(EventTarget.press), for: .touchUpInside)
+            b.addTarget(target(for: n), action: #selector(EventTarget.press), for: .touchUpInside)
             return n
         case "Input":
             let f = UITextField()
@@ -143,18 +201,9 @@ final class Renderer {
             f.delegate = t
             return n
         case "Toggle":
-            let row = UIStackView()
-            row.axis = .horizontal
-            row.spacing = 8
-            row.alignment = .center
-            let toggle = UISwitch()
-            let label = UILabel()
-            row.addArrangedSubview(toggle)
-            row.addArrangedSubview(label)
-            let n = Node(id: id, kind: kind, view: row, container: nil)
-            n.toggle = toggle
-            n.label = label
-            toggle.addTarget(target(for: n), action: #selector(EventTarget.toggled(_:)), for: .valueChanged)
+            let v = ToggleView()
+            let n = Node(id: id, kind: kind, view: v, container: nil)
+            v.toggle.addTarget(target(for: n), action: #selector(EventTarget.toggled(_:)), for: .valueChanged)
             return n
         case "Image":
             let img = UIImageView()
@@ -162,7 +211,7 @@ final class Renderer {
             img.clipsToBounds = true
             return Node(id: id, kind: kind, view: img, container: nil)
         case "Text":
-            let label = UILabel()
+            let label = PaddedLabel()
             label.numberOfLines = 0
             return Node(id: id, kind: kind, view: label, container: nil)
         default: // Spacer
@@ -189,19 +238,20 @@ final class Renderer {
         }
         if props.keys.contains(where: { ["background", "radius", "border"].contains($0) }) { restyle(n) }
         if props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
-        if props.keys.contains(where: { ["width", "height"].contains($0) }) { resize(n) }
     }
 
+    /// Visual props. Layout props (width, gap, align, grow, ...) are the core's job.
     private func setProp(_ n: Node, _ k: String, _ v: Any?) {
         let view = n.view
+        let label = (view as? UILabel) ?? (view as? ToggleView)?.label
         switch k {
         case "text":
             let s = v.map { "\($0)" } ?? ""
             if let b = view as? UIButton { b.setTitle(s, for: .normal) }
-            (n.label ?? view as? UILabel)?.text = s
+            label?.text = s
         case "value":
-            if let toggle = n.toggle {
-                toggle.setOn((v as? Bool) ?? false, animated: false)
+            if let t = view as? ToggleView {
+                t.toggle.setOn((v as? Bool) ?? false, animated: false)
             } else if let f = view as? UITextField {
                 let s = v.map { "\($0)" } ?? ""
                 if f.text != s { f.text = s }
@@ -211,11 +261,11 @@ final class Renderer {
         case "disabled":
             let enabled = !((v as? Bool) ?? false)
             (view as? UIControl)?.isEnabled = enabled
-            n.toggle?.isEnabled = enabled
+            (view as? ToggleView)?.toggle.isEnabled = enabled
         case "secure":
             (view as? UITextField)?.isSecureTextEntry = (v as? Bool) ?? false
         case "lines":
-            (view as? UILabel)?.numberOfLines = (v as? Int) ?? 0
+            label?.numberOfLines = (v as? Int) ?? 0
         case "src":
             if let img = view as? UIImageView { load(img, v as? String) }
         case "fit":
@@ -227,19 +277,17 @@ final class Renderer {
             view.accessibilityLabel = v.map { "\($0)" }
         case "color":
             let c = v.flatMap { Renderer.color("\($0)") }
-            (n.label ?? view as? UILabel)?.textColor = c ?? .label
+            label?.textColor = c ?? .label
             (view as? UITextField)?.textColor = c ?? .label
             if let b = view as? UIButton { b.setTitleColor(c, for: .normal) }
         case "padding":
-            if let s = n.container {
-                let p = CGFloat((v as? Double) ?? 0)
-                s.isLayoutMarginsRelativeArrangement = p > 0
-                s.layoutMargins = UIEdgeInsets(top: p, left: p, bottom: p, right: p)
-            }
-        case "gap":
-            n.container?.spacing = CGFloat((v as? Double) ?? 0)
+            // Containers are padded by the core's layout; leaves draw their own padding.
+            let p = CGFloat((v as? Double) ?? 0)
+            let insets = UIEdgeInsets(top: p, left: p, bottom: p, right: p)
+            (view as? PaddedLabel)?.insets = insets
+            (view as? UIButton)?.contentEdgeInsets = insets
         default:
-            break // layout, box and font props are applied together below and in arrange()
+            break
         }
     }
 
@@ -248,7 +296,7 @@ final class Renderer {
         let w = n.props["weight"]
         let bold = (w as? String).map { $0 == "bold" || $0 == "bolder" } ?? (((w as? Double) ?? 400) >= 600)
         let font = UIFont.systemFont(ofSize: size, weight: bold ? .bold : .regular)
-        (n.label ?? n.view as? UILabel)?.font = font
+        ((n.view as? UILabel) ?? (n.view as? ToggleView)?.label)?.font = font
         (n.view as? UITextField)?.font = font
         (n.view as? UIButton)?.titleLabel?.font = font
     }
@@ -276,14 +324,6 @@ final class Renderer {
         }
     }
 
-    private func resize(_ n: Node) {
-        NSLayoutConstraint.deactivate(n.size)
-        n.size = []
-        if let w = n.props["width"] as? Double { n.size.append(n.view.widthAnchor.constraint(equalToConstant: CGFloat(w))) }
-        if let h = n.props["height"] as? Double { n.size.append(n.view.heightAnchor.constraint(equalToConstant: CGFloat(h))) }
-        NSLayoutConstraint.activate(n.size)
-    }
-
     private func load(_ img: UIImageView, _ src: String?) {
         img.image = nil
         guard let src = src, src.hasPrefix("https://") || src.hasPrefix("http://"), let url = URL(string: src) else { return }
@@ -305,68 +345,13 @@ final class Renderer {
         return UIColor(red: CGFloat((v >> 24) & 0xff) / 255, green: CGFloat((v >> 16) & 0xff) / 255, blue: CGFloat((v >> 8) & 0xff) / 255, alpha: CGFloat(v & 0xff) / 255)
     }
 
-    // ---------- layout ----------
-
-    /// Puts a node's children in order and sets how they share the stack's main axis.
-    private func arrange(_ p: Node) {
-        guard let stack = p.container else { return }
-        let vertical = stack.axis == .vertical
-        switch p.props["align"] as? String {
-        case "start": stack.alignment = vertical ? .leading : .top
-        case "center": stack.alignment = .center
-        case "end": stack.alignment = vertical ? .trailing : .bottom
-        case "stretch": stack.alignment = .fill
-        default: stack.alignment = vertical ? .fill : .center
-        }
-        switch p.props["justify"] as? String {
-        case "between": stack.distribution = .equalSpacing
-        case "around": stack.distribution = .equalCentering
-        default: stack.distribution = .fill
-        }
-        var want = p.children.compactMap { nodes[$0]?.view }
-        // The filler only takes free space when no child grows; sharing it with a growing
-        // (e.g. multi-line) label would leave the split ambiguous.
-        let grows = p.children.contains { id in
-            guard let c = nodes[id] else { return false }
-            return ((c.props["grow"] as? Double) ?? (c.kind == "Spacer" ? 1 : 0)) > 0
-        }
-        if stack.distribution == .fill && !grows { want.append(p.filler) }
-        for v in stack.arrangedSubviews where !want.contains(v) {
-            stack.removeArrangedSubview(v)
-            v.removeFromSuperview()
-        }
-        for (i, v) in want.enumerated() where stack.arrangedSubviews.firstIndex(of: v) != i {
-            stack.insertArrangedSubview(v, at: i)
-        }
-        // Growing children take free space first (hugging 1), then the filler (2); others keep
-        // their size (750). Views with no content of their own get a weak zero-size preference.
-        let axis: NSLayoutConstraint.Axis = vertical ? .vertical : .horizontal
-        func preferZero(_ v: UIView, _ priority: Float) -> NSLayoutConstraint {
-            let c = (vertical ? v.heightAnchor : v.widthAnchor).constraint(equalToConstant: 0)
-            c.priority = UILayoutPriority(priority)
-            c.isActive = true
-            return c
-        }
-        for id in p.children {
-            guard let c = nodes[id] else { continue }
-            let grow = ((c.props["grow"] as? Double) ?? (c.kind == "Spacer" ? 1 : 0)) > 0
-            c.view.setContentHuggingPriority(UILayoutPriority(grow ? 1 : 750), for: axis)
-            c.view.setContentCompressionResistancePriority(UILayoutPriority(grow ? 250 : 750), for: axis)
-            c.flex?.isActive = false
-            c.flex = c.kind == "Spacer" ? preferZero(c.view, 1) : nil
-        }
-        p.filler.setContentHuggingPriority(UILayoutPriority(2), for: axis)
-        p.fillerFlex?.isActive = false
-        p.fillerFlex = preferZero(p.filler, 2)
-    }
+    // ---------- automation ----------
 
     /// The window size in points, for overflow checks.
     func viewport() -> [String: Int] {
-        let size = nodes[0]?.view.window?.bounds.size ?? .zero
+        let size = root.window?.bounds.size ?? .zero
         return ["w": Int(size.width), "h": Int(size.height)]
     }
-
-    // ---------- automation ----------
 
     /// Adds bounds (points, on screen) and visibility to an inspect tree, like the other hosts.
     func addBounds(_ tree: [[String: Any]]) -> [[String: Any]] {
@@ -386,7 +371,7 @@ final class Renderer {
 
     /// The whole screen as PNG, for visual tests.
     func screenshot() -> Data? {
-        guard let window = nodes[0]?.view.window else { return nil }
+        guard let window = root.window else { return nil }
         let renderer = UIGraphicsImageRenderer(bounds: window.bounds)
         let image = renderer.image { _ in window.drawHierarchy(in: window.bounds, afterScreenUpdates: true) }
         return image.pngData()

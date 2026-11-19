@@ -35,6 +35,15 @@ unsafe extern "C" fn keys(ctx: *mut c_void, p: *const u8, pl: usize, out: *mut T
     tj_buf_set(out, json.as_ptr(), json.len());
 }
 
+unsafe extern "C" fn measure(_ctx: *mut c_void, _node: u32, max_width: f32, w: *mut f32, h: *mut f32) {
+    *w = if max_width >= 0.0 { max_width.min(80.0) } else { 80.0 };
+    *h = 20.0;
+}
+
+fn host(map: &mut Map) -> TjHost {
+    TjHost { ctx: map as *mut Map as *mut c_void, load, save, keys, measure }
+}
+
 unsafe fn out(rt: *const TjRuntime) -> String {
     let mut len = 0;
     let p = tj_out(rt, &mut len);
@@ -44,7 +53,7 @@ unsafe fn out(rt: *const TjRuntime) -> String {
 const APP: &str = "object Counter { n = 0\n inc() { this.n += 1; return this.n } }";
 
 unsafe fn boot(map: &mut Map) -> *mut TjRuntime {
-    let rt = tj_new(TjStore { ctx: map as *mut Map as *mut c_void, load, save, keys });
+    let rt = tj_new(host(map));
     assert_eq!(tj_boot(rt, APP.as_ptr(), APP.len(), 0.0, 1, 0), 0, "{}", out(rt));
     rt
 }
@@ -79,10 +88,27 @@ fn boots_calls_persists_and_reloads_through_c_callbacks() {
 fn reports_compile_errors() {
     let mut map = Map::new();
     unsafe {
-        let rt = tj_new(TjStore { ctx: &mut map as *mut Map as *mut c_void, load, save, keys });
+        let rt = tj_new(host(&mut map));
         let src = "function f() { return nope }";
         assert_eq!(tj_boot(rt, src.as_ptr(), src.len(), 0.0, 1, 0), 1);
         assert!(out(rt).contains("unknown name 'nope'"));
+        tj_free(rt);
+    }
+}
+
+#[test]
+fn lays_out_through_the_measure_callback() {
+    let mut map = Map::new();
+    unsafe {
+        let rt = tj_new(host(&mut map));
+        let src = "function App() { return <Row><Text grow={1}>hi</Text><Text>there</Text></Row> }";
+        assert_eq!(tj_boot(rt, src.as_ptr(), src.len(), 0.0, 1, 1), 0, "{}", out(rt));
+        let input = r#"{"type":"layout","width":300,"height":600}"#;
+        assert_eq!(tj_handle(rt, 1.0, input.as_ptr(), input.len()), 0);
+        let frames = out(rt);
+        // The fake host measures every text as 80 wide: the growing one takes the rest.
+        assert!(frames.contains(r#""type":"frames""#), "{frames}");
+        assert!(frames.contains(r#""x":0.0,"y":0.0,"w":220.0"#) && frames.contains(r#""x":220.0,"y":0.0,"w":80.0"#), "{frames}");
         tj_free(rt);
     }
 }
