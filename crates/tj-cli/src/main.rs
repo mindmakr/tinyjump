@@ -1,5 +1,6 @@
 //! `tj`: the tinyjump command line.
 
+mod bench;
 mod engine;
 mod http;
 mod mcp;
@@ -19,6 +20,8 @@ tj: tinyjump
 
 USAGE:
   tj check <app.tj>              compile and report errors
+  tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
+  tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
@@ -40,6 +43,8 @@ struct Args {
     data: Option<PathBuf>,
     wasm: Option<PathBuf>,
     target: String,
+    budget: Option<PathBuf>,
+    json: bool,
 }
 
 impl Args {
@@ -52,7 +57,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into() };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -61,6 +66,8 @@ fn parse_args() -> Result<Args, String> {
             "--data" => args.data = Some(PathBuf::from(value()?)),
             "--wasm" => args.wasm = Some(PathBuf::from(value()?)),
             "--target" => args.target = value()?,
+            "--budget" => args.budget = Some(PathBuf::from(value()?)),
+            "--json" => args.json = true,
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -77,6 +84,7 @@ fn main() -> ExitCode {
     };
     let result = match args.command.as_str() {
         "check" => args.file().and_then(check),
+        "bench" => run_bench(&args),
         "serve" => serve(&args, false),
         "dev" => serve(&args, true),
         "review" => review(&args.target),
@@ -102,6 +110,21 @@ fn review(target: &str) -> Result<(), String> {
     print!("{}", review::report(snapshot, &findings));
     if findings.iter().any(|f| f.severity == review::Severity::Error) {
         return Err("review found errors".into());
+    }
+    Ok(())
+}
+
+fn run_bench(args: &Args) -> Result<(), String> {
+    if let Some(budget) = &args.budget {
+        return bench::check_budget(budget);
+    }
+    let file = args.file()?;
+    let name = file.display().to_string();
+    let b = bench::bench(&name, &read_source(file)?)?;
+    if args.json {
+        println!("{}", b.to_json());
+    } else {
+        print!("{}", b.report(&name));
     }
     Ok(())
 }

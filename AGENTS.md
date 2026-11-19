@@ -18,8 +18,10 @@ If a change does not serve a goal there, do not make it.
 - Every language feature and runtime behaviour gets a test. End-to-end tests are in
   `crates/tj-core/tests/runtime.rs`.
 - No dead code, placeholder files or speculative abstractions. Delete what is unused.
-- Keep device builds small (`cargo web` uses the `small` profile). Check the size before
-  adding a dependency to `tj-core` or `tj-wasm`.
+- Keep device builds small (`cargo web` uses the `small` profile) and fast. Run
+  `bash scripts/budget.sh` before merging: it fails when a build is bigger, or an example
+  slower or busier, than `scripts/budget.json` allows. Raise a budget only in the same
+  commit as the change that needs it, and say why.
 - The web host stays plain ES2017 with no build step, so old browsers work.
 
 ## Commands
@@ -30,6 +32,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo web                                # build hosts' WASM runtime
 cargo tj dev examples/todo/app.tj        # http://127.0.0.1:4700
 cargo tj check examples/todo/app.tj
+cargo tj bench examples/todo/app.tj      # compile, boot and tick timings, VM steps, patches
+bash scripts/budget.sh                   # size and speed budget; run before merging
 cd hosts/android && ./gradlew :demo:installDebug   # Android (needs SDK, NDK, cargo-ndk)
 bash scripts/site.sh --publish           # rebuild and publish GitHub Pages
 ```

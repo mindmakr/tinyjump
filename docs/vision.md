@@ -40,8 +40,8 @@ and the same agents can drive and inspect the running app.
 The vision has gained many planned items, so this order keeps the work focused:
 
 1. Reliable messaging, step 1: ordered, resumable change streams (done).
-2. **A benchmark and size budget that fail when things get worse:** boot time, render
-   time, and WASM, APK and binary sizes. Without it, "fast and small" drifts as
+2. **A benchmark and size budget that fail when things get worse (done: `tj bench`,
+   `scripts/budget.sh`):** boot time, render time, and WASM, APK and binary sizes. Without it, "fast and small" drifts as
    messaging, locales and modules land. Timings also give agents numbers to optimise.
 3. Reliable messaging, steps 2 to 4.
 4. Modules (multi-file apps), since agents need them for real apps. Then `tj build`.
