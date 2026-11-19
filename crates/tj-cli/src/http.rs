@@ -2,6 +2,7 @@
 //! stream as server-sent events, and the automation surface is under `/_tj/`.
 //!
 //!   POST /api/{Class}/{id}/{method}   body: JSON array of arguments -> {"ok": result} | {"error": msg}
+//!                                     an Idempotency-Key header makes repeats return the first result
 //!   GET  /api/{Class}/{id}            -> {"ok": state}
 //!   GET  /api/events?object=Class/id&since=N
 //!                                     -> SSE stream of `emit` and `changed`; it starts with
@@ -13,12 +14,12 @@
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
 //! plus `/_tj/reload` (SSE) for live reload.
 
-use crate::engine::{Engine, Event};
+use crate::engine::Engine;
+use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -34,13 +35,13 @@ pub struct Dev {
     pub source: PathBuf,
     pub web_dir: PathBuf,
     pub wasm: PathBuf,
-    pub reload: Mutex<Vec<Sender<Event>>>,
+    pub reload: Mutex<Vec<Arc<Mailbox>>>,
 }
 
 impl Dev {
     pub fn notify_reload(&self) {
         if let Ok(mut subs) = self.reload.lock() {
-            subs.retain(|s| s.send((String::new(), "event: reload\ndata: {}\n\n".into())).is_ok());
+            subs.retain(|s| s.push(Event { object: String::new(), state: false, text: "event: reload\ndata: {}\n\n".into() }));
         }
     }
 }
@@ -122,17 +123,17 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         (Method::Get, ["api", "events"]) => {
             let only = query_values(req.url(), "object");
             // A browser's EventSource reconnects with the id of the last event it saw.
-            let resume = req.headers().iter().find(|h| h.field.equiv("Last-Event-ID")).map(|h| h.value.as_str().to_string());
+            let resume = header_value(&req, "Last-Event-ID");
             let since = resume.into_iter().chain(query_values(req.url(), "since")).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
-            let events = engine.subscribe(only.clone(), since);
-            return sse(req, events, only);
+            return sse(req, &engine.subscribe(only, since));
         }
         (Method::Get, ["api", class, id]) => result_response(engine.request(Input::Get { object: format!("{class}/{id}"), reply: None })),
-        (Method::Post, ["api", class, id, name]) => match read_json(&mut req) {
-            Ok(Json::Null) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None })),
-            Ok(Json::Array(args)) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args, reply: None })),
-            Ok(_) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
-            Err(e) => json_response(400, &json!({ "error": e })),
+        (Method::Post, ["api", class, id, name]) => match (read_json(&mut req), header_value(&req, "Idempotency-Key")) {
+            // With an Idempotency-Key, a repeated request returns the first result without running again.
+            (Ok(Json::Null), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None, call })),
+            (Ok(Json::Array(args)), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args, reply: None, call })),
+            (Ok(_), _) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
+            (Err(e), _) => json_response(400, &json!({ "error": e })),
         },
         (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None })),
         (Method::Post, ["_tj", "input"]) => match read_json(&mut req).and_then(|j| serde_json::from_value::<Input>(j).map_err(|e| format!("not a protocol input: {e}"))) {
@@ -147,11 +148,11 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
                 ["tinyjump.wasm"] => file(dev.wasm.clone(), "application/wasm"),
                 ["app.tj"] => file(dev.source.clone(), "text/plain; charset=utf-8"),
                 ["_tj", "reload"] => {
-                    let (t, r) = std::sync::mpsc::channel();
+                    let events = Arc::new(Mailbox::new(Vec::new()));
                     if let Ok(mut subs) = dev.reload.lock() {
-                        subs.push(t);
+                        subs.push(events.clone());
                     }
-                    return sse(req, r, Vec::new());
+                    return sse(req, &events);
                 }
                 _ => json_response(404, &json!({ "error": "not found" })),
             }
@@ -159,6 +160,10 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         _ => json_response(404, &json!({ "error": "not found" })),
     };
     let _ = req.respond(response);
+}
+
+fn header_value(req: &Request, name: &'static str) -> Option<String> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
 }
 
 fn file(path: PathBuf, content_type: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -174,22 +179,15 @@ fn query_values(url: &str, name: &str) -> Vec<String> {
     query.split('&').filter_map(|pair| pair.split_once('=')).filter(|(k, _)| *k == name).filter_map(|(_, v)| percent_decode(&v.replace('+', " "))).collect()
 }
 
-/// Streams server-sent events until the client goes away; `only` limits them to those objects.
-fn sse(req: Request, rx: Receiver<Event>, only: Vec<String>) {
+/// Streams server-sent events from `events` until the client goes away.
+fn sse(req: Request, events: &Mailbox) {
     let mut w = req.into_writer();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-    if w.write_all(head.as_bytes()).and_then(|()| w.flush()).is_err() {
-        return;
+    let mut ok = w.write_all(head.as_bytes()).and_then(|()| w.flush()).is_ok();
+    while ok {
+        let batch = events.take(SSE_KEEPALIVE);
+        let chunk = if batch.is_empty() { ":\n\n".to_string() } else { batch.into_iter().map(|e| e.text).collect() };
+        ok = w.write_all(chunk.as_bytes()).and_then(|()| w.flush()).is_ok();
     }
-    loop {
-        let chunk = match rx.recv_timeout(SSE_KEEPALIVE) {
-            Ok((object, _)) if !only.is_empty() && !only.contains(&object) => continue,
-            Ok((_, msg)) => msg,
-            Err(RecvTimeoutError::Timeout) => ":\n\n".to_string(),
-            Err(RecvTimeoutError::Disconnected) => return,
-        };
-        if w.write_all(chunk.as_bytes()).and_then(|()| w.flush()).is_err() {
-            return;
-        }
-    }
+    events.close();
 }

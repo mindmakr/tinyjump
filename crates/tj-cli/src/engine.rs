@@ -1,6 +1,7 @@
 //! Owns the runtime on its own thread and carries out its outputs:
 //! replies, HTTP effects (worker pool), realtime broadcasts, logs and timers.
 
+use crate::mailbox::{Event, Mailbox};
 use crate::store::FileStore;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -18,13 +19,10 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Reply = Sender<Result<Json, String>>;
 
-/// A realtime event: the object it concerns and its server-sent-event text.
-pub type Event = (String, String);
-
 enum Msg {
     Input(Input, Option<Reply>),
     EffectDone(u32, Result<Json, String>),
-    Subscribe { events: Sender<Event>, objects: Vec<String>, since: u64 },
+    Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64 },
     Reload(String),
 }
 
@@ -81,13 +79,13 @@ impl Engine {
         })?
     }
 
-    /// Realtime stream of `emit` and `changed` events. It starts with the current state of
-    /// each of `objects` that changed after change number `since`, so a client that
-    /// reconnects resumes where it left off instead of refetching.
-    pub fn subscribe(&self, objects: Vec<String>, since: u64) -> Receiver<Event> {
-        let (t, r) = channel();
-        let _ = self.tx.send(Msg::Subscribe { events: t, objects, since });
-        r
+    /// Realtime stream of `emit` and `changed` events about `objects` (all if empty). It
+    /// starts with the current state of each of `objects` that changed after change number
+    /// `since`, so a client that reconnects resumes where it left off instead of refetching.
+    pub fn subscribe(&self, objects: Vec<String>, since: u64) -> Arc<Mailbox> {
+        let events = Arc::new(Mailbox::new(objects.clone()));
+        let _ = self.tx.send(Msg::Subscribe { events: events.clone(), objects, since });
+        events
     }
 
     /// Re-boots with new source. Objects keep their stored state.
@@ -103,14 +101,14 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Tick => {}
     }
 }
 
 struct Dispatch {
     replies: HashMap<u64, Reply>,
     next_reply: u64,
-    subscribers: Vec<Sender<Event>>,
+    subscribers: Vec<Arc<Mailbox>>,
     effects: Sender<(u32, Effect)>,
 }
 
@@ -136,14 +134,14 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
                 };
-                rt.handle(now_ms(), Input::EffectDone { id, ok, error })
+                rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false })
             }
             Ok(Msg::Subscribe { events, objects, since }) => {
                 // Catch-up and live changes come from this one thread, so the client sees every
                 // change once, in order.
                 for o in rt.changed_since(&objects, since) {
                     if let Output::Changed { object, state, seq } = o {
-                        let _ = events.send((object.clone(), changed_event(&object, &state, seq)));
+                        events.push(changed_event(&object, &state, seq));
                     }
                 }
                 d.subscribers.push(events);
@@ -185,13 +183,10 @@ impl Dispatch {
                     let _ = self.effects.send((id, effect));
                 }
                 Output::Emit { object, name, data } => {
-                    let msg = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
-                    self.broadcast(&object, msg);
+                    let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
+                    self.broadcast(Event { object, state: false, text });
                 }
-                Output::Changed { object, state, seq } => {
-                    let msg = changed_event(&object, &state, seq);
-                    self.broadcast(&object, msg);
-                }
+                Output::Changed { object, state, seq } => self.broadcast(changed_event(&object, &state, seq)),
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
                 Output::Error { message, trace } => {
                     eprintln!("[app] error: {message}");
@@ -205,15 +200,17 @@ impl Dispatch {
         }
     }
 
-    fn broadcast(&mut self, object: &str, msg: String) {
-        self.subscribers.retain(|s| s.send((object.to_string(), msg.clone())).is_ok());
+    /// Hands an event to every client; clients that have gone are forgotten.
+    fn broadcast(&mut self, e: Event) {
+        self.subscribers.retain(|s| s.push(e.clone()));
     }
 }
 
 /// A `changed` server-sent event. Its id is the change number, so a browser's EventSource
 /// resumes from it by itself (`Last-Event-ID`).
-fn changed_event(object: &str, state: &Json, seq: u64) -> String {
-    format!("id: {seq}\nevent: changed\ndata: {}\n\n", json!({ "object": object, "state": state, "seq": seq }))
+fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
+    let text = format!("id: {seq}\nevent: changed\ndata: {}\n\n", json!({ "object": object, "state": state, "seq": seq }));
+    Event { object: object.to_string(), state: true, text }
 }
 
 /// A small pool of threads that perform effects and post the results back.
@@ -271,14 +268,16 @@ mod tests {
     use super::*;
 
     /// The next `changed` event on a stream, with its change number.
-    fn next_change(events: &Receiver<Event>) -> (u64, String) {
-        loop {
-            let (_, msg) = events.recv_timeout(Duration::from_secs(5)).expect("a change");
-            if let Some(rest) = msg.strip_prefix("id: ") {
-                let seq = rest.split('\n').next().and_then(|s| s.parse().ok()).expect("a numeric id");
-                return (seq, msg);
+    fn next_change(events: &Mailbox) -> (u64, String) {
+        for _ in 0..50 {
+            for e in events.take(Duration::from_millis(100)) {
+                if let Some(rest) = e.text.strip_prefix("id: ") {
+                    let seq = rest.split('\n').next().and_then(|s| s.parse().ok()).expect("a numeric id");
+                    return (seq, e.text);
+                }
             }
         }
+        panic!("no change within 5s")
     }
 
     #[test]
@@ -286,7 +285,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
         let engine = Engine::start(source, data.clone(), false).expect("boots");
-        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None });
+        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None });
         post("one").expect("posted");
 
         // A new client catches up on the current state first.

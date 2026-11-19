@@ -43,7 +43,7 @@ The vision has gained many planned items, so this order keeps the work focused:
 2. **A benchmark and size budget that fail when things get worse (done: `tj bench`,
    `scripts/budget.sh`):** boot time, render time, and WASM, APK and binary sizes. Without it, "fast and small" drifts as
    messaging, locales and modules land. Timings also give agents numbers to optimise.
-3. Reliable messaging, steps 2 to 4.
+3. Reliable messaging, steps 2 to 4 (step 2 and backpressure done).
 4. Modules (multi-file apps), since agents need them for real apps. Then `tj build`.
 5. **One compact language reference** an agent can load in one go (the subset, the rules
    and the error hints), kept next to `docs/language.md`.
@@ -106,12 +106,12 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
 
 1. **Ordered, resumable change streams (done).** Every object change gets a sequence number, and a
    reconnecting replica resumes from its last one instead of refetching.
-2. **At-least-once server calls.** Devices queue calls in a durable outbox while offline. Each
+2. **At-least-once server calls (done).** Devices queue calls in a durable outbox while offline. Each
    call carries an id, and the server drops duplicates, so a retry never runs twice.
 3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
    objects, and durable object-to-object messages on the server.
-4. **Backpressure and access control.** Slow subscribers are coalesced to the latest state,
-   and each object has an access policy for who may read and call it.
+4. **Backpressure (done) and access control.** Slow subscribers are coalesced to the latest
+   state, and each object has an access policy for who may read and call it.
 
 Deliberately not planned: a general-purpose message broker, or "exactly-once" promises.
 Those are separate products, and exactly-once cannot be honestly guaranteed over a network;
@@ -129,6 +129,17 @@ Raised by the owner. To be discussed and critiqued before any work starts:
   (effects in, events out, through the existing protocol) plus catalog components
   (`<Camera>`, `<VideoCall>`). Hosts opt in, the core stays tiny, and permissions are
   declared per app. Calls build on WebRTC rather than a custom media stack.
+- **Messaging, what is left (needs a decision):**
+  - **Access control** needs an identity first: who is calling? Options include a signed
+    token (for example a JWT from any sign-in provider) that the server checks and passes
+    to methods as the caller, or sessions issued by `tj serve` itself. Each object then
+    declares who may read it and call each method. Until this lands, `tj serve` must stay
+    on localhost or behind an authenticating proxy.
+  - **Durable object-to-object messages:** one server runtime already calls between objects
+    atomically (one input, one write), so this only matters with several servers. Proposed:
+    drop it until there is more than one server.
+  - **Topics across objects:** subscribe to every object of a class (`Room/*`), for
+    dashboards and agents. Cheap to add; worth it only if an app needs it.
 - **Docker-like features:** park until the retro. First decide whether this means packaging
   and deploying apps as sealed units, or isolating running apps. The runtime is already
   sandboxed: it has no I/O except through its host.

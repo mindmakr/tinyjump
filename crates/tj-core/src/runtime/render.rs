@@ -35,7 +35,7 @@ impl Runtime {
         let mut metrics = serde_json::to_value(self.metrics).expect("metrics serialize");
         metrics["nodes"] = json!(self.tree.node_count());
         metrics["objects"] = json!(self.instances.len());
-        json!({ "tree": self.tree.to_json(), "objects": self.object_states(), "wake": self.next_wake(), "metrics": metrics })
+        json!({ "tree": self.tree.to_json(), "objects": self.object_states(), "outbox": self.outbox_json(), "wake": self.next_wake(), "metrics": metrics })
     }
 }
 

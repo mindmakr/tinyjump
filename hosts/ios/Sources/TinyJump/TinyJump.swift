@@ -137,10 +137,11 @@ public final class TinyJump {
         DispatchQueue.main.asyncAfter(deadline: .now() + max(0, (at - TinyJump.now()) / 1000), execute: item)
     }
 
-    private func effectDone(_ id: Int, _ ok: Any?, _ error: String?) {
+    private func effectDone(_ id: Int, _ ok: Any?, _ error: String?, unreachable: Bool = false) {
         var done: [String: Any] = ["type": "effectDone", "id": id]
         if let error = error {
             done["error"] = error
+            if unreachable { done["unreachable"] = true }
         } else {
             done["ok"] = ok ?? NSNull()
         }
@@ -150,7 +151,7 @@ public final class TinyJump {
     private func runEffect(id: Int, effect: [String: Any]) {
         switch effect["kind"] as? String {
         case "call":
-            sync.call(effect) { [weak self] ok, error in self?.effectDone(id, ok, error) }
+            sync.call(effect) { [weak self] ok, error, unreachable in self?.effectDone(id, ok, error, unreachable: unreachable) }
         case "http":
             http(effect) { [weak self] ok, error in self?.effectDone(id, ok, error) }
         default:

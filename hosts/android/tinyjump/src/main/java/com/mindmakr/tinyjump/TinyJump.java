@@ -218,15 +218,20 @@ public final class TinyJump {
             public void run() {
                 Object ok = null;
                 String error = null;
+                boolean call = "call".equals(effect.optString("kind"));
+                boolean unreachable = false;
                 try {
-                    ok = "call".equals(effect.optString("kind")) ? sync.call(effect) : http(effect);
+                    ok = call ? sync.call(effect) : http(effect);
                 } catch (Exception e) {
                     error = String.valueOf(e.getMessage() != null ? e.getMessage() : e);
+                    // A server call without an answer is retried by the runtime.
+                    unreachable = call && !(e instanceof Sync.CallFailed);
                 }
                 final JSONObject done = input("effectDone");
                 try {
                     done.put("id", id);
                     if (error == null) done.put("ok", ok == null ? JSONObject.NULL : ok); else done.put("error", error);
+                    if (unreachable) done.put("unreachable", true);
                 } catch (JSONException e) {
                     throw new IllegalStateException(e);
                 }
