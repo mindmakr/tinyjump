@@ -17,7 +17,14 @@ and the same agents can drive and inspect the running app.
 3. **Native UI.** The runtime owns the view tree and sends patches. Hosts draw real platform
    widgets: DOM on the web, Android Views, UIKit. The component catalog is shared.
 4. **Built-in automation.** Every host exposes the same semantic tree (nodes, props,
-   events, bounds), object state, a controllable clock and an input channel.
+   events, bounds), object state, a controllable clock and an input channel. It is for
+   testing as much as driving:
+   - **Visual accuracy:** screenshots on every host, golden-image diffs, and layout checks
+     (overlap, clipping, off-screen, contrast).
+   - **Feedback ("retro") reports** an agent can act on after a run.
+   - **Speed and performance:** boot time, render/diff/patch time, frame budget, memory.
+   - **The server too:** request latency and throughput, object counts, realtime fan-out
+     lag, and the same inspect and input API.
 5. **Backend too.** The same runtime serves HTTP: every public object method is an API,
    and changes stream to clients in realtime. `@server` objects live on the server, and
    every device holds a live, offline-cached replica of them (the server is the authority).
@@ -28,14 +35,47 @@ and the same agents can drive and inspect the running app.
    Scenes are declared in the same catalog (`<Scene>`, `<Mesh>`, `<Camera>`, `<Light>`) and patched
    like UI, plus a `@frame(dt)` hook. Hosts opt in, so apps without 3D stay small.
 
+## Reliable messaging (built in, scoped to objects)
+
+Apps should not have to build their own delivery plumbing. Planned, in this order:
+
+1. **Ordered, resumable change streams.** Every object change gets a sequence number, and a
+   reconnecting replica resumes from its last one instead of refetching.
+2. **At-least-once server calls.** Devices queue calls in a durable outbox while offline. Each
+   call carries an id, and the server drops duplicates, so a retry never runs twice.
+3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
+   objects, and durable object-to-object messages on the server.
+4. **Backpressure and access control.** Slow subscribers are coalesced to the latest state,
+   and each object has an access policy for who may read and call it.
+
+Deliberately not planned: a general-purpose message broker, or "exactly-once" promises.
+Those are separate products, and exactly-once cannot be honestly guaranteed over a network;
+idempotent calls give the same result for apps.
+
+## For the next review and retro
+
+Raised by the owner. To be discussed and critiqued before any work starts:
+
+- **Device capabilities:** sensors, camera, microphone, files, local storage, location,
+  notifications.
+- **Calls and media:** 1:1 and group voice and video calls, audio/video streaming, and the
+  server streaming progressive audio/video to clients.
+- **Initial take:** these become **plugins**, not core. Each is a typed host capability
+  (effects in, events out, through the existing protocol) plus catalog components
+  (`<Camera>`, `<VideoCall>`). Hosts opt in, the core stays tiny, and permissions are
+  declared per app. Calls build on WebRTC rather than a custom media stack.
+- **Docker-like features:** park until the retro. First decide whether this means packaging
+  and deploying apps as sealed units, or isolating running apps. The runtime is already
+  sandboxed: it has no I/O except through its host.
+
 ## Platforms
 
 | Target | Status |
 |---|---|
 | Web (WASM + DOM) | working |
 | Android (Views, minSdk 21; arm64, armv7, x86, x86_64) | working |
-| iOS (UIKit, iOS 12+) | runtime builds for iOS; UIKit host next (needs a Mac) |
-| macOS | runtime builds for macOS; host after iOS |
+| iOS (UIKit, iOS 13+) | UIKit host in progress, built and tested on a macOS CI runner |
+| macOS | runtime and CLI tested on macOS CI; AppKit host after iOS |
 | Linux (server/CLI, static: x86_64, aarch64, armv7) | working |
 | Linux desktop UI | after mobile |
 | Microcontrollers | out of scope for now |
