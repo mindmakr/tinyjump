@@ -43,7 +43,7 @@ The vision has gained many planned items, so this order keeps the work focused:
 2. **A benchmark and size budget that fail when things get worse (done: `tj bench`,
    `scripts/budget.sh`):** boot time, render time, and WASM, APK and binary sizes. Without it, "fast and small" drifts as
    messaging, locales and modules land. Timings also give agents numbers to optimise.
-3. Reliable messaging, steps 2 to 4 (step 2 done).
+3. Reliable messaging, steps 2 to 4 (step 2 and backpressure done).
 4. Modules (multi-file apps), since agents need them for real apps. Then `tj build`.
 5. **One compact language reference** an agent can load in one go (the subset, the rules
    and the error hints), kept next to `docs/language.md`.
@@ -110,8 +110,8 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
    call carries an id, and the server drops duplicates, so a retry never runs twice.
 3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
    objects, and durable object-to-object messages on the server.
-4. **Backpressure and access control.** Slow subscribers are coalesced to the latest state,
-   and each object has an access policy for who may read and call it.
+4. **Backpressure (done) and access control.** Slow subscribers are coalesced to the latest
+   state, and each object has an access policy for who may read and call it.
 
 Deliberately not planned: a general-purpose message broker, or "exactly-once" promises.
 Those are separate products, and exactly-once cannot be honestly guaranteed over a network;

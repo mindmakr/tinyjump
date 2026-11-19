@@ -147,7 +147,8 @@ A host keeps one stream for all its replicas:
 - Pass every event on as `sync`, with its `seq`.
 
 So a reconnect sends only what the device missed, and a late or repeated delivery can
-never take a replica back in time. `emit` events are not replayed: an object's state is
+never take a replica back in time. A slow client is never sent a backlog: it gets the latest
+state of each object, still in change order, and at most 1000 other events. `emit` events are not replayed: an object's state is
 the durable record.
 
 ## Reliable server calls
