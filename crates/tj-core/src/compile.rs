@@ -24,12 +24,17 @@ const MAX_ERRORS: usize = 20;
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
     let user = parse(src).map_err(|e| vec![e])?;
+    let mut errors = crate::typeck::check(&user);
     let mut c = Compiler::new();
     c.declare(&prelude, Source::Prelude);
     c.declare(&user, Source::User);
     let main = vec![c.main(&prelude, Source::Prelude), c.main(&user, Source::User)];
-    if !c.errors.is_empty() {
-        return Err(c.errors);
+    if !c.errors.is_empty() || !errors.is_empty() {
+        errors.append(&mut c.errors);
+        errors.sort_by_key(|d| d.span.start);
+        errors.dedup();
+        errors.truncate(MAX_ERRORS);
+        return Err(errors);
     }
     let app = c.globals.get("App").filter(|g| g.kind == GKind::Function).map(|g| g.slot);
     Ok(Program {
@@ -483,7 +488,17 @@ impl Compiler {
         let d = if name == "this" {
             Diagnostic::new("`this` is only available inside object methods", span)
         } else {
-            Diagnostic::new(format!("unknown name '{name}'"), span).hint("declare it with `let`, `const` or `function` before using it")
+            let visible: Vec<String> = self
+                .fns
+                .iter()
+                .flat_map(|f| f.scopes.iter().flat_map(|s| s.locals.iter().map(|l| l.name.to_string())))
+                .chain(self.globals.keys().filter(|g| !g.starts_with("__")).cloned())
+                .collect();
+            let hint = match crate::syntax::closest(name, visible.iter().map(String::as_str)) {
+                Some(c) => format!("did you mean '{c}'?"),
+                None => "declare it with `let`, `const` or `function` before using it".into(),
+            };
+            Diagnostic::new(format!("unknown name '{name}'"), span).hint(hint)
         };
         self.error(d);
     }
@@ -1011,7 +1026,11 @@ impl Compiler {
             let mut names = Vec::with_capacity(el.attrs.len());
             for (name, value) in &el.attrs {
                 if !kind.allows(name) {
-                    self.error(Diagnostic::new(format!("<{}> has no prop '{name}'", el.tag), value.span).hint(format!("props of <{}>: {}", el.tag, kind.all_props().join(", "))));
+                    let hint = match crate::syntax::closest(name, kind.all_props()) {
+                        Some(c) => format!("did you mean '{c}'?"),
+                        None => format!("props of <{}>: {}", el.tag, kind.all_props().join(", ")),
+                    };
+                    self.error(Diagnostic::new(format!("<{}> has no prop '{name}'", el.tag), value.span).hint(hint));
                 }
                 self.expr(value);
                 names.push(Rc::from(name.as_str()));
@@ -1046,8 +1065,10 @@ impl Compiler {
             self.emit(Op::Call(1), sp);
         } else {
             self.error(
-                Diagnostic::new(format!("unknown component <{}>", el.tag), sp)
-                    .hint(format!("built-in components: {}; or declare `function {}(props)`", catalog::names(), el.tag)),
+                Diagnostic::new(format!("unknown component <{}>", el.tag), sp).hint(match crate::syntax::closest(&el.tag, catalog::KINDS.iter().map(|k| k.name)) {
+                    Some(c) => format!("did you mean <{c}>?"),
+                    None => format!("built-in components: {}; or declare `function {}(props)`", catalog::names(), el.tag),
+                }),
             );
         }
     }
@@ -1319,6 +1340,11 @@ mod tests {
     fn checks_components_and_props() {
         assert_eq!(errors("function App() { return <Text colour=\"red\">x</Text> }"), vec!["<Text> has no prop 'colour'"]);
         assert_eq!(errors("function App() { return <Box /> }"), vec!["unknown component <Box>"]);
+        let hints = |src: &str| compile(src).err().unwrap().into_iter().filter_map(|d| d.hint).collect::<Vec<_>>();
+        assert_eq!(hints("function App() { return <Txt>x</Txt> }"), vec!["did you mean <Text>?"]);
+        assert_eq!(hints("function App() { return <Text colr=\"red\">x</Text> }"), vec!["did you mean 'color'?"]);
+        assert_eq!(hints("function f() { const total = 1; return totl }"), vec!["did you mean 'total'?"]);
+        assert_eq!(hints("type T = { text: string }\nfunction f(): T { return { txt: \"a\" } }"), vec!["did you mean 'text'?"]);
         assert!(errors("function Card(p) { return <Text>{p.title}</Text> }\nfunction App() { return <Card title=\"x\" /> }").is_empty());
     }
 

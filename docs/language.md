@@ -62,8 +62,25 @@ object Cart {
 object handles. **There is no `undefined`**: missing values, missing fields and
 out-of-range indexes are `null`.
 
-Type annotations are parsed and kept. They are not checked yet, but write them anyway:
-the type checker is coming, and it will use them.
+### Types
+
+Types are checked the way TypeScript checks them, except there are no strict null checks
+yet: `null` fits any type. Code without annotations is `any`, so it compiles.
+**Annotate fields, parameters and shared types**, and you get:
+
+- record shapes: missing fields, unknown fields (`'txt' is not a field of Todo`, with
+  "did you mean 'text'?"), and field types;
+- object members: unknown fields and methods, argument counts and argument types;
+- assignments, returns, arithmetic (`string - number`) and comparisons that can never be true;
+- component props: missing, unknown and wrongly typed props, and event props that are not
+  functions;
+- callbacks typed from context: in `todos.items.map(t => t.text)`, `t` is a `Todo`.
+
+Supported type syntax: `number`, `string`, `boolean`, `null`, `void`, `any`, string and
+number literals, unions, `T[]`, `Array<T>`, `{ a: T; b?: U }`, `Record<string, T>`,
+`{ [key: string]: T }`, `(a: T) => U`, `type` and `interface` (recursive types allowed),
+object names as types (`c: Counter`), and `Promise<T>` (treated as `T`). Generic
+parameters (`<T>`) are accepted and checked as `any`.
 
 ## Rules that differ from JavaScript
 

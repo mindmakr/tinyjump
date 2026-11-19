@@ -128,7 +128,8 @@ fn optional_chaining_and_errors() {
     assert_eq!(eval("try { const x = null; return x.y } catch (e) { return 'caught' }").unwrap(), json!("caught"));
     let err = eval("const x = null; return x.y").unwrap_err();
     assert!(err.contains("cannot read 'y' of null"), "{err}");
-    assert!(eval("return 1 - 'a'").unwrap_err().contains("arithmetic needs numbers"));
+    // The type checker rejects `1 - "a"`; values from outside (any) are still checked at runtime.
+    assert!(eval("const a = JSON.parse('\"a\"'); return 1 - a").unwrap_err().contains("arithmetic needs numbers"));
 }
 
 #[test]

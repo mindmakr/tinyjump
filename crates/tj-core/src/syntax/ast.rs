@@ -12,7 +12,7 @@ pub struct Program {
 pub enum Item {
     Function(Rc<FnDecl>),
     Object(ObjectDecl),
-    TypeAlias { name: String, ty: TypeExpr, span: Span },
+    TypeAlias { name: String, generics: Vec<String>, ty: TypeExpr, span: Span },
     /// Top-level `let` / `const`.
     Let(LetDecl),
 }
@@ -20,6 +20,8 @@ pub enum Item {
 #[derive(Debug, Clone)]
 pub struct FnDecl {
     pub name: String,
+    /// Generic type parameter names (`<T>`); they type-check as `any`.
+    pub generics: Vec<String>,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
     pub body: Vec<Stmt>,
@@ -31,6 +33,8 @@ pub struct Param {
     pub pattern: Pattern,
     pub ty: Option<TypeExpr>,
     pub default: Option<Expr>,
+    /// Declared with `?`.
+    pub optional: bool,
 }
 
 #[derive(Debug, Clone)]

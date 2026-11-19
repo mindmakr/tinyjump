@@ -146,23 +146,29 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn skip_generics(&mut self) -> PResult<()> {
+    /// `<T, U extends X = Y>`: returns the parameter names; constraints and defaults are ignored.
+    fn generics(&mut self) -> PResult<Vec<String>> {
+        let mut names = Vec::new();
         if !self.at(&Tok::Lt) {
-            return Ok(());
+            return Ok(names);
         }
         let mut depth = 0;
+        let mut expect_name = false;
         loop {
-            match self.bump()?.tok {
+            let t = self.bump()?.tok;
+            match &t {
                 Tok::Lt => depth += 1,
                 Tok::Gt => {
                     depth -= 1;
                     if depth == 0 {
-                        return Ok(());
+                        return Ok(names);
                     }
                 }
+                Tok::Ident(n) if expect_name && depth == 1 => names.push(n.clone()),
                 Tok::Eof => return Err(self.unexpected("'>'")),
                 _ => {}
             }
+            expect_name = depth == 1 && matches!(t, Tok::Lt | Tok::Comma);
         }
     }
 
@@ -179,18 +185,18 @@ impl<'a> Parser<'a> {
             Tok::Type => {
                 self.bump()?;
                 let (name, _) = self.ident("a type name")?;
-                self.skip_generics()?;
+                let generics = self.generics()?;
                 self.expect(&Tok::Assign, "'='")?;
                 let ty = self.ty()?;
                 self.end_stmt()?;
-                Ok(Item::TypeAlias { name, ty, span: self.since(start) })
+                Ok(Item::TypeAlias { name, generics, ty, span: self.since(start) })
             }
             Tok::Interface => {
                 self.bump()?;
                 let (name, _) = self.ident("an interface name")?;
-                self.skip_generics()?;
+                let generics = self.generics()?;
                 let ty = self.record_type()?;
-                Ok(Item::TypeAlias { name, ty, span: self.since(start) })
+                Ok(Item::TypeAlias { name, generics, ty, span: self.since(start) })
             }
             Tok::Let | Tok::Const => {
                 let d = self.let_decl()?;
@@ -209,15 +215,15 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::Async)?;
         self.expect(&Tok::Function, "'function'")?;
         let (name, _) = self.ident("a function name")?;
-        self.skip_generics()?;
-        self.fn_rest(name, start)
+        let generics = self.generics()?;
+        self.fn_rest(name, generics, start)
     }
 
-    fn fn_rest(&mut self, name: String, start: Span) -> PResult<FnDecl> {
+    fn fn_rest(&mut self, name: String, generics: Vec<String>, start: Span) -> PResult<FnDecl> {
         let params = self.params()?;
         let ret = if self.eat(&Tok::Colon)? { Some(self.ty()?) } else { None };
         let body = self.block()?;
-        Ok(FnDecl { name, params, ret, body, span: self.since(start) })
+        Ok(FnDecl { name, generics, params, ret, body, span: self.since(start) })
     }
 
     fn params(&mut self) -> PResult<Vec<Param>> {
@@ -228,10 +234,10 @@ impl<'a> Parser<'a> {
                 return Err(Diagnostic::new("rest parameters are not supported yet", self.cur.span).hint("take an array parameter instead"));
             }
             let pattern = self.pattern()?;
-            self.eat(&Tok::Question)?;
+            let optional = self.eat(&Tok::Question)?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.ty()?) } else { None };
             let default = if self.eat(&Tok::Assign)? { Some(self.assign_expr()?) } else { None };
-            out.push(Param { pattern, ty, default });
+            out.push(Param { pattern, ty, default, optional });
             if !self.eat(&Tok::Comma)? {
                 break;
             }
@@ -296,8 +302,8 @@ impl<'a> Parser<'a> {
             self.eat(&Tok::Async)?;
             let (mname, mspan) = self.prop_name()?;
             if self.at(&Tok::LParen) || self.at(&Tok::Lt) {
-                self.skip_generics()?;
-                let func = Rc::new(self.fn_rest(mname, mspan)?);
+                let generics = self.generics()?;
+                let func = Rc::new(self.fn_rest(mname, generics, mspan)?);
                 methods.push(Method { decorators, private, func });
                 continue;
             }
@@ -397,7 +403,21 @@ impl<'a> Parser<'a> {
     fn record_type(&mut self) -> PResult<TypeExpr> {
         self.expect(&Tok::LBrace, "'{'")?;
         let mut fields = Vec::new();
+        let mut index = None;
         while !self.at(&Tok::RBrace) {
+            // Index signature: `[key: string]: T`
+            if self.eat(&Tok::LBracket)? {
+                self.ident("a key name")?;
+                self.expect(&Tok::Colon, "':'")?;
+                let key = self.ty()?;
+                self.expect(&Tok::RBracket, "']'")?;
+                self.expect(&Tok::Colon, "':'")?;
+                index = Some((key, self.ty()?));
+                if !(self.eat(&Tok::Semi)? || self.eat(&Tok::Comma)? || self.cur.nl_before || self.at(&Tok::RBrace)) {
+                    return Err(self.unexpected("';' or a new line"));
+                }
+                continue;
+            }
             let (name, _) = self.prop_name()?;
             let optional = self.eat(&Tok::Question)?;
             let ty = if self.at(&Tok::LParen) {
@@ -415,7 +435,11 @@ impl<'a> Parser<'a> {
             }
         }
         self.bump()?;
-        Ok(TypeExpr::Record(fields))
+        Ok(match index {
+            // A pure index signature is a dictionary; named fields win otherwise.
+            Some((key, value)) if fields.is_empty() => TypeExpr::Named("Record".into(), vec![key, value]),
+            _ => TypeExpr::Record(fields),
+        })
     }
 
     // ---------- statements ----------
@@ -650,7 +674,7 @@ impl<'a> Parser<'a> {
                 if next.tok != Tok::Arrow || next.nl_before {
                     return Ok(None);
                 }
-                let param = Param { pattern: Pattern::Ident(name.clone(), self.cur.span), ty: None, default: None };
+                let param = Param { pattern: Pattern::Ident(name.clone(), self.cur.span), ty: None, default: None, optional: false };
                 self.bump()?;
                 self.bump()?;
                 let body = self.arrow_body()?;
@@ -692,7 +716,7 @@ impl<'a> Parser<'a> {
 
     fn arrow(&self, params: Vec<Param>, body: Vec<Stmt>, start: Span) -> Expr {
         let span = self.since(start);
-        Expr { kind: ExprKind::Arrow(Rc::new(FnDecl { name: "<anonymous>".into(), params, ret: None, body, span })), span }
+        Expr { kind: ExprKind::Arrow(Rc::new(FnDecl { name: "<anonymous>".into(), generics: Vec::new(), params, ret: None, body, span })), span }
     }
 
     fn cond_expr(&mut self) -> PResult<Expr> {
@@ -902,7 +926,7 @@ impl<'a> Parser<'a> {
                 } else {
                     "<anonymous>".to_string()
                 };
-                ExprKind::Arrow(Rc::new(self.fn_rest(name, start)?))
+                ExprKind::Arrow(Rc::new(self.fn_rest(name, Vec::new(), start)?))
             }
             Tok::New => {
                 self.bump()?;
@@ -970,7 +994,7 @@ impl<'a> Parser<'a> {
                 if self.eat(&Tok::Colon)? {
                     entries.push(RecordEntry::Field(key, self.assign_expr()?));
                 } else if self.at(&Tok::LParen) {
-                    let f = self.fn_rest(key.clone(), kspan)?;
+                    let f = self.fn_rest(key.clone(), Vec::new(), kspan)?;
                     let span = f.span;
                     entries.push(RecordEntry::Field(key, Expr { kind: ExprKind::Arrow(Rc::new(f)), span }));
                 } else {

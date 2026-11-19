@@ -8,6 +8,7 @@ pub mod compile;
 pub mod host;
 pub mod runtime;
 pub mod syntax;
+pub mod typeck;
 pub mod ui;
 pub mod vm;
 

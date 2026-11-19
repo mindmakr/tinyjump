@@ -52,6 +52,25 @@ impl Diagnostic {
     }
 }
 
+/// The closest candidate within two edits of `name`, for "did you mean" hints.
+pub fn closest<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    let limit = if name.chars().count() <= 3 { 1 } else { 2 };
+    candidates.into_iter().filter(|c| *c != name).map(|c| (edit_distance(name, c), c)).filter(|(d, _)| *d <= limit).min_by_key(|(d, _)| *d).map(|(_, c)| c)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != *cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
 /// 1-based line and column (in chars) of a byte offset.
 pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
     let offset = offset.min(src.len());
