@@ -13,5 +13,5 @@ publish = false
 crate-type = ["cdylib"]
 
 [target.'cfg(target_os = "android")'.dependencies]
-tj-core.workspace = true
+tj-core = { workspace = true, features = ["layout"] }
 jni = { version = "0.21", default-features = false }

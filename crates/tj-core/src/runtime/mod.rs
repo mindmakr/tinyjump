@@ -6,6 +6,9 @@ pub mod protocol;
 mod render;
 pub mod store;
 
+#[cfg(feature = "layout")]
+use crate::ui::layout::Layout;
+use crate::ui::layout::Measure;
 use crate::ui::tree::Tree;
 use crate::vm::builtins::GLOBALS;
 use crate::vm::interp::{Failure, Fiber, Run};
@@ -114,6 +117,10 @@ pub struct Runtime {
     /// Fibers suspended on an effect, with their reply id.
     waiting: HashMap<u32, (Fiber, Option<u64>)>,
     tree: Tree,
+    #[cfg(feature = "layout")]
+    layout: Layout,
+    /// Native hosts measure their widgets for layout; the web and servers do not need it.
+    measure: Option<Box<dyn Measure>>,
     render: bool,
     server: bool,
     ran_code: bool,
@@ -152,6 +159,9 @@ impl Runtime {
             next_effect: 0,
             waiting: HashMap::new(),
             tree: Tree::default(),
+            #[cfg(feature = "layout")]
+            layout: Layout::default(),
+            measure: None,
             render: opts.render,
             server: opts.server,
             ran_code: false,
@@ -225,6 +235,18 @@ impl Runtime {
                     self.reply(None, Err(e));
                 }
             }
+            // Without the layout engine (the web build) there is nothing to compute.
+            #[cfg(not(feature = "layout"))]
+            Input::Layout { .. } => {}
+            #[cfg(feature = "layout")]
+            Input::Layout { width, height } => {
+                if let Some(m) = self.measure.as_deref_mut() {
+                    let frames = self.layout.compute(&self.tree, width, height, m);
+                    if !frames.is_empty() {
+                        self.outputs.push(Output::Frames { frames });
+                    }
+                }
+            }
             Input::Tick => {}
             Input::Inspect { reply } => {
                 let snapshot = self.inspect();
@@ -237,6 +259,11 @@ impl Runtime {
         }
         self.flush();
         self.drain()
+    }
+
+    /// Native hosts: how to measure widgets, which turns on [`Input::Layout`].
+    pub fn set_measure(&mut self, measure: Box<dyn Measure>) {
+        self.measure = Some(measure);
     }
 
     /// When the host should next send [`Input::Tick`].

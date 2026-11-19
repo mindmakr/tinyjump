@@ -9,7 +9,7 @@ final class Native {
     private Native() {}
 
     /** Compiles and boots; status codes as in tj_core::host. The payload is in {@link #out()}. */
-    static native int boot(FileStore store, String source, double now, long seed, boolean render);
+    static native int boot(Host host, String source, double now, long seed, boolean render);
 
     /** Handles one JSON input; the payload is in {@link #out()}. */
     static native int handle(double now, String input);

@@ -12,7 +12,7 @@ homepage = "https://mindmakr.github.io/tinyjump/"
 rust-version = "1.80"
 
 [workspace.dependencies]
-tj-core = { path = "crates/tj-core" }
+tj-core = { path = "crates/tj-core", default-features = false }
 indexmap = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }

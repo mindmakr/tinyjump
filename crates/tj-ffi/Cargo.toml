@@ -14,4 +14,4 @@ publish = false
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
-tj-core.workspace = true
+tj-core = { workspace = true, features = ["layout"] }

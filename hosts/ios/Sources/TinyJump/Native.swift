@@ -1,4 +1,4 @@
-import Foundation
+import UIKit
 
 /// Object storage: one JSON file per key, written atomically.
 final class FileStore {
@@ -46,17 +46,27 @@ final class FileStore {
     }
 }
 
-/// The Rust runtime behind the C ABI (crates/tj-ffi/include/tinyjump.h). Main thread only.
-final class NativeRuntime {
-    private let store: FileStore
-    private var rt: OpaquePointer?
+/// What the Rust runtime calls back into: storage and widget measurement.
+final class HostBridge {
+    let store: FileStore
+    weak var renderer: Renderer?
 
     init(store: FileStore) {
         self.store = store
-        var s = TjStore()
-        s.ctx = Unmanaged.passUnretained(store).toOpaque()
+    }
+}
+
+/// The Rust runtime behind the C ABI (crates/tj-ffi/include/tinyjump.h). Main thread only.
+final class NativeRuntime {
+    private let bridge: HostBridge
+    private var rt: OpaquePointer?
+
+    init(bridge: HostBridge) {
+        self.bridge = bridge
+        var s = TjHost()
+        s.ctx = Unmanaged.passUnretained(bridge).toOpaque()
         s.load = { ctx, key, keyLen, out in
-            let store = Unmanaged<FileStore>.fromOpaque(ctx!).takeUnretainedValue()
+            let store = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue().store
             guard let data = store.load(NativeRuntime.string(key, keyLen)) else { return 0 }
             data.withUnsafeBytes { raw in
                 tj_buf_set(out, raw.bindMemory(to: UInt8.self).baseAddress, raw.count)
@@ -64,17 +74,23 @@ final class NativeRuntime {
             return 1
         }
         s.save = { ctx, key, keyLen, value, valueLen in
-            let store = Unmanaged<FileStore>.fromOpaque(ctx!).takeUnretainedValue()
+            let store = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue().store
             let data = value.map { Data(bytes: $0, count: valueLen) } ?? Data()
             return store.save(NativeRuntime.string(key, keyLen), data) ? 0 : 1
         }
         s.keys = { ctx, prefix, prefixLen, out in
-            let store = Unmanaged<FileStore>.fromOpaque(ctx!).takeUnretainedValue()
+            let store = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue().store
             let keys = store.keys(NativeRuntime.string(prefix, prefixLen))
             let json = (try? JSONSerialization.data(withJSONObject: keys)) ?? Data("[]".utf8)
             json.withUnsafeBytes { raw in
                 tj_buf_set(out, raw.bindMemory(to: UInt8.self).baseAddress, raw.count)
             }
+        }
+        s.measure = { ctx, node, maxWidth, width, height in
+            let bridge = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue()
+            let size = bridge.renderer?.measure(node: Int(node), maxWidth: maxWidth < 0 ? nil : CGFloat(maxWidth)) ?? .zero
+            width?.pointee = Float(size.width)
+            height?.pointee = Float(size.height)
         }
         rt = tj_new(s)
     }

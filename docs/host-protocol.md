@@ -61,6 +61,24 @@ widget. When the user acts, send `ui { target: { node: id }, event, value }`, bu
 for events listed on that node. Hosts should only write a widget's `value` when it
 differs from what the widget already shows, so typing is never interrupted.
 
+## Layout (native hosts)
+
+The core lays native screens out with CSS flexbox (`crates/tj-core/src/ui/layout.rs`),
+so Android and iOS place things exactly like the web host, whose browser uses the same
+rules. The cycle has three steps:
+
+1. After applying a `patch`, and whenever the screen size changes, send
+   `layout { width, height }` in points (iOS) or dp (Android).
+2. The core answers with `frames { frames: [{ id, x, y, w, h, content? }] }`. These are
+   only the nodes that moved, positioned relative to their parent. `content` is the
+   scrollable height of a `Scroll`.
+3. While computing, the core calls the host's **measure** callback for leaf widgets (text,
+   buttons, inputs, toggles, images). The callback returns the natural size at a maximum
+   width. Leaves draw their own padding, so it is included. Round sizes up, so text never
+   wraps because layout snapped to whole points.
+
+Containers handle no layout props themselves. They place children at their frames.
+
 ## Storage
 
 `Store` is synchronous: `load(key)`, `save(key, json)`, `keys(prefix)`. Keys are
@@ -75,19 +93,23 @@ The WASM and JNI crates are thin shims over it.
 
 ### C ABI (`crates/tj-ffi`, for Swift, C and C++)
 
-The header is `crates/tj-ffi/include/tinyjump.h`. Use `tj_new(store)`, then `tj_boot`,
-`tj_handle` and `tj_out`, and finally `tj_free`. Storage goes through the `TjStore`
-callbacks, which return data by copying it into a Rust-owned buffer with `tj_buf_set`, so
-no memory is ever freed across allocators. Build the static library with
+The header is `crates/tj-ffi/include/tinyjump.h`. Use `tj_new(host)`, then `tj_boot`,
+`tj_handle` and `tj_out`, and finally `tj_free`. Storage and measurement go through the
+`TjHost` callbacks. Storage returns data by copying it into a Rust-owned buffer with
+`tj_buf_set`, so no memory is ever freed across allocators. Build the static library with
 `cargo build -p tj-ffi --profile small --target aarch64-apple-ios` (or any other target).
 
 ### JNI (`crates/tj-android`)
 
-`com.mindmakr.tinyjump.Native`: `int boot(FileStore, String source, double now, long seed,
+`com.mindmakr.tinyjump.Native`: `int boot(Host, String source, double now, long seed,
 boolean render)`, `int handle(double now, String input)` and `String out()`. Calls must
-come from the main thread. Rust calls back into `FileStore`, by name, through
-`String load(String)`, `boolean save(String, String)` and `String keys(String)` (a JSON
-array).
+come from the main thread. Rust calls back into `Host`, by name, through:
+
+- `String load(String)`;
+- `boolean save(String, String)`;
+- `String keys(String)` (a JSON array);
+- `long measure(int node, float maxWidth)`, which returns the width and height as two float
+  bit patterns.
 
 ### The WASM ABI (`crates/tj-wasm`)
 

@@ -12,10 +12,7 @@ import java.util.Collections;
 import java.util.List;
 import org.json.JSONArray;
 
-/**
- * Object storage: one JSON file per key, written atomically. Called from Rust through JNI
- * (method names and signatures are part of the contract with crates/tj-android).
- */
+/** Object storage: one JSON file per key, written atomically. */
 final class FileStore {
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private final File dir;

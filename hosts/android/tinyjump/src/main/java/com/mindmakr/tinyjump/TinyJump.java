@@ -4,6 +4,7 @@ import android.content.Context;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
+import android.view.View;
 import android.view.ViewGroup;
 import java.io.File;
 import java.io.InputStream;
@@ -52,6 +53,13 @@ public final class TinyJump {
     private TinyJump(Context context, ViewGroup root, String server) {
         renderer = new Renderer(context, root, this);
         sync = new Sync(this, server);
+        // A new screen size means a new layout.
+        renderer.root.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override
+            public void onLayoutChange(View v, int l, int t, int r, int b, int ol, int ot, int or, int ob) {
+                if (r - l != or - ol || b - t != ob - ot) layout();
+            }
+        });
     }
 
     /** Boots {@code source} into {@code root}. Throws with the compiler's message if it does not compile. */
@@ -66,8 +74,9 @@ public final class TinyJump {
     public static TinyJump start(Context context, ViewGroup root, String source, String server) {
         assertMain();
         TinyJump tj = new TinyJump(context, root, server);
-        FileStore store = new FileStore(new File(context.getFilesDir(), "tinyjump"));
-        int code = Native.boot(store, source, now(), System.nanoTime(), true);
+        Host host = new Host(new FileStore(new File(context.getFilesDir(), "tinyjump")));
+        host.renderer = tj.renderer;
+        int code = Native.boot(host, source, now(), System.nanoTime(), true);
         String out = Native.out();
         if (code != 0) throw new IllegalStateException(describeFailure(code, out));
         tj.apply(out);
@@ -112,6 +121,17 @@ public final class TinyJump {
         apply(out);
     }
 
+    /** Asks the core to lay the screen out at the root's current size. */
+    void layout() {
+        float[] size = renderer.viewportDp();
+        if (size == null) return;
+        try {
+            send(input("layout").put("width", size[0]).put("height", size[1]));
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     static JSONObject input(String type) {
         try {
             return new JSONObject().put("type", type);
@@ -144,13 +164,17 @@ public final class TinyJump {
     }
 
     private void apply(String outputs) {
+        boolean relayout = false;
         try {
             JSONArray list = new JSONArray(outputs);
             for (int i = 0; i < list.length(); i++) {
                 JSONObject o = list.getJSONObject(i);
                 switch (o.getString("type")) {
                     case "patch":
-                        renderer.apply(o.getJSONArray("ops"));
+                        relayout |= renderer.apply(o.getJSONArray("ops"));
+                        break;
+                    case "frames":
+                        renderer.frames(o.getJSONArray("frames"));
                         break;
                     case "effect":
                         runEffect(o.getInt("id"), o.getJSONObject("effect"));
@@ -180,6 +204,7 @@ public final class TinyJump {
         } catch (JSONException e) {
             Log.e(TAG, "bad output from runtime", e);
         }
+        if (relayout) layout();
     }
 
     private static int level(String level) {

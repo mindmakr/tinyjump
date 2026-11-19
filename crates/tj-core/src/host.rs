@@ -2,6 +2,7 @@
 //! JNI/Java, Swift). Each call returns a status code and a JSON payload.
 
 use crate::runtime::{Options, Runtime};
+use crate::ui::layout::Measure;
 use crate::{compile, Input, Store};
 use serde_json::{json, Value as Json};
 
@@ -18,8 +19,8 @@ pub struct JsonHost {
 }
 
 impl JsonHost {
-    /// Compiles and boots `src`, replacing any running app.
-    pub fn boot(&mut self, src: &str, store: Box<dyn Store>, now: f64, seed: u64, render: bool) -> (i32, String) {
+    /// Compiles and boots `src`, replacing any running app. Native hosts pass a `measure` for layout.
+    pub fn boot(&mut self, src: &str, store: Box<dyn Store>, measure: Option<Box<dyn Measure>>, now: f64, seed: u64, render: bool) -> (i32, String) {
         let program = match compile(src) {
             Ok(p) => p,
             Err(errs) => {
@@ -35,7 +36,10 @@ impl JsonHost {
         };
         // Foreign-language hosts are devices: `@server` objects are replicas.
         match Runtime::boot(program, store, Options { now, seed, render, server: false }) {
-            Ok((rt, outputs)) => {
+            Ok((mut rt, outputs)) => {
+                if let Some(m) = measure {
+                    rt.set_measure(m);
+                }
                 self.runtime = Some(rt);
                 (OK, to_json(&outputs))
             }
@@ -74,10 +78,10 @@ mod tests {
     fn boots_handles_and_reports_errors() {
         let mut h = JsonHost::default();
         assert_eq!(h.handle(0.0, r#"{"type":"tick"}"#).0, INVALID, "not booted yet");
-        let (code, body) = h.boot("function f() { return x }", Box::new(MemStore::default()), 0.0, 1, false);
+        let (code, body) = h.boot("function f() { return x }", Box::new(MemStore::default()), None, 0.0, 1, false);
         assert_eq!(code, INVALID);
         assert!(body.contains("unknown name 'x'"));
-        let (code, _) = h.boot("object A { n = 0\n inc() { this.n += 1; return this.n } }", Box::new(MemStore::default()), 0.0, 1, false);
+        let (code, _) = h.boot("object A { n = 0\n inc() { this.n += 1; return this.n } }", Box::new(MemStore::default()), None, 0.0, 1, false);
         assert_eq!(code, OK);
         let (code, body) = h.handle(1.0, r#"{"type":"call","object":"A/a","method":"inc","reply":7}"#);
         assert_eq!(code, OK);

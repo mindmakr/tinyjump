@@ -35,14 +35,12 @@ and the same agents can drive and inspect the running app.
    Scenes are declared in the same catalog (`<Scene>`, `<Mesh>`, `<Camera>`, `<Light>`) and patched
    like UI, plus a `@frame(dt)` hook. Hosts opt in, so apps without 3D stay small.
 
-## Next: one layout engine for every host
+## One layout engine for every host (done)
 
-Hosts translate layout props into their own systems: CSS flexbox, `LinearLayout` and
-`UIStackView`. Results drift: on iOS, `grow` in rows with multi-line text does not take
-the free space the way it does on the web and Android. The fix is to compute flexbox
-layout once in the core (a small Rust flexbox engine), measure text through the host,
-and have hosts apply the frames. Layout is then identical everywhere and testable without
-a device.
+The core computes CSS flexbox layout once (Taffy), native hosts measure their leaf widgets
+and apply the frames, and the web host uses the browser's own flexbox, which follows the
+same rules. Layout is identical everywhere and testable without a device
+(`ui/layout.rs` tests).
 
 ## Reliable messaging (built in, scoped to objects)
 

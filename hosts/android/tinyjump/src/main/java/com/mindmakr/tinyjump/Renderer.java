@@ -3,6 +3,7 @@ package com.mindmakr.tinyjump;
 import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
@@ -12,8 +13,8 @@ import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
 import android.text.TextWatcher;
+import android.util.Log;
 import android.util.TypedValue;
-import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -24,46 +25,94 @@ import android.widget.CompoundButton;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
-import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.URL;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.IdentityHashMap;
 import java.util.Iterator;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 
-/** Applies view-tree patches to native Views. Mirrors the catalog in crates/tj-core/src/ui/catalog.rs. */
+/**
+ * Applies view-tree patches to native Views and places them where the core's layout says
+ * (crates/tj-core/src/ui/layout.rs). Mirrors the catalog in crates/tj-core/src/ui/catalog.rs.
+ */
 final class Renderer {
-    private static final Set<String> LAYOUT_PROPS = set("width", "height", "grow", "margin");
-    private static final Set<String> ARRANGE_PROPS = set("gap", "align", "justify");
-    private static final Set<String> BOX_PROPS = set("background", "radius", "border");
+    /** Where a view goes inside a {@link FrameBox}, in pixels. */
+    static final class Frame extends ViewGroup.LayoutParams {
+        int x;
+        int y;
+
+        Frame() {
+            super(0, 0);
+        }
+    }
+
+    /** A container that places children exactly at their frames. */
+    static final class FrameBox extends ViewGroup {
+        /** Content height in pixels when this box scrolls; 0 otherwise. */
+        int contentHeight;
+
+        FrameBox(Context c) {
+            super(c);
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                Frame f = (Frame) child.getLayoutParams();
+                child.measure(MeasureSpec.makeMeasureSpec(f.width, MeasureSpec.EXACTLY), MeasureSpec.makeMeasureSpec(f.height, MeasureSpec.EXACTLY));
+            }
+            int h = MeasureSpec.getMode(heightSpec) == MeasureSpec.EXACTLY ? MeasureSpec.getSize(heightSpec) : contentHeight;
+            setMeasuredDimension(MeasureSpec.getSize(widthSpec), h);
+        }
+
+        @Override
+        protected void onLayout(boolean changed, int l, int t, int r, int b) {
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                Frame f = (Frame) child.getLayoutParams();
+                child.layout(f.x, f.y, f.x + f.width, f.y + f.height);
+            }
+        }
+
+        @Override
+        protected LayoutParams generateDefaultLayoutParams() {
+            return new Frame();
+        }
+
+        @Override
+        protected boolean checkLayoutParams(LayoutParams p) {
+            return p instanceof Frame;
+        }
+
+        @Override
+        protected LayoutParams generateLayoutParams(LayoutParams p) {
+            return new Frame();
+        }
+    }
 
     static final class Node {
         final int id;
         final String kind;
         final View view;
         /** Where children go; null for leaf widgets. */
-        final ViewGroup container;
+        final FrameBox container;
         final JSONObject props = new JSONObject();
         List<String> events = new ArrayList<>();
-        List<Integer> children = new ArrayList<>();
-        final List<View> spacers = new ArrayList<>();
-        int parent = -1;
         /** True while the renderer itself changes a widget, so listeners stay quiet. */
         boolean quiet;
         Drawable defaultBackground;
         boolean customBackground;
 
-        Node(int id, String kind, View view, ViewGroup container) {
+        Node(int id, String kind, View view, FrameBox container) {
             this.id = id;
             this.kind = kind;
             this.view = view;
@@ -75,27 +124,23 @@ final class Renderer {
     private final TinyJump tj;
     private final float density;
     private final Map<Integer, Node> nodes = new HashMap<>();
-    private final Map<View, Node> byView = new IdentityHashMap<>();
+    final FrameBox root;
 
-    Renderer(Context ctx, ViewGroup root, TinyJump tj) {
+    Renderer(Context ctx, ViewGroup host, TinyJump tj) {
         this.ctx = ctx;
         this.tj = tj;
         this.density = ctx.getResources().getDisplayMetrics().density;
+        root = new FrameBox(ctx);
+        host.addView(root, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         nodes.put(0, new Node(0, "Root", root, root));
     }
 
-    private static Set<String> set(String... items) {
-        Set<String> s = new LinkedHashSet<>();
-        java.util.Collections.addAll(s, items);
-        return s;
+    private int px(double dp) {
+        return (int) Math.round(dp * density);
     }
 
-    int dp(double v) {
-        return (int) (v * density + 0.5);
-    }
-
-    void apply(JSONArray ops) throws JSONException {
-        Set<Node> rearrange = new LinkedHashSet<>();
+    /** True if the patch changed anything, so the screen needs a new layout. */
+    boolean apply(JSONArray ops) throws JSONException {
         for (int i = 0; i < ops.length(); i++) {
             JSONObject op = ops.getJSONObject(i);
             int id = op.getInt("id");
@@ -105,48 +150,76 @@ final class Renderer {
                     Node n = create(id, op.getString("kind"), props);
                     n.events = strings(op.getJSONArray("events"));
                     nodes.put(id, n);
-                    byView.put(n.view, n);
                     setProps(n, props);
                     break;
                 }
                 case "update": {
                     Node n = nodes.get(id);
                     if (n == null) break;
-                    JSONObject props = op.getJSONObject("props");
-                    setProps(n, props);
+                    setProps(n, op.getJSONObject("props"));
                     if (op.has("events")) n.events = strings(op.getJSONArray("events"));
-                    for (Iterator<String> it = props.keys(); it.hasNext(); ) {
-                        String k = it.next();
-                        if (LAYOUT_PROPS.contains(k) && nodes.containsKey(n.parent)) rearrange.add(nodes.get(n.parent));
-                        if (ARRANGE_PROPS.contains(k)) rearrange.add(n);
-                    }
                     break;
                 }
                 case "children": {
                     Node p = nodes.get(id);
-                    if (p == null) break;
-                    p.children = new ArrayList<>();
+                    if (p == null || p.container == null) break;
                     JSONArray ids = op.getJSONArray("ids");
                     for (int j = 0; j < ids.length(); j++) {
-                        p.children.add(ids.getInt(j));
                         Node c = nodes.get(ids.getInt(j));
-                        if (c != null) c.parent = id;
+                        if (c == null || p.container.getChildAt(j) == c.view) continue;
+                        if (c.view.getParent() instanceof ViewGroup) ((ViewGroup) c.view.getParent()).removeView(c.view);
+                        p.container.addView(c.view, j, c.view.getLayoutParams() instanceof Frame ? c.view.getLayoutParams() : new Frame());
                     }
-                    rearrange.add(p);
+                    while (p.container.getChildCount() > ids.length()) p.container.removeViewAt(p.container.getChildCount() - 1);
                     break;
                 }
                 case "remove": {
                     Node n = nodes.remove(id);
-                    if (n == null) break;
-                    byView.remove(n.view);
-                    if (n.view.getParent() instanceof ViewGroup) ((ViewGroup) n.view.getParent()).removeView(n.view);
+                    if (n != null && n.view.getParent() instanceof ViewGroup) ((ViewGroup) n.view.getParent()).removeView(n.view);
                     break;
                 }
                 default:
                     break;
             }
         }
-        for (Node p : rearrange) arrange(p);
+        return ops.length() > 0;
+    }
+
+    /** Places nodes at the frames the core computed (dp, relative to their parent). */
+    void frames(JSONArray frames) throws JSONException {
+        for (int i = 0; i < frames.length(); i++) {
+            JSONObject f = frames.getJSONObject(i);
+            Node n = nodes.get(f.getInt("id"));
+            if (n == null) continue;
+            Frame lp = n.view.getLayoutParams() instanceof Frame ? (Frame) n.view.getLayoutParams() : new Frame();
+            lp.x = px(f.getDouble("x"));
+            lp.y = px(f.getDouble("y"));
+            lp.width = px(f.getDouble("w"));
+            lp.height = px(f.getDouble("h"));
+            n.view.setLayoutParams(lp);
+            if (f.has("content") && n.container != null) {
+                n.container.contentHeight = px(f.getDouble("content"));
+                n.container.requestLayout();
+            }
+        }
+    }
+
+    /** The natural size of a leaf in dp, wrapping at maxWidth (dp; negative = unbounded), packed as two float bit patterns. */
+    long measure(int id, float maxWidth) {
+        Node n = nodes.get(id);
+        float w = 0;
+        float h = 0;
+        if (n != null) {
+            int widthSpec = maxWidth < 0
+                    ? View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+                    : View.MeasureSpec.makeMeasureSpec(px(maxWidth), View.MeasureSpec.AT_MOST);
+            n.view.measure(widthSpec, View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED));
+            // Round up, with 1dp of slack: layout snaps to whole dp, and text a fraction too
+            // narrow would wrap its last word onto a line nobody sees.
+            w = (float) Math.ceil(n.view.getMeasuredWidth() / density) + 1;
+            h = (float) Math.ceil(n.view.getMeasuredHeight() / density);
+        }
+        return ((long) Float.floatToRawIntBits(w) << 32) | (Float.floatToRawIntBits(h) & 0xffffffffL);
     }
 
     private static List<String> strings(JSONArray a) throws JSONException {
@@ -161,16 +234,14 @@ final class Renderer {
         switch (kind) {
             case "Column":
             case "Row": {
-                LinearLayout l = new LinearLayout(ctx);
-                l.setOrientation("Row".equals(kind) ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
-                return new Node(id, kind, l, l);
+                FrameBox box = new FrameBox(ctx);
+                return new Node(id, kind, box, box);
             }
             case "Scroll": {
-                ScrollView s = new ScrollView(ctx);
-                LinearLayout inner = new LinearLayout(ctx);
-                inner.setOrientation(LinearLayout.VERTICAL);
-                s.addView(inner, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-                return new Node(id, kind, s, inner);
+                ScrollView scroll = new ScrollView(ctx);
+                FrameBox content = new FrameBox(ctx);
+                scroll.addView(content, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                return new Node(id, kind, scroll, content);
             }
             case "Button": {
                 Button b = new Button(ctx);
@@ -244,8 +315,7 @@ final class Renderer {
     private void fire(Node n, String event, Object value) {
         if (n.quiet || !n.events.contains(event)) return;
         try {
-            JSONObject in = TinyJump.input("ui").put("target", new JSONObject().put("node", n.id)).put("event", event).put("value", value);
-            tj.send(in);
+            tj.send(TinyJump.input("ui").put("target", new JSONObject().put("node", n.id)).put("event", event).put("value", value));
         } catch (JSONException e) {
             throw new IllegalStateException(e);
         }
@@ -258,13 +328,14 @@ final class Renderer {
             Object v = props.get(k);
             boolean none = v == JSONObject.NULL;
             if (none) n.props.remove(k); else n.props.put(k, v);
-            if (BOX_PROPS.contains(k)) box = true;
+            if ("background".equals(k) || "radius".equals(k) || "border".equals(k)) box = true;
             setProp(n, k, v, none);
         }
         if (box) restyle(n);
     }
 
-    private void setProp(final Node n, String k, Object v, boolean none) {
+    /** Visual props. Layout props (width, gap, align, grow, ...) are the core's job. */
+    private void setProp(Node n, String k, Object v, boolean none) {
         View view = n.view;
         TextView text = view instanceof TextView ? (TextView) view : null;
         n.quiet = true;
@@ -315,11 +386,13 @@ final class Renderer {
                 case "label":
                     view.setContentDescription(none ? null : String.valueOf(v));
                     break;
-                case "padding": {
-                    int p = none ? 0 : dp(((Number) v).doubleValue());
-                    view.setPadding(p, p, p, p);
+                case "padding":
+                    // Containers are padded by the core's layout; leaves draw their own padding.
+                    if (n.container == null) {
+                        int p = none ? 0 : px(((Number) v).doubleValue());
+                        view.setPadding(p, p, p, p);
+                    }
                     break;
-                }
                 case "color":
                     if (text != null) {
                         Integer c = none ? null : color(String.valueOf(v));
@@ -333,7 +406,7 @@ final class Renderer {
                     if (text != null) text.setTypeface(null, !none && isBold(v) ? Typeface.BOLD : Typeface.NORMAL);
                     break;
                 default:
-                    break; // layout and box props are applied in arrange() and restyle()
+                    break;
             }
         } finally {
             n.quiet = false;
@@ -372,7 +445,7 @@ final class Renderer {
                         }
                     });
                 } catch (Exception e) {
-                    android.util.Log.w(TinyJump.TAG, "image " + src + ": " + e);
+                    Log.w(TinyJump.TAG, "image " + src + ": " + e);
                 }
             }
         });
@@ -394,9 +467,9 @@ final class Renderer {
         }
         GradientDrawable d = new GradientDrawable();
         d.setColor(bg != null ? bg : Color.TRANSPARENT);
-        d.setCornerRadius(dp(radius));
+        d.setCornerRadius(px(radius));
         if (border instanceof Number) {
-            d.setStroke(dp(((Number) border).doubleValue()), Color.BLACK);
+            d.setStroke(px(((Number) border).doubleValue()), Color.BLACK);
         } else if (border != null) {
             int width = 1;
             int c = Color.BLACK;
@@ -405,7 +478,7 @@ final class Renderer {
                 Integer parsed = color(part);
                 if (parsed != null) c = parsed;
             }
-            d.setStroke(dp(width), c);
+            d.setStroke(px(width), c);
         }
         n.view.setBackground(d);
     }
@@ -432,124 +505,21 @@ final class Renderer {
         }
     }
 
-    // ---------- layout ----------
-
-    /** Puts a node's children in order (with spacers for between/around) and sets their layout. */
-    private void arrange(Node p) {
-        ViewGroup c = p.container;
-        if (c == null) return;
-        boolean vertical = !(c instanceof LinearLayout) || ((LinearLayout) c).getOrientation() == LinearLayout.VERTICAL;
-        String justify = p.props.optString("justify", "start");
-        String align = p.props.optString("align", vertical ? "stretch" : "center");
-        boolean between = "between".equals(justify);
-        boolean around = "around".equals(justify);
-
-        List<View> want = new ArrayList<>();
-        int spacer = 0;
-        if (around) want.add(spacer(p, spacer++));
-        for (int i = 0; i < p.children.size(); i++) {
-            Node child = nodes.get(p.children.get(i));
-            if (child == null) continue;
-            if (i > 0 && (between || around)) want.add(spacer(p, spacer++));
-            want.add(child.view);
-        }
-        if (around) want.add(spacer(p, spacer));
-
-        for (int i = 0; i < want.size(); i++) {
-            View v = want.get(i);
-            if (c.getChildAt(i) == v) continue;
-            if (v.getParent() instanceof ViewGroup) ((ViewGroup) v.getParent()).removeView(v);
-            c.addView(v, i);
-        }
-        while (c.getChildCount() > want.size()) c.removeViewAt(c.getChildCount() - 1);
-
-        int gap = dp(p.props.optDouble("gap", 0));
-        boolean first = true;
-        for (View v : want) {
-            Node child = byView.get(v);
-            if (child == null) {
-                v.setLayoutParams(new LinearLayout.LayoutParams(0, 0, 1f)); // spacer
-                continue;
-            }
-            v.setLayoutParams(params(c, vertical, align, child, first ? 0 : gap));
-            first = false;
-        }
-        if (c instanceof LinearLayout) ((LinearLayout) c).setGravity(gravity(vertical, align, justify));
-    }
-
-    private View spacer(Node p, int i) {
-        while (p.spacers.size() <= i) p.spacers.add(new View(ctx));
-        return p.spacers.get(i);
-    }
-
-    private ViewGroup.LayoutParams params(ViewGroup parent, boolean vertical, String align, Node child, int gap) {
-        JSONObject pr = child.props;
-        int crossDefault = "stretch".equals(align) ? ViewGroup.LayoutParams.MATCH_PARENT : ViewGroup.LayoutParams.WRAP_CONTENT;
-        int w = size(pr.opt("width"), vertical ? crossDefault : ViewGroup.LayoutParams.WRAP_CONTENT);
-        int h = size(pr.opt("height"), vertical ? ViewGroup.LayoutParams.WRAP_CONTENT : crossDefault);
-        int m = dp(pr.optDouble("margin", 0));
-        if (!(parent instanceof LinearLayout)) {
-            FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(size(pr.opt("width"), ViewGroup.LayoutParams.MATCH_PARENT), size(pr.opt("height"), ViewGroup.LayoutParams.WRAP_CONTENT));
-            lp.setMargins(m, m, m, m);
-            return lp;
-        }
-        float weight = (float) pr.optDouble("grow", "Spacer".equals(child.kind) ? 1 : 0);
-        if (weight > 0) {
-            if (vertical && !pr.has("height")) h = 0;
-            if (!vertical && !pr.has("width")) w = 0;
-        }
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(w, h, weight);
-        lp.setMargins(m + (vertical ? 0 : gap), m + (vertical ? gap : 0), m, m);
-        return lp;
-    }
-
-    private int size(Object v, int fallback) {
-        if (v instanceof Number) return dp(((Number) v).doubleValue());
-        if ("100%".equals(v)) return ViewGroup.LayoutParams.MATCH_PARENT;
-        return fallback;
-    }
-
-    private static int gravity(boolean vertical, String align, String justify) {
-        int main;
-        switch (justify) {
-            case "center":
-                main = vertical ? Gravity.CENTER_VERTICAL : Gravity.CENTER_HORIZONTAL;
-                break;
-            case "end":
-                main = vertical ? Gravity.BOTTOM : Gravity.END;
-                break;
-            default:
-                main = vertical ? Gravity.TOP : Gravity.START;
-        }
-        int cross;
-        switch (align) {
-            case "center":
-                cross = vertical ? Gravity.CENTER_HORIZONTAL : Gravity.CENTER_VERTICAL;
-                break;
-            case "end":
-                cross = vertical ? Gravity.END : Gravity.BOTTOM;
-                break;
-            default:
-                cross = vertical ? Gravity.START : Gravity.TOP;
-        }
-        return main | cross;
-    }
-
     // ---------- automation ----------
 
     /** The window size in dp, for overflow checks. */
     JSONObject viewport() throws JSONException {
-        View window = nodes.get(0).view.getRootView();
+        View window = root.getRootView();
         return new JSONObject().put("w", Math.round(window.getWidth() / density)).put("h", Math.round(window.getHeight() / density));
     }
 
     /** The window as PNG, for visual tests; null before the first layout. */
     byte[] screenshot() {
-        View window = nodes.get(0).view.getRootView();
+        View window = root.getRootView();
         if (window.getWidth() == 0 || window.getHeight() == 0) return null;
         Bitmap bitmap = Bitmap.createBitmap(window.getWidth(), window.getHeight(), Bitmap.Config.ARGB_8888);
-        window.draw(new android.graphics.Canvas(bitmap));
-        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        window.draw(new Canvas(bitmap));
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
         bitmap.recycle();
         return out.toByteArray();
@@ -574,5 +544,11 @@ final class Renderer {
             }
             addBounds(n.getJSONArray("children"));
         }
+    }
+
+    /** The root's size in dp, or null before it has one. */
+    float[] viewportDp() {
+        if (root.getWidth() == 0 || root.getHeight() == 0) return null;
+        return new float[] {root.getWidth() / density, root.getHeight() / density};
     }
 }

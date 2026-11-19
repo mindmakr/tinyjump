@@ -62,6 +62,11 @@ impl Tree {
         found.map(|n| n.id)
     }
 
+    /// The nodes the host currently shows, top level first.
+    pub fn roots(&self) -> &[Node] {
+        &self.roots
+    }
+
     /// Number of nodes on screen.
     pub fn node_count(&self) -> usize {
         fn count(nodes: &[Node]) -> usize {
