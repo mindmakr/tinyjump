@@ -62,6 +62,14 @@ impl Tree {
         found.map(|n| n.id)
     }
 
+    /// Number of nodes on screen.
+    pub fn node_count(&self) -> usize {
+        fn count(nodes: &[Node]) -> usize {
+            nodes.iter().map(|n| 1 + count(&n.children)).sum()
+        }
+        count(&self.roots)
+    }
+
     /// The semantic tree for automation.
     pub fn to_json(&self) -> Json {
         fn node(n: &Node) -> Json {

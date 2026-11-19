@@ -20,6 +20,8 @@ impl Runtime {
         match nodes {
             Ok(nodes) => {
                 let ops = self.tree.update(nodes);
+                self.metrics.renders += 1;
+                self.metrics.patch_ops += ops.len() as u64;
                 if !ops.is_empty() {
                     self.outputs.push(Output::Patch { ops });
                 }
@@ -28,9 +30,12 @@ impl Runtime {
         }
     }
 
-    /// The semantic tree, object states and next wake time.
+    /// The semantic tree, object states, next wake time and work counters.
     pub fn inspect(&self) -> Json {
-        json!({ "tree": self.tree.to_json(), "objects": self.object_states(), "wake": self.next_wake() })
+        let mut metrics = serde_json::to_value(self.metrics).expect("metrics serialize");
+        metrics["nodes"] = json!(self.tree.node_count());
+        metrics["objects"] = json!(self.instances.len());
+        json!({ "tree": self.tree.to_json(), "objects": self.object_states(), "wake": self.next_wake(), "metrics": metrics })
     }
 }
 

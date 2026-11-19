@@ -36,4 +36,9 @@ bash scripts/site.sh --publish           # rebuild and publish GitHub Pages
 
 The Android host is plain Java with no AndroidX or Kotlin, so APKs stay small for old devices.
 
-CI is local-only. Do not add GitHub workflows without asking.
+CI: only `.github/workflows/apple.yml` (macOS + iOS Simulator, on PRs to main; free because
+the repo is public). Everything else runs locally. Do not add workflows without asking.
+
+To test a running app, use `tj review --target <url>` (it fails on layout errors) and
+`tj mcp`. Every host serves `/_tj/inspect` and `/_tj/input`; Android and iOS also serve
+`/_tj/screenshot`.

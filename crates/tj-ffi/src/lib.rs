@@ -59,6 +59,15 @@ impl TjRuntime {
     }
 }
 
+/// Hosts pass a null pointer for empty buffers (Swift does); a null slice is undefined behaviour.
+unsafe fn bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
+    if data.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(data, len)
+    }
+}
+
 /// Copies `len` bytes into the buffer.
 ///
 /// # Safety
@@ -67,7 +76,7 @@ impl TjRuntime {
 pub unsafe extern "C" fn tj_buf_set(buf: *mut TjBuf, data: *const u8, len: usize) {
     if let Some(buf) = buf.as_mut() {
         buf.0.clear();
-        buf.0.extend_from_slice(std::slice::from_raw_parts(data, len));
+        buf.0.extend_from_slice(bytes(data, len));
     }
 }
 
@@ -82,7 +91,7 @@ pub extern "C" fn tj_new(store: TjStore) -> *mut TjRuntime {
 #[no_mangle]
 pub unsafe extern "C" fn tj_boot(rt: *mut TjRuntime, source: *const u8, len: usize, now: f64, seed: u64, render: c_int) -> c_int {
     let rt = &mut *rt;
-    match std::str::from_utf8(std::slice::from_raw_parts(source, len)) {
+    match std::str::from_utf8(bytes(source, len)) {
         Ok(src) => {
             let result = rt.host.boot(src, Box::new(rt.store), now, seed, render != 0);
             rt.finish(result)
@@ -96,7 +105,7 @@ pub unsafe extern "C" fn tj_boot(rt: *mut TjRuntime, source: *const u8, len: usi
 #[no_mangle]
 pub unsafe extern "C" fn tj_handle(rt: *mut TjRuntime, now: f64, input: *const u8, len: usize) -> c_int {
     let rt = &mut *rt;
-    match std::str::from_utf8(std::slice::from_raw_parts(input, len)) {
+    match std::str::from_utf8(bytes(input, len)) {
         Ok(input) => {
             let result = rt.host.handle(now, input);
             rt.finish(result)

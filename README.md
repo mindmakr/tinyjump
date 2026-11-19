@@ -7,8 +7,8 @@ built-in **automation**, so AI agents can write, run and check apps in one loop.
 
 **[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/)
 
-> Status: early. The language, VM, runtime, web host, Android host and the
-> Linux/Windows/macOS server work. iOS is next. See [docs/vision.md](docs/vision.md).
+> Status: early. The language, VM, runtime, web, Android and iOS hosts, and the
+> Linux/Windows/macOS server work. See [docs/vision.md](docs/vision.md).
 
 ## Try it
 
@@ -30,12 +30,34 @@ curl localhost:4700/api/Todos/main
 curl -N localhost:4700/api/events          # realtime: emit + changed
 ```
 
+Examples (`cargo tj dev examples/<name>/app.tj`):
+
+- **durable-cart:** one cart shared by every device, the backend, the HTTP API and AI agents.
+  Change it anywhere, and every subscribed screen updates at once. Held stock is released
+  by a durable timer on the backend.
+- **smart-meter:** an event-driven workflow. Timer readings, API readings, actions and
+  durable alarms move it between normal, high and alert, and every step notifies
+  subscribers.
+- **chat:** realtime messages across devices.
+- **todo:** local objects, a live clock and native widgets.
+
 Realtime across devices: `cargo tj dev examples/chat/app.tj`, then open it in two
 browsers. `Room` is an `@server` object: it lives on the server, and each device holds a
 live, offline-cached replica of it.
 
 Other commands: `tj check app.tj` (compile errors with fix hints and types) and `tj serve app.tj`
 (backend only; add `--host 0.0.0.0` to expose it).
+
+Testing and agents: `tj review --target <url>` checks a running app for layout,
+accessibility and contrast problems and prints its work counters. `tj mcp --target <url>`
+lets any MCP-capable coding agent inspect, drive, screenshot and review it. Targets are
+`tj serve` (:4700), or Android and iOS debug builds (:4701).
+
+### iOS
+
+On a Mac with Xcode, `bash scripts/ios-sim.sh test` builds the app with `swiftc` (no Xcode
+project needed), runs it on the Simulator and drives it through automation. CI runs the
+same script on a GitHub macOS runner for every pull request.
 
 ### Android
 
@@ -71,6 +93,7 @@ crates/tj-android  the runtime as a JNI library for Android
 crates/tj-ffi    the runtime behind a C ABI (static library) for iOS, macOS and desktop
 hosts/web        web host: native DOM widgets, localStorage, automation (plain ES2017)
 hosts/android    Android host (Java, no dependencies) + demo app
+hosts/ios        iOS host (Swift, UIKit) + demo app
 site/            GitHub Pages: landing page and live demo (scripts/site.sh)
 examples/        sample apps
 docs/            vision, language, host protocol
@@ -89,7 +112,8 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
-CI is local-only for now.
+CI: one macOS job (`.github/workflows/apple.yml`) runs on pull requests to `main`. It runs
+the tests on macOS and drives the iOS app on the Simulator. Everything else runs locally.
 
 ## Credits and license
 

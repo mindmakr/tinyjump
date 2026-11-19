@@ -88,7 +88,15 @@ final class Automation {
             String method = request.length > 0 ? request[0] : "";
             String path = request.length > 1 ? request[1] : "";
             JSONObject result;
-            if ("GET".equals(method) && "/_tj/inspect".equals(path)) {
+            if ("GET".equals(method) && "/_tj/screenshot".equals(path)) {
+                byte[] png = screenshot();
+                if (png == null) {
+                    respond(s.getOutputStream(), 500, error("nothing to capture yet"));
+                } else {
+                    respond(s.getOutputStream(), 200, "image/png", png);
+                }
+                return;
+            } else if ("GET".equals(method) && "/_tj/inspect".equals(path)) {
                 result = onMain(TinyJump.input("inspect"), true);
             } else if ("POST".equals(method) && "/_tj/input".equals(path)) {
                 JSONObject input = new JSONObject(new String(body, "UTF-8"));
@@ -127,6 +135,7 @@ final class Automation {
                             } else {
                                 if ("inspect".equals(input.optString("type")) && ok instanceof JSONObject) {
                                     tj.renderer.addBounds(((JSONObject) ok).getJSONArray("tree"));
+                                    ((JSONObject) ok).put("viewport", tj.renderer.viewport());
                                 }
                                 out.set(ok(ok));
                             }
@@ -167,9 +176,27 @@ final class Automation {
         return line.toString("UTF-8");
     }
 
+    /** Captures the window on the main thread. */
+    private byte[] screenshot() throws InterruptedException {
+        final CountDownLatch done = new CountDownLatch(1);
+        final AtomicReference<byte[]> png = new AtomicReference<>();
+        tj.main.post(new Runnable() {
+            @Override
+            public void run() {
+                png.set(tj.renderer.screenshot());
+                done.countDown();
+            }
+        });
+        done.await(TIMEOUT_S, TimeUnit.SECONDS);
+        return png.get();
+    }
+
     private static void respond(OutputStream out, int status, JSONObject body) throws IOException {
-        byte[] bytes = body.toString().getBytes("UTF-8");
-        String head = "HTTP/1.1 " + status + (status == 200 ? " OK" : " Error") + "\r\nContent-Type: application/json\r\nContent-Length: " + bytes.length + "\r\nConnection: close\r\n\r\n";
+        respond(out, status, "application/json", body.toString().getBytes("UTF-8"));
+    }
+
+    private static void respond(OutputStream out, int status, String type, byte[] bytes) throws IOException {
+        String head = "HTTP/1.1 " + status + (status == 200 ? " OK" : " Error") + "\r\nContent-Type: " + type + "\r\nContent-Length: " + bytes.length + "\r\nConnection: close\r\n\r\n";
         out.write(head.getBytes("UTF-8"));
         out.write(bytes);
         out.flush();
