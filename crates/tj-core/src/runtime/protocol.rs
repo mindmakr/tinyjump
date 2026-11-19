@@ -40,8 +40,14 @@ pub enum Input {
         #[serde(default)]
         error: Option<String>,
     },
-    /// The server's latest state of an `@server` object this device subscribed to.
-    Sync { object: String, state: Json },
+    /// The server's state of an `@server` object this device subscribed to, with its change
+    /// number. Older or repeated numbers are ignored, so late deliveries never go back in time.
+    Sync {
+        object: String,
+        state: Json,
+        #[serde(default)]
+        seq: Option<u64>,
+    },
     /// Native hosts: lay the screen out in this viewport (points/dp) after applying patches
     /// or when the screen size changes. Answered with [`Output::Frames`].
     /// `rtl` mirrors the layout for right-to-left locales (Arabic, Urdu, Hebrew, ...).
@@ -81,11 +87,13 @@ pub enum Output {
     Effect { id: u32, effect: Effect },
     /// An object emitted an event (realtime channel `object`).
     Emit { object: String, name: String, data: Json },
-    /// An object's state changed (already persisted).
-    Changed { object: String, state: Json },
-    /// Keep this device's replica of an `@server` object current: fetch its state now and
-    /// send [`Input::Sync`] whenever the server reports a change.
-    Subscribe { object: String },
+    /// An object's state changed (already persisted). `seq` is its change number: it grows
+    /// with every change this runtime makes, across restarts.
+    Changed { object: String, state: Json, seq: u64 },
+    /// Keep this device's replica of an `@server` object current: stream the server's changes
+    /// after `seq` (the cached replica's change number, 0 if none) and send each as
+    /// [`Input::Sync`].
+    Subscribe { object: String, seq: u64 },
     Reply {
         reply: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]

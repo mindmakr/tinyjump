@@ -211,7 +211,9 @@ final class Renderer {
         case "Input":
             let f = UITextField()
             f.borderStyle = .roundedRect
-            f.textAlignment = .natural
+            // Start where the layout starts (right in RTL), like Android and the web. `.natural`
+            // would follow the typed text's script instead.
+            f.textAlignment = rtl ? .right : .left
             let n = Node(id: id, kind: kind, view: f, container: nil)
             let t = target(for: n)
             f.addTarget(t, action: #selector(EventTarget.changed(_:)), for: .editingChanged)

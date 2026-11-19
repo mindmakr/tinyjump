@@ -147,7 +147,7 @@ export async function start(opts) {
       switch (o.type) {
         case 'patch': o.ops.forEach(patch); break;
         case 'effect': runEffect(o.id, o.effect); break;
-        case 'subscribe': subscribe(o.object); break;
+        case 'subscribe': subscribe(o.object, o.seq); break;
         case 'wake': wake(o.at); break;
         case 'reply': {
           const p = pending.get(o.reply);
@@ -170,35 +170,34 @@ export async function start(opts) {
   // ---------- server objects ----------
 
   const server = opts.server; // base URL of `tj serve`/`tj dev`; '' = same origin; undefined = none
-  const replicas = new Set();
+  const replicas = new Map(); // object key -> change number of the state this device has
   let events = null;
   let reconnect = null;
 
   const objectUrl = (key) => server + '/api/' + key.split('/').map(encodeURIComponent).join('/');
 
-  function refresh(key) {
-    fetch(objectUrl(key)).then((r) => r.json()).then((j) => {
-      if ('ok' in j) send({ type: 'sync', object: key, state: j.ok });
-    }).catch(() => { /* offline: keep the cached replica */ });
-  }
-
-  // One realtime stream for all replicas; reopened when the set changes.
+  // One realtime stream for all replicas, reopened when the set changes. It resumes from the
+  // oldest replica's change number, so the server sends only what this device missed; after a
+  // dropped connection the browser resumes by itself from the last event id.
   function connectRealtime() {
     if (events) events.close();
-    const query = Array.from(replicas).map((k) => 'object=' + encodeURIComponent(k)).join('&');
-    events = new EventSource(server + '/api/events?' + query);
-    events.addEventListener('open', () => replicas.forEach(refresh)); // catch up after reconnects
+    let since = Infinity;
+    const query = [];
+    replicas.forEach((seq, k) => { since = Math.min(since, seq); query.push('object=' + encodeURIComponent(k)); });
+    events = new EventSource(server + '/api/events?' + query.join('&') + '&since=' + since);
     events.addEventListener('changed', (e) => {
       const d = JSON.parse(e.data);
-      if (replicas.has(d.object)) send({ type: 'sync', object: d.object, state: d.state });
+      if (!replicas.has(d.object)) return;
+      replicas.set(d.object, Math.max(replicas.get(d.object), d.seq));
+      send({ type: 'sync', object: d.object, state: d.state, seq: d.seq });
     });
     // Server-side events (emit, read) reach the page like local ones.
     events.addEventListener('emit', (e) => window.dispatchEvent(new CustomEvent('tinyjump:emit', { detail: JSON.parse(e.data) })));
   }
 
-  function subscribe(key) {
+  function subscribe(key, seq) {
     if (server === undefined || replicas.has(key)) return;
-    replicas.add(key);
+    replicas.set(key, seq || 0);
     clearTimeout(reconnect);
     reconnect = setTimeout(connectRealtime, 0);
   }

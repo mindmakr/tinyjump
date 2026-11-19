@@ -345,7 +345,7 @@ fn server_objects_replicate_to_devices() {
     let (mut server, _) = boot_as(CHAT, Shared::default(), 0.0, true);
     let device_store = Shared::default();
     let (mut device, out) = boot_as(CHAT, device_store.clone(), 0.0, false);
-    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object } if object == "Room/lobby")));
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, .. } if object == "Room/lobby")));
 
     // Pressing the button asks the host to call the server instead of running the method here.
     let out = device.handle(1.0, Input::Ui { target: Target::Id { id: "send".into() }, event: "onPress".into(), value: Json::Null, reply: None });
@@ -364,14 +364,14 @@ fn server_objects_replicate_to_devices() {
     let state = out
         .iter()
         .find_map(|o| match o {
-            Output::Changed { object, state } if object == "Room/lobby" => Some(state.clone()),
+            Output::Changed { object, state, .. } if object == "Room/lobby" => Some(state.clone()),
             _ => None,
         })
         .expect("a change to broadcast");
 
     // The host relays the result and the change; the device re-renders from its replica.
     device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None });
-    let out = device.handle(3.0, Input::Sync { object: "Room/lobby".into(), state });
+    let out = device.handle(3.0, Input::Sync { object: "Room/lobby".into(), state, seq: None });
     assert!(patches(&out).iter().any(|op| matches!(op, PatchOp::Create { props, .. } if props.get("text") == Some(&json!("ana: hi")))));
 
     // Replicas never run methods locally.
@@ -381,6 +381,46 @@ fn server_objects_replicate_to_devices() {
     let (mut again, _) = boot_as(CHAT, device_store, 5.0, false);
     let cached = reply(&again.handle(5.0, Input::Get { object: "Room/lobby".into(), reply: Some(1) })).unwrap();
     assert_eq!(cached["messages"][0]["text"], json!("hi"));
+}
+
+#[test]
+fn change_numbers_order_replicas_and_resume_streams() {
+    let post = |text: &str| Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: Some(1) };
+    let changed = |out: Vec<Output>| {
+        out.into_iter()
+            .find_map(|o| match o {
+                Output::Changed { object, state, seq } if object == "Room/lobby" => Some((state, seq)),
+                _ => None,
+            })
+            .expect("a change")
+    };
+    let server_store = Shared::default();
+    let (mut server, _) = boot_as(CHAT, server_store.clone(), 1.0, true);
+    let first = changed(server.handle(2.0, post("one")));
+    let second = changed(server.handle(3.0, post("two")));
+    assert!(second.1 > first.1, "every change gets a larger number");
+
+    // A restarted server keeps counting up, even if its clock went back.
+    let (mut server, _) = boot_as(CHAT, server_store, 0.0, true);
+    let third = changed(server.handle(4.0, post("three")));
+    assert!(third.1 > second.1);
+
+    // Resuming a stream: only the objects changed after the client's number come back.
+    let lobby = vec!["Room/lobby".to_string(), "Nope/x".to_string()];
+    assert!(server.changed_since(&lobby, third.1).is_empty());
+    let resumed = server.changed_since(&lobby, second.1);
+    assert!(matches!(&resumed[..], [Output::Changed { seq, .. }] if *seq == third.1), "{resumed:?}");
+
+    // A replica ignores states older than its own, so late deliveries never go back in time.
+    let device_store = Shared::default();
+    let (mut device, _) = boot_as(CHAT, device_store.clone(), 0.0, false);
+    device.handle(5.0, Input::Sync { object: "Room/lobby".into(), state: third.0, seq: Some(third.1) });
+    device.handle(5.0, Input::Sync { object: "Room/lobby".into(), state: first.0, seq: Some(first.1) });
+    assert_eq!(state(&mut device, 6.0, "Room/lobby")["messages"].as_array().map(Vec::len), Some(3));
+
+    // The cached replica keeps its number, so after a restart the host resumes from there.
+    let (_, out) = boot_as(CHAT, device_store, 7.0, false);
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq } if object == "Room/lobby" && *seq == third.1)), "{out:?}");
 }
 
 /// The source of an example app in examples/<name>/app.tj.

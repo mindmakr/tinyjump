@@ -24,7 +24,7 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 | `get` | `object` | state |
 | `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
 | `effectDone` | `id`, and either `ok` or `error` | — |
-| `sync` | `object`, `state`: the server's latest state for a replica | — |
+| `sync` | `object`, `state`, `seq`: the server's state for a replica and its change number. States no newer than the replica's are ignored | — |
 | `tick` | — | — |
 | `inspect` | — | `{ tree, objects, wake }` |
 
@@ -37,9 +37,9 @@ id and it fails, the runtime reports the failure as an `error` output.
 |---|---|
 | `patch` | `ops` to apply to the native view tree (below) |
 | `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }`. For `{ kind: "call", object, method, args }`, `POST /api/{object}/{method}` with `args` and answer with its `ok`. Failures are `error: "message"` |
-| `subscribe` | `{ object }`: keep this replica of an `@server` object current. Fetch `GET /api/{object}` now, listen on `/api/events?object=…`, and send `sync` for every `changed` event and after every reconnect |
+| `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams) |
 | `emit` | `{ object, name, data }`: realtime event |
-| `changed` | `{ object, state }`: state after a persisted change |
+| `changed` | `{ object, state, seq }`: state after a persisted change, with its change number |
 | `reply` | `{ reply, ok }` or `{ reply, error }` |
 | `log` | `{ level, message }` |
 | `error` | `{ message, trace }`: uncaught error in a handler, timer or render |
@@ -126,6 +126,28 @@ Imports (module `env`): `tj_host_load(key, len, out_ptr) -> len | -1`,
 `tj_host_save(key, klen, val, vlen) -> 0 | 1`, `tj_host_keys(prefix, len, out_ptr) -> len`.
 For `load` and `keys`, the host allocates the result with `tj_alloc`, writes its pointer
 to `out_ptr` and returns its length. Rust then owns that memory.
+
+## Change streams
+
+Every persisted change of an object gets a **change number** (`seq`). Numbers grow with
+every change the runtime makes and keep growing across restarts. The counter is stored,
+and it starts from the clock, so it grows even if the store is lost.
+
+`GET /api/events?object=Class/id&object=…&since=N` first sends a `changed` event for each
+listed object whose current state is newer than `N`, oldest first. Then it streams live
+changes. Each `changed` event has `id: <seq>`, so a browser's `EventSource` resumes by
+itself (`Last-Event-ID` wins over `since`).
+
+A host keeps one stream for all its replicas:
+
+- Start it from the lowest `seq` among them.
+- Advance the cursor with each event (the stream is in change order), and reconnect from
+  the cursor.
+- Pass every event on as `sync`, with its `seq`.
+
+So a reconnect sends only what the device missed, and a late or repeated delivery can
+never take a replica back in time. `emit` events are not replayed: an object's state is
+the durable record.
 
 ## Read events
 

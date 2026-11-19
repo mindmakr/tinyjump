@@ -10,6 +10,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 const ALARM_INDEX_KEY: &str = "tj:alarms";
+/// The last change number handed out, so numbers keep growing across restarts.
+const CHANGE_SEQ_KEY: &str = "tj:seq";
 const MAX_ID_LEN: usize = 128;
 
 pub(crate) struct Instance {
@@ -18,6 +20,9 @@ pub(crate) struct Instance {
     remote: bool,
     state: Rc<RefCell<Record>>,
     alarms: Vec<Alarm>,
+    /// The change number of the current state: assigned here for objects this runtime owns,
+    /// the server's for replicas. Streams resume from it and replicas ignore older states.
+    seq: u64,
     /// The last persisted record, to skip unchanged writes.
     saved: String,
 }
@@ -36,6 +41,8 @@ struct Stored {
     state: Map<String, Json>,
     #[serde(default)]
     alarms: Vec<Alarm>,
+    #[serde(default)]
+    seq: u64,
 }
 
 impl Runtime {
@@ -57,6 +64,7 @@ impl Runtime {
             unreachable!("object init returns a record")
         };
         let mut alarms = Vec::new();
+        let mut seq = 0;
         let mut saved = String::new();
         if let Some(text) = self.store.load(&handle.key()) {
             let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::msg(format!("{} has unreadable stored state: {e}", handle.key())))?;
@@ -68,13 +76,14 @@ impl Runtime {
                 }
             }
             alarms = stored.alarms;
+            seq = stored.seq;
             saved = text;
         }
         let remote = def.server && !self.server;
         if remote {
             // Timers and alarms of a replica run on the server, not here.
             alarms.clear();
-            self.outputs.push(Output::Subscribe { object: handle.key() });
+            self.outputs.push(Output::Subscribe { object: handle.key(), seq });
         } else {
             for (name, m) in &def.methods {
                 if let Some(interval) = m.every {
@@ -88,7 +97,7 @@ impl Runtime {
                 self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
             }
         }
-        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, saved });
+        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, seq, saved });
         Ok(handle)
     }
 
@@ -110,12 +119,21 @@ impl Runtime {
     }
 
     /// Applies the server's state to a replica; it is cached locally and re-rendered.
-    pub(crate) fn sync(&mut self, key: &str, state: &Json) -> Result<(), String> {
+    /// A state numbered `seq` no newer than the replica's is stale (it was overtaken in
+    /// flight) and is ignored.
+    pub(crate) fn sync(&mut self, key: &str, state: &Json, seq: Option<u64>) -> Result<(), String> {
         let o = self.resolve_object(key)?;
         if !self.is_remote(&o) {
             return Err(format!("{key} is not a replica of a server object"));
         }
         let Json::Object(fields) = state else { return Err(format!("state for {key} must be a record")) };
+        if let Some(seq) = seq {
+            let inst = self.inst_mut(&o);
+            if seq <= inst.seq {
+                return Ok(());
+            }
+            inst.seq = seq;
+        }
         let inst = self.inst(&o);
         let mut s = inst.state.borrow_mut();
         for (k, v) in fields {
@@ -250,6 +268,23 @@ impl Runtime {
         Value::Rec(self.inst(o).state.clone()).to_json()
     }
 
+    /// For a server resuming a client's stream: the current state of each of `objects` that
+    /// changed after change number `since`, oldest change first. Unknown objects are skipped.
+    pub fn changed_since(&mut self, objects: &[String], since: u64) -> Vec<Output> {
+        let mut out = Vec::new();
+        for key in objects {
+            let Ok(o) = self.resolve_object(key) else { continue };
+            let seq = self.inst(&o).seq;
+            if seq > since {
+                if let Ok(state) = self.object_state(&o) {
+                    out.push((seq, Output::Changed { object: o.key(), state, seq }));
+                }
+            }
+        }
+        out.sort_by_key(|(seq, _)| *seq);
+        out.into_iter().map(|(_, o)| o).collect()
+    }
+
     pub(crate) fn object_states(&self) -> Json {
         let mut list: Vec<(String, Json)> = self.instances.values().map(|i| (i.handle.key(), Value::Rec(i.state.clone()).to_json().unwrap_or(Json::Null))).collect();
         list.sort_by(|a, b| a.0.cmp(&b.0));
@@ -260,6 +295,7 @@ impl Runtime {
     pub(crate) fn flush(&mut self) {
         let touched = std::mem::take(&mut self.touched);
         let mut index_changed = false;
+        let mut seq_changed = false;
         for key in touched {
             let Some(inst) = self.instances.get(&key) else { continue };
             let object = inst.handle.key();
@@ -272,10 +308,18 @@ impl Runtime {
                 }
             };
             let has_alarms = !inst.alarms.is_empty();
-            let record = Stored { state, alarms: inst.alarms.clone() };
-            let text = serde_json::to_string(&record).expect("JSON values serialize");
+            let remote = inst.remote;
+            let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq };
+            let mut text = serde_json::to_string(&record).expect("JSON values serialize");
             if text == inst.saved {
                 continue;
+            }
+            if !remote {
+                // A new state of an object this runtime owns gets the next change number.
+                self.change_seq += 1;
+                seq_changed = true;
+                record.seq = self.change_seq;
+                text = serde_json::to_string(&record).expect("JSON values serialize");
             }
             if let Err(e) = self.store.save(&object, &text) {
                 self.outputs.push(Output::Error { message: format!("{object}: could not save: {e}"), trace: Vec::new() });
@@ -283,9 +327,15 @@ impl Runtime {
             }
             if let Some(inst) = self.instances.get_mut(&key) {
                 inst.saved = text;
+                inst.seq = record.seq;
             }
             index_changed |= if has_alarms { self.alarm_index.insert(object.clone()) } else { self.alarm_index.remove(&object) };
-            self.outputs.push(Output::Changed { object, state: Json::Object(record.state) });
+            self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
+        }
+        if seq_changed {
+            if let Err(e) = self.store.save(CHANGE_SEQ_KEY, &self.change_seq.to_string()) {
+                self.outputs.push(Output::Error { message: format!("could not save the change number: {e}"), trace: Vec::new() });
+            }
         }
         if index_changed {
             let text = serde_json::to_string(&self.alarm_index).expect("strings serialize");
@@ -299,6 +349,10 @@ impl Runtime {
     /// methods, and every instance with pending alarms.
     pub(crate) fn restore(&mut self) -> Result<(), BootError> {
         let boot_err = |e: Exc| BootError { message: e.message(), trace: Vec::new() };
+        // Change numbers start from the clock (x1000), so they keep growing even if the stored
+        // counter is lost, as long as fewer than 1000 changes happen per millisecond.
+        let stored_seq = self.store.load(CHANGE_SEQ_KEY).and_then(|s| s.parse().ok()).unwrap_or(0);
+        self.change_seq = stored_seq.max((self.now.max(0.0) as u64).saturating_mul(1000));
         if let Some(text) = self.store.load(ALARM_INDEX_KEY) {
             self.alarm_index = serde_json::from_str(&text).unwrap_or_default();
         }

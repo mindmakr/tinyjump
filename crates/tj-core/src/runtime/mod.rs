@@ -112,6 +112,8 @@ pub struct Runtime {
     alarm_index: BTreeSet<String>,
     timers: BinaryHeap<Reverse<Timer>>,
     seq: u64,
+    /// The last change number given to an object state (see `objects.rs`).
+    change_seq: u64,
     next_alarm: u64,
     next_effect: u32,
     /// Fibers suspended on an effect, with their reply id.
@@ -155,6 +157,7 @@ impl Runtime {
             alarm_index: BTreeSet::new(),
             timers: BinaryHeap::new(),
             seq: 0,
+            change_seq: 0,
             next_alarm: 0,
             next_effect: 0,
             waiting: HashMap::new(),
@@ -230,8 +233,8 @@ impl Runtime {
                     self.settle(f, reply, r);
                 }
             }
-            Input::Sync { object, state } => {
-                if let Err(e) = self.sync(&object, &state) {
+            Input::Sync { object, state, seq } => {
+                if let Err(e) = self.sync(&object, &state, seq) {
                     self.reply(None, Err(e));
                 }
             }
