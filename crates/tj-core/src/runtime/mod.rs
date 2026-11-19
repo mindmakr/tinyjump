@@ -239,9 +239,9 @@ impl Runtime {
             #[cfg(not(feature = "layout"))]
             Input::Layout { .. } => {}
             #[cfg(feature = "layout")]
-            Input::Layout { width, height } => {
+            Input::Layout { width, height, rtl } => {
                 if let Some(m) = self.measure.as_deref_mut() {
-                    let frames = self.layout.compute(&self.tree, width, height, m);
+                    let frames = self.layout.compute(&self.tree, width, height, rtl, m);
                     if !frames.is_empty() {
                         self.outputs.push(Output::Frames { frames });
                     }

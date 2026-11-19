@@ -3,6 +3,7 @@ package com.mindmakr.tinyjump.demo;
 import android.app.Activity;
 import android.content.pm.ApplicationInfo;
 import android.os.Bundle;
+import android.view.View;
 import android.widget.FrameLayout;
 import com.mindmakr.tinyjump.TinyJump;
 import java.io.ByteArrayOutputStream;
@@ -10,8 +11,8 @@ import java.io.IOException;
 import java.io.InputStream;
 
 /**
- * Runs one of the repo's example apps. Launch extras: {@code example} (default "todo") and
- * {@code server} (a `tj serve`/`tj dev` URL for @server objects, e.g. http://10.0.2.2:4700).
+ * Runs one of the repo's example apps. Launch extras: {@code example} (default "todo"),
+ * {@code dir} ("rtl" or "ltr", overriding the locale) and {@code server} (a `tj serve`/`tj dev` URL for @server objects, e.g. http://10.0.2.2:4700).
  * Debug builds serve automation on port 4701.
  */
 public final class MainActivity extends Activity {
@@ -23,6 +24,10 @@ public final class MainActivity extends Activity {
         super.onCreate(state);
         FrameLayout root = new FrameLayout(this);
         root.setFitsSystemWindows(true);
+        // `dir` overrides the locale's direction ("rtl"/"ltr"), e.g. to test Arabic or Urdu layouts.
+        String dir = getIntent().getStringExtra("dir");
+        if ("rtl".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);
+        if ("ltr".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         setContentView(root);
         String example = getIntent().getStringExtra("example");
         String source = asset((example == null ? "todo" : example) + "/app.tj");

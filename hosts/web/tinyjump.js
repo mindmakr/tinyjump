@@ -6,6 +6,7 @@
 const ALIGN = { start: 'flex-start', center: 'center', end: 'flex-end', stretch: 'stretch' };
 const JUSTIFY = { start: 'flex-start', center: 'center', end: 'flex-end', between: 'space-between', around: 'space-around' };
 const MAX_TIMEOUT = 2147483647;
+const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ku'];
 
 const CSS = [
   '.tj-column,.tj-row,.tj-scroll{display:flex;box-sizing:border-box;min-width:0}',
@@ -15,6 +16,11 @@ const CSS = [
   '.tj-spacer{flex:1}',
   '.tj-text{white-space:pre-wrap}',
   '.tj-toggle{display:inline-flex;gap:8px;align-items:center}',
+  // Each text reads in its own script's direction (English stays "3 left" in an Arabic
+  // screen) while aligning to the layout's start, like Android and iOS.
+  '.tj-text,.tj-input,.tj-toggle span,.tj-input::placeholder{unicode-bidi:plaintext;text-align:left}',
+  '.tj-button{unicode-bidi:plaintext}',
+  '[dir=rtl] .tj-text,[dir=rtl] .tj-input,[dir=rtl] .tj-toggle span,[dir=rtl] .tj-input::placeholder{text-align:right}',
   '.tj-error{position:fixed;left:8px;right:8px;bottom:8px;padding:12px;background:#2b0d0d;color:#ffd7d7;',
   'font:13px/1.4 ui-monospace,monospace;white-space:pre-wrap;border-radius:8px;z-index:99999;max-height:40vh;overflow:auto}',
 ].join('');
@@ -48,6 +54,7 @@ function localStore(prefix) {
  * Boots an app.
  * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean}} opts
  *   server: base URL of a `tj serve` backend for `@server` objects ('' = same origin).
+ *   dir: 'ltr' or 'rtl'; defaults to the page's dir, then the browser language.
  */
 export async function start(opts) {
   const store = opts.store || localStore('tj:');
@@ -89,6 +96,8 @@ export async function start(opts) {
 
   const result = () => JSON.parse(readStr(ex.tj_out_ptr(), ex.tj_out_len()));
   const root = opts.root;
+  // Right-to-left locales mirror the layout; the browser's flexbox follows `dir`.
+  root.setAttribute('dir', opts.dir || document.documentElement.dir || (RTL_LANGUAGES.indexOf((navigator.language || '').split('-')[0]) >= 0 ? 'rtl' : 'ltr'));
   const nodes = new Map([[0, root]]);
   const pending = new Map();
   let nextReply = 1;
@@ -232,8 +241,8 @@ export async function start(opts) {
   function create(kind, props) {
     let el;
     switch (kind) {
-      case 'Button': el = document.createElement('button'); el.type = 'button'; break;
-      case 'Input': el = document.createElement(props.multiline ? 'textarea' : 'input'); break;
+      case 'Button': el = document.createElement('button'); el.type = 'button'; el.className = 'tj-button'; break;
+      case 'Input': el = document.createElement(props.multiline ? 'textarea' : 'input'); el.className = 'tj-input'; break;
       case 'Toggle': {
         el = document.createElement('label');
         el.className = 'tj-toggle';

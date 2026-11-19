@@ -44,7 +44,13 @@ pub enum Input {
     Sync { object: String, state: Json },
     /// Native hosts: lay the screen out in this viewport (points/dp) after applying patches
     /// or when the screen size changes. Answered with [`Output::Frames`].
-    Layout { width: f32, height: f32 },
+    /// `rtl` mirrors the layout for right-to-left locales (Arabic, Urdu, Hebrew, ...).
+    Layout {
+        width: f32,
+        height: f32,
+        #[serde(default)]
+        rtl: bool,
+    },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.

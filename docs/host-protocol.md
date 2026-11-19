@@ -68,7 +68,11 @@ so Android and iOS place things exactly like the web host, whose browser uses th
 rules. The cycle has three steps:
 
 1. After applying a `patch`, and whenever the screen size changes, send
-   `layout { width, height }` in points (iOS) or dp (Android).
+   `layout { width, height, rtl }` in points (iOS) or dp (Android). Set `rtl` for
+   right-to-left locales (Arabic, Urdu, Hebrew, Persian): the core mirrors the layout, so
+   rows run from the right. Hosts align text to the layout's start, not to the text's own
+   script. The web host sets `dir` on its root instead (option `dir`, or the page's
+   `dir`, or the browser language), and the browser mirrors.
 2. The core answers with `frames { frames: [{ id, x, y, w, h, content? }] }`. These are
    only the nodes that moved, positioned relative to their parent. `content` is the
    scrollable height of a `Scroll`.

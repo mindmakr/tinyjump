@@ -73,8 +73,11 @@ final class ToggleView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         let sw = toggle.intrinsicContentSize
-        toggle.frame = CGRect(x: 0, y: (bounds.height - sw.height) / 2, width: sw.width, height: sw.height)
-        label.frame = CGRect(x: sw.width + spacing, y: 0, width: max(0, bounds.width - sw.width - spacing), height: bounds.height)
+        let labelWidth = max(0, bounds.width - sw.width - spacing)
+        // The switch sits at the start: the left, or the right in right-to-left layouts.
+        let rtl = effectiveUserInterfaceLayoutDirection == .rightToLeft
+        toggle.frame = CGRect(x: rtl ? bounds.width - sw.width : 0, y: (bounds.height - sw.height) / 2, width: sw.width, height: sw.height)
+        label.frame = CGRect(x: rtl ? 0 : sw.width + spacing, y: 0, width: labelWidth, height: bounds.height)
     }
 }
 
@@ -105,7 +108,10 @@ final class Renderer {
     let root = RootView()
     private var nodes: [Int: Node] = [:]
 
+    /// The root follows `host`'s direction: set `host.semanticContentAttribute` to
+    /// `.forceRightToLeft` (or `.forceLeftToRight`) to override the app's language.
     init(host: UIView) {
+        root.semanticContentAttribute = host.semanticContentAttribute
         root.translatesAutoresizingMaskIntoConstraints = false
         host.addSubview(root)
         let safe = host.safeAreaLayoutGuide
@@ -126,6 +132,7 @@ final class Renderer {
             case "create":
                 let props = op["props"] as? [String: Any] ?? [:]
                 let n = create(id: id, kind: op["kind"] as? String ?? "", props: props)
+                inheritDirection(n.view)
                 n.events = op["events"] as? [String] ?? []
                 nodes[id] = n
                 setProps(n, props)
@@ -146,6 +153,15 @@ final class Renderer {
         }
         return !ops.isEmpty
     }
+
+    /// Views take the root's direction, so text alignment and widget parts mirror with it.
+    private func inheritDirection(_ view: UIView) {
+        view.semanticContentAttribute = root.semanticContentAttribute
+        view.subviews.forEach(inheritDirection)
+    }
+
+    /// Whether the screen reads right to left (the app's language, or the host's override).
+    var rtl: Bool { root.effectiveUserInterfaceLayoutDirection == .rightToLeft }
 
     /// Places nodes at the frames the core computed (points, relative to their parent).
     func frames(_ list: [[String: Any]]) {
@@ -195,6 +211,7 @@ final class Renderer {
         case "Input":
             let f = UITextField()
             f.borderStyle = .roundedRect
+            f.textAlignment = .natural
             let n = Node(id: id, kind: kind, view: f, container: nil)
             let t = target(for: n)
             f.addTarget(t, action: #selector(EventTarget.changed(_:)), for: .editingChanged)
@@ -213,6 +230,7 @@ final class Renderer {
         case "Text":
             let label = PaddedLabel()
             label.numberOfLines = 0
+            label.textAlignment = .natural
             return Node(id: id, kind: kind, view: label, container: nil)
         default: // Spacer
             return Node(id: id, kind: kind, view: UIView(), container: nil)
