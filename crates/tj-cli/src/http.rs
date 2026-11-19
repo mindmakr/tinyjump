@@ -3,7 +3,10 @@
 //!
 //!   POST /api/{Class}/{id}/{method}   body: JSON array of arguments -> {"ok": result} | {"error": msg}
 //!   GET  /api/{Class}/{id}            -> {"ok": state}
-//!   GET  /api/events                  -> SSE stream of `emit` and `changed`
+//!   GET  /api/events?object=Class/id&since=N
+//!                                     -> SSE stream of `emit` and `changed`; it starts with
+//!                                        the listed objects changed after N (or after the
+//!                                        `Last-Event-ID` header), then streams live
 //!   GET  /_tj/inspect                 -> semantic tree + object states
 //!   POST /_tj/input                   body: one protocol Input
 //!
@@ -118,7 +121,11 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
     let response = match (&method, segs.as_slice()) {
         (Method::Get, ["api", "events"]) => {
             let only = query_values(req.url(), "object");
-            return sse(req, engine.subscribe(), only);
+            // A browser's EventSource reconnects with the id of the last event it saw.
+            let resume = req.headers().iter().find(|h| h.field.equiv("Last-Event-ID")).map(|h| h.value.as_str().to_string());
+            let since = resume.into_iter().chain(query_values(req.url(), "since")).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
+            let events = engine.subscribe(only.clone(), since);
+            return sse(req, events, only);
         }
         (Method::Get, ["api", class, id]) => result_response(engine.request(Input::Get { object: format!("{class}/{id}"), reply: None })),
         (Method::Post, ["api", class, id, name]) => match read_json(&mut req) {

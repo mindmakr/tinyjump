@@ -1,12 +1,16 @@
 import Foundation
 
 /// Server objects: calls `@server` methods over HTTP and keeps this device's replicas current
-/// from the server's realtime stream, catching up after every reconnect. Main thread only.
+/// from the server's realtime stream. The stream resumes from a change number, so after a
+/// reconnect the server sends only what this device missed. Main thread only.
 final class Sync: NSObject, URLSessionDataDelegate {
     private weak var tj: TinyJump?
     /// Base URL of a `tj serve` backend, or nil when the app has none.
     private let server: String?
-    private var replicas: [String] = []
+    /// Object key -> change number of the state this device has.
+    private var replicas: [String: UInt64] = [:]
+    /// Where the stream resumes: the last change number it delivered.
+    private var cursor: UInt64 = 0
     private var session: URLSession!
     private var stream: URLSessionDataTask?
     private var buffer = Data()
@@ -21,9 +25,11 @@ final class Sync: NSObject, URLSessionDataDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
-    func subscribe(_ key: String) {
-        guard server != nil, !replicas.contains(key) else { return }
-        replicas.append(key)
+    /// Starts keeping `key` current; `seq` is the change number of its cached state.
+    func subscribe(_ key: String, seq: UInt64) {
+        guard server != nil, replicas[key] == nil else { return }
+        replicas[key] = seq
+        cursor = replicas.values.min() ?? 0
         connect()
     }
 
@@ -66,30 +72,22 @@ final class Sync: NSObject, URLSessionDataDelegate {
         (server ?? "") + "/api/" + key.split(separator: "/").map { Sync.encode(String($0)) }.joined(separator: "/")
     }
 
-    private func deliver(_ key: String, _ state: Any) {
-        guard replicas.contains(key) else { return }
-        tj?.send(["type": "sync", "object": key, "state": state])
+    private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
+        cursor = max(cursor, seq) // the stream is in change order
+        guard let have = replicas[key] else { return }
+        replicas[key] = max(have, seq)
+        tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 
-    private func refresh(_ key: String) {
-        guard let url = URL(string: objectUrl(key)) else { return }
-        URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
-            guard let state = reply?["ok"] else { return } // offline: keep the cached replica
-            DispatchQueue.main.async { self?.deliver(key, state) }
-        }.resume()
-    }
-
-    /// One stream for all replicas, replaced when the set grows.
+    /// One stream for all replicas, replaced when the set grows, resuming from `cursor`.
     private func connect() {
         generation += 1
         stream?.cancel()
         buffer = Data()
-        let query = replicas.map { "object=" + Sync.encode($0) }.joined(separator: "&")
-        guard let url = URL(string: (server ?? "") + "/api/events?" + query) else { return }
+        let query = replicas.keys.map { "object=" + Sync.encode($0) }.joined(separator: "&")
+        guard let url = URL(string: (server ?? "") + "/api/events?" + query + "&since=\(cursor)") else { return }
         stream = session.dataTask(with: url)
         stream?.resume()
-        replicas.forEach(refresh) // catch up on what we missed
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -107,8 +105,9 @@ final class Sync: NSObject, URLSessionDataDelegate {
             }
             guard event == "changed",
                   let d = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any],
-                  let key = d["object"] as? String, let state = d["state"] else { continue }
-            deliver(key, state)
+                  let key = d["object"] as? String, let state = d["state"],
+                  let seq = (d["seq"] as? NSNumber)?.uint64Value else { continue }
+            deliver(key, state, seq)
         }
     }
 

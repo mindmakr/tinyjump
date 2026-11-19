@@ -24,7 +24,7 @@ pub type Event = (String, String);
 enum Msg {
     Input(Input, Option<Reply>),
     EffectDone(u32, Result<Json, String>),
-    Subscribe(Sender<Event>),
+    Subscribe { events: Sender<Event>, objects: Vec<String>, since: u64 },
     Reload(String),
 }
 
@@ -81,10 +81,12 @@ impl Engine {
         })?
     }
 
-    /// Realtime stream of `emit` and `changed` events.
-    pub fn subscribe(&self) -> Receiver<Event> {
+    /// Realtime stream of `emit` and `changed` events. It starts with the current state of
+    /// each of `objects` that changed after change number `since`, so a client that
+    /// reconnects resumes where it left off instead of refetching.
+    pub fn subscribe(&self, objects: Vec<String>, since: u64) -> Receiver<Event> {
         let (t, r) = channel();
-        let _ = self.tx.send(Msg::Subscribe(t));
+        let _ = self.tx.send(Msg::Subscribe { events: t, objects, since });
         r
     }
 
@@ -136,8 +138,15 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 };
                 rt.handle(now_ms(), Input::EffectDone { id, ok, error })
             }
-            Ok(Msg::Subscribe(s)) => {
-                d.subscribers.push(s);
+            Ok(Msg::Subscribe { events, objects, since }) => {
+                // Catch-up and live changes come from this one thread, so the client sees every
+                // change once, in order.
+                for o in rt.changed_since(&objects, since) {
+                    if let Output::Changed { object, state, seq } = o {
+                        let _ = events.send((object.clone(), changed_event(&object, &state, seq)));
+                    }
+                }
+                d.subscribers.push(events);
                 continue;
             }
             Ok(Msg::Reload(source)) => match boot(&source, &data, render) {
@@ -175,8 +184,14 @@ impl Dispatch {
                 Output::Effect { id, effect } => {
                     let _ = self.effects.send((id, effect));
                 }
-                Output::Emit { object, name, data } => self.broadcast("emit", &object, &json!({ "object": object, "name": name, "data": data })),
-                Output::Changed { object, state } => self.broadcast("changed", &object, &json!({ "object": object, "state": state })),
+                Output::Emit { object, name, data } => {
+                    let msg = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
+                    self.broadcast(&object, msg);
+                }
+                Output::Changed { object, state, seq } => {
+                    let msg = changed_event(&object, &state, seq);
+                    self.broadcast(&object, msg);
+                }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
                 Output::Error { message, trace } => {
                     eprintln!("[app] error: {message}");
@@ -190,10 +205,15 @@ impl Dispatch {
         }
     }
 
-    fn broadcast(&mut self, event: &str, object: &str, data: &Json) {
-        let msg = format!("event: {event}\ndata: {data}\n\n");
+    fn broadcast(&mut self, object: &str, msg: String) {
         self.subscribers.retain(|s| s.send((object.to_string(), msg.clone())).is_ok());
     }
+}
+
+/// A `changed` server-sent event. Its id is the change number, so a browser's EventSource
+/// resumes from it by itself (`Last-Event-ID`).
+fn changed_event(object: &str, state: &Json, seq: u64) -> String {
+    format!("id: {seq}\nevent: changed\ndata: {}\n\n", json!({ "object": object, "state": state, "seq": seq }))
 }
 
 /// A small pool of threads that perform effects and post the results back.
@@ -244,4 +264,40 @@ fn perform(agent: &ureq::Agent, effect: Effect) -> Result<Json, String> {
     let headers: serde_json::Map<String, Json> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.clone(), Json::String(v.to_string())))).collect();
     let body = resp.into_string().map_err(|e| e.to_string())?;
     Ok(json!({ "status": status, "headers": headers, "body": body }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The next `changed` event on a stream, with its change number.
+    fn next_change(events: &Receiver<Event>) -> (u64, String) {
+        loop {
+            let (_, msg) = events.recv_timeout(Duration::from_secs(5)).expect("a change");
+            if let Some(rest) = msg.strip_prefix("id: ") {
+                let seq = rest.split('\n').next().and_then(|s| s.parse().ok()).expect("a numeric id");
+                return (seq, msg);
+            }
+        }
+    }
+
+    #[test]
+    fn streams_resume_from_the_clients_change_number() {
+        let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
+        let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
+        let engine = Engine::start(source, data.clone(), false).expect("boots");
+        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None });
+        post("one").expect("posted");
+
+        // A new client catches up on the current state first.
+        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0));
+        assert!(msg.contains("\"one\""), "{msg}");
+
+        // A client that already has that change gets nothing old, only what happens next.
+        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq);
+        post("two").expect("posted");
+        let (next, msg) = next_change(&resumed);
+        assert!(next > seq && msg.contains("\"two\""), "{msg}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
 }

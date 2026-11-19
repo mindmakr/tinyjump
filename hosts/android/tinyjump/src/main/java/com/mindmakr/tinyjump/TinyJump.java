@@ -181,7 +181,7 @@ public final class TinyJump {
                         runEffect(o.getInt("id"), o.getJSONObject("effect"));
                         break;
                     case "subscribe":
-                        sync.subscribe(o.getString("object"));
+                        sync.subscribe(o.getString("object"), o.optLong("seq"));
                         break;
                     case "wake":
                         main.removeCallbacks(tick);

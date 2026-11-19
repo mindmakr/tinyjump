@@ -110,7 +110,7 @@ public final class TinyJump {
             case "effect":
                 runEffect(id: o["id"] as? Int ?? 0, effect: o["effect"] as? [String: Any] ?? [:])
             case "subscribe":
-                sync.subscribe(o["object"] as? String ?? "")
+                sync.subscribe(o["object"] as? String ?? "", seq: (o["seq"] as? NSNumber)?.uint64Value ?? 0)
             case "wake":
                 schedule(at: o["at"] as? Double)
             case "reply":
