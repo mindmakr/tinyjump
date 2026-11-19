@@ -103,7 +103,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Tick => {}
     }
 }
 
@@ -136,7 +136,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
                 };
-                rt.handle(now_ms(), Input::EffectDone { id, ok, error })
+                rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false })
             }
             Ok(Msg::Subscribe { events, objects, since }) => {
                 // Catch-up and live changes come from this one thread, so the client sees every
@@ -286,7 +286,7 @@ mod tests {
         let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
         let engine = Engine::start(source, data.clone(), false).expect("boots");
-        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None });
+        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None });
         post("one").expect("posted");
 
         // A new client catches up on the current state first.

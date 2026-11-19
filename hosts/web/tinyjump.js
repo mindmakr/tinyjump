@@ -185,6 +185,8 @@ export async function start(opts) {
     const query = [];
     replicas.forEach((seq, k) => { since = Math.min(since, seq); query.push('object=' + encodeURIComponent(k)); });
     events = new EventSource(server + '/api/events?' + query.join('&') + '&since=' + since);
+    // The server is reachable again: queued calls go now rather than after their backoff.
+    events.addEventListener('open', () => send({ type: 'online' }));
     events.addEventListener('changed', (e) => {
       const d = JSON.parse(e.data);
       if (!replicas.has(d.object)) return;
@@ -204,17 +206,19 @@ export async function start(opts) {
 
   function serverCall(id, effect) {
     if (server === undefined) {
-      send({ type: 'effectDone', id, error: 'no server configured for ' + effect.object });
+      send({ type: 'effectDone', id, error: 'no server configured for ' + effect.object }); // permanent: not retried
       return;
     }
+    // The call id makes retries safe: the server runs each call once. No answer (offline, a
+    // 5xx, an unreadable reply) is `unreachable`, and the runtime retries the call later.
     fetch(objectUrl(effect.object) + '/' + encodeURIComponent(effect.method), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'idempotency-key': effect.call },
       body: JSON.stringify(effect.args),
     })
-      .then((r) => r.json())
+      .then((r) => (r.status >= 500 ? Promise.reject(new Error('server error ' + r.status)) : r.json()))
       .then((j) => send(j.error ? { type: 'effectDone', id, error: j.error } : { type: 'effectDone', id, ok: j.ok }))
-      .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e) }));
+      .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e), unreachable: true }));
   }
 
   function runEffect(id, effect) {

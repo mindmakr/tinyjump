@@ -1,6 +1,7 @@
 //! The I/O-free runtime: boots a program, takes [`Input`]s with the current time,
 //! and returns [`Output`]s for the host to carry out.
 
+mod calls;
 mod objects;
 pub mod protocol;
 mod render;
@@ -15,6 +16,7 @@ use crate::vm::interp::{Failure, Fiber, Run};
 use crate::vm::program::Program;
 use crate::vm::value::{Closure, Exc, ObjRef, Value};
 use indexmap::IndexSet;
+use calls::{Outbox, CALL_REPLY_BASE};
 use objects::Instance;
 use protocol::{Effect, Input, Output};
 use serde_json::Value as Json;
@@ -78,6 +80,8 @@ struct Timer {
 enum TimerKind {
     Every { obj: Rc<ObjRef>, method: Rc<str>, interval: f64 },
     Alarm { obj: Rc<ObjRef>, alarm: u64 },
+    /// Retry server calls waiting in the outbox.
+    Outbox,
 }
 
 impl PartialEq for Timer {
@@ -118,6 +122,12 @@ pub struct Runtime {
     next_effect: u32,
     /// Fibers suspended on an effect, with their reply id.
     waiting: HashMap<u32, (Fiber, Option<u64>)>,
+    /// Devices: server calls not yet answered (see `calls.rs`).
+    outbox: Outbox,
+    /// Servers: calls with an id that are still running, and who waits for each.
+    running_calls: HashMap<String, Vec<Option<u64>>>,
+    call_replies: HashMap<u64, (Rc<ObjRef>, String)>,
+    next_call_reply: u64,
     tree: Tree,
     #[cfg(feature = "layout")]
     layout: Layout,
@@ -161,6 +171,10 @@ impl Runtime {
             next_alarm: 0,
             next_effect: 0,
             waiting: HashMap::new(),
+            outbox: Outbox::default(),
+            running_calls: HashMap::new(),
+            call_replies: HashMap::new(),
+            next_call_reply: 0,
             tree: Tree::default(),
             #[cfg(feature = "layout")]
             layout: Layout::default(),
@@ -179,6 +193,9 @@ impl Runtime {
             rt.run_sync(f)?;
         }
         rt.restore()?;
+        if !rt.server {
+            rt.load_outbox();
+        }
         if rt.render {
             rt.render_app();
         }
@@ -194,11 +211,12 @@ impl Runtime {
         }
         self.metrics.inputs += 1;
         match input {
-            Input::Call { object, method, args, reply } => {
+            Input::Call { object, method, args, reply, call } => {
                 let args = args.iter().map(Value::from_json).collect();
-                match self.resolve_object(&object) {
-                    Ok(obj) => self.invoke(obj, &method, args, true, reply),
-                    Err(e) => self.reply(reply, Err(e)),
+                match (self.resolve_object(&object), call) {
+                    (Ok(obj), Some(call)) => self.call_once(obj, &method, args, reply, call),
+                    (Ok(obj), None) => self.invoke(obj, &method, args, true, reply),
+                    (Err(e), _) => self.reply(reply, Err(e)),
                 }
             }
             Input::Get { object, reply } => {
@@ -220,17 +238,11 @@ impl Runtime {
                     None => self.reply(reply, Err(format!("no {event} handler on {target:?}"))),
                 }
             }
-            Input::EffectDone { id, ok, error } => {
-                if let Some((mut f, reply)) = self.waiting.remove(&id) {
-                    self.ran_code = true;
-                    let r = match error {
-                        Some(e) => self.unwind(&mut f, Exc::msg(e)).and_then(|()| self.run(&mut f)),
-                        None => {
-                            f.stack.push(Value::from_json(&ok.unwrap_or(Json::Null)));
-                            self.run(&mut f)
-                        }
-                    };
-                    self.settle(f, reply, r);
+            Input::EffectDone { id, ok, error, unreachable } => {
+                if self.is_queued_call(id) {
+                    self.call_attempt_done(id, ok, error, unreachable);
+                } else {
+                    self.resume(id, ok, error);
                 }
             }
             Input::Sync { object, state, seq } => {
@@ -250,6 +262,7 @@ impl Runtime {
                     }
                 }
             }
+            Input::Online => self.retry_calls_now(),
             Input::Tick => {}
             Input::Inspect { reply } => {
                 let snapshot = self.inspect();
@@ -358,8 +371,27 @@ impl Runtime {
         }
     }
 
+    /// Continues the fiber waiting on promise `id` with an effect's result.
+    fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>) {
+        if let Some((mut f, reply)) = self.waiting.remove(&id) {
+            self.ran_code = true;
+            let r = match error {
+                Some(e) => self.unwind(&mut f, Exc::msg(e)).and_then(|()| self.run(&mut f)),
+                None => {
+                    f.stack.push(Value::from_json(&ok.unwrap_or(Json::Null)));
+                    self.run(&mut f)
+                }
+            };
+            self.settle(f, reply, r);
+        }
+    }
+
     /// Answers a request; without a reply id, errors are reported and results dropped.
     fn reply(&mut self, reply: Option<u64>, r: Result<Json, String>) {
+        if let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) {
+            self.finish_call(internal, r);
+            return;
+        }
         match (reply, r) {
             (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None }),
             (Some(id), Err(e)) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e) }),
@@ -394,6 +426,7 @@ impl Runtime {
                         self.invoke(obj, &a.method, args, false, None);
                     }
                 }
+                TimerKind::Outbox => self.dispatch_calls(),
             }
         }
     }

@@ -2,6 +2,7 @@
 //! stream as server-sent events, and the automation surface is under `/_tj/`.
 //!
 //!   POST /api/{Class}/{id}/{method}   body: JSON array of arguments -> {"ok": result} | {"error": msg}
+//!                                     an Idempotency-Key header makes repeats return the first result
 //!   GET  /api/{Class}/{id}            -> {"ok": state}
 //!   GET  /api/events?object=Class/id&since=N
 //!                                     -> SSE stream of `emit` and `changed`; it starts with
@@ -122,17 +123,18 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         (Method::Get, ["api", "events"]) => {
             let only = query_values(req.url(), "object");
             // A browser's EventSource reconnects with the id of the last event it saw.
-            let resume = req.headers().iter().find(|h| h.field.equiv("Last-Event-ID")).map(|h| h.value.as_str().to_string());
+            let resume = header_value(&req, "Last-Event-ID");
             let since = resume.into_iter().chain(query_values(req.url(), "since")).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
             let events = engine.subscribe(only.clone(), since);
             return sse(req, events, only);
         }
         (Method::Get, ["api", class, id]) => result_response(engine.request(Input::Get { object: format!("{class}/{id}"), reply: None })),
-        (Method::Post, ["api", class, id, name]) => match read_json(&mut req) {
-            Ok(Json::Null) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None })),
-            Ok(Json::Array(args)) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args, reply: None })),
-            Ok(_) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
-            Err(e) => json_response(400, &json!({ "error": e })),
+        (Method::Post, ["api", class, id, name]) => match (read_json(&mut req), header_value(&req, "Idempotency-Key")) {
+            // With an Idempotency-Key, a repeated request returns the first result without running again.
+            (Ok(Json::Null), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None, call })),
+            (Ok(Json::Array(args)), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args, reply: None, call })),
+            (Ok(_), _) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
+            (Err(e), _) => json_response(400, &json!({ "error": e })),
         },
         (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None })),
         (Method::Post, ["_tj", "input"]) => match read_json(&mut req).and_then(|j| serde_json::from_value::<Input>(j).map_err(|e| format!("not a protocol input: {e}"))) {
@@ -159,6 +161,10 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         _ => json_response(404, &json!({ "error": "not found" })),
     };
     let _ = req.respond(response);
+}
+
+fn header_value(req: &Request, name: &'static str) -> Option<String> {
+    req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
 }
 
 fn file(path: PathBuf, content_type: &str) -> Response<std::io::Cursor<Vec<u8>>> {

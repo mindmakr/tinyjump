@@ -49,7 +49,7 @@ fn reply(outputs: &[Output]) -> Result<Json, String> {
 
 fn call(rt: &mut Runtime, now: f64, object: &str, method: &str, args: Json) -> Result<Json, String> {
     let args = args.as_array().cloned().unwrap_or_default();
-    reply(&rt.handle(now, Input::Call { object: object.into(), method: method.into(), args, reply: Some(1) }))
+    reply(&rt.handle(now, Input::Call { object: object.into(), method: method.into(), args, reply: Some(1), call: None }))
 }
 
 /// Runs `body` as a method and returns its result.
@@ -167,7 +167,7 @@ fn objects_persist_across_reboots() {
     let store = Shared::default();
     let (mut rt, _) = boot_with(COUNTER, store.clone(), 0.0);
     assert_eq!(call(&mut rt, 1.0, "Counter/main", "increment", json!([2])).unwrap(), json!(2));
-    let out = rt.handle(2.0, Input::Call { object: "Counter/main".into(), method: "increment".into(), args: vec![], reply: None });
+    let out = rt.handle(2.0, Input::Call { object: "Counter/main".into(), method: "increment".into(), args: vec![], reply: None, call: None });
     assert!(out.iter().any(|o| matches!(o, Output::Emit { name, data, .. } if name == "changed" && data == &json!({ "count": 3 }))));
     assert!(out.iter().any(|o| matches!(o, Output::Changed { object, .. } if object == "Counter/main")));
     drop(rt);
@@ -287,7 +287,7 @@ fn fetch_suspends_and_resumes() {
     }
     "#;
     let mut rt = boot(src);
-    let out = rt.handle(0.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("Oslo")], reply: Some(9) });
+    let out = rt.handle(0.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("Oslo")], reply: Some(9), call: None });
     let (id, url) = out
         .iter()
         .find_map(|o| match o {
@@ -298,12 +298,12 @@ fn fetch_suspends_and_resumes() {
     assert_eq!(url, "https://api.example.com/w?city=Oslo");
     assert!(!out.iter().any(|o| matches!(o, Output::Reply { .. })), "reply waits for the effect");
 
-    let out = rt.handle(1.0, Input::EffectDone { id, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"temp\": 21.5}" })), error: None });
+    let out = rt.handle(1.0, Input::EffectDone { id, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"temp\": 21.5}" })), error: None, unreachable: false });
     assert_eq!(reply(&out).unwrap(), json!(21.5));
 
-    let out = rt.handle(2.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("X")], reply: Some(10) });
+    let out = rt.handle(2.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("X")], reply: Some(10), call: None });
     let id = out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
-    let out = rt.handle(3.0, Input::EffectDone { id, ok: None, error: Some("network down".into()) });
+    let out = rt.handle(3.0, Input::EffectDone { id, ok: None, error: Some("network down".into()), unreachable: false });
     assert_eq!(reply(&out).unwrap(), Json::Null);
     let state = reply(&rt.handle(4.0, Input::Get { object: "Weather/w".into(), reply: Some(1) })).unwrap();
     assert_eq!(state["error"], json!("network down"));
@@ -352,14 +352,14 @@ fn server_objects_replicate_to_devices() {
     let (id, (object, method, args)) = out
         .iter()
         .find_map(|o| match o {
-            Output::Effect { id, effect: Effect::Call { object, method, args } } => Some((*id, (object.clone(), method.clone(), args.clone()))),
+            Output::Effect { id, effect: Effect::Call { object, method, args, .. } } => Some((*id, (object.clone(), method.clone(), args.clone()))),
             _ => None,
         })
         .expect("a server call");
     assert_eq!((object.as_str(), method.as_str(), &args), ("Room/lobby", "post", &vec![json!("ana"), json!("hi")]));
 
     // The server runs it, persists it, and reports the change.
-    let out = server.handle(2.0, Input::Call { object, method, args, reply: Some(1) });
+    let out = server.handle(2.0, Input::Call { object, method, args, reply: Some(1), call: None });
     assert_eq!(reply(&out).unwrap(), json!(1));
     let state = out
         .iter()
@@ -370,7 +370,7 @@ fn server_objects_replicate_to_devices() {
         .expect("a change to broadcast");
 
     // The host relays the result and the change; the device re-renders from its replica.
-    device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None });
+    device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None, unreachable: false });
     let out = device.handle(3.0, Input::Sync { object: "Room/lobby".into(), state, seq: None });
     assert!(patches(&out).iter().any(|op| matches!(op, PatchOp::Create { props, .. } if props.get("text") == Some(&json!("ana: hi")))));
 
@@ -385,7 +385,7 @@ fn server_objects_replicate_to_devices() {
 
 #[test]
 fn change_numbers_order_replicas_and_resume_streams() {
-    let post = |text: &str| Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: Some(1) };
+    let post = |text: &str| Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: Some(1), call: None };
     let changed = |out: Vec<Output>| {
         out.into_iter()
             .find_map(|o| match o {
@@ -423,6 +423,119 @@ fn change_numbers_order_replicas_and_resume_streams() {
     assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq } if object == "Room/lobby" && *seq == third.1)), "{out:?}");
 }
 
+const BOARD: &str = r#"
+@server object Board {
+  notes: string[] = []
+  add(text: string): number {
+    this.notes.push(text)
+    return this.notes.length
+  }
+  async slow(text: string) {
+    await fetch("https://example.com/slow")
+    return this.add(text)
+  }
+}
+
+object Me {
+  last: string = ""
+  async note(text: string) {
+    const n = await Board.get("b").add(text)
+    this.last = text + " #" + n
+  }
+}
+
+function App() {
+  return <Text>{Me.get("me").last}</Text>
+}
+"#;
+
+/// Server calls a device asks its host to make: (effect id, call id, args).
+fn server_calls(out: &[Output]) -> Vec<(u32, String, Json)> {
+    out.iter()
+        .filter_map(|o| match o {
+            Output::Effect { id, effect: Effect::Call { call, args, .. } } => Some((*id, call.clone(), json!(args))),
+            _ => None,
+        })
+        .collect()
+}
+
+fn note(text: &str) -> Input {
+    Input::Call { object: "Me/me".into(), method: "note".into(), args: vec![json!(text)], reply: None, call: None }
+}
+
+fn answered(id: u32, ok: Json) -> Input {
+    Input::EffectDone { id, ok: Some(ok), error: None, unreachable: false }
+}
+
+#[test]
+fn device_calls_wait_out_outages_in_order_and_survive_restarts() {
+    // The caller's await gets the server's answer.
+    let (mut device, _) = boot_as(BOARD, Shared::default(), 0.0, false);
+    let sent = server_calls(&device.handle(0.0, note("x")));
+    device.handle(10.0, answered(sent[0].0, json!(7)));
+    assert_eq!(state(&mut device, 20.0, "Me/me")["last"], json!("x #7"));
+
+    let store = Shared::default();
+    let (mut device, _) = boot_as(BOARD, store.clone(), 0.0, false);
+    let first = server_calls(&device.handle(1000.0, note("one")));
+    assert_eq!(first.len(), 1);
+    assert!(server_calls(&device.handle(1000.0, note("two"))).is_empty(), "calls to one object go one at a time, in order");
+
+    // Unreachable: the app sees no error, and the call is retried later with the same id.
+    let out = device.handle(2000.0, Input::EffectDone { id: first[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+    assert!(server_calls(&out).is_empty() && !out.iter().any(|o| matches!(o, Output::Error { .. })), "{out:?}");
+    let retry = server_calls(&device.handle(3000.0, Input::Tick));
+    assert_eq!((retry.len(), &retry[0].1), (1, &first[0].1), "a retry keeps its call id");
+
+    // Unreachable again; the backoff doubles, but the host's `online` sends it at once.
+    device.handle(3100.0, Input::EffectDone { id: retry[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+    assert!(server_calls(&device.handle(3200.0, Input::Tick)).is_empty(), "still backing off");
+    let now = server_calls(&device.handle(3300.0, Input::Online));
+    assert_eq!((now.len(), &now[0].1), (1, &first[0].1));
+
+    // Restarted before the server answered: the outbox survives, with the same ids, in order.
+    let (mut device, out) = boot_as(BOARD, store, 4000.0, false);
+    let resent = server_calls(&out);
+    assert_eq!((resent.len(), &resent[0].1, &resent[0].2), (1, &first[0].1, &json!(["one"])));
+    let waiting = reply(&device.handle(4000.0, Input::Inspect { reply: Some(1) })).unwrap()["outbox"].clone();
+    assert_eq!(waiting.as_array().map(Vec::len), Some(2), "automation sees what is waiting");
+
+    // The server answers; the next call goes out.
+    let next = server_calls(&device.handle(5000.0, answered(resent[0].0, json!(1))));
+    assert_eq!((next.len(), &next[0].2), (1, &json!(["two"])));
+    assert_ne!(next[0].1, first[0].1);
+}
+
+#[test]
+fn calls_with_an_id_run_once_even_after_restarts_and_while_running() {
+    let add = |call: &str, reply: u64| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!("one")], reply: Some(reply), call: Some(call.into()) };
+    let changed = |out: &[Output]| out.iter().any(|o| matches!(o, Output::Changed { .. }));
+    let store = Shared::default();
+    let (mut server, _) = boot_as(BOARD, store.clone(), 0.0, true);
+    let out = server.handle(1.0, add("d-1", 1));
+    assert_eq!((reply(&out), changed(&out)), (Ok(json!(1)), true));
+
+    // A retry gets the first result; nothing runs again and nothing is broadcast.
+    let out = server.handle(2.0, add("d-1", 2));
+    assert_eq!((reply(&out), changed(&out)), (Ok(json!(1)), false));
+
+    // Also after a restart: the record was saved with the state.
+    let (mut server, _) = boot_as(BOARD, store, 3.0, true);
+    assert_eq!(reply(&server.handle(3.0, add("d-1", 3))), Ok(json!(1)));
+    assert_eq!(state(&mut server, 3.0, "Board/b")["notes"], json!(["one"]));
+
+    // A repeat that arrives while the first is still running waits for its result.
+    let slow = |reply: u64| Input::Call { object: "Board/b".into(), method: "slow".into(), args: vec![json!("two")], reply: Some(reply), call: Some("d-2".into()) };
+    let out = server.handle(4.0, slow(4));
+    let fetch = out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).expect("a fetch");
+    let out = server.handle(5.0, slow(5));
+    assert!(!out.iter().any(|o| matches!(o, Output::Reply { .. } | Output::Effect { .. })), "the repeat waits: {out:?}");
+    let out = server.handle(6.0, answered(fetch, json!({ "status": 200, "headers": {}, "body": "" })));
+    let replies: Vec<(u64, Option<Json>)> = out.iter().filter_map(|o| if let Output::Reply { reply, ok, .. } = o { Some((*reply, ok.clone())) } else { None }).collect();
+    assert_eq!(replies, vec![(4, Some(json!(2))), (5, Some(json!(2)))]);
+    assert_eq!(state(&mut server, 7.0, "Board/b")["notes"], json!(["one", "two"]));
+}
+
 /// The source of an example app in examples/<name>/app.tj.
 fn example(name: &str) -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name).join("app.tj");
@@ -454,7 +567,7 @@ fn durable_cart_holds_stock_and_the_backend_releases_it() {
     assert!(call(&mut server, 700_000.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap_err().contains("released"));
     call(&mut server, 700_000.0, "Cart/demo", "startOver", json!(["bo"])).unwrap();
     call(&mut server, 700_001.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap();
-    let out = server.handle(700_002.0, Input::Call { object: "Cart/demo".into(), method: "checkout".into(), args: vec![json!("bo")], reply: Some(1) });
+    let out = server.handle(700_002.0, Input::Call { object: "Cart/demo".into(), method: "checkout".into(), args: vec![json!("bo")], reply: Some(1), call: None });
     assert_eq!(reply(&out).unwrap(), json!(4.5));
     assert!(out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "checkedOut")));
 }

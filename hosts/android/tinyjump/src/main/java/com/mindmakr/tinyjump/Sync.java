@@ -36,6 +36,13 @@ final class Sync {
     private volatile HttpURLConnection stream;
     private volatile boolean stopped;
 
+    /** The call got an answer, an error: retrying would not help. Anything else is unreachable. */
+    static final class CallFailed extends Exception {
+        CallFailed(String message) {
+            super(message);
+        }
+    }
+
     Sync(TinyJump tj, String server) {
         this.tj = tj;
         this.server = server == null ? null : server.replaceAll("/+$", "");
@@ -54,21 +61,26 @@ final class Sync {
         if (s != null) s.disconnect();
     }
 
-    /** Runs a server call; returns the method's result. Called on an io thread. */
+    /**
+     * Runs a server call; returns the method's result. The call id makes retries safe: the
+     * server runs each call once. Called on an io thread.
+     */
     Object call(JSONObject effect) throws Exception {
-        if (server == null) throw new IOException("no server configured for " + effect.getString("object"));
+        if (server == null) throw new CallFailed("no server configured for " + effect.getString("object"));
         String url = objectUrl(effect.getString("object")) + "/" + encode(effect.getString("method"));
         HttpURLConnection c = open(url);
         try {
             c.setRequestMethod("POST");
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "application/json");
+            c.setRequestProperty("Idempotency-Key", effect.getString("call"));
             JSONArray args = effect.getJSONArray("args");
             try (OutputStream out = c.getOutputStream()) {
                 out.write(args.toString().getBytes("UTF-8"));
             }
+            if (c.getResponseCode() >= 500) throw new IOException("server error " + c.getResponseCode());
             JSONObject reply = new JSONObject(body(c));
-            if (reply.has("error")) throw new IOException(reply.getString("error"));
+            if (reply.has("error")) throw new CallFailed(reply.getString("error"));
             return reply.opt("ok");
         } finally {
             c.disconnect();
@@ -95,6 +107,15 @@ final class Sync {
     private static String body(HttpURLConnection c) throws IOException {
         InputStream in = c.getResponseCode() >= 400 ? c.getErrorStream() : c.getInputStream();
         return in == null ? "{}" : FileStore.readAll(in, 10 << 20);
+    }
+
+    private void online() {
+        tj.main.post(new Runnable() {
+            @Override
+            public void run() {
+                tj.send(TinyJump.input("online"));
+            }
+        });
     }
 
     private void deliver(final String key, final Object state, final long seq) {
@@ -135,6 +156,7 @@ final class Sync {
                         c.setReadTimeout(0); // the server sends keep-alives; wait indefinitely
                         stream = c;
                         BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
+                        online(); // reachable again: queued calls go now, not after their backoff
                         String event = null;
                         for (String line; (line = r.readLine()) != null && gen == generation; ) {
                             if (line.startsWith("event: ")) {

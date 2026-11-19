@@ -8,7 +8,8 @@ use serde_json::{Map, Value as Json};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Input {
-    /// Call a public method on an object. `object` is `"Class/id"`.
+    /// Call a public method on an object. `object` is `"Class/id"`. A call with a `call` id
+    /// runs at most once: repeating it returns the first result (`Idempotency-Key` in HTTP).
     Call {
         object: String,
         method: String,
@@ -16,6 +17,8 @@ pub enum Input {
         args: Vec<Json>,
         #[serde(default)]
         reply: Option<u64>,
+        #[serde(default)]
+        call: Option<String>,
     },
     /// Read an object's state.
     Get {
@@ -32,13 +35,16 @@ pub enum Input {
         #[serde(default)]
         reply: Option<u64>,
     },
-    /// The result of an [`Output::Effect`].
+    /// The result of an [`Output::Effect`]. `unreachable`: a server call never got an
+    /// answer (offline, timed out, or the server is down or busy), so it is retried later.
     EffectDone {
         id: u32,
         #[serde(default)]
         ok: Option<Json>,
         #[serde(default)]
         error: Option<String>,
+        #[serde(default)]
+        unreachable: bool,
     },
     /// The server's state of an `@server` object this device subscribed to, with its change
     /// number. Older or repeated numbers are ignored, so late deliveries never go back in time.
@@ -57,6 +63,9 @@ pub enum Input {
         #[serde(default)]
         rtl: bool,
     },
+    /// The host reached the server again (its change stream connected): queued server calls
+    /// are retried now instead of waiting out their backoff.
+    Online,
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -119,8 +128,9 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         body: Option<String>,
     },
-    /// Call a method of an `@server` object on the server; answer with its result.
-    Call { object: String, method: String, args: Vec<Json> },
+    /// Call a method of an `@server` object on the server, sending `call` as the
+    /// `Idempotency-Key` header; answer with its result, or with `unreachable` if no answer came.
+    Call { object: String, method: String, args: Vec<Json>, call: String },
 }
 
 /// One change to the native view tree. Node 0 is the host's root container.

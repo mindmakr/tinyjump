@@ -1,6 +1,6 @@
 //! Durable objects: loading, field access rules, events, alarms and persistence.
 
-use super::protocol::{Effect, Output};
+use super::protocol::Output;
 use super::{BootError, Runtime, TimerKind};
 use crate::vm::interp::Fiber;
 use crate::vm::value::{Closure, Exc, ObjRef, Record, Value};
@@ -13,6 +13,8 @@ const ALARM_INDEX_KEY: &str = "tj:alarms";
 /// The last change number handed out, so numbers keep growing across restarts.
 const CHANGE_SEQ_KEY: &str = "tj:seq";
 const MAX_ID_LEN: usize = 128;
+/// How many recent call ids an object remembers, so retries of them do not run twice.
+const MAX_CALL_RECORDS: usize = 100;
 
 pub(crate) struct Instance {
     handle: Rc<ObjRef>,
@@ -23,8 +25,21 @@ pub(crate) struct Instance {
     /// The change number of the current state: assigned here for objects this runtime owns,
     /// the server's for replicas. Streams resume from it and replicas ignore older states.
     seq: u64,
+    /// Results of recent calls made with an id (see `calls.rs`), oldest first.
+    calls: Vec<CallRecord>,
     /// The last persisted record, to skip unchanged writes.
     saved: String,
+    /// The state part of it: only a new state gets a change number and is broadcast.
+    state_text: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct CallRecord {
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ok: Option<Json>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -43,6 +58,8 @@ struct Stored {
     alarms: Vec<Alarm>,
     #[serde(default)]
     seq: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    calls: Vec<CallRecord>,
 }
 
 impl Runtime {
@@ -65,6 +82,7 @@ impl Runtime {
         };
         let mut alarms = Vec::new();
         let mut seq = 0;
+        let mut calls = Vec::new();
         let mut saved = String::new();
         if let Some(text) = self.store.load(&handle.key()) {
             let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::msg(format!("{} has unreadable stored state: {e}", handle.key())))?;
@@ -77,6 +95,7 @@ impl Runtime {
             }
             alarms = stored.alarms;
             seq = stored.seq;
+            calls = stored.calls;
             saved = text;
         }
         let remote = def.server && !self.server;
@@ -97,7 +116,8 @@ impl Runtime {
                 self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
             }
         }
-        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, seq, saved });
+        let state_text = Value::Rec(state.clone()).to_json().map(|j| j.to_string()).unwrap_or_default();
+        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text });
         Ok(handle)
     }
 
@@ -112,10 +132,30 @@ impl Runtime {
             return Err(Exc::msg(format!("'{method}' is private to {}", o.class_name)));
         }
         let args = args.iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("arguments to a server call must be data: {e}")))?;
-        self.next_effect += 1;
-        let id = self.next_effect;
-        self.outputs.push(Output::Effect { id, effect: Effect::Call { object: o.key(), method: method.to_string(), args } });
-        Ok(Value::Promise(id))
+        Ok(Value::Promise(self.queue_call(o.key(), method.to_string(), args)))
+    }
+
+    /// The recorded result of call `id` on `o`, if it already ran.
+    pub(crate) fn call_result(&self, o: &ObjRef, id: &str) -> Option<Result<Json, String>> {
+        let r = self.inst(o).calls.iter().find(|c| c.id == id)?;
+        Some(match &r.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(r.ok.clone().unwrap_or(Json::Null)),
+        })
+    }
+
+    /// Remembers the result of call `id`; it is saved with the object's state.
+    pub(crate) fn record_call(&mut self, o: &ObjRef, id: &str, r: &Result<Json, String>) {
+        let (ok, error) = match r {
+            Ok(v) => (Some(v.clone()), None),
+            Err(e) => (None, Some(e.clone())),
+        };
+        let calls = &mut self.inst_mut(o).calls;
+        calls.push(CallRecord { id: id.to_string(), ok, error });
+        if calls.len() > MAX_CALL_RECORDS {
+            calls.remove(0);
+        }
+        self.touch(o);
     }
 
     /// Applies the server's state to a replica; it is cached locally and re-rendered.
@@ -308,13 +348,16 @@ impl Runtime {
                 }
             };
             let has_alarms = !inst.alarms.is_empty();
+            let state_text = serde_json::to_string(&state).expect("JSON values serialize");
+            let state_changed = state_text != inst.state_text;
             let remote = inst.remote;
-            let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq };
+            let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone() };
             let mut text = serde_json::to_string(&record).expect("JSON values serialize");
             if text == inst.saved {
                 continue;
             }
-            if !remote {
+            // Alarms and call records are bookkeeping; only a new state is a change to share.
+            if state_changed && !remote {
                 // A new state of an object this runtime owns gets the next change number.
                 self.change_seq += 1;
                 seq_changed = true;
@@ -328,9 +371,12 @@ impl Runtime {
             if let Some(inst) = self.instances.get_mut(&key) {
                 inst.saved = text;
                 inst.seq = record.seq;
+                inst.state_text = state_text;
             }
             index_changed |= if has_alarms { self.alarm_index.insert(object.clone()) } else { self.alarm_index.remove(&object) };
-            self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
+            if state_changed {
+                self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
+            }
         }
         if seq_changed {
             if let Err(e) = self.store.save(CHANGE_SEQ_KEY, &self.change_seq.to_string()) {

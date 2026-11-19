@@ -39,24 +39,30 @@ final class Sync: NSObject, URLSessionDataDelegate {
         session.invalidateAndCancel()
     }
 
-    /// Calls a method of an `@server` object; `done` gets its result or an error.
-    func call(_ effect: [String: Any], done: @escaping TinyJump.Reply) {
+    /// Calls a method of an `@server` object; `done` gets its result or an error, and whether
+    /// the server was unreachable (no answer, a 5xx or an unreadable reply), in which case the
+    /// runtime retries. The call id makes retries safe: the server runs each call once.
+    func call(_ effect: [String: Any], done: @escaping (Any?, String?, Bool) -> Void) {
         let object = effect["object"] as? String ?? ""
         guard server != nil, let url = URL(string: objectUrl(object) + "/" + Sync.encode(effect["method"] as? String ?? "")) else {
-            done(nil, "no server configured for \(object)")
+            done(nil, "no server configured for \(object)", false)
             return
         }
         var req = URLRequest(url: url, timeoutInterval: 30)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(effect["call"] as? String, forHTTPHeaderField: "Idempotency-Key")
         req.httpBody = try? JSONSerialization.data(withJSONObject: effect["args"] as? [Any] ?? [])
-        URLSession.shared.dataTask(with: req) { data, _, error in
-            let reply = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let reply = status < 500 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
             DispatchQueue.main.async {
                 if let reply = reply, reply["error"] == nil {
-                    done(reply["ok"], nil)
+                    done(reply["ok"], nil, false)
+                } else if let message = reply?["error"] as? String {
+                    done(nil, message, false)
                 } else {
-                    done(nil, reply?["error"] as? String ?? error?.localizedDescription ?? "server call failed")
+                    done(nil, error?.localizedDescription ?? "the server did not answer", true)
                 }
             }
         }.resume()
@@ -88,6 +94,13 @@ final class Sync: NSObject, URLSessionDataDelegate {
         guard let url = URL(string: (server ?? "") + "/api/events?" + query + "&since=\(cursor)") else { return }
         stream = session.dataTask(with: url)
         stream?.resume()
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        if dataTask === stream, (response as? HTTPURLResponse)?.statusCode == 200 {
+            tj?.send(["type": "online"]) // reachable again: queued calls go now, not after their backoff
+        }
+        completionHandler(.allow)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {

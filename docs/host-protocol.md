@@ -20,10 +20,11 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 
 | type | fields | reply |
 |---|---|---|
-| `call` | `object: "Class/id"`, `method`, `args: []` | method result |
+| `call` | `object: "Class/id"`, `method`, `args: []`, optional `call` id: a call with an id runs once, and repeats get the first result | method result |
 | `get` | `object` | state |
 | `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
-| `effectDone` | `id`, and either `ok` or `error` | — |
+| `effectDone` | `id`, and either `ok` or `error`; `unreachable: true` when a server call got no answer | — |
+| `online` | — : the server is reachable again (the change stream connected), so queued server calls are retried now | — |
 | `sync` | `object`, `state`, `seq`: the server's state for a replica and its change number. States no newer than the replica's are ignored | — |
 | `tick` | — | — |
 | `inspect` | — | `{ tree, objects, wake }` |
@@ -36,7 +37,7 @@ id and it fails, the runtime reports the failure as an `error` output.
 | type | meaning |
 |---|---|
 | `patch` | `ops` to apply to the native view tree (below) |
-| `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }`. For `{ kind: "call", object, method, args }`, `POST /api/{object}/{method}` with `args` and answer with its `ok`. Failures are `error: "message"` |
+| `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }`. For `{ kind: "call", object, method, args, call }`, `POST /api/{object}/{method}` with `args` and the header `Idempotency-Key: {call}`, and answer with its `ok`. Failures are `error: "message"`. If no answer came (offline, a 5xx, an unreadable reply), add `unreachable: true` (see Reliable server calls) |
 | `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams) |
 | `emit` | `{ object, name, data }`: realtime event |
 | `changed` | `{ object, state, seq }`: state after a persisted change, with its change number |
@@ -148,6 +149,27 @@ A host keeps one stream for all its replicas:
 So a reconnect sends only what the device missed, and a late or repeated delivery can
 never take a replica back in time. `emit` events are not replayed: an object's state is
 the durable record.
+
+## Reliable server calls
+
+Calls from a device to an `@server` object are delivered **at least once** and run **at
+most once**, so each runs exactly once in effect:
+
+- **On the device,** the runtime keeps every server call in a durable outbox (store key
+  `tj:outbox`) until it gets an answer. Each call has a unique id.
+- **When the server is unreachable,** the host reports `unreachable: true`. The runtime
+  then retries after 1, 2, 4… seconds, at most every 30 seconds, and at once when the host
+  sends `online` (its change stream connected). The app's `await` waits and does not fail.
+- **Calls to one object** are sent one at a time, so they arrive in the order they were
+  made.
+- **After a restart,** pending calls are sent again. Their callers are gone, so a failure
+  is reported as an `error` output.
+- **On the server,** a call with an id (`Idempotency-Key` over HTTP) runs once. The object
+  saves the id and the result with its state, in one write, and remembers its last 100
+  calls. A repeat gets the first result without running again, even after a restart. A
+  repeat that arrives while the first is still running waits for its result.
+- An answer that is an error (`{"error": …}`) is final and is not retried.
+- `inspect` lists the waiting calls under `outbox`.
 
 ## Read events
 
