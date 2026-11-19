@@ -35,6 +35,15 @@ and the same agents can drive and inspect the running app.
    Scenes are declared in the same catalog (`<Scene>`, `<Mesh>`, `<Camera>`, `<Light>`) and patched
    like UI, plus a `@frame(dt)` hook. Hosts opt in, so apps without 3D stay small.
 
+## Next: one layout engine for every host
+
+Hosts translate layout props into their own systems: CSS flexbox, `LinearLayout` and
+`UIStackView`. Results drift: on iOS, `grow` in rows with multi-line text does not take
+the free space the way it does on the web and Android. The fix is to compute flexbox
+layout once in the core (a small Rust flexbox engine), measure text through the host,
+and have hosts apply the frames. Layout is then identical everywhere and testable without
+a device.
+
 ## Reliable messaging (built in, scoped to objects)
 
 Apps should not have to build their own delivery plumbing. Planned, in this order:
