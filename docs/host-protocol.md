@@ -184,6 +184,12 @@ don't count.
 
 ## Automation
 
+Automation can run any input, so `tj serve` guards it. `/_tj/*` needs
+`Authorization: Bearer <key>`, where the server reads the key (24 characters or more) from
+`TJ_ADMIN_KEY`. Without that variable, automation is off. `tj review` and `tj mcp` send
+`TJ_ADMIN_KEY` when it is set. `tj dev` and debug builds of the Android and iOS hosts stay
+open, because they are for your own machine.
+
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
 `window.tinyjump` and adds `bounds` and `visible` to each node. The CLI, and Android debug

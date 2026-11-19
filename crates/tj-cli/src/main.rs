@@ -1,6 +1,7 @@
 //! `tj`: the tinyjump command line.
 
 mod app;
+mod auth;
 mod bench;
 mod engine;
 mod http;
@@ -114,8 +115,18 @@ fn main() -> ExitCode {
 /// Prints the review of a running app; fails if it found errors, so CI can gate on it.
 fn review(target: &str) -> Result<(), String> {
     let url = format!("{}/_tj/inspect", target.trim_end_matches('/'));
-    let body = ureq::get(&url).call().map_err(|e| format!("cannot reach {url}: {e}"))?.into_string().map_err(|e| e.to_string())?;
+    let mut req = ureq::get(&url);
+    if let Some(h) = auth::client_header() {
+        req = req.set("Authorization", &h);
+    }
+    let body = match req.call() {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r.into_string().map_err(|e| e.to_string())?,
+        Err(e) => return Err(format!("cannot reach {url}: {e}")),
+    };
     let reply: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("bad reply from {url}: {e}"))?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(e.to_string());
+    }
     let snapshot = &reply["ok"];
     let findings = review::review(snapshot);
     print!("{}", review::report(snapshot, &findings));
@@ -168,6 +179,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // In dev mode the browser runs the UI; the server keeps the backend objects.
     let engine = Engine::start(source, data.clone(), false)?;
     let addr = format!("{}:{}", args.host, args.port);
+    let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     let dev = if dev_mode {
         let wasm = args.wasm.clone().unwrap_or_else(|| workspace_dir().join("target/wasm32-unknown-unknown/small/tj_wasm.wasm"));
         if !wasm.exists() {
@@ -179,8 +191,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     } else {
         None
     };
-    eprintln!("tinyjump {} on http://{addr}  (data: {})", if dev_mode { "dev" } else { "server" }, data.display());
-    http::serve(&addr, engine, dev)
+    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe());
+    http::serve(&addr, engine, dev, automation)
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.
