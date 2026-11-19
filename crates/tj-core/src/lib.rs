@@ -6,6 +6,7 @@
 
 pub mod compile;
 pub mod host;
+pub mod modules;
 pub mod runtime;
 pub mod syntax;
 pub mod typeck;

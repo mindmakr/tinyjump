@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 use tj_core::Input;
 
@@ -41,7 +41,7 @@ pub struct Dev {
 impl Dev {
     pub fn notify_reload(&self) {
         if let Ok(mut subs) = self.reload.lock() {
-            subs.retain(|s| s.push(Event { object: String::new(), state: false, text: "event: reload\ndata: {}\n\n".into() }));
+            subs.retain(|s| s.push(Event::new(String::new(), false, "event: reload\ndata: {}\n\n".into())));
         }
     }
 }
@@ -111,6 +111,7 @@ fn read_json(req: &mut Request) -> Result<Json, String> {
 }
 
 fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
+    let started = Instant::now();
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let segs: Option<Vec<String>> = path.trim_start_matches('/').split('/').map(percent_decode).collect();
     let Some(segs) = segs else {
@@ -135,7 +136,11 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
             (Ok(_), _) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
             (Err(e), _) => json_response(400, &json!({ "error": e })),
         },
-        (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None })),
+        // A server's inspect also has its own counters: requests, latency, realtime fan-out.
+        (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None }).map(|mut s| {
+            s["server"] = engine.stats().json();
+            s
+        })),
         (Method::Post, ["_tj", "input"]) => match read_json(&mut req).and_then(|j| serde_json::from_value::<Input>(j).map_err(|e| format!("not a protocol input: {e}"))) {
             Ok(input) => result_response(engine.request(input)),
             Err(e) => json_response(400, &json!({ "error": e })),
@@ -146,9 +151,13 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
                 [""] | ["index.html"] => file(dev.web_dir.join("index.html"), "text/html; charset=utf-8"),
                 ["tinyjump.js"] => file(dev.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
                 ["tinyjump.wasm"] => file(dev.wasm.clone(), "application/wasm"),
-                ["app.tj"] => file(dev.source.clone(), "text/plain; charset=utf-8"),
+                // The whole app as one bundle: the entry and the files it imports.
+                ["app.tj"] => match crate::app::read(&dev.source) {
+                    Ok(app) => Response::from_data(app.source).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Cache-Control", "no-store")),
+                    Err(e) => json_response(404, &json!({ "error": e })),
+                },
                 ["_tj", "reload"] => {
-                    let events = Arc::new(Mailbox::new(Vec::new()));
+                    let events = Arc::new(Mailbox::new(Vec::new(), None));
                     if let Ok(mut subs) = dev.reload.lock() {
                         subs.push(events.clone());
                     }
@@ -159,7 +168,9 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         }
         _ => json_response(404, &json!({ "error": "not found" })),
     };
+    let ok = response.status_code().0 < 400;
     let _ = req.respond(response);
+    engine.stats().request(started.elapsed(), ok);
 }
 
 fn header_value(req: &Request, name: &'static str) -> Option<String> {
@@ -184,10 +195,15 @@ fn sse(req: Request, events: &Mailbox) {
     let mut w = req.into_writer();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     let mut ok = w.write_all(head.as_bytes()).and_then(|()| w.flush()).is_ok();
+    events.connected(true);
     while ok {
         let batch = events.take(SSE_KEEPALIVE);
-        let chunk = if batch.is_empty() { ":\n\n".to_string() } else { batch.into_iter().map(|e| e.text).collect() };
+        let chunk: String = if batch.is_empty() { ":\n\n".to_string() } else { batch.iter().map(|e| e.text.as_str()).collect() };
         ok = w.write_all(chunk.as_bytes()).and_then(|()| w.flush()).is_ok();
+        if ok {
+            events.delivered(&batch);
+        }
     }
+    events.connected(false);
     events.close();
 }

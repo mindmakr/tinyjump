@@ -22,8 +22,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         default: break
         }
         let example = defaults.string(forKey: "example") ?? "todo"
-        guard let url = Bundle.main.url(forResource: "app", withExtension: "tj", subdirectory: "examples/\(example)"),
-              let source = try? String(contentsOf: url, encoding: .utf8) else {
+        guard let source = AppDelegate.source(example) else {
             fatalError("missing example \(example)")
         }
         do {
@@ -35,5 +34,17 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         app?.enableAutomation(port: 4701)
         #endif
         return true
+    }
+
+    /// The example's files as one source: app.tj first, then its other .tj files, each after a
+    /// `//# file: <path>` line (the bundle format, see tj-core's modules.rs).
+    private static func source(_ example: String) -> String? {
+        guard let dir = Bundle.main.resourceURL?.appendingPathComponent("examples/\(example)"),
+              let paths = FileManager.default.subpaths(atPath: dir.path) else { return nil }
+        let names = ["app.tj"] + paths.filter { $0.hasSuffix(".tj") && $0 != "app.tj" }.sorted()
+        let texts = names.compactMap { try? String(contentsOf: dir.appendingPathComponent($0), encoding: .utf8) }
+        guard texts.count == names.count else { return nil }
+        if texts.count == 1 { return texts[0] }
+        return zip(names, texts).map { name, text in "//# file: \(name)\n\(text)\(text.hasSuffix("\n") ? "" : "\n")" }.joined()
     }
 }

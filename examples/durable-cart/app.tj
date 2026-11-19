@@ -6,113 +6,12 @@
 //   Agent:   tj mcp, then call Cart/demo add ["mug", "agent"]
 //   Backend: held stock returns to the shelf when a cart is left alone,
 //            and the shelf restocks itself every minute
+//
+// The app is three files: shelf.tj (stock), cart.tj (the cart workflow) and this one
+// (this device's shopper and the screen).
 
-type Product = { sku: string, name: string, price: number, stock: number }
-type Line = { sku: string, name: string, price: number, qty: number }
-
-const HOLD_MS = 10 * 60 * 1000
-
-@server object Shelf {
-  products: Product[] = [
-    { sku: "tea", name: "Green tea", price: 4.5, stock: 12 },
-    { sku: "mug", name: "Stone mug", price: 12, stock: 5 },
-    { sku: "pot", name: "Cast-iron pot", price: 48, stock: 2 },
-  ]
-
-  /// Holds one unit for a cart; false when none are left.
-  take(sku: string): boolean {
-    const p = this.products.find(p => p.sku === sku)
-    if (p === null || p.stock === 0) { return false }
-    p.stock -= 1
-    return true
-  }
-
-  give(sku: string, qty: number) {
-    const p = this.products.find(p => p.sku === sku)
-    if (p !== null) { p.stock += qty }
-  }
-
-  // The backend changes things too: one unit of anything running low, every minute.
-  @every("1m") restock() {
-    for (const p of this.products) {
-      if (p.stock < 2) { p.stock += 1 }
-    }
-  }
-}
-
-@server object Cart {
-  lines: Line[] = []
-  status: "open" | "checked out" | "released" = "open"
-  total: number = 0
-  changedBy: string = ""
-  changedAt: number = 0
-
-  add(sku: string, by: string) {
-    this.mustBeOpen()
-    const shelf = Shelf.get("main")
-    const product = shelf.products.find(p => p.sku === sku)
-    if (product === null) { throw new Error(`no product '${sku}'`) }
-    if (!shelf.take(sku)) { throw new Error(`${product.name} is out of stock`) }
-    const line = this.lines.find(l => l.sku === sku)
-    if (line === null) {
-      this.lines.push({ sku, name: product.name, price: product.price, qty: 1 })
-    } else {
-      line.qty += 1
-    }
-    this.changed(by)
-  }
-
-  remove(sku: string, by: string) {
-    this.mustBeOpen()
-    const line = this.lines.find(l => l.sku === sku)
-    if (line === null) { return }
-    line.qty -= 1
-    if (line.qty === 0) { this.lines = this.lines.filter(l => l.sku !== sku) }
-    Shelf.get("main").give(sku, 1)
-    this.changed(by)
-  }
-
-  checkout(by: string): number {
-    this.mustBeOpen()
-    if (this.lines.length === 0) { throw new Error("the cart is empty") }
-    this.status = "checked out"
-    this.changed(by)
-    this.emit("checkedOut", { total: this.total, by })
-    return this.total
-  }
-
-  startOver(by: string) {
-    this.release()
-    this.status = "open"
-    this.changed(by)
-  }
-
-  private mustBeOpen() {
-    if (this.status !== "open") { throw new Error(`the cart is ${this.status}; start a new one`) }
-  }
-
-  private changed(by: string) {
-    this.total = this.lines.reduce((sum, l) => sum + l.price * l.qty, 0)
-    this.changedBy = by
-    this.changedAt = Date.now()
-    // A durable timer: if nobody touches the cart, its held stock goes back on the shelf.
-    if (this.status === "open" && this.lines.length > 0) { this.schedule(HOLD_MS, "expire", this.changedAt) }
-  }
-
-  private expire(stamp: number) {
-    if (this.status !== "open" || this.changedAt !== stamp) { return }
-    this.release()
-    this.status = "released"
-    this.changed("backend")
-  }
-
-  private release() {
-    if (this.status === "open") {
-      for (const l of this.lines) { Shelf.get("main").give(l.sku, l.qty) }
-    }
-    this.lines = []
-  }
-}
+import { Shelf } from "./shelf"
+import { Cart } from "./cart"
 
 /// This device's shopper: their name and the last error, kept locally.
 object Shopper {

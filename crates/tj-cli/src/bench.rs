@@ -140,7 +140,7 @@ pub fn check_budget(path: &Path) -> Result<(), String> {
         }
     }
     for (app, limits) in budget["apps"].as_object().into_iter().flatten() {
-        let source = std::fs::read_to_string(app).map_err(|e| format!("cannot read {app}: {e}"))?;
+        let source = crate::app::read(Path::new(app))?.source;
         let measured = bench(app, &source)?.to_json();
         for (key, limit) in limits.as_object().into_iter().flatten() {
             let (Some(limit), Some(value)) = (limit.as_f64(), measured[key.as_str()].as_f64()) else {

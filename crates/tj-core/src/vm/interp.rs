@@ -5,7 +5,6 @@ use super::builtins;
 use super::program::{Capture, Op, Source};
 use super::value::{fmt_num, Closure, Elem, Exc, ObjRef, Value};
 use crate::runtime::Runtime;
-use crate::syntax::line_col;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -447,8 +446,10 @@ impl Runtime {
                 let at = match proto.source {
                     Source::User => {
                         let off = proto.offsets.get(fr.ip.saturating_sub(1)).copied().unwrap_or(0);
-                        let (line, col) = line_col(&self.program.user_source, off as usize);
-                        format!("{line}:{col}")
+                        match crate::modules::locate(&self.program.user_source, off as usize) {
+                            (Some(file), line, col) => format!("{file}:{line}:{col}"),
+                            (None, line, col) => format!("{line}:{col}"),
+                        }
                     }
                     Source::Prelude => "prelude".into(),
                 };

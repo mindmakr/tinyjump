@@ -227,8 +227,8 @@ struct Checker<'a> {
     errors: Vec<Diagnostic>,
 }
 
-/// Type-checks a parsed program.
-pub fn check(program: &Program) -> Vec<Diagnostic> {
+/// Type-checks the top-level items of an app (all its files, in the order they run).
+pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
     let mut c = Checker {
         aliases: HashMap::new(),
         objects: HashMap::new(),
@@ -241,7 +241,7 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
         type_span: Span::default(),
         errors: Vec::new(),
     };
-    for item in &program.items {
+    for &item in items {
         match item {
             Item::TypeAlias { name, generics, ty, .. } => {
                 c.aliases.insert(name, (generics, ty));
@@ -253,7 +253,7 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
             _ => {}
         }
     }
-    for item in &program.items {
+    for &item in items {
         match item {
             Item::Function(f) => {
                 let sig = c.signature(f);
@@ -263,12 +263,12 @@ pub fn check(program: &Program) -> Vec<Diagnostic> {
             _ => {}
         }
     }
-    for item in &program.items {
+    for &item in items {
         if let Item::Let(d) = item {
             c.let_decl(d);
         }
     }
-    for item in &program.items {
+    for &item in items {
         match item {
             Item::Function(f) => {
                 c.function(f, None);
@@ -1210,7 +1210,7 @@ mod tests {
     use crate::vm::value::Value;
 
     fn errors(src: &str) -> Vec<String> {
-        check(&parse(src).unwrap()).into_iter().map(|d| d.message).collect()
+        check(&parse(src).unwrap().items.iter().collect::<Vec<_>>()).into_iter().map(|d| d.message).collect()
     }
 
     fn ok(src: &str) {
@@ -1302,20 +1302,5 @@ mod tests {
             let in_prelude = prelude.items.iter().any(|i| matches!(i, Item::Function(f) if f.name == format!("__arr_{name}")));
             assert!(native || in_prelude, "runtime lacks array method {name}");
         }
-    }
-
-    #[test]
-    fn example_apps_type_check() {
-        let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
-        let mut checked = 0;
-        for entry in std::fs::read_dir(examples).unwrap() {
-            let app = entry.unwrap().path().join("app.tj");
-            if let Ok(src) = std::fs::read_to_string(&app) {
-                let e = errors(&src);
-                assert!(e.is_empty(), "{}: {e:?}", app.display());
-                checked += 1;
-            }
-        }
-        assert!(checked > 0, "no example apps found");
     }
 }

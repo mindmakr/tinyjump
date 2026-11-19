@@ -203,9 +203,12 @@ pub fn report(snapshot: &Json, findings: &[Finding]) -> String {
         let level = if f.severity == Severity::Error { "error" } else { "warning" };
         out.push_str(&format!("{level} [{}] {}: {}\n", f.check, f.node, f.message));
     }
-    if let Some(m) = snapshot["metrics"].as_object() {
-        let counters: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        out.push_str(&format!("metrics: {}\n", counters.join(" ")));
+    // Runtime work counters, and on a server its own: requests, latency, realtime fan-out.
+    for key in ["metrics", "server"] {
+        if let Some(m) = snapshot[key].as_object() {
+            let counters: Vec<String> = m.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            out.push_str(&format!("{key}: {}\n", counters.join(" ")));
+        }
     }
     out
 }

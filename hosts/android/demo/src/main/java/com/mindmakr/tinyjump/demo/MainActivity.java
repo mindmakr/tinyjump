@@ -9,6 +9,9 @@ import com.mindmakr.tinyjump.TinyJump;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 /**
  * Runs one of the repo's example apps. Launch extras: {@code example} (default "todo"),
@@ -30,7 +33,7 @@ public final class MainActivity extends Activity {
         if ("ltr".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);
         setContentView(root);
         String example = getIntent().getStringExtra("example");
-        String source = asset((example == null ? "todo" : example) + "/app.tj");
+        String source = source(example == null ? "todo" : example);
         app = TinyJump.start(this, root, source, getIntent().getStringExtra("server"));
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) app.enableAutomation(AUTOMATION_PORT);
     }
@@ -39,6 +42,40 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         if (app != null) app.stop();
         super.onDestroy();
+    }
+
+    /**
+     * The example's files as one source: app.tj first, then its other .tj files, each after a
+     * {@code //# file: <path>} line (the bundle format, see tj-core's modules.rs).
+     */
+    private String source(String example) {
+        List<String> names = new ArrayList<>();
+        collect(example, "", names);
+        Collections.sort(names);
+        names.remove("app.tj");
+        if (names.isEmpty()) return asset(example + "/app.tj");
+        names.add(0, "app.tj");
+        StringBuilder out = new StringBuilder();
+        for (String name : names) {
+            String text = asset(example + "/" + name);
+            out.append("//# file: ").append(name).append('\n').append(text);
+            if (!text.endsWith("\n")) out.append('\n');
+        }
+        return out.toString();
+    }
+
+    private void collect(String dir, String prefix, List<String> out) {
+        String[] children;
+        try {
+            children = getAssets().list(dir);
+        } catch (IOException e) {
+            return;
+        }
+        if (children == null) return;
+        for (String child : children) {
+            if (child.endsWith(".tj")) out.add(prefix + child);
+            else collect(dir + "/" + child, prefix + child + "/", out);
+        }
     }
 
     private String asset(String name) {

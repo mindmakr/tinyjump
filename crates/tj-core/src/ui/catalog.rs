@@ -59,3 +59,23 @@ impl Kind {
 pub fn names() -> String {
     KINDS.iter().map(|k| k.name).collect::<Vec<_>>().join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Agents load docs/language.md (`tj docs`, the MCP `language` tool) instead of reading
+    /// the code, so it must name every component, prop, event and built-in.
+    #[test]
+    fn the_language_reference_lists_every_component_and_builtin() {
+        let doc = include_str!("../../../../docs/language.md");
+        let mentioned = |name: &str| doc.contains(&format!("`{name}`")) || doc.contains(&format!("`{name}(")) || doc.contains(&format!("{name},")) || doc.contains(&format!("{name}`")) || doc.contains(&format!("`{name}."));
+        let mut missing: Vec<&str> = Vec::new();
+        for k in KINDS {
+            missing.extend(std::iter::once(k.name).chain(k.props.iter().copied()).chain(k.events.iter().copied()).filter(|n| !mentioned(n)));
+        }
+        missing.extend(COMMON_PROPS.iter().copied().filter(|n| !mentioned(n)));
+        missing.extend(crate::vm::builtins::GLOBALS.iter().map(|(n, _)| n.trim_start_matches("__")).filter(|n| *n != "sort" && !mentioned(n)));
+        assert!(missing.is_empty(), "docs/language.md does not mention: {missing:?}");
+    }
+}

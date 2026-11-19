@@ -45,8 +45,10 @@ Realtime across devices: `cargo tj dev examples/chat/app.tj`, then open it in tw
 browsers. `Room` is an `@server` object: it lives on the server, and each device holds a
 live, offline-cached replica of it.
 
-Other commands: `tj check app.tj` (compile errors with fix hints and types) and `tj serve app.tj`
-(backend only; add `--host 0.0.0.0` to expose it).
+Other commands: `tj docs` (the language reference, for agents), `tj check app.tj` (compile
+errors with fix hints and types), `tj bench app.tj` (timings and work counters) and
+`tj serve app.tj` (backend only; add `--host 0.0.0.0` to expose it). Apps can span several
+files with `import { Cart } from "./cart"`.
 
 Testing and agents: `tj review --target <url>` checks a running app for layout,
 accessibility and contrast problems and prints its work counters. `tj mcp --target <url>`

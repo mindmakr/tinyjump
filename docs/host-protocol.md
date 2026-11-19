@@ -11,7 +11,11 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 ## Lifecycle
 
 1. `compile(source)`, then `Runtime::boot(program, store, Options { now, seed, render })`.
-   Boot returns the first outputs, including the initial `patch`.
+   Boot returns the first outputs, including the initial `patch`. An app of several files
+   is passed as one **bundle**: each file follows a line `//# file: <path>`, with the path
+   relative to the entry file's folder and the entry first. A one-file app is just its
+   source. `tj` builds bundles by following imports (`crates/tj-cli/src/app.rs`), and
+   `tj dev` serves them as `/app.tj`. Native demo apps bundle an example's folder.
 2. For every event, call `runtime.handle(now_ms, input)` and carry out the outputs in order.
 3. Every batch ends with `wake { at }`. Send `tick` at that time (or earlier). `null` means
    no timer is pending.
@@ -197,6 +201,10 @@ Two tools build on this:
 - **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
   touch targets under 44×44, unlabelled controls and text contrast below WCAG AA. It prints
   the metrics, and exits non-zero on errors, so CI can gate on it.
-- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `inspect`, `act`,
-  `call`, `get`, `screenshot`, `review` and `input`, so any coding agent can drive and test
-  a running app.
+- On `tj serve`, `inspect` also has `server`: its own counters. They cover HTTP requests
+  (count, errors, average and slowest time) and realtime (connected clients, events sent,
+  average and worst fan-out lag from a change to its event being written, and states
+  coalesced or events dropped for slow clients). `tj review` prints them.
+- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
+  language reference, to load before writing code), `inspect`, `act`, `call`, `get`,
+  `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.

@@ -22,9 +22,31 @@ function App() {
 }
 ```
 
-One file per app. Top level may contain `object`, `function`, `type`, `interface`,
-`let` and `const`. `export` and `export default` are accepted and ignored.
-`function App()` is the UI root.
+Top level may contain `object`, `function`, `type`, `interface`, `let` and `const`.
+`function App()` is the UI root, in the app's entry file.
+
+## Files
+
+An app can be split into files, the TypeScript way:
+
+```tsx
+// cart.tj
+import { Shelf } from "./shelf"
+export @server object Cart { /* ... */ }
+
+// app.tj, the entry file
+import { Cart } from "./cart"
+function App() { /* ... */ }
+```
+
+- Put `export` before a declaration to let other files import it. Import with
+  `import { A, B } from "./file"`: a relative path without the extension.
+- All files of an app share one set of top-level names, so each name is declared once.
+  Object names must be unique anyway: they name the stored objects and the HTTP API.
+- A name from another file must be imported; the error says which import to add.
+- Files run in dependency order (imports first). Import cycles are allowed.
+- Not supported, each with a fix hint: default exports, `export { a }` lists,
+  `import X from`, `import * as`, `import type`, renaming with `as`, and packages.
 
 ## Objects: durable state
 
@@ -133,7 +155,7 @@ parameters, destructuring (`const { a, b = 1 } = r`, `const [x, y] = arr`, also 
 parameters), spread in arrays and records, `?.`, `?.[ ]`, `??`, `&&`, `||`, ternaries,
 template strings and computed keys.
 
-Not yet: imports, `switch`, `finally`, rest parameters, spread arguments, getters,
+Not yet: `switch`, `finally`, rest parameters, spread arguments, getters,
 `for...in`, regular expressions, generators, labels.
 
 ## Async

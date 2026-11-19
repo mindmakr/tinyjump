@@ -1,14 +1,19 @@
 //! `tj`: the tinyjump command line.
 
+mod app;
 mod bench;
 mod engine;
 mod http;
 mod mailbox;
+mod stats;
 mod mcp;
 mod review;
 mod store;
 
 use engine::Engine;
+
+/// The language reference (docs/language.md), for agents: `tj docs` and the MCP `language` tool.
+pub const LANGUAGE: &str = include_str!("../../../docs/language.md");
 use http::Dev;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +25,7 @@ const USAGE: &str = "\
 tj: tinyjump
 
 USAGE:
+  tj docs                        print the language reference: load it before writing app code
   tj check <app.tj>              compile and report errors
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
@@ -84,6 +90,10 @@ fn main() -> ExitCode {
         }
     };
     let result = match args.command.as_str() {
+        "docs" => {
+            print!("{LANGUAGE}");
+            Ok(())
+        }
         "check" => args.file().and_then(check),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -130,8 +140,9 @@ fn run_bench(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// The app as one source: the file and every file it imports.
 fn read_source(file: &Path) -> Result<String, String> {
-    std::fs::read_to_string(file).map_err(|e| format!("cannot read {}: {e}", file.display()))
+    app::read(file).map(|a| a.source)
 }
 
 fn check(file: &Path) -> Result<(), String> {
@@ -172,25 +183,28 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     http::serve(&addr, engine, dev)
 }
 
-/// Polls the app file; on change, reloads the backend and tells browsers to reload.
+/// Polls the app's files; on a change, reloads the backend and tells browsers to reload.
 fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
-    let modified = |f: &Path| std::fs::metadata(f).and_then(|m| m.modified()).ok();
+    let stamps = |files: &[PathBuf]| -> Vec<Option<SystemTime>> { files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect() };
     let spawned = thread::Builder::new().name("tj-watch".into()).spawn(move || {
-        let mut last: Option<SystemTime> = modified(&file);
+        let mut files = app::read(&file).map(|a| a.files).unwrap_or_else(|_| vec![file.clone()]);
+        let mut last = stamps(&files);
         loop {
             thread::sleep(Duration::from_millis(300));
-            let now = modified(&file);
-            if now == last {
+            if stamps(&files) == last {
                 continue;
             }
-            last = now;
-            match std::fs::read_to_string(&file) {
-                Ok(src) => match tj_core::compile(&src) {
-                    Ok(_) => engine.reload(src),
-                    Err(errs) => eprintln!("{}", errs.iter().map(|d| d.render(&file.display().to_string(), &src)).collect::<Vec<_>>().join("\n\n")),
-                },
-                Err(e) => eprintln!("[tj] cannot read {}: {e}", file.display()),
+            match app::read(&file) {
+                Ok(app) => {
+                    match tj_core::compile(&app.source) {
+                        Ok(_) => engine.reload(app.source),
+                        Err(errs) => eprintln!("{}", errs.iter().map(|d| d.render(&file.display().to_string(), &app.source)).collect::<Vec<_>>().join("\n\n")),
+                    }
+                    files = app.files; // imports may have changed
+                }
+                Err(e) => eprintln!("[tj] {e}"),
             }
+            last = stamps(&files);
             // Browsers reload either way: they show compile errors in their overlay.
             dev.notify_reload();
         }

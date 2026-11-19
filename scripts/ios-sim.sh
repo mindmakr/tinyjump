@@ -25,8 +25,11 @@ xcrun --sdk iphonesimulator swiftc -O -D DEBUG -parse-as-library -target "$swift
 mkdir -p "$app/examples"
 for dir in examples/*/; do
   name=$(basename "$dir")
-  mkdir -p "$app/examples/$name"
-  cp "$dir/app.tj" "$app/examples/$name/"
+  # Every .tj file of the example: apps can be several files.
+  (cd "$dir" && find . -name '*.tj') | while read -r f; do
+    mkdir -p "$app/examples/$name/$(dirname "$f")"
+    cp "$dir/$f" "$app/examples/$name/$f"
+  done
 done
 cp hosts/ios/Demo/Info.plist "$app/Info.plist"
 codesign --force --sign - "$app"
@@ -129,4 +132,19 @@ expect "$api/_tj/inspect" 'hi phone'
 curl -sf "$api/_tj/screenshot" -o "$out/chat-rtl.png"
 "$tj" review --target "$api"
 starts_left send draft
+kill $server 2>/dev/null || true
+xcrun simctl terminate "$udid" "$bundle"
+
+echo "== durable-cart: an app in several files, @server objects and server calls"
+rm -rf "$out/cart-data"
+"$tj" serve examples/durable-cart/app.tj --data "$out/cart-data" &
+server=$!
+xcrun simctl launch "$udid" "$bundle" -example durable-cart -server http://127.0.0.1:4700
+wait_up
+input '{"type":"ui","target":{"id":"name"},"event":"onChange","value":"iPhone"}'
+input '{"type":"ui","target":{"id":"add-tea"},"event":"onPress"}'
+expect http://127.0.0.1:4700/api/Cart/demo '"changedBy":"iPhone"'
+expect "$api/_tj/inspect" 'Last change by iPhone'
+curl -sf "$api/_tj/screenshot" -o "$out/cart.png"
+"$tj" review --target "$api"
 echo "iOS tests passed"
