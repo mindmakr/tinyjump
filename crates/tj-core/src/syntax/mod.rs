@@ -4,7 +4,7 @@ pub mod ast;
 pub mod lexer;
 pub mod parser;
 
-pub use parser::parse;
+pub use parser::{parse, parse_range};
 
 /// Byte range in a source file.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -38,10 +38,22 @@ impl Diagnostic {
         self.hint = Some(hint.into());
         self
     }
-    /// `file:line:col: error: message`, the source line, a caret and the hint.
-    pub fn render(&self, file: &str, src: &str) -> String {
-        let (line, col) = line_col(src, self.span.start as usize);
-        let text = src.lines().nth(line - 1).unwrap_or("");
+    /// `file:line:col: error: message`, the source line, a caret and the hint. `src` may be
+    /// a bundle of several files (see `modules`): `entry` is how to name the entry file, and
+    /// the others are named relative to it.
+    pub fn render(&self, entry: &str, src: &str) -> String {
+        let offset = self.span.start as usize;
+        let (name, line, col) = crate::modules::locate(src, offset);
+        let files = crate::modules::files(src);
+        let here = files.iter().rev().find(|f| f.start <= offset).map_or(src, |f| &src[f.start..f.end]);
+        let file = match name {
+            Some(n) if Some(n.as_str()) != files.first().map(|f| f.name.as_str()) => match entry.rfind(['/', '\\']) {
+                Some(i) => format!("{}/{n}", &entry[..i]),
+                None => n,
+            },
+            _ => entry.to_string(),
+        };
+        let text = here.lines().nth(line - 1).unwrap_or("");
         let width = (self.span.end.saturating_sub(self.span.start) as usize).clamp(1, text.len().saturating_sub(col - 1).max(1));
         let mut out = format!("{file}:{line}:{col}: error: {}\n  {text}\n  {}{}", self.message, " ".repeat(col - 1), "^".repeat(width));
         if let Some(h) = &self.hint {

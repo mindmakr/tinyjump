@@ -17,12 +17,26 @@ pub struct Parser<'a> {
 
 /// Parses a whole source file.
 pub fn parse(src: &str) -> PResult<Program> {
-    let mut p = Parser::new(src, 0)?;
-    let mut items = Vec::new();
+    parse_range(src, 0, src.len())
+}
+
+/// Parses one file of a bundle, `src[start..end]`; spans stay offsets into `src`.
+pub fn parse_range(src: &str, start: usize, end: usize) -> PResult<Program> {
+    let mut p = Parser::new(&src[..end], start)?;
+    let mut program = Program::default();
     while p.cur.tok != Tok::Eof {
-        items.push(p.item()?);
+        if p.at(&Tok::Reserved("import")) {
+            program.imports.push(p.import()?);
+            continue;
+        }
+        let exported = p.export()?;
+        let item = p.item()?;
+        if exported {
+            program.exports.extend(item_names(&item).into_iter().map(|(n, _)| n));
+        }
+        program.items.push(item);
     }
-    Ok(Program { items })
+    Ok(program)
 }
 
 fn tok_text(t: &Tok) -> String {
@@ -58,7 +72,7 @@ fn not_supported(word: &str, span: Span) -> Diagnostic {
         "class" => ("`class` is not supported".into(), "use `object Name { ... }` for durable state, or plain functions and records"),
         "undefined" => ("`undefined` does not exist".into(), "use `null`"),
         "switch" => ("`switch` is not supported yet".into(), "use if / else if"),
-        "import" => ("imports are not supported yet".into(), "keep the app in one file for now"),
+        "import" => ("`import` belongs at the top of a file".into(), "import { Name } from \"./file\""),
         "finally" => ("`finally` is not supported yet".into(), "repeat the cleanup at the end of both the try and the catch block"),
         "in" => ("`in` is not supported".into(), "use `obj[key] !== null`, or `for (const key of Object.keys(obj))`"),
         "delete" => ("`delete` is not supported".into(), "build a new record without the key, or set it to null"),
@@ -174,10 +188,54 @@ impl<'a> Parser<'a> {
 
     // ---------- items ----------
 
-    fn item(&mut self) -> PResult<Item> {
-        if self.eat(&Tok::Export)? {
-            self.eat(&Tok::Default)?;
+    /// `import { a, b } from "./file"`; other forms get a hint.
+    fn import(&mut self) -> PResult<Import> {
+        let start = self.cur.span;
+        self.bump()?;
+        if !self.at(&Tok::LBrace) {
+            let hint = if self.at(&Tok::Type) { "types import like values: import { Cart } from \"./cart\"" } else { "use named imports: import { Cart } from \"./cart\"" };
+            return Err(self.unexpected("'{'").hint(hint));
         }
+        self.bump()?;
+        let mut names = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            names.push(self.ident("a name to import")?);
+            if self.at(&Tok::As) {
+                return Err(Diagnostic::new("renaming imports is not supported", self.cur.span).hint("names are unique across an app's files; import it by its own name"));
+            }
+            if !self.eat(&Tok::Comma)? {
+                break;
+            }
+        }
+        self.expect(&Tok::RBrace, "'}'")?;
+        let (from, span) = self.ident("'from'")?;
+        if from != "from" {
+            return Err(Diagnostic::new(format!("expected 'from', found '{from}'"), span).hint("import { Cart } from \"./cart\""));
+        }
+        let Tok::Str(path) = self.cur.tok.clone() else {
+            return Err(self.unexpected("a path like \"./cart\""));
+        };
+        self.bump()?;
+        self.end_stmt()?;
+        Ok(Import { names, from: path, span: self.since(start) })
+    }
+
+    /// `export` before a declaration; other forms get a hint.
+    fn export(&mut self) -> PResult<bool> {
+        if !self.eat(&Tok::Export)? {
+            return Ok(false);
+        }
+        if self.at(&Tok::Default) {
+            return Err(Diagnostic::new("default exports are not supported", self.cur.span)
+                .hint("export the declaration by name, `export function Cart() { ... }`, and import it as `import { Cart } from \"./cart\"`"));
+        }
+        if self.at(&Tok::LBrace) {
+            return Err(Diagnostic::new("export lists are not supported", self.cur.span).hint("put `export` before the declaration itself"));
+        }
+        Ok(true)
+    }
+
+    fn item(&mut self) -> PResult<Item> {
         let start = self.cur.span;
         match self.cur.tok {
             Tok::Function | Tok::Async => Ok(Item::Function(Rc::new(self.fn_decl()?))),

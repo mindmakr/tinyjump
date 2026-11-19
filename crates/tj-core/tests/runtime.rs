@@ -536,10 +536,94 @@ fn calls_with_an_id_run_once_even_after_restarts_and_while_running() {
     assert_eq!(state(&mut server, 7.0, "Board/b")["notes"], json!(["one", "two"]));
 }
 
-/// The source of an example app in examples/<name>/app.tj.
+/// A bundle of app files, entry first.
+fn files(list: &[(&str, &str)]) -> String {
+    tj_core::modules::bundle(&list.iter().map(|(n, s)| (n.to_string(), s.to_string())).collect::<Vec<_>>())
+}
+
+/// Compile errors of a bundle, rendered as the CLI shows them.
+fn errors(src: &str) -> String {
+    compile(src).err().map(|errs| errs.iter().map(|e| e.render("demo/app.tj", src)).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
+
+#[test]
+fn apps_can_be_split_into_files() {
+    let src = files(&[
+        ("app.tj", "import { Shop } from \"./shop\"\nimport { money } from \"./lib/format\"\nfunction App() {\n  return <Text>{money(Shop.get(\"s\").total)}</Text>\n}\n"),
+        ("shop.tj", "import { TAX } from \"./lib/format\"\nexport object Shop {\n  total: number = 0\n  buy(price: number) { this.total += price * (1 + TAX) }\n}\n"),
+        ("lib/format.tj", "export const TAX = 0.5\nexport function money(n: number): string { return \"$\" + n.toFixed(2) }\nexport function fail() { throw new Error(\"boom\") }\n"),
+    ]);
+    let (mut rt, out) = boot_with(&src, Shared::default(), 0.0);
+    assert!(patches(&out).iter().any(|op| matches!(op, PatchOp::Create { props, .. } if props.get("text") == Some(&json!("$0.00")))));
+    call(&mut rt, 1.0, "Shop/s", "buy", json!([10])).unwrap();
+    assert_eq!(state(&mut rt, 2.0, "Shop/s")["total"], json!(15));
+
+    // Runtime errors point at the right file and line.
+    let failing = files(&[("app.tj", "import { fail } from \"./lib/format\"\nobject T {\n  run() { fail() }\n}\n"), ("lib/format.tj", "export function fail() {\n  throw new Error(\"boom\")\n}\n")]);
+    let mut rt = boot(&failing);
+    let out = rt.handle(1.0, Input::Call { object: "T/t".into(), method: "run".into(), args: vec![], reply: None, call: None });
+    let trace = out.iter().find_map(|o| if let Output::Error { trace, .. } = o { Some(trace.join(" ")) } else { None }).expect("an error");
+    assert!(trace.contains("lib/format.tj:2:") && trace.contains("app.tj:3:"), "{trace}");
+}
+
+#[test]
+fn module_mistakes_say_how_to_fix_them() {
+    let shop = ("shop.tj", "export object Shop { total: number = 0 }\nfunction helper() { return 1 }\n");
+    let e = errors(&files(&[("app.tj", "function App() { return <Text>{String(Shop.get(\"s\").total)}</Text> }\n"), shop]));
+    assert!(e.contains("demo/app.tj:1:") && e.contains("'Shop' is declared in shop.tj") && e.contains("add import { Shop } from \"./shop\""), "{e}");
+
+    let e = errors(&files(&[("app.tj", "import { helper } from \"./shop\"\n"), shop]));
+    assert!(e.contains("shop.tj does not export 'helper'") && e.contains("add `export` before its declaration in shop.tj"), "{e}");
+
+    let e = errors(&files(&[("app.tj", "import { Shop } from \"./shops\"\n"), shop]));
+    assert!(e.contains("no file shops.tj") && e.contains("did you mean \"./shop\"?"), "{e}");
+
+    let e = errors(&files(&[("app.tj", "import { Shop } from \"./shop\"\nfunction helper() { return 2 }\n"), shop]));
+    assert!(e.contains("'helper' is already declared in") && e.contains("rename one"), "{e}");
+
+    let e = errors(&files(&[("app.tj", "x"), ("lib/bad.tj", "const a = 1\nconst b = \n")]));
+    assert!(e.contains("demo/lib/bad.tj:"), "errors name the file they are in: {e}");
+
+    for (src, hint) in [
+        ("export default function App() {}\n", "export the declaration by name"),
+        ("import Shop from \"./shop\"\n", "use named imports"),
+        ("import { Shop as S } from \"./shop\"\n", "import it by its own name"),
+        ("import { Shop } from \"lodash\"\n", "packages are not supported"),
+        ("import { Shop } from \"./shop.tj\"\n", "write \"./cart\" for cart.tj"),
+        ("const a = 1\nexport { a }\n", "put `export` before the declaration"),
+    ] {
+        let e = errors(&files(&[("app.tj", src), shop]));
+        assert!(e.contains(hint), "{src}: {e}");
+    }
+}
+
+/// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
 fn example(name: &str) -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name).join("app.tj");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name);
+    let mut files: Vec<(String, String)> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "tj"))
+        .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read_to_string(&p).unwrap()))
+        .collect();
+    files.sort_by_key(|(n, _)| (n != "app.tj", n.clone()));
+    tj_core::modules::bundle(&files)
+}
+
+#[test]
+fn every_example_compiles() {
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(examples).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+        let src = example(&name);
+        if let Err(errs) = compile(&src) {
+            panic!("{}", errs.iter().map(|e| e.render(&format!("examples/{name}/app.tj"), &src)).collect::<Vec<_>>().join("
+"));
+        }
+        checked += 1;
+    }
+    assert!(checked >= 4, "found {checked} examples");
 }
 
 fn state(rt: &mut Runtime, now: f64, object: &str) -> Json {

@@ -146,7 +146,11 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
                 [""] | ["index.html"] => file(dev.web_dir.join("index.html"), "text/html; charset=utf-8"),
                 ["tinyjump.js"] => file(dev.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
                 ["tinyjump.wasm"] => file(dev.wasm.clone(), "application/wasm"),
-                ["app.tj"] => file(dev.source.clone(), "text/plain; charset=utf-8"),
+                // The whole app as one bundle: the entry and the files it imports.
+                ["app.tj"] => match crate::app::read(&dev.source) {
+                    Ok(app) => Response::from_data(app.source).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Cache-Control", "no-store")),
+                    Err(e) => json_response(404, &json!({ "error": e })),
+                },
                 ["_tj", "reload"] => {
                     let events = Arc::new(Mailbox::new(Vec::new()));
                     if let Ok(mut subs) = dev.reload.lock() {

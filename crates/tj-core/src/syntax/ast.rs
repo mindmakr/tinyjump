@@ -1,11 +1,46 @@
-//! Abstract syntax tree. Type annotations are kept for the upcoming type checker.
+//! Abstract syntax tree. Type annotations are kept for the type checker.
 
 use super::Span;
 use std::rc::Rc;
 
-#[derive(Debug, Clone)]
+/// One file.
+#[derive(Debug, Clone, Default)]
 pub struct Program {
     pub items: Vec<Item>,
+    pub imports: Vec<Import>,
+    /// Names the file exports.
+    pub exports: Vec<String>,
+}
+
+/// `import { a, b } from "./file"`
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub names: Vec<(String, Span)>,
+    pub from: String,
+    pub span: Span,
+}
+
+/// The top-level names an item declares.
+pub fn item_names(item: &Item) -> Vec<(String, Span)> {
+    match item {
+        Item::Function(f) => vec![(f.name.clone(), f.span)],
+        Item::Object(o) => vec![(o.name.clone(), o.span)],
+        Item::TypeAlias { name, span, .. } => vec![(name.clone(), *span)],
+        Item::Let(d) => {
+            let mut names = Vec::new();
+            pattern_names(&d.pattern, &mut names);
+            names
+        }
+    }
+}
+
+/// The names a binding pattern declares.
+pub fn pattern_names(p: &Pattern, out: &mut Vec<(String, Span)>) {
+    match p {
+        Pattern::Ident(n, s) => out.push((n.clone(), *s)),
+        Pattern::Record(entries, _) => entries.iter().for_each(|(_, sub, _)| pattern_names(sub, out)),
+        Pattern::Array(items, _) => items.iter().for_each(|sub| pattern_names(sub, out)),
+    }
 }
 
 #[derive(Debug, Clone)]

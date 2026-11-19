@@ -5,7 +5,8 @@
 //! JavaScript's by-reference semantics without a separate escape analysis.
 
 use crate::syntax::ast::*;
-use crate::syntax::{parse, Diagnostic, Span};
+use crate::modules;
+use crate::syntax::{parse, parse_range, Diagnostic, Span};
 use crate::ui::catalog;
 use crate::vm::builtins::GLOBALS;
 use crate::vm::program::*;
@@ -23,12 +24,36 @@ const MAX_ERRORS: usize = 20;
 /// Compiles a source file (plus the prelude) to a program.
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
-    let user = parse(src).map_err(|e| vec![e])?;
-    let mut errors = crate::typeck::check(&user);
+    // An app may be a bundle of files (see `modules`); each is parsed on its own.
+    let files = modules::files(src);
+    let mut errors = Vec::new();
+    let mut parsed = Vec::new();
+    for f in &files {
+        match parse_range(src, f.start, f.end) {
+            Ok(p) => parsed.push(p),
+            Err(e) => errors.push(e),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let linked = modules::link(&files, &parsed, &mut errors);
+    let all: Vec<&Item> = linked.order.iter().flat_map(|&i| &parsed[i].items).collect();
+    errors.extend(crate::typeck::check(&all));
     let mut c = Compiler::new();
+    c.file_names = files.into_iter().map(|f| f.name).collect();
+    c.imports = linked.imports;
+    c.exports = linked.exports;
     c.declare(&prelude, Source::Prelude);
-    c.declare(&user, Source::User);
-    let main = vec![c.main(&prelude, Source::Prelude), c.main(&user, Source::User)];
+    for &i in &linked.order {
+        c.file = i as u16;
+        c.declare(&parsed[i], Source::User);
+    }
+    let mut main = vec![c.main(&prelude, Source::Prelude)];
+    for &i in &linked.order {
+        c.file = i as u16;
+        main.push(c.main(&parsed[i], Source::User));
+    }
     if !c.errors.is_empty() || !errors.is_empty() {
         errors.append(&mut c.errors);
         errors.sort_by_key(|d| d.span.start);
@@ -61,7 +86,11 @@ struct Global {
     slot: u32,
     mutable: bool,
     kind: GKind,
+    /// The app file that declares it; `EVERYWHERE` for builtins and the prelude.
+    file: u16,
 }
+
+const EVERYWHERE: u16 = u16::MAX;
 
 struct Local {
     name: Rc<str>,
@@ -117,6 +146,13 @@ struct Compiler {
     num_consts: HashMap<u64, u32>,
     fns: Vec<FnCtx>,
     errors: Vec<Diagnostic>,
+    /// The app file being compiled, and per file its name, imports and exports.
+    file: u16,
+    file_names: Vec<String>,
+    imports: Vec<HashSet<String>>,
+    exports: Vec<HashSet<String>>,
+    /// Names already reported as used without an import, so each is reported once per file.
+    unimported: Vec<(u16, String)>,
 }
 
 impl Compiler {
@@ -133,6 +169,11 @@ impl Compiler {
             num_consts: HashMap::new(),
             fns: Vec::new(),
             errors: Vec::new(),
+            file: EVERYWHERE,
+            file_names: Vec::new(),
+            imports: Vec::new(),
+            exports: Vec::new(),
+            unimported: Vec::new(),
         };
         for (name, _) in GLOBALS {
             c.add_global(name, false, GKind::Builtin);
@@ -151,7 +192,8 @@ impl Compiler {
     fn add_global(&mut self, name: &str, mutable: bool, kind: GKind) -> u32 {
         let slot = self.global_names.len() as u32;
         self.global_names.push(Rc::from(name));
-        self.globals.insert(name.to_string(), Global { slot, mutable, kind });
+        let file = if self.source == Source::User { self.file } else { EVERYWHERE };
+        self.globals.insert(name.to_string(), Global { slot, mutable, kind, file });
         slot
     }
 
@@ -167,8 +209,15 @@ impl Compiler {
             return false;
         }
         if let Some(g) = self.globals.get(name) {
-            let what = if g.kind == GKind::Builtin { "a built-in" } else { "already declared" };
-            self.error(Diagnostic::new(format!("'{name}' is {what}"), span));
+            let d = if g.kind == GKind::Builtin {
+                Diagnostic::new(format!("'{name}' is a built-in"), span)
+            } else if g.file != self.file && g.file != EVERYWHERE {
+                let other = self.file_names[g.file as usize].clone();
+                Diagnostic::new(format!("'{name}' is already declared in {other}"), span).hint("all files of an app share their top-level names; rename one")
+            } else {
+                Diagnostic::new(format!("'{name}' is already declared"), span)
+            };
+            self.error(d);
             return false;
         }
         true
@@ -511,7 +560,28 @@ impl Compiler {
         self.error(d);
     }
 
+    /// A top-level name of another file must be imported, as in TypeScript.
+    fn check_imported(&mut self, name: &str, span: Span) {
+        let Some(owner) = self.globals.get(name).map(|g| g.file) else { return };
+        let here = self.file;
+        if self.source != Source::User || owner == EVERYWHERE || owner == here || self.imports[here as usize].contains(name) {
+            return;
+        }
+        if self.unimported.iter().any(|(f, n)| *f == here && n == name) {
+            return;
+        }
+        self.unimported.push((here, name.to_string()));
+        let (owner_name, here_name) = (&self.file_names[owner as usize], &self.file_names[here as usize]);
+        let import = format!("import {{ {name} }} from \"{}\"", modules::relative(here_name, owner_name));
+        let hint = if self.exports[owner as usize].contains(name) { format!("add {import}") } else { format!("export it from {owner_name}, then add {import}") };
+        let d = Diagnostic::new(format!("'{name}' is declared in {owner_name}"), span).hint(hint);
+        self.error(d);
+    }
+
     fn load_var(&mut self, name: &str, span: Span) {
+        if let Some(Var::Global { .. }) = self.resolve(name) {
+            self.check_imported(name, span);
+        }
         match self.resolve(name) {
             Some(Var::Local { slot, cell: false, .. }) => self.emit(Op::LoadLocal(slot), span),
             Some(Var::Local { slot, cell: true, .. }) => self.emit(Op::LoadCell(slot), span),
@@ -529,6 +599,9 @@ impl Compiler {
             self.unknown_name(name, span);
             return;
         };
+        if let Var::Global { .. } = var {
+            self.check_imported(name, span);
+        }
         let mutable = match var {
             Var::Local { mutable, .. } | Var::Upval { mutable, .. } | Var::Global { mutable, .. } => mutable,
         };
@@ -1129,14 +1202,6 @@ fn duration_ms(e: &Expr) -> Option<f64> {
             Some(n * mul)
         }
         _ => None,
-    }
-}
-
-fn pattern_names(p: &Pattern, out: &mut Vec<(String, Span)>) {
-    match p {
-        Pattern::Ident(n, s) => out.push((n.clone(), *s)),
-        Pattern::Record(entries, _) => entries.iter().for_each(|(_, sub, _)| pattern_names(sub, out)),
-        Pattern::Array(items, _) => items.iter().for_each(|sub| pattern_names(sub, out)),
     }
 }
 
