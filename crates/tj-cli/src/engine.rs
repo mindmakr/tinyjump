@@ -2,6 +2,7 @@
 //! replies, HTTP effects (worker pool), realtime broadcasts, logs and timers.
 
 use crate::mailbox::{Event, Mailbox};
+use crate::stats::Stats;
 use crate::store::FileStore;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ enum Msg {
 #[derive(Clone)]
 pub struct Engine {
     tx: Sender<Msg>,
+    stats: Arc<Stats>,
 }
 
 pub fn now_ms() -> f64 {
@@ -62,7 +64,7 @@ impl Engine {
             })
             .map_err(|e| e.to_string())?;
         ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
-        Ok(Engine { tx })
+        Ok(Engine { tx, stats: Arc::new(Stats::default()) })
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -83,9 +85,14 @@ impl Engine {
     /// starts with the current state of each of `objects` that changed after change number
     /// `since`, so a client that reconnects resumes where it left off instead of refetching.
     pub fn subscribe(&self, objects: Vec<String>, since: u64) -> Arc<Mailbox> {
-        let events = Arc::new(Mailbox::new(objects.clone()));
+        let events = Arc::new(Mailbox::new(objects.clone(), Some(self.stats.clone())));
         let _ = self.tx.send(Msg::Subscribe { events: events.clone(), objects, since });
         events
+    }
+
+    /// The server's work counters.
+    pub fn stats(&self) -> &Stats {
+        &self.stats
     }
 
     /// Re-boots with new source. Objects keep their stored state.
@@ -184,7 +191,7 @@ impl Dispatch {
                 }
                 Output::Emit { object, name, data } => {
                     let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
-                    self.broadcast(Event { object, state: false, text });
+                    self.broadcast(Event::new(object, false, text));
                 }
                 Output::Changed { object, state, seq } => self.broadcast(changed_event(&object, &state, seq)),
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
@@ -210,7 +217,7 @@ impl Dispatch {
 /// resumes from it by itself (`Last-Event-ID`).
 fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
     let text = format!("id: {seq}\nevent: changed\ndata: {}\n\n", json!({ "object": object, "state": state, "seq": seq }));
-    Event { object: object.to_string(), state: true, text }
+    Event::new(object.to_string(), true, text)
 }
 
 /// A small pool of threads that perform effects and post the results back.

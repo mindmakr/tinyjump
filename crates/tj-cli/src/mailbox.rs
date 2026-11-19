@@ -4,9 +4,10 @@
 //! server hold an unbounded backlog. Skipping states in between is safe: a `changed` event
 //! carries the whole state and its change number, and the stream stays in change order.
 
+use crate::stats::Stats;
 use std::collections::VecDeque;
-use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const MAX_EVENTS: usize = 1000;
 
@@ -17,11 +18,20 @@ pub struct Event {
     pub state: bool,
     /// The server-sent-event text.
     pub text: String,
+    /// When it happened, to measure how long it took to reach the client.
+    pub at: Instant,
+}
+
+impl Event {
+    pub fn new(object: String, state: bool, text: String) -> Event {
+        Event { object, state, text, at: Instant::now() }
+    }
 }
 
 pub struct Mailbox {
     /// Only events about these objects are kept; empty means all.
     only: Vec<String>,
+    stats: Option<Arc<Stats>>,
     queue: Mutex<Queue>,
     ready: Condvar,
 }
@@ -33,8 +43,8 @@ struct Queue {
 }
 
 impl Mailbox {
-    pub fn new(only: Vec<String>) -> Mailbox {
-        Mailbox { only, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
+    pub fn new(only: Vec<String>, stats: Option<Arc<Stats>>) -> Mailbox {
+        Mailbox { only, stats, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
     }
 
     /// Adds an event; false once the client has gone, so the sender can forget it.
@@ -47,13 +57,18 @@ impl Mailbox {
             return true;
         }
         if e.state {
+            let before = q.events.len();
             q.events.retain(|old| !(old.state && old.object == e.object));
+            if q.events.len() < before {
+                self.stats.iter().for_each(|s| s.coalesced());
+            }
         }
         q.events.push_back(e);
         if q.events.len() > MAX_EVENTS {
             // States are bounded by the number of objects; drop the oldest other event.
             if let Some(i) = q.events.iter().position(|old| !old.state) {
                 q.events.remove(i);
+                self.stats.iter().for_each(|s| s.dropped());
             }
         }
         self.ready.notify_one();
@@ -66,6 +81,18 @@ impl Mailbox {
         match self.ready.wait_timeout_while(q, timeout, |q| q.events.is_empty() && !q.closed) {
             Ok((mut q, _)) => q.events.drain(..).collect(),
             Err(_) => Vec::new(),
+        }
+    }
+
+    /// The client is connected (true) or has gone (false), for the counters.
+    pub fn connected(&self, yes: bool) {
+        self.stats.iter().for_each(|s| s.client(yes));
+    }
+
+    /// These events were written to the client.
+    pub fn delivered(&self, events: &[Event]) {
+        if let Some(s) = &self.stats {
+            events.iter().for_each(|e| s.event_sent(e.at.elapsed()));
         }
     }
 
@@ -83,16 +110,17 @@ mod tests {
     use super::*;
 
     fn state(object: &str, seq: u64) -> Event {
-        Event { object: object.into(), state: true, text: format!("{object}@{seq}") }
+        Event::new(object.into(), true, format!("{object}@{seq}"))
     }
 
     fn emit(n: usize) -> Event {
-        Event { object: "A/a".into(), state: false, text: format!("emit {n}") }
+        Event::new("A/a".into(), false, format!("emit {n}"))
     }
 
     #[test]
     fn a_slow_client_gets_the_latest_states_in_order_and_a_bounded_backlog() {
-        let m = Mailbox::new(Vec::new());
+        let stats = Arc::new(Stats::default());
+        let m = Mailbox::new(Vec::new(), Some(stats.clone()));
         for e in [state("A/a", 1), state("B/b", 2), state("A/a", 3)] {
             assert!(m.push(e));
         }
@@ -108,13 +136,16 @@ mod tests {
         assert_eq!(got[0].text, "emit 11", "the oldest other events are dropped first");
         assert_eq!(got.last().map(|e| e.text.as_str()), Some("A/a@4"), "states are never dropped");
 
+        let counted = stats.json();
+        assert_eq!((counted["coalesced"].clone(), counted["dropped"].clone()), (serde_json::json!(1), serde_json::json!(11)), "both are counted");
+
         m.close();
         assert!(!m.push(state("A/a", 5)), "a closed mailbox tells the sender to forget it");
     }
 
     #[test]
     fn keeps_only_the_objects_asked_for() {
-        let m = Mailbox::new(vec!["A/a".into()]);
+        let m = Mailbox::new(vec!["A/a".into()], None);
         m.push(state("B/b", 1));
         m.push(state("A/a", 2));
         let texts: Vec<String> = m.take(Duration::ZERO).into_iter().map(|e| e.text).collect();

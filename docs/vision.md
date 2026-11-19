@@ -47,7 +47,7 @@ The vision has gained many planned items, so this order keeps the work focused:
 4. Modules (multi-file apps), since agents need them for real apps (done). Then `tj build`.
 5. **One compact language reference** an agent can load in one go (done: `docs/language.md`,
    served by `tj docs` and the MCP `language` tool; a test keeps it complete).
-6. The rest of automation (golden images, retro reports, server metrics), then
+6. The rest of automation (golden images, retro reports; server metrics done), then
    translations and locale formats, the agent loop, and GPU/3D.
 
 ## One layout engine for every host (done)

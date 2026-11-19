@@ -5,6 +5,7 @@ mod bench;
 mod engine;
 mod http;
 mod mailbox;
+mod stats;
 mod mcp;
 mod review;
 mod store;

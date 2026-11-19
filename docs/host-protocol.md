@@ -201,6 +201,10 @@ Two tools build on this:
 - **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
   touch targets under 44×44, unlabelled controls and text contrast below WCAG AA. It prints
   the metrics, and exits non-zero on errors, so CI can gate on it.
+- On `tj serve`, `inspect` also has `server`: its own counters. They cover HTTP requests
+  (count, errors, average and slowest time) and realtime (connected clients, events sent,
+  average and worst fan-out lag from a change to its event being written, and states
+  coalesced or events dropped for slow clients). `tj review` prints them.
 - **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
   language reference, to load before writing code), `inspect`, `act`, `call`, `get`,
   `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.
