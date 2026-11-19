@@ -1,0 +1,17 @@
+[package]
+name = "tj-wasm"
+description = "tinyjump runtime for the web: a JSON-in, JSON-out C ABI compiled to WebAssembly"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tj-core.workspace = true
+serde_json.workspace = true

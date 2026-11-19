@@ -1,0 +1,96 @@
+// Library code written in tinyjump itself. Compiled into every program.
+// Array methods that take callbacks live here so the VM never re-enters itself.
+
+function __arr_map(a, f) {
+  const out = []
+  for (let i = 0; i < a.length; i++) { out.push(f(a[i], i)) }
+  return out
+}
+
+function __arr_filter(a, f) {
+  const out = []
+  for (let i = 0; i < a.length; i++) { if (f(a[i], i)) { out.push(a[i]) } }
+  return out
+}
+
+function __arr_find(a, f) {
+  for (let i = 0; i < a.length; i++) { if (f(a[i], i)) { return a[i] } }
+  return null
+}
+
+function __arr_findIndex(a, f) {
+  for (let i = 0; i < a.length; i++) { if (f(a[i], i)) { return i } }
+  return -1
+}
+
+function __arr_some(a, f) {
+  for (let i = 0; i < a.length; i++) { if (f(a[i], i)) { return true } }
+  return false
+}
+
+function __arr_every(a, f) {
+  for (let i = 0; i < a.length; i++) { if (!f(a[i], i)) { return false } }
+  return true
+}
+
+function __arr_forEach(a, f) {
+  for (let i = 0; i < a.length; i++) { f(a[i], i) }
+  return null
+}
+
+function __arr_reduce(a, f, init) {
+  let acc = init
+  let start = 0
+  if (init === null) {
+    if (a.length === 0) { throw new Error("reduce of an empty array with no initial value") }
+    acc = a[0]
+    start = 1
+  }
+  for (let i = start; i < a.length; i++) { acc = f(acc, a[i], i) }
+  return acc
+}
+
+function __arr_flatMap(a, f) {
+  const out = []
+  for (let i = 0; i < a.length; i++) {
+    const r = f(a[i], i)
+    if (Array.isArray(r)) { for (const x of r) { out.push(x) } } else { out.push(r) }
+  }
+  return out
+}
+
+// Stable merge sort with a compare function; sorts in place like JavaScript.
+function __arr_sort(a, cmp) {
+  if (cmp === null) { return __sort(a) }
+  let src = a.slice(0)
+  let width = 1
+  while (width < src.length) {
+    const out = []
+    for (let lo = 0; lo < src.length; lo += 2 * width) {
+      const mid = Math.min(lo + width, src.length)
+      const hi = Math.min(lo + 2 * width, src.length)
+      let i = lo
+      let j = mid
+      while (i < mid && j < hi) {
+        if (cmp(src[j], src[i]) < 0) { out.push(src[j]); j++ } else { out.push(src[i]); i++ }
+      }
+      while (i < mid) { out.push(src[i]); i++ }
+      while (j < hi) { out.push(src[j]); j++ }
+    }
+    src = out
+    width = width * 2
+  }
+  for (let k = 0; k < src.length; k++) { a[k] = src[k] }
+  return a
+}
+
+async function fetch(url, init) {
+  const r = await __fetch(url, init)
+  return {
+    status: r.status,
+    ok: r.status >= 200 && r.status < 300,
+    headers: r.headers,
+    text: () => r.body,
+    json: () => JSON.parse(r.body),
+  }
+}

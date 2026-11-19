@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/tj-core", "crates/tj-cli", "crates/tj-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Asif Raja"]
+repository = "https://github.com/mindmakr/tinyjump"
+homepage = "https://mindmakr.github.io/tinyjump/"
+rust-version = "1.80"
+
+[workspace.dependencies]
+tj-core = { path = "crates/tj-core" }
+indexmap = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+lto = "thin"
+
+# Size-first profile for device builds (WASM, iOS, Android).
+[profile.small]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

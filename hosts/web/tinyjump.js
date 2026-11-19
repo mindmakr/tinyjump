@@ -1,0 +1,327 @@
+// tinyjump web host. Runs the runtime (WebAssembly) in the page, draws the view tree
+// with real DOM elements, performs effects, persists objects in localStorage, and
+// exposes the same automation surface as every other host on `window.tinyjump`.
+// Plain ES2017, no build step, so it runs on old browsers.
+
+const ALIGN = { start: 'flex-start', center: 'center', end: 'flex-end', stretch: 'stretch' };
+const JUSTIFY = { start: 'flex-start', center: 'center', end: 'flex-end', between: 'space-between', around: 'space-around' };
+const MAX_TIMEOUT = 2147483647;
+
+const CSS = [
+  '.tj-column,.tj-row,.tj-scroll{display:flex;box-sizing:border-box;min-width:0}',
+  '.tj-column,.tj-scroll{flex-direction:column}',
+  '.tj-row{flex-direction:row;align-items:center}',
+  '.tj-scroll{overflow:auto}',
+  '.tj-spacer{flex:1}',
+  '.tj-text{white-space:pre-wrap}',
+  '.tj-toggle{display:inline-flex;gap:8px;align-items:center}',
+  '.tj-error{position:fixed;left:8px;right:8px;bottom:8px;padding:12px;background:#2b0d0d;color:#ffd7d7;',
+  'font:13px/1.4 ui-monospace,monospace;white-space:pre-wrap;border-radius:8px;z-index:99999;max-height:40vh;overflow:auto}',
+].join('');
+
+function px(v) {
+  return typeof v === 'number' ? v + 'px' : v;
+}
+
+function localStore(prefix) {
+  return {
+    load(key) {
+      try { return localStorage.getItem(prefix + key); } catch (e) { return null; }
+    },
+    save(key, value) {
+      localStorage.setItem(prefix + key, value);
+    },
+    keys(p) {
+      const out = [];
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.indexOf(prefix + p) === 0) out.push(k.slice(prefix.length));
+        }
+      } catch (e) { /* storage blocked: behave as empty */ }
+      return out;
+    },
+  };
+}
+
+/**
+ * Boots an app.
+ * @param {{wasm: string, source: string, root: HTMLElement, store?: object, seed?: number, devOverlay?: boolean}} opts
+ */
+export async function start(opts) {
+  const store = opts.store || localStore('tj:');
+  const enc = new TextEncoder();
+  const dec = new TextDecoder();
+  let ex = null;
+
+  const view = (ptr, len) => new Uint8Array(ex.memory.buffer, ptr, len);
+  const readStr = (ptr, len) => dec.decode(view(ptr, len).slice());
+  const writeStr = (s) => {
+    const b = enc.encode(s);
+    const p = ex.tj_alloc(b.length);
+    view(p, b.length).set(b);
+    return [p, b.length];
+  };
+  // Hands a string to Rust, which takes ownership of the allocation.
+  const giveStr = (s, outPtr) => {
+    const [p, n] = writeStr(s);
+    new DataView(ex.memory.buffer).setUint32(outPtr, p, true);
+    return n;
+  };
+
+  const imports = {
+    env: {
+      tj_host_load(kp, kl, out) {
+        const v = store.load(readStr(kp, kl));
+        return v === null || v === undefined ? -1 : giveStr(v, out);
+      },
+      tj_host_save(kp, kl, vp, vl) {
+        try { store.save(readStr(kp, kl), readStr(vp, vl)); return 0; } catch (e) { return 1; }
+      },
+      tj_host_keys(pp, pl, out) {
+        return giveStr(JSON.stringify(store.keys(readStr(pp, pl))), out);
+      },
+    },
+  };
+  const bytes = await (await fetch(opts.wasm)).arrayBuffer();
+  ex = (await WebAssembly.instantiate(bytes, imports)).instance.exports;
+
+  const result = () => JSON.parse(readStr(ex.tj_out_ptr(), ex.tj_out_len()));
+  const root = opts.root;
+  const nodes = new Map([[0, root]]);
+  const pending = new Map();
+  let nextReply = 1;
+  let wakeTimer = null;
+  let overlay = null;
+
+  if (!document.getElementById('tj-style')) {
+    const style = document.createElement('style');
+    style.id = 'tj-style';
+    style.textContent = CSS;
+    document.head.appendChild(style);
+  }
+
+  function showError(message, trace) {
+    console.error('[tinyjump]', message, (trace || []).join('\n'));
+    if (!opts.devOverlay) return;
+    if (!overlay) {
+      overlay = document.createElement('div');
+      overlay.className = 'tj-error';
+      overlay.title = 'click to dismiss';
+      overlay.onclick = () => { overlay.remove(); overlay = null; };
+      document.body.appendChild(overlay);
+    }
+    overlay.textContent = message + (trace && trace.length ? '\n  ' + trace.join('\n  ') : '');
+  }
+
+  function send(input) {
+    const [p, n] = writeStr(JSON.stringify(input));
+    const code = ex.tj_handle(Date.now(), p, n);
+    ex.tj_free(p, n);
+    const out = result();
+    if (code !== 0) { showError(out.message); return; }
+    apply(out);
+  }
+
+  function request(input) {
+    const id = nextReply++;
+    input.reply = id;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      send(input);
+    });
+  }
+
+  function apply(outputs) {
+    for (const o of outputs) {
+      switch (o.type) {
+        case 'patch': o.ops.forEach(patch); break;
+        case 'effect': runEffect(o.id, o.effect); break;
+        case 'wake': wake(o.at); break;
+        case 'reply': {
+          const p = pending.get(o.reply);
+          if (p) { pending.delete(o.reply); if (o.error) p.reject(new Error(o.error)); else p.resolve(o.ok); }
+          break;
+        }
+        case 'log': (o.level === 'error' ? console.error : o.level === 'warn' ? console.warn : console.log)('[app]', o.message); break;
+        case 'error': showError(o.message, o.trace); break;
+        case 'emit': case 'changed': window.dispatchEvent(new CustomEvent('tinyjump:' + o.type, { detail: o })); break;
+      }
+    }
+  }
+
+  function wake(at) {
+    clearTimeout(wakeTimer);
+    if (at === null || at === undefined) return;
+    wakeTimer = setTimeout(() => send({ type: 'tick' }), Math.min(MAX_TIMEOUT, Math.max(0, at - Date.now())));
+  }
+
+  function runEffect(id, effect) {
+    if (effect.kind !== 'http') {
+      send({ type: 'effectDone', id, error: 'unsupported effect ' + effect.kind });
+      return;
+    }
+    fetch(effect.url, { method: effect.method, headers: effect.headers, body: effect.body })
+      .then((res) => res.text().then((body) => {
+        const headers = {};
+        res.headers.forEach((v, k) => { headers[k] = v; });
+        send({ type: 'effectDone', id, ok: { status: res.status, headers, body } });
+      }))
+      .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e) }));
+  }
+
+  // ---------- native widgets ----------
+
+  function create(kind, props) {
+    let el;
+    switch (kind) {
+      case 'Button': el = document.createElement('button'); el.type = 'button'; break;
+      case 'Input': el = document.createElement(props.multiline ? 'textarea' : 'input'); break;
+      case 'Toggle': {
+        el = document.createElement('label');
+        el.className = 'tj-toggle';
+        el.appendChild(document.createElement('input')).type = 'checkbox';
+        el.appendChild(document.createElement('span'));
+        break;
+      }
+      case 'Image': el = document.createElement('img'); break;
+      default: el = document.createElement('div'); el.className = 'tj-' + kind.toLowerCase();
+    }
+    return el;
+  }
+
+  function setProp(el, kind, k, v) {
+    const s = el.style;
+    const none = v === null || v === undefined;
+    switch (k) {
+      case 'text':
+        if (kind === 'Toggle') el.lastChild.textContent = none ? '' : v;
+        else el.textContent = none ? '' : v;
+        break;
+      case 'value':
+        if (kind === 'Toggle') el.firstChild.checked = !!v;
+        else if (el.value !== (none ? '' : String(v))) el.value = none ? '' : String(v);
+        break;
+      case 'placeholder': el.placeholder = none ? '' : v; break;
+      case 'disabled': el.disabled = !!v; break;
+      case 'secure': if (el.tagName === 'INPUT') el.type = v ? 'password' : 'text'; break;
+      case 'src': el.src = none ? '' : v; break;
+      case 'fit': s.objectFit = none ? '' : v; break;
+      case 'lines':
+        s.display = none ? '' : '-webkit-box';
+        s.webkitLineClamp = none ? '' : String(v);
+        s.webkitBoxOrient = none ? '' : 'vertical';
+        s.overflow = none ? '' : 'hidden';
+        break;
+      case 'id': if (none) delete el.dataset.tjId; else el.dataset.tjId = v; break;
+      case 'label': if (none) el.removeAttribute('aria-label'); else el.setAttribute('aria-label', v); break;
+      case 'padding': s.padding = none ? '' : px(v); break;
+      case 'margin': s.margin = none ? '' : px(v); break;
+      case 'gap': s.gap = none ? '' : px(v); break;
+      case 'align': s.alignItems = none ? '' : (ALIGN[v] || v); break;
+      case 'justify': s.justifyContent = none ? '' : (JUSTIFY[v] || v); break;
+      case 'grow': s.flexGrow = none ? '' : String(v); break;
+      case 'width': s.width = none ? '' : px(v); break;
+      case 'height': s.height = none ? '' : px(v); break;
+      case 'color': s.color = none ? '' : v; break;
+      case 'background': s.background = none ? '' : v; break;
+      case 'radius': s.borderRadius = none ? '' : px(v); break;
+      case 'size': s.fontSize = none ? '' : px(v); break;
+      case 'weight': s.fontWeight = none ? '' : String(v); break;
+      case 'border': s.border = none ? '' : (typeof v === 'number' ? v + 'px solid currentColor' : v); break;
+    }
+  }
+
+  function listen(el, id, kind) {
+    const fire = (event, value) => {
+      if (el.__tj.events.indexOf(event) >= 0) send({ type: 'ui', target: { node: id }, event, value });
+    };
+    if (kind === 'Button') el.addEventListener('click', () => fire('onPress', null));
+    if (kind === 'Input') {
+      el.addEventListener('input', () => fire('onChange', el.value));
+      el.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (el.tagName === 'INPUT' || e.ctrlKey || e.metaKey)) fire('onSubmit', el.value);
+      });
+    }
+    if (kind === 'Toggle') el.firstChild.addEventListener('change', () => fire('onChange', el.firstChild.checked));
+  }
+
+  function patch(op) {
+    switch (op.op) {
+      case 'create': {
+        const el = create(op.kind, op.props);
+        el.__tj = { id: op.id, kind: op.kind, events: op.events };
+        Object.keys(op.props).forEach((k) => setProp(el, op.kind, k, op.props[k]));
+        listen(el, op.id, op.kind);
+        nodes.set(op.id, el);
+        break;
+      }
+      case 'update': {
+        const el = nodes.get(op.id);
+        Object.keys(op.props).forEach((k) => setProp(el, el.__tj.kind, k, op.props[k]));
+        if (op.events) el.__tj.events = op.events;
+        break;
+      }
+      case 'children': {
+        const parent = nodes.get(op.id);
+        op.ids.forEach((cid, i) => {
+          const child = nodes.get(cid);
+          if (parent.childNodes[i] !== child) parent.insertBefore(child, parent.childNodes[i] || null);
+        });
+        while (parent.childNodes.length > op.ids.length) parent.removeChild(parent.lastChild);
+        break;
+      }
+      case 'remove': {
+        const el = nodes.get(op.id);
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+        nodes.delete(op.id);
+        break;
+      }
+    }
+  }
+
+  // ---------- automation ----------
+
+  function withBounds(list) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    return list.map((n) => {
+      const el = nodes.get(n.id);
+      const r = el ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
+      const visible = !!el && r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+      return Object.assign({}, n, {
+        bounds: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+        visible,
+        children: withBounds(n.children),
+      });
+    });
+  }
+
+  const api = {
+    /** Semantic tree with bounds and viewport visibility, plus object states. */
+    inspect: () => request({ type: 'inspect' }).then((s) => Object.assign(s, { tree: withBounds(s.tree), viewport: { w: window.innerWidth, h: window.innerHeight } })),
+    /** Fire a UI event. target: {id} | {text} | {node} */
+    act: (target, event, value) => request({ type: 'ui', target, event, value: value === undefined ? null : value }),
+    call: (object, method, args) => request({ type: 'call', object, method, args: args || [] }),
+    get: (object) => request({ type: 'get', object }),
+    tick: () => send({ type: 'tick' }),
+  };
+
+  // ---------- boot ----------
+
+  const [p, n] = writeStr(opts.source);
+  const code = ex.tj_boot(p, n, Date.now(), opts.seed || Date.now(), 1);
+  ex.tj_free(p, n);
+  const out = result();
+  if (code === 1) {
+    showError(out.map((e) => e.text).join('\n\n'));
+    throw new Error('compile failed');
+  }
+  if (code === 2) {
+    showError('boot failed: ' + out.message, out.trace);
+    throw new Error(out.message);
+  }
+  apply(out);
+  window.tinyjump = api;
+  return api;
+}

@@ -1,0 +1,85 @@
+# Host protocol
+
+A host embeds `tj-core` and does all the I/O. The runtime never touches the network,
+disk, clock or screen itself. That keeps it identical on every platform, and lets
+tests and automation drive it exactly. Types live in `crates/tj-core/src/runtime/protocol.rs`.
+
+```
+host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
+```
+
+## Lifecycle
+
+1. `compile(source)`, then `Runtime::boot(program, store, Options { now, seed, render })`.
+   Boot returns the first outputs, including the initial `patch`.
+2. For every event, call `runtime.handle(now_ms, input)` and carry out the outputs in order.
+3. Every batch ends with `wake { at }`. Send `tick` at that time (or earlier). `null` means
+   no timer is pending.
+
+## Inputs (JSON, tagged by `type`)
+
+| type | fields | reply |
+|---|---|---|
+| `call` | `object: "Class/id"`, `method`, `args: []` | method result |
+| `get` | `object` | state |
+| `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
+| `effectDone` | `id`, and either `ok` or `error` | — |
+| `tick` | — | — |
+| `inspect` | — | `{ tree, objects, wake }` |
+
+Give a request a `reply` number to get a `reply` output back. If a request has no `reply`
+id and it fails, the runtime reports the failure as an `error` output.
+
+## Outputs (tagged by `type`)
+
+| type | meaning |
+|---|---|
+| `patch` | `ops` to apply to the native view tree (below) |
+| `effect` | `{ id, effect: { kind: "http", url, method, headers, body } }`. Perform it, then send `effectDone` with `ok: { status, headers, body }` or `error: "message"` |
+| `emit` | `{ object, name, data }`: realtime event |
+| `changed` | `{ object, state }`: state after a persisted change |
+| `reply` | `{ reply, ok }` or `{ reply, error }` |
+| `log` | `{ level, message }` |
+| `error` | `{ message, trace }`: uncaught error in a handler, timer or render |
+| `wake` | `{ at }` |
+
+## Patches
+
+Node `0` is the host's root container. The ops are:
+
+- `create { id, kind, props, events }`: make a detached widget.
+- `update { id, props, events? }`: apply changed props. A `null` value resets a prop.
+  `events`, if present, replaces the list of handled events.
+- `children { id, ids }`: make `ids` the exact, ordered children of `id`. Nodes not in
+  the list are detached.
+- `remove { id }`: forget the node. The runtime removes descendants first.
+
+A host maps each `kind` in the catalog (`crates/tj-core/src/ui/catalog.rs`) to a native
+widget. When the user acts, send `ui { target: { node: id }, event, value }`, but only
+for events listed on that node. Hosts should only write a widget's `value` when it
+differs from what the widget already shows, so typing is never interrupted.
+
+## Storage
+
+`Store` is synchronous: `load(key)`, `save(key, json)`, `keys(prefix)`. Keys are
+`Class/id` plus `tj:alarms`. The CLI uses one file per key, and the web host uses
+`localStorage`.
+
+## The WASM ABI (`crates/tj-wasm`)
+
+Exports: `tj_alloc(len) -> ptr`, `tj_free(ptr, len)`,
+`tj_boot(src, len, now, seed, render) -> 0|1|2`, `tj_handle(now, input, len) -> 0|1`,
+`tj_out_ptr()`, `tj_out_len()`. Results are UTF-8 JSON in the out buffer. Return codes:
+0 means an outputs array; 1 means compile errors or a bad input; 2 means a boot error.
+
+Imports (module `env`): `tj_host_load(key, len, out_ptr) -> len | -1`,
+`tj_host_save(key, klen, val, vlen) -> 0 | 1`, `tj_host_keys(prefix, len, out_ptr) -> len`.
+For `load` and `keys`, the host allocates the result with `tj_alloc`, writes its pointer
+to `out_ptr` and returns its length. Rust then owns that memory.
+
+## Automation
+
+Every host exposes the same surface: `inspect`, `act(target, event, value)`,
+`call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
+`window.tinyjump` and adds `bounds` and `visible` to each node. The CLI serves it at
+`/_tj/inspect` and `/_tj/input`.

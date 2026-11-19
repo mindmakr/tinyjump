@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>tinyjump demo</title>
+  <style>
+    :root { --bg: #f6f4ef; --fg: #16150f; --muted: #6b675c; --line: #dcd7cb; --card: #fffdf8; --accent: #d9480f; --code-bg: #1d1b16; --code-fg: #ece6d8; }
+    @media (prefers-color-scheme: dark) { :root { --bg: #12110d; --fg: #ece6d8; --muted: #9a9484; --line: #2c2a23; --card: #1a1914; --accent: #ff7a3d; --code-bg: #0b0a08; } }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding: 18px 20px; border-bottom: 1px solid var(--line); font-family: ui-monospace, Menlo, Consolas, monospace; }
+    header a { color: var(--muted); text-decoration: none; margin-left: 16px; font-size: 13px; }
+    .brand span { color: var(--accent); }
+    main { display: grid; grid-template-columns: minmax(320px, 460px) 1fr; gap: 20px; padding: 20px; max-width: 1280px; margin: 0 auto; }
+    .panel { background: var(--card); border: 1px solid var(--line); border-radius: 4px; min-width: 0; }
+    .label { font: 600 11px ui-monospace, Menlo, Consolas, monospace; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); padding: 10px 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+    .label button { font: inherit; text-transform: none; letter-spacing: 0; background: none; border: 1px solid var(--line); color: var(--fg); padding: 3px 8px; cursor: pointer; }
+    #app { color: #16150f; background: #fffdf8; min-height: 300px; }
+    pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 14px; overflow: auto; font: 12.5px/1.55 ui-monospace, Menlo, Consolas, monospace; max-height: 60vh; }
+    .side { display: grid; gap: 20px; min-width: 0; }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand"><a href="../" style="color:inherit;margin:0">tiny<span>jump</span></a> / demo</div>
+    <div><a href="https://github.com/mindmakr/tinyjump/blob/main/examples/todo/app.tj">source</a><a href="https://github.com/mindmakr/tinyjump">github</a></div>
+  </header>
+  <main>
+    <div class="panel">
+      <div class="label">running app · wasm runtime + native DOM</div>
+      <div id="app"></div>
+    </div>
+    <div class="side">
+      <div class="panel">
+        <div class="label">automation · window.tinyjump.inspect() <button id="inspect" type="button">inspect</button></div>
+        <pre id="tree">Press "inspect" to see what an agent sees: every node with its bounds and visibility, plus object state.</pre>
+      </div>
+      <div class="panel">
+        <div class="label">app.tj</div>
+        <pre id="source"></pre>
+      </div>
+    </div>
+  </main>
+  <script type="module">
+    import { start } from './tinyjump.js';
+
+    function outline(nodes, depth, out) {
+      for (const n of nodes) {
+        const text = n.props.text ? ' "' + n.props.text + '"' : '';
+        const id = n.props.id ? ' #' + n.props.id : '';
+        const ev = n.events.length ? '  on ' + n.events.join(',') : '';
+        const b = n.bounds;
+        out.push('  '.repeat(depth) + n.kind + text + id + '  [' + b.x + ',' + b.y + ' ' + b.w + 'x' + b.h + (n.visible ? '' : ' hidden') + ']' + ev);
+        outline(n.children, depth + 1, out);
+      }
+      return out;
+    }
+
+    async function main() {
+      const source = await (await fetch('app.tj')).text();
+      document.getElementById('source').textContent = source;
+      const tj = await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), devOverlay: true });
+      document.getElementById('inspect').addEventListener('click', async () => {
+        const s = await tj.inspect();
+        const objects = s.objects.map((o) => o.object + ' ' + JSON.stringify(o.state)).join('\n');
+        document.getElementById('tree').textContent = outline(s.tree, 0, []).join('\n') + '\n\n' + objects;
+      });
+    }
+    main();
+  </script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+[package]
+name = "tj-cli"
+description = "tinyjump command line: check, serve (backend) and dev (backend + web host)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "tj"
+path = "src/main.rs"
+
+[dependencies]
+tj-core.workspace = true
+serde_json.workspace = true
+tiny_http = "0.12"
+ureq = "2"

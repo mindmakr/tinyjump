@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>tinyjump — a tiny runtime for apps</title>
+  <meta name="description" content="One TypeScript-shaped file. Durable objects, native UI, a backend API and built-in automation, in a runtime small enough for old devices.">
+  <style>
+    :root {
+      --bg: #f6f4ef; --fg: #16150f; --muted: #6b675c; --line: #dcd7cb; --card: #fffdf8;
+      --accent: #d9480f; --code-bg: #1d1b16; --code-fg: #ece6d8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #12110d; --fg: #ece6d8; --muted: #9a9484; --line: #2c2a23; --card: #1a1914; --accent: #ff7a3d; --code-bg: #0b0a08; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.55 ui-serif, Georgia, "Times New Roman", serif; }
+    a { color: inherit; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding: 28px 0; border-bottom: 1px solid var(--line); }
+    .brand { font: 600 18px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: -0.02em; }
+    .brand span { color: var(--accent); }
+    nav a { margin-left: 20px; font: 14px ui-monospace, Menlo, Consolas, monospace; text-decoration: none; color: var(--muted); }
+    nav a:hover { color: var(--fg); }
+    .hero { padding: 72px 0 40px; display: grid; gap: 40px; grid-template-columns: 1.1fr 1fr; align-items: start; }
+    h1 { font-size: clamp(36px, 5.2vw, 60px); line-height: 1.02; letter-spacing: -0.03em; margin: 0 0 20px; font-weight: 600; }
+    h1 em { font-style: italic; color: var(--accent); }
+    .lede { font-size: 19px; color: var(--muted); max-width: 34em; margin: 0 0 28px; }
+    .cta { display: flex; gap: 12px; flex-wrap: wrap; font: 15px ui-monospace, Menlo, Consolas, monospace; }
+    .cta a { padding: 11px 16px; border: 1px solid var(--fg); text-decoration: none; }
+    .cta a.primary { background: var(--fg); color: var(--bg); }
+    pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 20px; overflow: auto; font: 13.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; border-radius: 4px; }
+    .k { color: #ff9e6b; } .s { color: #b8d68a; } .c { color: #8a8475; } .t { color: #8cc7e8; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); margin-top: 32px; }
+    .cell { padding: 28px 24px 32px 0; border-bottom: 1px solid var(--line); }
+    .cell h3 { margin: 0 0 8px; font: 600 14px ui-monospace, Menlo, Consolas, monospace; text-transform: uppercase; letter-spacing: 0.06em; }
+    .cell p { margin: 0; color: var(--muted); font-size: 16px; }
+    section { padding: 56px 0 8px; }
+    h2 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 18px; font-weight: 600; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; }
+    .note { color: var(--muted); font-size: 16px; }
+    footer { margin-top: 72px; padding: 28px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 15px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+    @media (max-width: 820px) { .hero, .two { grid-template-columns: 1fr; } .grid { grid-template-columns: 1fr; } nav a { margin-left: 12px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">tiny<span>jump</span></div>
+      <nav>
+        <a href="demo/">demo</a>
+        <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">language</a>
+        <a href="https://github.com/mindmakr/tinyjump">github</a>
+      </nav>
+    </header>
+
+    <div class="hero">
+      <div>
+        <h1>One small runtime.<br>Your app, <em>everywhere</em>.</h1>
+        <p class="lede">Write one TypeScript-shaped file. Durable objects hold your state, timers and events. The UI is drawn with native widgets, and the same objects are your backend API. Every host can be driven by AI agents.</p>
+        <div class="cta">
+          <a class="primary" href="demo/">Run the demo →</a>
+          <a href="https://github.com/mindmakr/tinyjump#try-it">Install</a>
+        </div>
+      </div>
+<pre><span class="k">object</span> <span class="t">Counter</span> {
+  count: <span class="t">number</span> = 0
+
+  increment(by = 1) { <span class="k">this</span>.count += by }
+
+  <span class="c">// durable timer, survives restarts</span>
+  <span class="k">@every</span>(<span class="s">"1s"</span>) tick() { <span class="k">this</span>.count += 1 }
+}
+
+<span class="k">function</span> <span class="t">App</span>() {
+  <span class="k">const</span> c = Counter.get(<span class="s">"main"</span>)
+  <span class="k">return</span> &lt;<span class="t">Column</span> padding={16}&gt;
+    &lt;<span class="t">Text</span>&gt;Count: {c.count}&lt;/<span class="t">Text</span>&gt;
+    &lt;<span class="t">Button</span> id=<span class="s">"inc"</span> onPress={() =&gt; c.increment()}&gt;
+      Add one
+    &lt;/<span class="t">Button</span>&gt;
+  &lt;/<span class="t">Column</span>&gt;
+}</pre>
+    </div>
+
+    <div class="grid">
+      <div class="cell"><h3>Durable objects</h3><p>State, <code>@every</code> timers, scheduled alarms and realtime events live on objects. They persist and survive restarts.</p></div>
+      <div class="cell"><h3>Native UI</h3><p>The runtime owns the view tree and sends small patches. Hosts draw real widgets: DOM today, then Android and iOS.</p></div>
+      <div class="cell"><h3>Backend included</h3><p>Every public method is an HTTP endpoint. State changes stream as server-sent events. Same code, same objects.</p></div>
+      <div class="cell"><h3>Built for agents</h3><p>A language agents already know, with one way to do each thing and errors that say how to fix them.</p></div>
+      <div class="cell"><h3>Automation built in</h3><p>Every host exposes the semantic tree, bounds, visibility, object state and a controllable clock. Agents can drive and check apps.</p></div>
+      <div class="cell"><h3>Tiny</h3><p>A Rust core with no async runtime. The browser runtime, compiler included, is about half a megabyte. Old devices are in scope.</p></div>
+    </div>
+
+    <section class="two">
+      <div>
+        <h2>Run it locally</h2>
+        <p class="note">You need Rust 1.80+ and the WASM target. Edit the file, and the page reloads with your objects' state kept.</p>
+      </div>
+<pre>git clone https://github.com/mindmakr/tinyjump
+cd tinyjump
+rustup target add wasm32-unknown-unknown
+cargo web
+cargo tj dev examples/todo/app.tj
+<span class="c"># open http://127.0.0.1:4700</span>
+
+curl -X POST localhost:4700/api/Todos/main/add</pre>
+    </section>
+
+    <footer>
+      <span>Created by Asif Raja · <a href="https://github.com/mindmakr">mindmakr</a></span>
+      <span>MIT or Apache-2.0 · early and moving fast</span>
+    </footer>
+  </div>
+</body>
+</html>

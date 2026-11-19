@@ -1,0 +1,5 @@
+[alias]
+# Build the web runtime (WASM) used by `tj dev` and hosts/web.
+web = "build -p tj-wasm --target wasm32-unknown-unknown --profile small"
+# Run the CLI: `cargo tj dev examples/todo/app.tj`
+tj = "run -q -p tj-cli --release --"
