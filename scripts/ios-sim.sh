@@ -64,6 +64,22 @@ expect() { # expect <url> <text>
   return 1
 }
 
+starts_left() { # starts_left <first id> <second id>: the first is left of the second on screen
+  curl -sf "$api/_tj/inspect" | python3 -c '
+import json, sys
+first, second = sys.argv[1:]
+x = {}
+def walk(nodes):
+    for n in nodes:
+        if "id" in n.get("props", {}) and "bounds" in n:
+            x[n["props"]["id"]] = n["bounds"]["x"]
+        walk(n.get("children", []))
+walk(json.load(sys.stdin)["ok"]["tree"])
+if not x[first] < x[second]:
+    sys.exit(f"expected #{first} (x={x[first]}) left of #{second} (x={x[second]})")
+' "$1" "$2"
+}
+
 cargo build --release -p tj-cli
 tj=target/release/tj
 
@@ -76,6 +92,16 @@ expect "$api/_tj/inspect" 'Hello from iOS'
 curl -sf "$api/_tj/inspect" >"$out/todo-inspect.json"
 curl -sf "$api/_tj/screenshot" -o "$out/todo.png"
 "$tj" review --target "$api" # fails on layout errors; prints warnings
+starts_left draft add
+xcrun simctl terminate "$udid" "$bundle"
+
+echo "== todo, right to left: the core mirrors the layout"
+xcrun simctl launch "$udid" "$bundle" -example todo -dir rtl
+wait_up
+expect "$api/_tj/inspect" 'Hello from iOS'
+curl -sf "$api/_tj/screenshot" -o "$out/todo-rtl.png"
+"$tj" review --target "$api"
+starts_left add draft
 xcrun simctl terminate "$udid" "$bundle"
 
 echo "== chat: @server objects against tj serve"
@@ -93,4 +119,14 @@ curl -sf -X POST http://127.0.0.1:4700/api/Room/lobby/post -d '["server","hi pho
 expect "$api/_tj/inspect" 'hi phone'
 curl -sf "$api/_tj/screenshot" -o "$out/chat.png"
 "$tj" review --target "$api"
+starts_left draft send
+xcrun simctl terminate "$udid" "$bundle"
+
+echo "== chat, right to left"
+xcrun simctl launch "$udid" "$bundle" -example chat -server http://127.0.0.1:4700 -dir rtl
+wait_up
+expect "$api/_tj/inspect" 'hi phone'
+curl -sf "$api/_tj/screenshot" -o "$out/chat-rtl.png"
+"$tj" review --target "$api"
+starts_left send draft
 echo "iOS tests passed"

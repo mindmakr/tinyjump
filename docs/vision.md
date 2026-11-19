@@ -63,6 +63,28 @@ languages, with local time, number and currency formats.
   translations and RTL mirroring, and runs a pseudo-locale (long, accented text) to catch
   layout breaks early.
 
+## Modules and app builds (planned)
+
+Today an app is one `.tj` file. `import` is rejected with "imports are not supported yet".
+That was a shortcut to get running, not a design decision. Native hosts ship the source
+inside a real app (APK or `.app`, with native widgets) and compile it to bytecode on the
+device at startup. The web runs the runtime as WASM, and Linux uses one static `tj` binary.
+App code is interpreted bytecode, which iOS allows, and it keeps apps small, deterministic
+and live-reloadable.
+
+In order:
+
+1. **Modules:** TypeScript-style `import { Cart } from "./cart"` and `export`. All files
+   compile into one program. The type checker and `tj check` work across files, and errors
+   name the right file and line.
+2. **Ahead-of-time bytecode:** `tj build` emits bytecode, so devices skip the compiler.
+   Apps are smaller, start faster, and do not ship the source.
+3. **Packaging:** `tj build --android`, `--ios` and `--linux` produce the APK, the `.app`,
+   or a single binary with the app embedded.
+4. **Machine code for app logic:** only if benchmarks show the VM is too slow for a real
+   workload. It costs size, complicates durable state and replay, and slows the reload
+   loop. Heavy computation can go into WASM or Rust plugins instead.
+
 ## Reliable messaging (built in, scoped to objects)
 
 Apps should not have to build their own delivery plumbing. Planned, in this order:
