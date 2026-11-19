@@ -129,6 +129,17 @@ Raised by the owner. To be discussed and critiqued before any work starts:
   (effects in, events out, through the existing protocol) plus catalog components
   (`<Camera>`, `<VideoCall>`). Hosts opt in, the core stays tiny, and permissions are
   declared per app. Calls build on WebRTC rather than a custom media stack.
+- **Messaging, what is left (needs a decision):**
+  - **Access control** needs an identity first: who is calling? Options include a signed
+    token (for example a JWT from any sign-in provider) that the server checks and passes
+    to methods as the caller, or sessions issued by `tj serve` itself. Each object then
+    declares who may read it and call each method. Until this lands, `tj serve` must stay
+    on localhost or behind an authenticating proxy.
+  - **Durable object-to-object messages:** one server runtime already calls between objects
+    atomically (one input, one write), so this only matters with several servers. Proposed:
+    drop it until there is more than one server.
+  - **Topics across objects:** subscribe to every object of a class (`Room/*`), for
+    dashboards and agents. Cheap to add; worth it only if an app needs it.
 - **Docker-like features:** park until the retro. First decide whether this means packaging
   and deploying apps as sealed units, or isolating running apps. The runtime is already
   sandboxed: it has no I/O except through its host.
