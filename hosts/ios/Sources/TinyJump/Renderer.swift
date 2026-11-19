@@ -324,7 +324,13 @@ final class Renderer {
         default: stack.distribution = .fill
         }
         var want = p.children.compactMap { nodes[$0]?.view }
-        if stack.distribution == .fill { want.append(p.filler) }
+        // The filler only takes free space when no child grows; sharing it with a growing
+        // (e.g. multi-line) label would leave the split ambiguous.
+        let grows = p.children.contains { id in
+            guard let c = nodes[id] else { return false }
+            return ((c.props["grow"] as? Double) ?? (c.kind == "Spacer" ? 1 : 0)) > 0
+        }
+        if stack.distribution == .fill && !grows { want.append(p.filler) }
         for v in stack.arrangedSubviews where !want.contains(v) {
             stack.removeArrangedSubview(v)
             v.removeFromSuperview()
