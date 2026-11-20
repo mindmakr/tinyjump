@@ -820,6 +820,44 @@ fn the_shop_assistant_acts_within_the_askers_rights() {
     assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
 }
 
+/// A store whose saves can be made to fail, like a full or broken disk.
+#[derive(Clone, Default)]
+struct Flaky(Shared, Rc<std::cell::Cell<bool>>);
+
+impl Store for Flaky {
+    fn load(&mut self, key: &str) -> Option<String> {
+        self.0.load(key)
+    }
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if self.1.get() {
+            return Err("disk full".into());
+        }
+        self.0.save(key, value)
+    }
+    fn keys(&mut self, prefix: &str) -> Vec<String> {
+        self.0.keys(prefix)
+    }
+}
+
+#[test]
+fn a_failed_save_fails_the_call_and_changes_nothing() {
+    let store = Flaky::default();
+    let program = compile(BOARD).unwrap();
+    let mut rt = Runtime::boot(program, Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let add = |text: &str, reply: u64| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!(text)], reply: Some(reply), call: Some("c-1".into()), caller: Some(Caller::trusted()) };
+    let answer = |out: Vec<Output>| out.into_iter().find_map(|o| if let Output::Reply { ok, status, .. } = o { Some((ok, status)) } else { None }).unwrap();
+
+    store.1.set(true);
+    assert_eq!(answer(rt.handle(1.0, add("one", 1))), (None, Some(503)), "nobody is told it worked");
+    assert_eq!(state(&mut rt, 2.0, "Board/b")["notes"], json!([]), "the change is undone in memory too");
+
+    // The disk recovers: the retry with the same call id runs, rather than returning a result
+    // that was never saved.
+    store.1.set(false);
+    assert_eq!(answer(rt.handle(3.0, add("one", 3))), (Some(json!(1)), None));
+    assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["one"]));
+}
+
 #[test]
 fn every_example_compiles() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
