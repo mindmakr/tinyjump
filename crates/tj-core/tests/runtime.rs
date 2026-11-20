@@ -1143,6 +1143,7 @@ const KEPT: &str = r#"
 @server @read("owner") @retain("1d") object Visit {
   @pii("location", "service") place: string = ""
   @allow("owner") set(p: string) { this.place = p }
+  @allow("owner") async check() { await fetch("https://maps.example.com/") }
 }
 @server @read("owner") @retain("1d", "created") object Signup {
   note: string = ""
@@ -1185,6 +1186,10 @@ fn retention_erases_on_time_and_never_twice() {
     assert_eq!(erased_outputs(&out), [("Signup/user:ana".into(), "retain".into())]);
     let out = rt.handle(1.9 * DAY, Input::Tick);
     assert_eq!(erased_outputs(&out), [("Visit/user:ana".into(), "retain".into())]);
+    // Someone who comes back starts a fresh clock, even when it counts from creation.
+    call_as(&mut rt, 3.5 * DAY, "Signup/user:ana", "set", json!(["back"]), ana()).unwrap();
+    assert!(erased_outputs(&rt.handle(4.0 * DAY, Input::Tick)).is_empty(), "not erased the day after coming back");
+    assert_eq!(erased_outputs(&rt.handle(4.6 * DAY, Input::Tick)), [("Signup/user:ana".into(), "retain".into())]);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Visit/user:ana"]["place"], json!(""));
     // A blank object is not erased again every hour.
     for hour in 1..30 {
@@ -1209,6 +1214,23 @@ fn retention_reads_records_without_loading_them_and_dates_old_ones() {
     assert_eq!((old["state"]["place"].clone(), old["created"].as_f64()), (json!("Abha"), Some(2.0 * DAY)), "dated, not erased");
     let out = rt.handle(3.1 * DAY, Input::Tick);
     assert_eq!(erased_outputs(&out), [("Visit/user:old".into(), "retain".into())]);
+}
+
+#[test]
+fn retention_waits_for_a_call_part_way_through_and_an_erase_typo_spares_shared_objects() {
+    let store = Shared::default();
+    let mut rt = kept(&store, 0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Visit/user:ana", "set", json!(["Riyadh"]), ana()).unwrap();
+    let out = rt.handle(2000.0, Input::Call { object: "Visit/user:ana".into(), method: "check".into(), args: vec![], reply: Some(9), call: None, caller: ana() });
+    let effect = fetches(&out)[0];
+    assert!(erased_outputs(&rt.handle(1.5 * DAY, Input::Tick)).is_empty(), "not while a call is part way through");
+    rt.handle(1.5 * DAY, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
+    assert_eq!(erased_outputs(&rt.handle(1.5 * DAY + 3_600_000.0, Input::Tick)), [("Visit/user:ana".into(), "retain".into())]);
+
+    // `tj privacy erase main` by mistake: Board/main belongs to nobody, so it is untouched.
+    call_as(&mut rt, 2.0 * DAY, "Board/main", "later", json!([]), ana()).unwrap();
+    assert!(rt.erase_subject("main").unwrap().erased.is_empty());
 }
 
 #[test]

@@ -21,7 +21,7 @@ const MAX_CALL_RECORDS: usize = 100;
 pub(crate) const CALL_RECORD_MS: f64 = 72.0 * 3_600_000.0;
 
 pub(crate) struct Instance {
-    handle: Rc<ObjRef>,
+    pub(crate) handle: Rc<ObjRef>,
     /// A device-side replica of an `@server` object: methods run on the server.
     remote: bool,
     pub(crate) state: Rc<RefCell<Record>>,
@@ -30,7 +30,7 @@ pub(crate) struct Instance {
     /// the server's for replicas. Streams resume from it and replicas ignore older states.
     seq: u64,
     /// Results of recent calls made with an id (see `calls.rs`), oldest first.
-    calls: Vec<CallRecord>,
+    pub(crate) calls: Vec<CallRecord>,
     /// The last persisted record, to skip unchanged writes.
     saved: String,
     /// The state part of it: only a new state gets a change number and is broadcast.
@@ -38,6 +38,8 @@ pub(crate) struct Instance {
     /// When it was created and last changed (epoch ms), for `@retain` and `@legalHold`.
     pub(crate) created: f64,
     pub(crate) changed: f64,
+    /// Just erased: saving the blank does not start its clock; the next change does.
+    pub(crate) cleared: bool,
 }
 
 /// A call made with an id: who made it and with what, so a repeat is recognised, and its
@@ -113,7 +115,7 @@ pub(crate) struct Stored {
     #[serde(default)]
     seq: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    calls: Vec<CallRecord>,
+    pub(crate) calls: Vec<CallRecord>,
     /// When the object was created and last changed (epoch ms); 0 in records from before
     /// they were kept, which then count from the first time they are seen.
     #[serde(default)]
@@ -179,7 +181,7 @@ impl Runtime {
             }
         }
         let state_text = Value::Rec(state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
-        self.instances.insert(key.clone(), Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text, created, changed });
+        self.instances.insert(key.clone(), Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text, created, changed, cleared: false });
         if !dated && !remote && self.server {
             // Saved with the times from now on, so retention never counts from zero.
             self.touched.insert(key);
@@ -493,7 +495,18 @@ impl Runtime {
         inst.state = state;
         inst.calls.clear();
         inst.alarms.clear();
+        // No clock until it holds something again, so a person who comes back starts afresh.
+        inst.created = 0.0;
+        inst.changed = 0.0;
+        inst.cleared = true;
         self.touched.insert((o.class, o.id.clone()));
+    }
+
+    /// Whether `o` holds nothing: default state, no alarms, no call records.
+    #[cfg(feature = "server")]
+    pub(crate) fn is_blank(&self, o: &ObjRef, defaults: &Json) -> Result<bool, String> {
+        let inst = self.inst(o);
+        Ok(inst.alarms.is_empty() && inst.calls.is_empty() && &Value::Rec(inst.state.clone().into()).to_json()? == defaults)
     }
 
     /// Persists every object touched by the last input whose record changed. Whether every
@@ -546,7 +559,12 @@ impl Runtime {
                 self.change_seq += 1;
                 seq_changed = true;
                 record.seq = self.change_seq;
-                record.changed = self.now;
+                if !inst.cleared {
+                    record.changed = self.now;
+                    if record.created <= 0.0 {
+                        record.created = self.now;
+                    }
+                }
                 text = serde_json::to_string(&record).expect("JSON values serialize");
             }
             if let Err(e) = self.store.save(&object, &text) {
@@ -562,6 +580,8 @@ impl Runtime {
                 inst.seq = record.seq;
                 inst.state_text = state_text;
                 inst.changed = record.changed;
+                inst.created = record.created;
+                inst.cleared = false;
             }
             // Objects joined the index above; leaving it can wait, as a stale entry only loads
             // an object without alarms at boot.

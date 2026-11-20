@@ -87,10 +87,17 @@ impl Runtime {
 #[cfg(feature = "server")]
 impl Runtime {
     /// Every object held about `subject`: loaded, or in the store.
+    /// Only classes that can belong to a person count: those with `@pii`, or an `"owner"`
+    /// rule. A mistyped id (`lobby` for `user:lobby`) cannot blank a shared `Room/lobby`.
     fn subject_objects(&mut self, subject: &str) -> Result<Vec<(u16, String)>, String> {
         let mut held = Vec::new();
         for class in 0..self.program.objects.len() as u16 {
-            let key = format!("{}/{subject}", self.program.objects[class as usize].name);
+            let def = &self.program.objects[class as usize];
+            let owner = |r: &Option<std::rc::Rc<[std::rc::Rc<str>]>>| r.as_ref().is_some_and(|r| r.iter().any(|w| &**w == "owner"));
+            if def.pii.is_empty() && !owner(&def.read) && !def.methods.values().any(|m| owner(&m.allow)) {
+                continue;
+            }
+            let key = format!("{}/{subject}", def.name);
             if self.is_loaded(&key) || self.store.load(&key)?.is_some() {
                 held.push((class, key));
             }
@@ -133,7 +140,7 @@ impl Runtime {
             self.reset(&o, fresh);
             erased.push(key);
         }
-        self.drop_alarms_of(subject);
+        self.drop_alarms_of(subject, &held);
         if !self.flush() {
             return Err((503, "the erasure could not be saved; nothing was erased; try again".into()));
         }
@@ -155,9 +162,14 @@ impl Runtime {
 
     /// Drops the alarms `subject` scheduled, wherever they are. Objects with alarms are always
     /// loaded (the alarm index brings them in at boot), so memory is the whole picture.
-    fn drop_alarms_of(&mut self, subject: &str) {
+    fn drop_alarms_of(&mut self, subject: &str, held: &[(String, f64)]) {
         let mine = |a: &super::objects::Alarm| matches!(&a.caller, Some(crate::runtime::protocol::Caller::Remote { id, .. }) if id == subject);
-        let keys: Vec<(u16, std::rc::Rc<str>)> = self.instances.iter().filter(|(_, i)| i.alarms.iter().any(mine)).map(|(k, _)| k.clone()).collect();
+        let keys: Vec<(u16, std::rc::Rc<str>)> = self
+            .instances
+            .iter()
+            .filter(|(_, i)| i.alarms.iter().any(mine) && !held.iter().any(|(k, _)| *k == i.handle.key()))
+            .map(|(k, _)| k.clone())
+            .collect();
         for key in keys {
             if let Some(inst) = self.instances.get_mut(&key) {
                 inst.alarms.retain(|a| !mine(a));
@@ -224,18 +236,27 @@ impl Runtime {
         let loaded = self.is_loaded(key);
         let (created, changed, blank) = if loaded {
             let o = self.instance(class, id).map_err(|e| e.message())?;
+            if self.in_use(class, id) {
+                // A call is part way through it: the next round looks again.
+                return Ok(());
+            }
             let inst = self.inst(&o);
-            (inst.created, inst.changed, Value::Rec(inst.state.clone().into()).to_json()? == defaults)
+            if inst.created <= 0.0 || inst.changed <= 0.0 {
+                // Its clock starts when what it now holds is saved, at the end of this turn.
+                return Ok(());
+            }
+            (inst.created, inst.changed, self.is_blank(&o, &defaults)?)
         } else {
             let Some(text) = self.store.load(key)? else { return Ok(()) };
             let mut stored: Stored = serde_json::from_str(&text).map_err(|e| format!("unreadable stored state: {e}"))?;
-            if stored.created <= 0.0 || stored.changed <= 0.0 {
+            let blank = stored.alarms.is_empty() && stored.calls.is_empty() && Json::Object(stored.state.clone()) == defaults;
+            if !blank && (stored.created <= 0.0 || stored.changed <= 0.0) {
                 // A record from before times were kept: its clock starts now.
                 stored.created = self.now;
                 stored.changed = self.now;
                 return self.store.save(key, &serde_json::to_string(&stored).expect("records serialize"));
             }
-            (stored.created, stored.changed, Json::Object(stored.state) == defaults)
+            (stored.created, stored.changed, blank)
         };
         let waiting = self.erasures.get(key).copied();
         let retained = retain.is_some_and(|r| self.now >= (if r.from_created { created } else { changed }) + r.ms);
@@ -258,7 +279,8 @@ impl Runtime {
             self.change_seq += 1;
             let seq = self.change_seq;
             let Json::Object(state) = defaults else { unreachable!("state is a record") };
-            let record = serde_json::json!({ "state": state, "seq": seq, "created": self.now, "changed": self.now });
+            // No clock: it holds nothing until someone writes to it again.
+            let record = serde_json::json!({ "state": state, "seq": seq });
             self.store.save(key, &record.to_string())?;
             self.store.save("tj:seq", &seq.to_string())?;
             self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
