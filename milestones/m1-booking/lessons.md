@@ -29,14 +29,14 @@ do.
 | # | Status | What there is now |
 |---|---|---|
 | 1 | Done | `Time.add`, `startOf`, `parts` and `from`, on the `time` crate (calendar only, 12 KB on devices); `<Time>` is formatted by each platform in the viewer's zone |
-| 2 | Mostly done | `<Input type="number" \| "date" \| "time" \| "datetime">` with the platforms' own pickers, returning typed values. `Number.isInteger` is next |
+| 2 | Done | `<Input type="number" \| "date" \| "time" \| "datetime">` with the platforms' own pickers, returning typed values. `Number.isInteger` was dropped: `Math.trunc(x) === x` says it already |
 | 3 | Done, differently | Parameter types are checked at every call from outside, and `check(ok, field, message)` is one rule for the UI and the server. `@range` was dropped: the TypeScript types and `check` cover it with one way to do each thing |
 | 4 | Done | `tj:ui`: `<Field>` (a visible label, the value and the error) and `<Notice>` |
-| 5 | Next | A screen that shows the time redraws on the clock without an `@every` timer |
+| 5 | Done | A screen that reads `Date.now()` is drawn again at the start of each minute |
 | 6 | Done | `Class.all()`, filtered like any list; devices stream the whole class. There are no indexes yet: a full scan is fine at this size |
 | 7 | Done | `this.schedule` returns a handle; `this.unschedule(handle)` |
 | 8 | Done | `@pii(...) @by("customer", "at")` lists: masked for tools, exported, erased and kept per entry |
-| 9 | Next | `encodeURIComponent` |
+| 9 | Done | `encodeURIComponent` |
 | 10 | Done | A failed fetch shows only the kind of failure, never the address |
 
 ## Found in tinyjump itself, already fixed (`m1-fixes-1`)
