@@ -233,6 +233,9 @@ export async function start(opts) {
       replicas.set(d.object, Math.max(replicas.get(d.object), d.seq));
       send({ type: 'sync', object: d.object, state: d.state, seq: d.seq });
     });
+    // Objects this user may not read (a replica kept from before they signed in as someone
+    // else): stop asking for them.
+    stream.addEventListener('refused', (e) => JSON.parse(e.data).objects.forEach((o) => replicas.delete(o)));
     // Server-side events (emit, read) reach the page like local ones.
     stream.addEventListener('emit', (e) => window.dispatchEvent(new CustomEvent('tinyjump:emit', { detail: JSON.parse(e.data) })));
   }

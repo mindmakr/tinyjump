@@ -76,6 +76,8 @@ object Cart {
   included: from outside, `room.messages.push(x)` fails. Other code calls a method, or
   changes a copy (`room.messages.slice()`, `[...room.messages]`).
 - `this.id` is the instance id. `id`, `emit` and `schedule` are reserved names.
+- `this.schedule(ms, "method", ...args)` calls the named method of this object after `ms`
+  milliseconds (at least 10), with the arguments given. It survives restarts and runs once.
 - Durations: `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"`, or a number of milliseconds (at least 10ms).
 - If a device sleeps through several `@every` beats, the timer fires once and carries on.
   It does not fire a burst of catch-up calls.
@@ -248,7 +250,9 @@ async load(city: string) {
 ```
 
 `fetch(url, { method, headers, body })` returns `{ status, ok, headers, text(), json() }`.
-A network failure throws.
+A network failure throws. On a server, `fetch` reaches public addresses only: a private
+or local one (`127.0.0.1`, `10.x`, `192.168.x`) throws, unless the server runs with
+`TJ_ALLOW_PRIVATE_FETCH=1` (for tests against a local service).
 
 ### One call at a time: `@exclusive`
 
@@ -299,11 +303,12 @@ Built-in components, drawn as real native widgets:
 | `Toggle` | `value` | `onChange(checked)` | text (label) |
 | `Image` | `src`, `fit` | | none |
 
-Every component also accepts `id` (the automation handle), `key` (list identity),
+Every built-in component also accepts `id` (the automation handle), `key` (list identity),
 `label` (accessibility), and the layout and style props `padding`, `margin`, `gap`,
 `align` (`start|center|end|stretch`), `justify` (`start|center|end|between|around`),
 `grow`, `width`, `height`, `color`, `background`, `radius`, `size` (font), `weight`
-and `border`. Numbers are pixels.
+(`"bold"` or `"normal"`) and `border` (a width, or `"2px #ccc"`). Numbers are pixels.
+Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 
 - Give lists a `key`: `{items.map(i => <Row key={i.id}>…</Row>)}`.
 - `{cond && <X/>}` renders nothing when `cond` is false or null. Bare strings and numbers
@@ -326,6 +331,10 @@ and `border`. Numbers are pixels.
   `findIndex`, `some`, `every`, `forEach`, `reduce`, `flatMap`.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
+`Date.now()` may be used anywhere, the UI included; a screen that shows the time is drawn
+again when something changes, so add an `@every` timer to redraw it on a clock. There is
+no date parsing or formatting yet: work in UTC milliseconds. `Number(x)` is `NaN` when `x`
+is not a number (`Number.isNaN` is not available; `n !== n` is true only for `NaN`).
 
 For secrets, use `crypto`, never `Math.random()`:
 
@@ -367,8 +376,14 @@ Keep keys in a server object nobody outside the server can read or call:
 
 - `tj check app.tj` prints errors with the line, a caret and a fix hint.
 - `tj dev app.tj` runs the app with live reload.
-- In the browser, `window.tinyjump.inspect()` returns every node with its bounds and
-  visibility, plus all object state. `tinyjump.act({ id: "inc" }, "onPress")` presses a button.
+- In the browser, `await window.tinyjump.inspect()` gives every node with its bounds and
+  visibility, plus all object state. Each node's `id` is a number; the `id` you gave it is
+  `props.id`. `tinyjump.act({ id: "inc" }, "onPress")` presses a button.
+- Over HTTP, `POST /api/<Class>/<id>/<method>` with a JSON array of the arguments
+  (`["Ana", 2]`, `Content-Type: application/json`) calls a method, and
+  `GET /api/<Class>/<id>` reads an object. Answers are `{ "ok": value }` or
+  `{ "error": "why" }` with a 4xx or 5xx status. Send who is calling as
+  `Authorization: Bearer <key or token>`.
 - `tj mcp` and `tj review` drive the real screen: under `tj dev`, the open browser tab
   answers them (with no tab open, the server does). `tj dev --as ana:staff` signs the
   browser in as `dev:ana` with the role `staff`.

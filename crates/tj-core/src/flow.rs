@@ -470,7 +470,9 @@ impl Checker {
         match old {
             None => new,
             Some(Val::Cell(c)) => {
-                c.borrow_mut().join(&self.flatten(&new));
+                // Read first: `new` may be this same container.
+                let t = self.flatten(&new);
+                c.borrow_mut().join(&t);
                 Val::Cell(c.clone())
             }
             Some(old) => {
@@ -777,7 +779,8 @@ impl Checker {
                     let merged = self.merge(fr.vars.get(n), v);
                     fr.vars.insert(n.clone(), merged);
                 } else if let Some(Val::Cell(c)) = fr.vars.get(n) {
-                    c.borrow_mut().join(&self.flatten(&v));
+                    let t = self.flatten(&v);
+                    c.borrow_mut().join(&t);
                 } else {
                     let merged = self.merge(fr.vars.get(n), Val::Data(self.flatten(&v)));
                     fr.vars.insert(n.clone(), merged);

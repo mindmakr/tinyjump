@@ -68,7 +68,8 @@ impl Mailbox {
         if q.closed {
             return false;
         }
-        if !self.only.is_empty() && !self.only.contains(&e.object) {
+        // Events about no object (`refused`, `reload`) are for every mailbox.
+        if !self.only.is_empty() && !e.object.is_empty() && !self.only.contains(&e.object) {
             return true;
         }
         if e.merge.is_some() {

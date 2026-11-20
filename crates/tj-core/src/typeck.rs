@@ -1177,7 +1177,12 @@ impl<'a> Checker<'a> {
                             self.expr(v, None);
                             if !r.open {
                                 let known: Vec<String> = r.fields.keys().map(|k| k.to_string()).collect();
-                                self.errors.push(Diagnostic::new(format!("<{}> has no prop '{name}'", el.tag), v.span).hint(suggest(name, "props", &known)));
+                                let hint = if name == "key" || name == "id" {
+                                    format!("your own components take only the props they declare: add `{name}: string` to {}'s props and put it on the element it returns, e.g. <Row {name}={{props.{name}}}>", el.tag)
+                                } else {
+                                    suggest(name, "props", &known)
+                                };
+                                self.errors.push(Diagnostic::new(format!("<{}> has no prop '{name}'", el.tag), v.span).hint(hint));
                             }
                         }
                     }

@@ -58,7 +58,7 @@ never share one:
    [{ "name": "warehouse-sync", "roles": ["staff"], "sha256": "9f2c…" }]
    ```
 
-   `tj key new <name> --role staff --keys keys.json` generates a key, prints it once and
+   `tj key <name> --keys keys.json --role staff` generates a key, prints it once and
    adds its hash. Removing the line revokes the key, including on open streams (below).
 3. **Anonymous:** no credentials, `{ id: "", roles: [] }`.
 
@@ -182,7 +182,7 @@ method and a hash of the arguments.
 |---|---|
 | `POST /api/{Class}/{id}/{method}` | method `@allow`; private methods refused; body must be `application/json` (blocks cross-site form posts) |
 | `GET /api/{Class}/{id}` | object `@read` |
-| `GET /api/events?object=…` | `@read` for every listed object, else `403`. A malformed `object=` is `400`. Without any `object=`, a stream of every object needs the admin key |
+| `GET /api/events?object=…` | `@read` for the listed objects: those refused are named in a `refused` event and left out; `403` when every one is refused. A malformed `object=` is `400`. Without any `object=`, a stream of every object needs the admin key |
 | Device server calls (outbox) | the same as the first row; devices send their token |
 | `/_tj/*` | the admin key; trusted, rules bypassed |
 
@@ -245,7 +245,7 @@ can come later, as a plugin.
   - `@server` objects without `@read` (devices cannot hold replicas of them);
   - `@allow("anyone")` methods that take a parameter named like an identity (`author`,
     `by`, `user`).
-- `tj key new` manages API keys (above).
+- `tj key` makes API keys (above).
 - `tj mcp` and `tj review` keep using the admin key.
 
 ## Later

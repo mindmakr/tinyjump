@@ -2111,3 +2111,39 @@ fn needs_consent_is_checked_where_it_must_be() {
 ";
     assert!(msg(own).contains("add import { consented } from \"tj:consent\""), "{}", msg(own));
 }
+
+#[test]
+fn the_privacy_check_follows_callbacks_over_the_same_list_without_crashing() {
+    // Found by the Milestone 1 builder: these crashed the compiler (a container merged into
+    // itself while the check followed an arrow callback).
+    let src = r#"@server @read("owner") object Profile { @pii("contact", "booking") name: string = "" }
+function f(parts: string[], s: string) { const q = [s]; const ok = parts.every(p => p === "") }
+@server object Roster {
+  entries: string[] = []
+  has(id: string): boolean { return this.entries.some(e => e === id) }
+  drop(id: string) { this.entries = this.entries.filter(e => e !== id) }
+}
+@server @read("owner") object Customer {
+  @allow("owner") leave() { const r = Roster.get("main"); if (r.has(this.id)) { r.drop(this.id) } }
+}
+"#;
+    assert_eq!(errors(src), "");
+}
+
+#[test]
+fn number_of_text_that_is_not_a_number_is_nan() {
+    let mut rt = boot("object T {\n  n: string = \"\"\n  f() { const x = Number(\"abc\"); const y = Number(\"42\"); this.n = (x !== x ? \"nan\" : \"num\") + \",\" + String(y) }\n}\n");
+    call(&mut rt, 1.0, "T/t", "f", json!([])).unwrap();
+    assert_eq!(state(&mut rt, 2.0, "T/t")["n"], json!("nan,42"));
+}
+
+#[test]
+fn a_press_is_answered_once_its_handler_starts_waiting() {
+    // Found in Milestone 1: an agent's tap whose handler awaited a server call hung until the
+    // server came back.
+    let src = "@server object Board {\n  notes: string[] = []\n  add(text: string) { this.notes.push(text) }\n}\nfunction App() {\n  return <Button id=\"add\" onPress={async () => { await Board.get(\"b\").add(\"x\") }}>Add</Button>\n}\n";
+    let (mut device, _) = boot_as(src, Shared::default(), 0.0, false);
+    let out = device.handle(1.0, Input::Ui { target: Target::Id { id: "add".into() }, event: "onPress".into(), value: Json::Null, reply: Some(9) });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 9, error: None, .. })), "answered now: {out:?}");
+    assert_eq!(server_calls(&out).len(), 1, "and the call went out");
+}

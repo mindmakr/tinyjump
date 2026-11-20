@@ -385,10 +385,16 @@ impl Runtime {
                         Ok(mut f) => {
                             f.caller = self.local();
                             self.ran_code = true;
-                            // A handler that starts a call without awaiting it (`onPress={() =>
-                            // cart.add(x)}`) has done its part: the press is answered then.
+                            // A press is answered when its handler has started its work, as for a
+                            // person: once it returns a promise it does not await (`onPress={() =>
+                            // cart.add(x)}`) or first waits (for a server that may be offline). What
+                            // happens after is on the screen, and errors are reported as usual.
                             match self.run(&mut f) {
                                 Ok(Run::Done(Value::Promise(_))) => self.settle(f, reply, Ok(Run::Done(Value::Null))),
+                                Ok(Run::Await(p)) => {
+                                    self.settle(f, None, Ok(Run::Await(p)));
+                                    self.reply(reply, Ok(Json::Null));
+                                }
                                 r => self.settle(f, reply, r),
                             }
                         }

@@ -477,6 +477,7 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
         return Err((400, "list the objects to stream: {\"objects\": [\"Class/id\", ...]}".into()));
     }
     let verified = front.identity.verify(authorization)?;
+    // The stream checks again when it opens, and names any it refuses.
     front.engine.may_read(objects.clone(), verified.caller.clone())?;
     let value = hex(&random::<32>().map_err(|e| (500, e))?);
     let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
