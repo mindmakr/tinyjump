@@ -62,6 +62,16 @@ the goal; being in the market early, to gain momentum and contributors, is.
   served by `tj serve` on Linux with sign-in, keeps working offline and syncs when back,
   updates live on every screen, and passes the spec's behaviours, driven by an agent
   through `tj mcp` and `tj review`.
+- **Status (2026-11-21):**
+  - **Round 1 is done.** Two blind reviews scored it 95 and 88. About 250 of the app's 612
+    lines were code tinyjump should provide (`milestones/m1-booking/lessons.md`).
+  - **Libraries built for round 2:**
+    - dates and times;
+    - declared validation;
+    - queries (`Class.all()`) and cancellable alarms;
+    - personal data on shared objects (`@by`).
+  - **Next:** three small built-ins, then round 2: a new blind builder and two blind
+    reviewers.
 
 ### The rest of the agreed order
 
@@ -78,9 +88,15 @@ the goal; being in the market early, to gain momentum and contributors, is.
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
-   - personal data with subject rights (`@pii`, masking, export and erase, and the flow
-     check with `reveal` done; retention and per-person keys next);
-   - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
+   - personal data with subject rights (done):
+     - `@pii`, masking, export and erase;
+     - the flow check with `reveal`;
+     - retention and legal holds;
+     - per-person keys;
+     - lists of several people's entries (`@by`);
+   - region compliance packs (done): files outside the runtime that anyone can write or
+     extend, checked by `tj check --compliance`. No pack is built in; a sample GDPR pack is
+     in `examples/members`.
    - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
      scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,
      shadow boot and rollback, size and AI-cost caps and `tj retro`.
