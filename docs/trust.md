@@ -1,208 +1,234 @@
 # Trust: integrity, audit, privacy, encryption and compliance
 
 How tinyjump keeps data correct, records what happened, protects personal data and helps
-apps meet the rules of their regions. Status: design, under review. It builds on
-[access control](access-control.md).
+apps meet the rules of their regions. It builds on [access control](access-control.md).
+
+Status: an independent security review (2026-11-20) found serious flaws in the first
+draft, and this version corrects them. The agreed build order is at the end.
 
 ## Goals
 
-- **Correct by default.** Concurrent requests never corrupt an object's state.
-- **Accountable.** What every caller did is recorded, in a log that shows tampering.
-- **Private by design.** Personal data is marked in the code. It is encrypted at rest,
-  masked in logs and tools, and can be exported or erased per person.
-- **Observable.** Every method's counts and timings are measured, so performance can be
-  watched and improved.
-- **Compliance as code.** A region's rules come as a pack that checks the app. Third
-  parties can write packs.
-- **Cheap.** None of this may slow requests noticeably or grow device builds much; the
-  benchmark and size budget hold us to it.
+- **Correct.** Saved state is never lost or half-written without anyone knowing, and
+  concurrent requests do not corrupt an object.
+- **Accountable.** What every caller did is recorded, in a log that shows tampering by
+  anyone without the audit key.
+- **Private by design.** Personal data is marked in the code. Where it may flow is checked
+  before the app runs, and it can be exported or erased per person.
+- **Observable.** Every method's counts and timings are measured.
+- **Honest compliance.** Region packs check technical controls, cite their sources, and
+  never claim to make an app "compliant".
+- **Cheap.** This is server code, behind a `server` feature, so device builds do not pay
+  for it.
 
-## 1. Objects are actors: one call at a time
+## 1. Saving: nothing lost, nothing claimed that did not happen
 
-Each server runs every object on one thread, and an input runs to completion or to an
-`await`. Today another call can enter an object while one of its methods waits at an
-`await`, so a read-check-write that spans the `await` can be broken.
+- **The file store syncs to disk.** Each record is written to a temporary file, synced,
+  renamed over the old one, and the folder is synced too. A crash leaves either the old
+  record or the new one.
+- **A failed save is a failed call.** If any object touched by a call cannot be saved, the
+  call answers with an error. A call made once (with a call id) is not recorded, so its
+  retry runs again.
+- **What callers see.** Changes are saved, numbered and streamed at the end of each input,
+  so other callers can see a method's state between its `await`s. The language guide says
+  so: check, then write, in the same step; or mark the method `@exclusive` (section 2).
+  Changes to several objects in one input are saved one file after another. They are not a
+  single atomic step, and the guide says so too.
 
-**From now on, an object handles one call at a time,** as in Orleans and other actor
-runtimes:
+## 2. Objects as actors, where it matters
 
-- While a call is inside an object, including while it waits, calls into that object from
-  other requests, timers and alarms queue in the object's mailbox. They run in order when
-  the current call finishes.
-- Calls made by the running call itself (into the same object, or into other objects that
-  call back) go straight in, so call chains cannot deadlock.
-- A queued call that waits longer than 30 seconds fails with `503`.
-- `inspect` shows each object's queue length.
-- Reads (`get`, replicas, rendering) never wait: they see the last committed state.
+A method without `await` already runs to the end before anything else happens. Nested
+calls are part of the same run, so no other call can interleave. Locking only matters for
+methods that `await`.
 
-Writes are committed (persisted, numbered and streamed) at the end of each input, as
-today. A method that throws keeps the changes it made before throwing, as JavaScript would.
-Apps that need all-or-nothing should validate before changing anything; the language guide
-says so.
+- **`@exclusive`** on a method that awaits means no other exclusive call enters the object
+  until this one finishes. Calls that are not exclusive, reads, replicas and rendering do
+  not wait.
+- **Calls belong to a chain.** The chain is the request, and everything it calls,
+  including through `invoke` and `tj:agent` tools. A chain that already holds an object
+  goes straight in, so an agent calling back into its own object never waits for itself.
+- **Waits are checked for cycles.** If entering would wait on a chain that is itself
+  waiting, directly or indirectly, for this one, the call fails at once with a clear error.
+  It does not hang.
+- **Queues are capped:** 100 waiting calls per object, and 30 seconds per call. A call that
+  times out answers `503`, and its call id is not recorded, so a retry runs normally.
+- **Timers and alarms never expire in a queue.** `@every` ticks that pile up are merged
+  into one.
 
-## 2. Audit log (built in)
+## 3. Runtime statistics
 
-Every remote `call` and `get`, every refusal, and every timer, alarm, plugin call and state
-change appends one audit entry:
+Per method: calls, errors, refusals, wall time (p50, p95, max) and VM steps. Per class:
+objects loaded and queue depth. Effects: HTTP, plugin and outbox calls, with failures and
+latency.
 
-```json
-{ "seq": 812, "at": 1795133217123, "caller": "user:ana", "kind": "call", "object": "Cart/demo",
-  "method": "add", "outcome": "ok", "ms": 0.4, "changed": ["lines", "total"], "prev": "9f2c…", "hash": "41ab…" }
-```
+- Statistics appear in `inspect` under `stats`.
+- `/_tj/metrics` serves them as OpenMetrics text (admin key) for Prometheus or Grafana.
+- `tj stats` shows the slowest and busiest methods.
+- Labels are method and class names only, never object ids, which can identify people.
 
-- **It is a hash chain.** Each entry's `hash` covers the entry and the previous entry's
-  hash. `tj audit verify` checks the chain, so deleting or editing an entry is detectable.
-  The chain head is also written to a separate file, which can be sent to a write-once
-  store.
-- **No values are logged.** Arguments and state values are never logged, only field names,
-  so the log holds no personal data. Personal-data fields (section 4) are named but never
-  shown.
-- **It costs requests nothing.** The core emits `audit` outputs. `tj serve` appends them on
-  a background thread to `<data>/audit/<date>.jsonl`, in batches, and syncs each batch to
-  disk. If the writer falls behind, requests are not slowed. The backlog is capped, and
-  `audit.dropped` counts any losses, which `tj review` reports as an error.
-- **Retention** is `TJ_AUDIT_DAYS` (default 365). Compliance packs can require more.
-- `tj audit` searches the log by caller, object, method, outcome and time.
+## 4. Audit log
 
-## 3. Runtime statistics (built in)
+Every remote `call` and `get` on objects that hold personal data, every refusal, admin
+action, erasure and key use, and every timer, alarm and plugin call appends an entry. It
+records who, what, the outcome, the time taken and which fields changed; never values.
 
-The core already counts VM steps, renders and patches; the server counts requests and
-stream lag. Added:
+- **Keyed, not just hashed.** Each entry carries an HMAC that chains to the previous
+  entry, under an audit key held apart from the data (`TJ_AUDIT_KEY_FILE`). Someone with
+  only the data disk cannot rewrite history unnoticed.
+- **Anchored.** Every 1,000 entries, and every hour, a checkpoint (the chain head and a
+  count) is signed with Ed25519 and can be copied off the machine, for example to a
+  write-once bucket. `tj audit verify` checks the HMACs and the checkpoints.
+- **Defined bytes.** The hash covers a canonical serialisation: sorted keys and no
+  whitespace.
+- **Personal data is pseudonymised.** Caller and object ids are written as keyed tokens,
+  and the mapping is kept apart from the log. Erasing a person destroys their mapping, so
+  their entries become anonymous, and the log never has to be edited.
+- **Never logged:** tokens, URLs (stream tickets live in query strings), arguments, results,
+  error text and forwarded addresses.
+- **Losses cannot hide.** The writer runs on a background thread and syncs each batch. For
+  most entries, a full backlog writes a `dropped N` entry into the chain; it never drops
+  silently. Security events (refusals, admin actions, erasures) wait for the disk
+  instead: they fail closed.
+- **Retention:** `TJ_AUDIT_DAYS` (default 365). Older days are pruned behind a signed
+  carry-over checkpoint. The files are readable by the server's user only.
 
-- **Per method:** calls, errors, refusals, and wall time (p50, p95, max; hosts measure
-  time, the core counts work), plus VM steps.
-- **Per object class:** objects loaded, the deepest queue (section 1) and stored bytes.
-- **Effects:** HTTP, plugin and outbox calls, with counts, failures and latency.
+## 5. Encryption
 
-They appear in `inspect` under `stats`. On a server they are also available as OpenMetrics
-text at `/_tj/metrics` (admin key), for Prometheus or Grafana. `tj stats` prints the
-slowest and busiest methods, and the MCP `review` tool includes them, so agents can find
-what to optimise.
+- **Stored data (servers):** the encryption lives in a store wrapper on the host, so the
+  core stays free of cryptography.
+  - Each record has a random data key and is sealed with AES-256-GCM (`ring`). The data
+    key is wrapped by a key-encryption key, so rotating means re-wrapping, not
+    re-encrypting.
+  - The authenticated data binds the format version, key id, object key and change number,
+    so an old record cannot be swapped back in.
+  - The key-encryption key comes from a file readable only by the server
+    (`TJ_KEY_FILE`), or later from a key manager (AWS KMS, Azure Key Vault, Vault)
+    through a plugin. Environment variables can leak, so they are not used for this key.
+- **File names reveal nothing:** stored keys are keyed hashes of the object key, with the
+  real key inside the encrypted record.
+- **Personal data is sealed per person** (section 6) with a random key per subject, held
+  in a key table. Erasing someone destroys their key, which makes their data unreadable,
+  backups included, as long as backups of the key table are pruned on the same schedule.
+  This is called crypto-shredding.
+- **In transit:**
+  - Put `tj serve` behind a TLS-terminating proxy.
+  - On a non-loopback address, `tj serve` refuses credentials sent over plain HTTP,
+    unless `TJ_TLS_TERMINATED=1` says a proxy terminates TLS. That setting is declared, not
+    verified, and packs say so.
+  - `fetch` warns on `http://` URLs, and packs can forbid them.
+- **For apps:** `crypto.hmac(key, text)`, `crypto.timingSafeEqual(a, b)` and
+  `crypto.randomId()` from the host's secure random source. There is no plain hash,
+  because a hash of an email is easy to reverse.
+- **Later:** device-side store encryption (the Android Keystore needs API 23 and minSdk
+  is 21; WebCrypto is asynchronous while stores are synchronous), built-in TLS, and
+  compression.
 
-## 4. Personal data (built in)
+## 6. Personal data
 
 ```ts
 @server @read("owner") object Account {
-  @pii("email") email: string = ""
-  @pii("health") notes: string = ""
-  @subject owner: string = ""
+  @pii("contact", "account") email: string = ""
+  @pii("health", "care") notes: string = ""
   plan: string = "free"
 }
 ```
 
-- **`@pii(category)` marks a field as personal data.** The categories are `contact`,
-  `email`, `phone`, `address`, `id-number`, `financial`, `health`, `biometric`,
-  `location`, `child` and `other`. Packs (section 6) use the categories to name what is
-  sensitive in their region.
-- **`@subject` names the field that holds the person's id.** The `owner` rule's object id
-  counts as one too. This is how tinyjump finds a person's data.
-- Personal-data fields are:
-  - **encrypted at rest** separately from the rest of the record (section 5), so a copied
-    data file does not reveal them;
-  - **masked** (`"•••"`) in `inspect`, `tj review`, MCP tools, audit entries, logs and
-    error messages.
+- **`@pii(category, purpose)` marks a field.**
+  - The categories follow GDPR articles 9 and 10 and the Saudi PDPL: `contact`,
+    `identifier`, `online-id`, `location`, `financial`, `health`, `genetic`, `biometric`,
+    `religion`, `politics`, `union`, `sexual`, `criminal` and `other`.
+  - Every field states its purpose. A field read for a purpose it does not list is
+    reported.
+- **One subject per object.** A personal-data object belongs to one person, its owner:
+  the object id is the person's id. Shared objects, such as a chat room, keep personal data
+  in per-person objects and refer to them. Element-level subjects are later work.
+- **Flow is checked before the app runs.** `tj check` traces each personal-data field
+  through the code and reports every path into:
+  - a field that is not personal data;
+  - `emit`;
+  - `throw` messages;
+  - `fetch`;
+  - plugin calls (including `tj:agent` prompts and tool results);
+  - return values of methods others may call.
 
-  The app's own code and permitted readers see them as usual.
-- **Subject rights:** `tj privacy export <subject>` writes every object and field held
-  about one person as JSON, which serves GDPR article 15 and PDPL access requests.
-  `tj privacy erase <subject>` deletes objects whose subject or owner is that person and
-  blanks their personal-data fields elsewhere; the erasure itself is audited. The same
-  operations are available to apps with the `privacy` role, through `tj:privacy`.
-- **Retention:** `@retain("30d")` on an object, or on a personal-data field, removes or
-  blanks it after that long without a change, through a durable alarm.
-- `tj check --privacy` prints a data map: every personal-data field, its category, who may
-  read it, its retention, and which plugins and hosts it may flow to.
+  Each path must be accepted explicitly: `reveal(value, "why")` in code, or a plugin that
+  declares the categories it accepts. Masking in tools covers state fields. The check
+  covers code paths. Both are stated in the guide as what they are.
+- **Masked everywhere tools look:** `inspect`, `tj review`, MCP tools, logs, error
+  messages, call records, alarm arguments and the device outbox show `•••`. Change streams
+  carry personal-data fields only to readers with the `owner` rule.
+- **Subject rights:**
+  - `tj privacy export <person>` writes everything held about one person.
+  - `tj privacy erase <person>` destroys their key, deletes their objects, and clears them
+    from loaded instances, call records, alarms and outboxes. It also sends a tombstone, so
+    devices drop their copies when they next connect.
+  - `@legalHold("6y")` keeps records the law requires (for example invoices), sealed.
+  - Export and erase are audited. In app code they need the `privacy` role and leave a
+    second audit entry.
+- **Retention:** `@retain("30d", from: "created" | "changed")` deletes or blanks data on a
+  schedule. One periodic sweep runs per class, not one alarm per record.
+- **Data map:** `tj check --privacy` lists every personal-data field with its category,
+  purpose, readers, retention and every accepted flow. It also writes a record of
+  processing (GDPR article 30) from the same facts.
 
-The store gains `delete(key)`, which every host implements, so erasure really deletes.
+## 7. Compliance packs
 
-## 5. Encryption and compression (built in)
+A pack is **data only**: no code, pinned by hash, and marked **official** (published by
+mindmakr after review by named legal counsel) or **community**. A pack can only add
+controls; it cannot weaken another pack's.
 
-- **Data at rest (servers):** `TJ_DATA_KEY` (32 bytes, base64) turns on AES-256-GCM for
-  every stored record, with a fresh nonce per write and the object key as associated data.
-  This uses `ring`, which tj already contains.
-  - Personal-data fields are also sealed with a second key, derived per subject. Erasing a
-    subject destroys that key, so even backups of their data become unreadable
-    ("crypto-shredding").
-  - Keys can rotate: records carry a key id, and `tj data rekey` re-encrypts them.
-  - A key manager (AWS KMS, Azure Key Vault, HashiCorp Vault) can supply the key through a
-    plugin later.
-- **Devices:** the Android Keystore and the iOS Keychain hold a device key that encrypts
-  the local store, so cached replicas and outboxes are encrypted on the phone. The web uses
-  WebCrypto with a non-extractable key in IndexedDB.
-- **In transit:** `tj serve --tls cert.pem key.pem` serves HTTPS itself, using `rustls`,
-  already present; a proxy is no longer needed. `TJ_HSTS=1` adds the HSTS header. Plain
-  HTTP stays for `tj dev`.
-- **For apps:** a `crypto` built-in offers `crypto.hash(text)` (SHA-256),
-  `crypto.randomId()` and `crypto.hmac(key, text)`. Keys for app-level encryption never sit
-  in app code; they come through a plugin.
-- **Compression:** HTTP responses and server-sent event streams are compressed with gzip
-  when the client asks (`Accept-Encoding`), above 1 KB. Stored records over 4 KB are
-  compressed before encryption.
-
-## 6. Compliance packs (a framework third parties extend)
-
-A pack is a plugin-style module, `tj:compliance/<name>`. It declares a region's technical
-controls as data, and `tj` checks the app and the server's configuration against them:
-
-```ts
-// plugins/compliance/pdpl-ksa/pack.tj
-export const PACK = {
-  name: "pdpl-ksa", title: "Saudi Arabia PDPL", version: "2026.1",
-  sensitive: ["health", "biometric", "id-number", "financial", "child"],
-  requires: {
-    encryptionAtRest: true,                // TJ_DATA_KEY set
-    tls: true,
-    auditDays: 365 * 2,                     // two years
-    retentionOnSensitive: true,             // every sensitive field has @retain
-    subjectExport: true, subjectErase: true,
-    residency: ["SA"],                      // TJ_REGION must be one of these
-    consentFor: ["health", "biometric"],    // a consent record before processing
-  },
-  breachNotice: { hours: 72, to: "SDAIA" },
+```json
+{
+  "name": "pdpl-ksa", "status": "draft", "reviewedBy": null, "effective": "2023-09-14",
+  "sensitive": ["health", "genetic", "biometric", "religion", "criminal", "financial", "location"],
+  "requires": [
+    { "control": "encryption-at-rest", "source": "PDPL Implementing Regulation, art. 23" },
+    { "control": "subject-export", "source": "PDPL art. 4" }
+  ],
+  "transfers": { "allowed": [], "source": "Transfer Regulation (2023)" }
 }
 ```
 
-- `tj check --compliance pdpl-ksa,gdpr-eu app.tj` reports each control as **met**, **not
-  met** (with how to fix it) or **needs a person** (organisational duties no tool can check,
-  such as appointing a data protection officer).
-- `tj serve` refuses to start if a required control is not met, so a misconfiguration
-  cannot reach production.
-- **Consent:** `tj:consent` records each person's consent per purpose (versioned,
-  timestamped, audited). A method can require it with `@needs("consent:health")`; without
-  it the call is refused.
-- **Residency:** `TJ_REGION` states where the server runs. Packs can forbid plugins or
-  `fetch` hosts outside allowed regions, which `tj check` and the runtime enforce.
-- **Breach notice:** the pack names the deadline and authority. `tj audit breach-report`
-  drafts the technical part (affected subjects and fields, from the audit log).
-- **Starter packs**, each with sources cited:
-  - `gdpr-eu`;
-  - `uk-gdpr`;
-  - `pdpl-ksa` (Saudi Arabia, SDAIA);
-  - `pdpl-uae` (UAE federal);
-  - `dpl-qatar`;
-  - `pdpl-bahrain`;
-  - `ccpa-cpra-us` (California);
-  - `hipaa-us` (technical safeguards only).
-- **Third parties** publish packs the same way, as modules in the registry. A pack is data
-  plus optional check functions, so adding a region needs no change to tinyjump.
-- **Not legal advice:** packs implement technical controls. Every pack says what it does not
-  cover, and organisations need their own legal review.
+- **Every control cites its source**, with an article number and effective date. A
+  control without a source is not allowed into a pack.
+- **`tj check --compliance pdpl-ksa`** reports each control as met, not met (with how to
+  fix it), or "needs a person": duties such as appointing a DPO, assessments (DPIA)
+  and contracts. The report opens by saying it is not legal advice and lists what the pack
+  does not cover.
+- **`tj serve --compliance <pack>`** refuses to start when a control the server can check
+  is not met.
+- **Transfers:** packs list the allowed destinations for personal data, with the legal
+  basis for each. `tj check` compares them with every `fetch` host, plugin and model
+  provider the data can reach.
+- **Lawful basis:** each purpose names its basis: consent, contract, legal obligation,
+  vital interest, public task or legitimate interest. Consent comes from `tj:consent`:
+  - each consent is recorded with the text the person saw, its version and the time;
+  - consent can be withdrawn;
+  - `@needs("consent:marketing")` refuses a call without it.
+- **First packs:** `gdpr-eu` and `pdpl-ksa`, both marked draft until counsel reviews them.
+  Other regions (UAE, Qatar, Bahrain, UK, California, HIPAA) come as community drafts, and
+  are mostly "needs a person" because those regimes are largely organisational.
 
-## Rollout
+## Build order (agreed)
 
-1. **Objects as actors:** one call at a time, with tests for interleaving, deadlock-free
-   chains and queue timeouts.
-2. **Audit log and statistics:**
-   - audit outputs, the background writer, the hash chain, `tj audit` and `verify`;
-   - per-method stats, `/_tj/metrics` and `tj stats`.
-3. **Encryption and compression:**
-   - store encryption on servers, rotation, and `--tls`;
-   - gzip and the `crypto` built-in;
-   - device store encryption.
-4. **Personal data:**
-   - `@pii`, `@subject` and `@retain`, with masking;
+1. **Saving:** sync to disk, and failed saves fail the call.
+2. **Statistics.**
+3. **`@exclusive`,** with chains through `invoke`, cycle detection, capped queues and
+   merged ticks.
+4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`.
+5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
+   hashed file names, and `crypto.*`.
+6. **Personal data:**
+   - `@pii` for single-subject objects;
+   - masking;
+   - the flow check;
    - `delete` on every store;
-   - `tj privacy export` / `erase`, with crypto-shredding;
+   - export and erase with crypto-shredding;
+   - retention sweeps;
    - the data map.
-5. **Compliance:** the pack format, `tj check --compliance`, refusing to start when a
-   control is not met, `tj:consent` and `@needs`, residency, and the starter packs.
+7. **Compliance:**
+   - the data-only pack format;
+   - `gdpr-eu` and `pdpl-ksa` as drafts;
+   - `tj check --compliance`;
+   - transfers;
+   - lawful basis;
+   - `tj:consent`.
