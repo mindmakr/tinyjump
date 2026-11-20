@@ -163,10 +163,11 @@ enum Var {
     Global { slot: u32, mutable: bool },
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum FnKind {
+#[derive(Clone, Copy)]
+enum FnKind<'a> {
     Plain,
-    Method,
+    /// A method, with the consents it needs (`@needs`).
+    Method(&'a [String]),
 }
 
 struct Compiler {
@@ -362,6 +363,30 @@ impl Compiler {
         Some(words.into())
     }
 
+    /// `@needs("consent:<purpose>", ...)`: the purposes, for a method of a server object that
+    /// belongs to a person, in an app that imports tj:consent.
+    fn needs(&mut self, d: &Decorator, o: &ObjectDecl) -> Vec<String> {
+        let mut purposes = Vec::new();
+        for a in &d.args {
+            match &a.kind {
+                ExprKind::Str(s) if s.strip_prefix("consent:").is_some_and(|p| !p.is_empty()) => purposes.push(s["consent:".len()..].to_string()),
+                _ => self.error(Diagnostic::new("@needs takes \"consent:<purpose>\"", a.span).hint("e.g. @needs(\"consent:marketing\")")),
+            }
+        }
+        if d.args.is_empty() {
+            self.error(Diagnostic::new("@needs takes \"consent:<purpose>\"", d.span).hint("e.g. @needs(\"consent:marketing\")"));
+        }
+        let words = |name: &str, ds: &[Decorator]| ds.iter().filter(|d| d.name == name).flat_map(|d| &d.args).any(|a| matches!(&a.kind, ExprKind::Str(w) if w == "owner"));
+        let server = o.decorators.iter().any(|d| d.name == "server");
+        let personal = words("read", &o.decorators) || o.fields.iter().any(|f| f.decorators.iter().any(|d| d.name == "pii")) || o.methods.iter().any(|m| words("allow", &m.decorators));
+        if !server || !personal {
+            self.error(Diagnostic::new(format!("@needs is for methods of a @server object that belongs to a person, and {} is not one", o.name), d.span).hint("consent is a person's: put the method on their object, e.g. @server @read(\"owner\") object Member, so its id is theirs"));
+        } else if !self.objects.iter().any(|c| &*c.name == "Consent") {
+            self.error(Diagnostic::new("@needs(\"consent:...\") checks the consents kept by tj:consent", d.span).hint("add import { consented } from \"tj:consent\", and let people give consent with Consent.get(caller.id).give(purpose, text, version)"));
+        }
+        purposes
+    }
+
     fn object(&mut self, o: &ObjectDecl, class: usize) {
         let mut server = false;
         let mut read = None;
@@ -435,8 +460,10 @@ impl Compiler {
             let mut every = None;
             let mut allow = None;
             let mut exclusive = false;
+            let mut needs: Vec<String> = Vec::new();
             for d in &m.decorators {
                 match d.name.as_str() {
+                    "needs" if needs.is_empty() => needs = self.needs(d, o),
                     "every" => match d.args.first().and_then(duration_ms) {
                         Some(ms) if d.args.len() == 1 && ms >= 10.0 => every = Some(ms),
                         _ => self.error(Diagnostic::new("@every needs one duration of at least 10ms", d.span).hint("e.g. @every(\"5s\"), @every(\"500ms\"), @every(\"1h\")")),
@@ -450,10 +477,10 @@ impl Compiler {
                     }
                     "exclusive" if !exclusive && d.args.is_empty() => exclusive = true,
                     "exclusive" if !exclusive => self.error(Diagnostic::new("@exclusive takes no arguments", d.span).hint("write @exclusive on its own")),
-                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely) and @exclusive (one exclusive call at a time per object)")),
+                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object) and @needs(\"consent:<purpose>\")")),
                 }
             }
-            let proto = self.function(&m.func, FnKind::Method);
+            let proto = self.function(&m.func, FnKind::Method(&needs));
             methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive });
         }
         let def = &mut self.objects[class];
@@ -528,8 +555,14 @@ impl Compiler {
 
     fn function(&mut self, f: &FnDecl, kind: FnKind) -> u32 {
         self.begin_fn(&f.name, nested_names(f), false);
-        if kind == FnKind::Method {
-            self.declare_local("this", false, f.span);
+        if let FnKind::Method(needs) = kind {
+            let (this, _) = self.declare_local("this", false, f.span);
+            // Checked before anything else runs, on every path into the method.
+            for purpose in needs {
+                let k = self.str_const(purpose);
+                self.emit(Op::LoadLocal(this), f.span);
+                self.emit(Op::NeedsConsent(k), f.span);
+            }
         }
         let first = self.cur().next_slot;
         for p in &f.params {

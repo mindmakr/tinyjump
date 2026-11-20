@@ -14,6 +14,7 @@
     { "check": "encryption-at-rest", "source": "GDPR art. 32(1)(a)" },
     { "check": "encryption-in-transit", "source": "GDPR art. 32(1)(a)" },
     { "check": "transfers", "source": "GDPR arts. 28 and 44-49" },
+    { "check": "consent", "source": "GDPR arts. 6(1)(a) and 7" },
     { "person": "Tell people what you hold, why, on what basis and for how long, when you collect it (a privacy notice)", "source": "GDPR arts. 13-14" },
     { "person": "Have a contract with every processor: hosting, email, AI and other providers", "source": "GDPR art. 28" },
     { "person": "Notify the supervisory authority of a personal data breach within 72 hours where required, tell the people affected when the risk to them is high, and keep a log of breaches", "source": "GDPR arts. 33-34" },

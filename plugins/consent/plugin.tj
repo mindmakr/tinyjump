@@ -1,0 +1,35 @@
+// tj:consent: consent for purposes whose lawful basis is consent (docs/compliance.md).
+// A person's consents live in Consent/<their id>: it belongs to them, so `tj privacy
+// export` and `erase` cover it, and every give and withdraw is an audited call. A method
+// marked @needs("consent:<purpose>") refuses to run (403) unless the person it belongs to
+// has consented to that purpose and not withdrawn it.
+
+/// One consent: the text the person was shown, its version, when it was given, and when it
+/// was withdrawn (0 while it stands).
+export type Given = { text: string, version: string, at: number, withdrawn: number }
+
+export @server @read("owner") object Consent {
+  given: Record<string, Given> = {}
+
+  /// Records consent to `purpose`, with the exact text shown and its version.
+  @allow("owner") give(purpose: string, text: string, version: string) {
+    if (purpose === "" || text === "" || version === "") {
+      throw new Error("give the purpose, the exact text the person was shown, and its version")
+    }
+    this.given[purpose] = { text, version, at: Date.now(), withdrawn: 0 }
+  }
+
+  /// Withdraws consent to `purpose`; methods that need it refuse from now on.
+  @allow("owner") withdraw(purpose: string) {
+    const g = this.given[purpose]
+    if (g !== null && g.withdrawn === 0) {
+      this.given[purpose] = { text: g.text, version: g.version, at: g.at, withdrawn: Date.now() }
+    }
+  }
+}
+
+/// Whether the person has consented to `purpose` and not withdrawn it.
+export function consented(person: string, purpose: string): boolean {
+  const g = Consent.get(person).given[purpose]
+  return g !== null && g.withdrawn === 0
+}

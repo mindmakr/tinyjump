@@ -138,7 +138,9 @@ the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `-
 the record of processing. Optionally, `const lawfulBasis = { account: "contract" }` gives each
 purpose its lawful basis (`consent`, `contract`, `legal-obligation`, `vital-interest`,
 `public-task`, `legitimate-interest`), and `tj check --compliance <pack.json>` checks the
-app against a region's rules. Details: [personal data](privacy.md),
+app against a region's rules. For a purpose that rests on consent, `tj:consent` keeps
+people's consents (`Consent.get(caller.id).give(purpose, text, version)`, `withdraw`), and
+`@needs("consent:news")` on a method makes it refuse to run without consent. Details: [personal data](privacy.md),
 [compliance packs](compliance.md).
 
 ## Plugins

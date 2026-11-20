@@ -114,6 +114,25 @@ impl Exc {
         Exc(error_record(&message.into()))
     }
 
+    /// An error that refuses the request, answered with 403 when nothing catches it.
+    pub fn refused(message: impl Into<String>) -> Exc {
+        let e = error_record(&message.into());
+        if let Value::Rec(r) = &e {
+            r.borrow_mut().insert("status".into(), Value::Num(403.0));
+        }
+        Exc(e)
+    }
+
+    /// The status a request fails with when nothing catches this error (see [`Exc::refused`]).
+    pub fn status(&self) -> Option<u16> {
+        let Value::Rec(r) = &self.0 else { return None };
+        let r = r.borrow();
+        match r.get("status") {
+            Some(Value::Num(n)) if (400.0..600.0).contains(n) => Some(*n as u16),
+            _ => None,
+        }
+    }
+
     pub fn message(&self) -> String {
         if let Value::Rec(r) = &self.0 {
             if let Some(Value::Str(m)) = r.borrow().get("message") {

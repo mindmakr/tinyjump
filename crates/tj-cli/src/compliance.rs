@@ -22,6 +22,7 @@ const CHECKS: &[(&str, &str)] = &[
     ("encryption-at-rest", "stored data is encrypted, under a key kept apart from the data; checked when the server starts"),
     ("encryption-in-transit", "the server is reached over TLS, or only from this machine; checked when the server starts"),
     ("transfers", "personal data leaves the server only for destinations the pack lists, each with its basis"),
+    ("consent", "purposes resting on consent are recorded with tj:consent and checked with @needs before the data is used"),
 ];
 
 /// A pack, with the packs it extends merged in.
@@ -211,6 +212,16 @@ impl Pack {
                     "subject-rights" => Verdict::Met("built in: tj privacy export|erase, and tj:privacy in app code".into()),
                     "records" => Verdict::Met("built in: tj check --privacy --record".into()),
                     "transfers" => self.transfers_verdict(src, &facts.transfers),
+                    "consent" => {
+                        let on_consent: Vec<&str> = bases.iter().flatten().filter(|(_, b)| b == "consent").map(|(p, _)| p.as_str()).collect();
+                        if on_consent.is_empty() {
+                            Verdict::Met("no purpose rests on consent".into())
+                        } else if program.object("Consent").is_some() {
+                            Verdict::Met(format!("{}: recorded with tj:consent; the data is revealed only in methods marked @needs", on_consent.join(", ")))
+                        } else {
+                            Verdict::NotMet(format!("purposes resting on consent, which the app does not record: {}. Import {{ consented }} from \"tj:consent\", let people give it with Consent.get(caller.id).give(purpose, text, version), and mark the methods that use the data @needs(\"consent:<purpose>\")", on_consent.join(", ")))
+                        }
+                    }
                     "audit-log" => match server {
                         None => Verdict::AtServe,
                         Some(s) if s.audit_key_apart => Verdict::Met("on, with its key kept apart from the data".into()),
@@ -414,7 +425,7 @@ mod tests {
         assert!(r.contains("NOT MET   retention: kept forever: Patient."), "{r}");
         assert!(r.contains("at serve  encryption-at-rest") && r.contains("person    Appoint a DPO  [art. 37]"), "{r}");
 
-        let src = "const lawfulBasis = { care: \"consent\" }\n@server @read(\"owner\") @retain(\"2y\") object Patient {\n  @pii(\"health\", \"care\") notes: string = \"\"\n}\n";
+        let src = "import { consented } from \"tj:consent\"\nconst lawfulBasis = { care: \"consent\" }\n@server @read(\"owner\") @retain(\"2y\") object Patient {\n  @pii(\"health\", \"care\") notes: string = \"\"\n}\n";
         let program = tj_core::compile(src).unwrap();
         let good = Server { encrypted: true, encryption_key_apart: true, audit_key_apart: true, tls: true };
         let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(&good)));

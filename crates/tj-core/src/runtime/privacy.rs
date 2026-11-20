@@ -12,7 +12,7 @@ use super::access::Who;
 use super::Runtime;
 use serde_json::Value as Json;
 #[cfg(feature = "server")]
-use {super::objects::Stored, super::TimerKind, crate::runtime::protocol::Output, crate::vm::value::Value, serde_json::Map};
+use {super::objects::Stored, super::TimerKind, crate::runtime::protocol::Output, crate::vm::value::{Exc, Value}, serde_json::Map};
 
 #[cfg(feature = "server")]
 const SWEEP_BATCH: usize = 500;
@@ -343,6 +343,26 @@ impl Runtime {
         let waiting = self.waiting.iter().filter(|(p, _)| Some(**p) != awaiting).any(|(_, (f, _))| f.frames.iter().any(|fr| here(&fr.this)));
         let own_chain = awaiting.and_then(|p| self.waiting.get(&p)).map(|(f, _)| f.chain);
         waiting || self.exclusive_busy(class, id, own_chain)
+    }
+
+    /// `@needs("consent:<purpose>")`: whether the person `o` belongs to has consented to
+    /// `purpose` (in `Consent/<their id>`, tj:consent) and not withdrawn it.
+    pub(crate) fn needs_consent(&mut self, o: &crate::vm::value::ObjRef, purpose: &str) -> Result<(), Exc> {
+        let class = self.program.object("Consent").ok_or_else(|| Exc::msg("@needs(\"consent:...\") needs tj:consent"))?;
+        let consent = self.instance(class, &o.id)?;
+        let given = self.obj_field(None, &consent, "given")?;
+        let standing = match &given {
+            Value::Rec(r) => match r.borrow().get(purpose) {
+                Some(Value::Rec(g)) => matches!(g.borrow().get("withdrawn"), Some(Value::Num(n)) if *n == 0.0),
+                _ => false,
+            },
+            _ => false,
+        };
+        if standing {
+            Ok(())
+        } else {
+            Err(Exc::refused(format!("this person has not consented to {purpose}, or withdrew it (tj:consent)")))
+        }
     }
 
     /// Whether a call made by the person `id` is still running (waiting on something), so

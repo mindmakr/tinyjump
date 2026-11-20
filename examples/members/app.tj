@@ -1,16 +1,20 @@
 // A members' club that holds personal data the way the law expects: each purpose names its
 // lawful basis, records are erased after two years, members can download or delete their
-// own data, and the welcome email goes only to the mail provider the club's pack allows.
+// own data, the welcome email goes only to the mail provider the club's pack allows, and
+// the newsletter goes only to members who said yes to it (and stops when they say no).
 // club.pack.json extends the sample GDPR pack with that provider:
 //   tj check examples/members/app.tj --compliance examples/members/club.pack.json
 
 import { erase, exportData } from "tj:privacy"
+import { Consent, consented } from "tj:consent"
 
-const lawfulBasis = { account: "contract" }
+const lawfulBasis = { account: "contract", news: "consent" }
+const NEWS = "Send me the club's monthly newsletter by email. You can stop it at any time."
+
 
 @server @read("owner") @retain("2y") object Member {
   @pii("contact", "account") name: string = ""
-  @pii("contact", "account") email: string = ""
+  @pii("contact", "account", "news") email: string = ""
 
   @allow("owner") setName(name: string) { this.name = name.trim() }
   @allow("owner") setEmail(email: string) { this.email = email.trim() }
@@ -19,6 +23,14 @@ const lawfulBasis = { account: "contract" }
     await fetch("https://api.mailer.example/send", {
       method: "POST",
       body: JSON.stringify({ to: reveal(this.email, "account"), template: "welcome" }),
+    })
+  }
+
+  // Runs only for members who consented to the newsletter, whoever starts it.
+  @needs("consent:news") async newsletter(issue: string) {
+    await fetch("https://api.mailer.example/send", {
+      method: "POST",
+      body: JSON.stringify({ to: reveal(this.email, "news"), template: issue }),
     })
   }
 
@@ -32,6 +44,8 @@ function App() {
     return <Column padding={24}><Text>Sign in to see your membership.</Text></Column>
   }
   const me = Member.get(caller.id)
+  const consent = Consent.get(caller.id)
+  const news = consented(caller.id, "news")
   return <Column padding={24} gap={12}>
     <Text size={24} weight="bold">Members</Text>
     <Input id="name" value={me.name} placeholder="Your name" onSubmit={(t) => me.setName(t)} />
@@ -41,5 +55,6 @@ function App() {
       <Button id="download" onPress={() => me.myData()}>Download my data</Button>
       <Button id="leave" onPress={() => me.leave()}>Delete my account</Button>
     </Row>
+    <Toggle id="news" value={news} onChange={(on) => on ? consent.give("news", NEWS, "v1") : consent.withdraw("news")}>{NEWS}</Toggle>
   </Column>
 }

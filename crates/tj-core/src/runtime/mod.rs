@@ -591,9 +591,10 @@ impl Runtime {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
                 self.count_error(f.stat);
-                match reply {
-                    Some(_) => self.reply(reply, Err(fail.message)),
-                    None => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
+                match (reply, fail.status) {
+                    (Some(_), Some(status)) => self.reply_status(reply, status, fail.message),
+                    (Some(_), None) => self.reply(reply, Err(fail.message)),
+                    (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
             }
         }
