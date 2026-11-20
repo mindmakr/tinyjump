@@ -42,6 +42,11 @@ pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let linked = modules::link(&files, &parsed, &mut errors);
     let all: Vec<&Item> = linked.order.iter().flat_map(|&i| &parsed[i].items).collect();
     errors.extend(crate::typeck::check(&all));
+    #[cfg(feature = "check")]
+    {
+        let named: Vec<(&str, &crate::syntax::ast::Program)> = linked.order.iter().map(|&i| (files[i].name.as_str(), &parsed[i])).collect();
+        errors.extend(crate::flow::check(&named));
+    }
     let mut c = Compiler::new();
     c.file_names = files.into_iter().map(|f| f.name).collect();
     c.imports = linked.imports;
