@@ -131,7 +131,6 @@ fn builtin(name: &str) -> Option<Ty> {
                 ("startOf", func(&[("time", Ty::Num, false), ("unit", unit, false)], None, Ty::Num)),
                 ("parts", func(&[("time", Ty::Num, false)], None, parts)),
                 ("from", func(&[("parts", opt(&["year", "month", "day", "hour", "minute", "second"]), false)], None, Ty::Union(vec![Ty::Num, Ty::Null]))),
-                ("daysBetween", func(&[("from", Ty::Num, false), ("to", Ty::Num, false)], None, Ty::Num)),
             ])
         }
         "reveal" => func(&[("value", Ty::Any, false), ("purpose", Ty::Str, false)], None, Ty::Any),

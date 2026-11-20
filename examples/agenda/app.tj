@@ -1,0 +1,52 @@
+// An agenda: pick a day and a time with the platform's own pickers, and see each entry in
+// your own language and time zone. Shows <Input type="datetime">, <Time> and Time.add.
+
+type Entry = { id: number, what: string, at: number }
+
+object Agenda {
+  entries: Entry[] = []
+  nextId: number = 1
+  what: string = ""
+  at: number | null = null
+
+  setWhat(text: string) { this.what = text }
+  setAt(ms: number | null) { this.at = ms }
+
+  add() {
+    const what = this.what.trim()
+    if (what === "" || this.at === null) { return }
+    this.entries.push({ id: this.nextId, what, at: this.at })
+    this.entries.sort((a, b) => a.at - b.at)
+    this.nextId += 1
+    this.what = ""
+  }
+
+  // The same entry a week later.
+  repeat(id: number) {
+    const e = this.entries.find(x => x.id === id)
+    if (e === null) { return }
+    this.entries.push({ id: this.nextId, what: e.what, at: Time.add(e.at, { weeks: 1 }) })
+    this.entries.sort((a, b) => a.at - b.at)
+    this.nextId += 1
+  }
+
+  remove(id: number) { this.entries = this.entries.filter(x => x.id !== id) }
+}
+
+function App() {
+  const agenda = Agenda.get("main")
+  return <Column padding={16} gap={12}>
+    <Text size={22} weight="bold">Agenda</Text>
+    <Input id="what" value={agenda.what} placeholder="What" onChange={(t) => agenda.setWhat(t)} />
+    <Input id="when" type="datetime" value={agenda.at} label="When" onChange={(ms) => agenda.setAt(ms)} />
+    <Button id="add" onPress={() => agenda.add()} disabled={agenda.what.trim() === "" || agenda.at === null}>Add</Button>
+    {agenda.entries.map(e => <Row key={String(e.id)} gap={8}>
+      <Column grow={1}>
+        <Text weight="bold">{e.what}</Text>
+        <Time id={`at-${e.id}`} value={e.at} />
+      </Column>
+      <Button id={`repeat-${e.id}`} onPress={() => agenda.repeat(e.id)}>+1 week</Button>
+      <Button id={`remove-${e.id}`} onPress={() => agenda.remove(e.id)}>Remove</Button>
+    </Row>)}
+  </Column>
+}

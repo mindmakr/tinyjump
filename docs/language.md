@@ -358,7 +358,6 @@ alike. Compare them with `<` and subtract them. For the calendar, use `Time`:
   count from 1; weekdays run from 1 (Monday) to 7 (Sunday).
 - `Time.from({ year, month, day, hour, minute, second })`: the time in UTC, or `null` when
   the parts are not a real date (February 30, hour 24).
-- `Time.daysBetween(a, b)`: whole calendar days from `a` to `b`.
 
 Do not format or parse dates in code: show a time with `<Time>`, and let people pick one
 with `<Input type="date">` (see UI). `Number(x)` is `NaN` when `x`

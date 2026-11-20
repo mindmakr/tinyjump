@@ -8,18 +8,21 @@ use crate::runtime::Runtime;
 use std::rc::Rc;
 use time::{Date, Duration, Month, OffsetDateTime, Time as Clock};
 
-const MS_PER_DAY: f64 = 86_400_000.0;
 
 fn at(v: &Value, what: &str) -> Result<OffsetDateTime, Exc> {
     let Value::Num(ms) = v else { return Err(Exc::msg(format!("{what} expects a time in milliseconds, got {}", v.type_name()))) };
     if !ms.is_finite() {
         return Err(Exc::msg(format!("{what} expects a time in milliseconds, got {ms}")));
     }
-    OffsetDateTime::from_unix_timestamp_nanos(*ms as i128 * 1_000_000).map_err(|_| Exc::msg(format!("{what}: {ms} is outside the years -9999 to 9999")))
+    // Whole seconds and the milliseconds left over: 64-bit arithmetic only, as 128-bit
+    // division costs WebAssembly builds kilobytes.
+    let ms = ms.floor() as i64;
+    let at = OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000)).map_err(|_| Exc::msg(format!("{what}: {ms} is outside the years -9999 to 9999")))?;
+    Ok(at + Duration::milliseconds(ms.rem_euclid(1000)))
 }
 
 fn ms_of(t: OffsetDateTime) -> Value {
-    Value::Num((t.unix_timestamp_nanos() / 1_000_000) as f64)
+    Value::Num((t.unix_timestamp() * 1000 + t.millisecond() as i64) as f64)
 }
 
 /// A whole number from a record field (0 when absent).
@@ -112,11 +115,3 @@ pub fn from(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     Ok(date.map_or(Value::Null, ms_of))
 }
 
-/// How many whole days from one time to another (negative when `b` is earlier), counting
-/// calendar days in UTC.
-pub fn days_between(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
-    let x = at(a.first().unwrap_or(&Value::Null), "Time.daysBetween")?;
-    let y = at(a.get(1).unwrap_or(&Value::Null), "Time.daysBetween")?;
-    let (dx, dy) = (x.date().midnight().assume_utc(), y.date().midnight().assume_utc());
-    Ok(Value::Num(((dy - dx).whole_milliseconds() as f64 / MS_PER_DAY).round()))
-}
