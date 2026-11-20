@@ -261,7 +261,11 @@ impl Runtime {
             self.reply_status(reply, 400, format!("a call id must be 1-{MAX_CALL_ID} characters"));
             return;
         }
-        let mine = CallRecord::new(&call, &who, method, args);
+        let by = match self.caller_tag(&who) {
+            Ok(by) => by,
+            Err(e) => return self.reply_status(reply, 503, e),
+        };
+        let mine = CallRecord::new(&call, by, method, args, self.now);
         if let Some(done) = self.call_record(&obj, &call) {
             match done.same_call(&mine) {
                 true => self.reply(reply, done.result()),

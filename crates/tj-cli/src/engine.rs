@@ -237,10 +237,11 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     continue;
                 }
                 match rt.erase_subject(&subject) {
-                    Ok((erased, out)) => {
+                    Ok(e) => {
                         d.audit.forget(&subject);
-                        let _ = done.send(Ok(json!({ "erased": erased })));
-                        out
+                        let held: Vec<Json> = e.held.iter().map(|(object, until)| json!({ "object": object, "until": until })).collect();
+                        let _ = done.send(Ok(json!({ "erased": e.erased, "held": held })));
+                        e.outputs
                     }
                     Err(e) => {
                         let _ = done.send(Err(e));
@@ -341,6 +342,7 @@ impl Dispatch {
                     }
                 }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
+                Output::Erased { object, reason } => self.audit.record(Entry::new("erased").object(&object).text("reason", &reason)),
                 Output::Ran { object, method, by, caller, ok, ms } => {
                     let kind = match by.as_str() {
                         "timer" => "timer",

@@ -237,7 +237,7 @@ As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
   - `@legalHold("6y")` keeps records the law requires (for example invoices), sealed.
   - Export and erase are audited. In app code they need the `privacy` role and leave a
     second audit entry.
-- **Retention:** `@retain("30d", from: "created" | "changed")` deletes or blanks data on a
+- **Retention:** `@retain("30d", "created" | "changed")` deletes or blanks data on a
   schedule. One periodic sweep runs per class, not one alarm per record.
 - **Data map:** `tj check --privacy` lists every personal-data field with its category,
   purpose, readers, retention and every accepted flow. It also writes a record of
@@ -254,8 +254,16 @@ As built, in three parts:
    (`feedback/2026-11-20-builder-006`, `critic-reply-006`): the critic's four leaks and
    four wrongly rejected programs are its tests. It runs in the command line only (the
    `check` feature): about 60 KB that devices, which run checked apps, leave out.
-3. **Then:** `@retain` and `@legalHold`, per-person keys (crypto-shredding), app-level
-   export and erase behind the `privacy` role, and the record of processing.
+3. **Part 3, first half built:** `@retain` and `@legalHold`, erase reaching shared objects
+   (alarms dropped; call records keep a keyed hash of the caller for 72 hours), the devices
+   section in `docs/privacy.md`. Design reviewed before code (`builder-010`,
+   `critic-010`, `builder-reply-010`): the sweep reads raw records in batches of 500 rather
+   than keeping a timestamp map (the critic conceded the write cost), and skips blank
+   objects so nothing is erased twice.
+   **Next, second half:** per-`Class/id` keys (crypto-shredding), `tj:privacy` as a host
+   effect for app code (self-erase allowed, flow-tainted export), forgetting audit
+   pseudonyms after the request's own entry and when holds end, and the record of
+   processing.
 
 Corrections made while building:
 

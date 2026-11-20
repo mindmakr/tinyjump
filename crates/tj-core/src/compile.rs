@@ -248,7 +248,7 @@ impl Compiler {
                 }
                 Item::Object(o) => {
                     if self.check_top_name(&o.name, o.span) {
-                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None, pii: Vec::new() });
+                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None, pii: Vec::new(), retain: None, hold: None });
                         self.add_global(&o.name, false, GKind::Object);
                     }
                 }
@@ -337,11 +337,24 @@ impl Compiler {
     fn object(&mut self, o: &ObjectDecl, class: usize) {
         let mut server = false;
         let mut read = None;
+        let (mut retain, mut hold) = (None, None);
         for d in &o.decorators {
             match (d.name.as_str(), d.args.is_empty()) {
                 ("server", true) => server = true,
                 ("read", _) if read.is_none() => read = self.rule(d),
-                _ => self.error(Diagnostic::new(format!("unknown or repeated object decorator @{}", d.name), d.span).hint("supported: @server (the object lives on the server) and @read(...) (who may read it remotely)")),
+                ("retain", _) if retain.is_none() => retain = self.retain(d),
+                ("legalHold", _) if hold.is_none() => {
+                    hold = d.args.first().and_then(duration_ms).filter(|ms| *ms > 0.0 && d.args.len() == 1);
+                    if hold.is_none() {
+                        self.error(Diagnostic::new("@legalHold needs one duration", d.span).hint("e.g. @legalHold(\"6y\"): kept six years after the last change, even when erased"));
+                    }
+                }
+                _ => self.error(Diagnostic::new(format!("unknown or repeated object decorator @{}", d.name), d.span).hint("supported: @server, @read(...), @retain(duration, \"created\" | \"changed\") and @legalHold(duration)")),
+            }
+        }
+        if !server {
+            if let Some(d) = o.decorators.iter().find(|d| d.name == "retain" || d.name == "legalHold") {
+                self.error(Diagnostic::new(format!("@{} is for @server objects", d.name), d.span).hint(format!("add @server to {}: retention runs on the server", o.name)));
             }
         }
         let mut seen: HashSet<&str> = HashSet::new();
@@ -422,6 +435,26 @@ impl Compiler {
         def.server = server;
         def.read = read;
         def.pii = pii;
+        def.retain = retain;
+        def.hold = hold;
+    }
+
+    /// `@retain(duration, "created" | "changed")`; the second defaults to "changed".
+    fn retain(&mut self, d: &Decorator) -> Option<Retain> {
+        let ms = d.args.first().and_then(duration_ms).filter(|ms| *ms > 0.0);
+        let from = match d.args.get(1).map(|a| &a.kind) {
+            None => Some(false),
+            Some(ExprKind::Str(s)) if s == "changed" => Some(false),
+            Some(ExprKind::Str(s)) if s == "created" => Some(true),
+            _ => None,
+        };
+        match (ms, from) {
+            (Some(ms), Some(from_created)) if d.args.len() <= 2 => Some(Retain { ms, from_created }),
+            _ => {
+                self.error(Diagnostic::new("@retain takes a duration, then \"created\" or \"changed\"", d.span).hint("e.g. @retain(\"30d\") or @retain(\"1y\", \"created\"): erased that long after the last change, or after creation"));
+                None
+            }
+        }
     }
 
     /// `@pii(category, purpose, ...)` on `field`.
@@ -1295,6 +1328,7 @@ fn duration_ms(e: &Expr) -> Option<f64> {
                 "m" => 60e3,
                 "h" => 3600e3,
                 "d" => 86400e3,
+                "y" => 365.0 * 86400e3,
                 _ => return None,
             };
             Some(n * mul)

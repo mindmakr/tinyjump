@@ -101,6 +101,9 @@ enum TimerKind {
     Outbox,
     /// Give up on calls that waited too long for an exclusive object.
     Expire,
+    /// The next step of the retention sweep (`privacy.rs`).
+    #[cfg(feature = "server")]
+    Retain,
 }
 
 /// How a method call starts: who it is for, its chain (0: a new one, see `exclusive.rs`),
@@ -214,6 +217,14 @@ pub struct Runtime {
     strong: bool,
     /// Plain-HTTP origins `fetch` has already warned about.
     plain_http: BTreeSet<String>,
+    /// Objects the retention sweep still has to look at in this round.
+    #[cfg(feature = "server")]
+    retain_queue: Vec<String>,
+    /// Erasures waiting for a legal hold to end: object -> when (epoch ms). Saved.
+    #[cfg(feature = "server")]
+    erasures: std::collections::BTreeMap<String, f64>,
+    /// The secret behind `caller_tag`, once read or made.
+    secret: Option<Rc<str>>,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
     stats: stats::Table,
@@ -274,6 +285,11 @@ impl Runtime {
             drbg: crate::crypto::Drbg::new(&[opts.seed.to_le_bytes(), opts.now.to_bits().to_le_bytes()].concat()),
             strong: false,
             plain_http: BTreeSet::new(),
+            #[cfg(feature = "server")]
+            retain_queue: Vec::new(),
+            #[cfg(feature = "server")]
+            erasures: std::collections::BTreeMap::new(),
+            secret: None,
             outputs: Vec::new(),
             metrics: Metrics::default(),
             stats: stats::table(&program),
@@ -284,6 +300,8 @@ impl Runtime {
             rt.run_sync(f)?;
         }
         rt.restore()?;
+        #[cfg(feature = "server")]
+        rt.start_retention().map_err(|message| BootError { message, trace: Vec::new() })?;
         if !rt.server {
             rt.load_outbox();
         }
@@ -675,6 +693,8 @@ impl Runtime {
                 }
                 TimerKind::Outbox => self.dispatch_calls(),
                 TimerKind::Expire => self.expire_waiters(),
+                #[cfg(feature = "server")]
+                TimerKind::Retain => self.retain_step(),
             }
         }
     }
