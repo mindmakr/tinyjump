@@ -79,6 +79,24 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
   answering, and never loads an object it does not erase. Objects stored before these times
   were kept count from the first sweep that sees them, so an upgrade erases nothing at once.
 
+## Backups: erasure reaches them with `TJ_KEY_FILE`
+
+With an encrypted store, each object that belongs to a person (its class has `@pii` or an
+`"owner"` rule) is sealed under a key of its own. Those keys are kept apart from the data,
+in `<TJ_KEY_FILE>.own/`. Erasing the person, or retention, or the end of a hold, destroys
+the object's key, so the copies of it in backups of the data folder can no longer be
+opened (checked by restoring a whole backup taken before an erasure: the record answers
+503 and holds nothing readable).
+
+- **Back up the key file** (it rarely changes): without it nothing can be read.
+- **Back up `<TJ_KEY_FILE>.own/` for no longer than the retention you promise.** A backup
+  of that folder brings erased people's keys back with it. Losing it, with no backup,
+  loses the objects that belong to people; the trade-off is the point of crypto-shredding.
+- Records encrypted by `tj store rekey` from a plain folder get their own key when the
+  server next saves them.
+- Without `TJ_KEY_FILE`, erasure blanks the live data only, and backups keep what they
+  hold. File names then show object ids.
+
 ## What stays on the person's own devices
 
 A device that held the person's own objects keeps its cached copy until it connects again:
@@ -126,8 +144,5 @@ Devices do not run the check: they run apps the command line has checked.
 
 These are designed (trust.md, section 6) and not built. Until they are, the app's code is
 responsible for them:
-- **Backups:** erase blanks the live data; copies in backups keep it until per-person keys
-  make them unreadable (crypto-shredding, next). With a plain store, file names hold object
-  ids; `TJ_KEY_FILE` hashes them.
 - **App code** cannot export or erase yet (planned behind a `privacy` role).
 - The record of processing (GDPR article 30).

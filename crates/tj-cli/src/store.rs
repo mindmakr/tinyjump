@@ -21,11 +21,6 @@ impl FileStore {
         self.dir.join(format!("{}.json", encode(key)))
     }
 
-    /// Deletes a record, durably (`tj store rekey` removes records it has re-saved sealed).
-    pub fn remove(&mut self, key: &str) -> Result<(), String> {
-        let path = self.path(key);
-        fs::remove_file(&path).and_then(|()| sync_dir(&self.dir)).map_err(|e| format!("{}: {e}", path.display()))
-    }
 }
 
 pub fn private_dir(dir: &Path) -> io::Result<()> {
@@ -106,6 +101,12 @@ impl Store for FileStore {
             sync_dir(&self.dir)
         };
         write().map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Deletes a record, durably.
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        let path = self.path(key);
+        fs::remove_file(&path).and_then(|()| sync_dir(&self.dir)).map_err(|e| format!("{}: {e}", path.display()))
     }
 
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {

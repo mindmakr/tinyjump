@@ -260,10 +260,15 @@ As built, in three parts:
    `critic-010`, `builder-reply-010`): the sweep reads raw records in batches of 500 rather
    than keeping a timestamp map (the critic conceded the write cost), and skips blank
    objects so nothing is erased twice.
-   **Next, second half:** per-`Class/id` keys (crypto-shredding), `tj:privacy` as a host
-   effect for app code (self-erase allowed, flow-tainted export), forgetting audit
-   pseudonyms after the request's own entry and when holds end, and the record of
-   processing.
+   **Part 3B1 built:** a key per object that belongs to a person, destroyed by erasure,
+   retention and the end of a hold (`Store::forget`), so backups of the data cannot be
+   opened afterwards; the audit log forgets a person when the last of their held objects is
+   erased. Corrected while testing it live: the keys were first stored with the data, so a
+   restored backup of the whole data folder brought them back; they now live in
+   `<TJ_KEY_FILE>.own/`, and the docs say how to back that folder up.
+   **Next, 3B2:** `tj:privacy` as a host effect for app code (self-erase allowed,
+   flow-tainted export), forgetting audit pseudonyms after the request's own entry, and the
+   record of processing.
 
 Corrections made while building:
 

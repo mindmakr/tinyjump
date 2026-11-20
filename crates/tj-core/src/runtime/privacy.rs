@@ -93,8 +93,7 @@ impl Runtime {
         let mut held = Vec::new();
         for class in 0..self.program.objects.len() as u16 {
             let def = &self.program.objects[class as usize];
-            let owner = |r: &Option<std::rc::Rc<[std::rc::Rc<str>]>>| r.as_ref().is_some_and(|r| r.iter().any(|w| &**w == "owner"));
-            if def.pii.is_empty() && !owner(&def.read) && !def.methods.values().any(|m| owner(&m.allow)) {
+            if !def.belongs_to_a_person() {
                 continue;
             }
             let key = format!("{}/{subject}", def.name);
@@ -141,8 +140,13 @@ impl Runtime {
             erased.push(key);
         }
         self.drop_alarms_of(subject, &held);
+        // First the stored copies' keys, so copies in backups cannot be read either; then the
+        // blank, under a new key.
+        for key in &erased {
+            self.store.forget(key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; nothing was erased; try again")))?;
+        }
         if !self.flush() {
-            return Err((503, "the erasure could not be saved; nothing was erased; try again".into()));
+            return Err((503, "the old data can no longer be read, but the blank could not be saved; try again".into()));
         }
         if !held.is_empty() {
             for (key, until) in &held {
@@ -270,6 +274,7 @@ impl Runtime {
         if hold.is_some_and(|h| self.now < changed + h) {
             return Ok(());
         }
+        self.store.forget(key)?;
         if loaded {
             let o = self.instance(class, id).map_err(|e| e.message())?;
             let fresh = self.defaults(class).map_err(|e| e.message())?;
@@ -286,11 +291,14 @@ impl Runtime {
             self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
         }
         let reason = if waiting.is_some() { "erase after hold" } else { "retain" };
-        self.outputs.push(Output::Erased { object: key.to_string(), reason: reason.into() });
         if waiting.is_some() {
             self.erasures.remove(key);
             self.save_erasures()?;
         }
+        // The person was erased earlier; when nothing of theirs is held any more, the audit
+        // log forgets them too. Retention alone does not: the person may still be active.
+        let forget = waiting.is_some() && !self.erasures.keys().any(|k| k.split_once('/').is_some_and(|(_, i)| i == id));
+        self.outputs.push(Output::Erased { object: key.to_string(), reason: reason.into(), forget });
         Ok(())
     }
 
