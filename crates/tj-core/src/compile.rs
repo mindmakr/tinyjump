@@ -630,6 +630,13 @@ impl Compiler {
         if o.decorators.iter().any(|d| d.name == "legalHold") {
             self.error(Diagnostic::new("@legalHold is not supported with @by lists yet", d.span).hint("keep held records in an object per person, whose id is theirs"));
         }
+        // An object either belongs to one person (its id is theirs) or holds lists of several
+        // people's entries: erasing a person blanks the first kind whole.
+        let owner = |ds: &[Decorator], name: &str| ds.iter().filter(|d| d.name == name).flat_map(|d| &d.args).any(|a| matches!(&a.kind, ExprKind::Str(w) if w == "owner"));
+        let personal_field = o.fields.iter().any(|g| g.decorators.iter().any(|d| d.name == "pii") && !g.decorators.iter().any(|d| d.name == "by"));
+        if personal_field || owner(&o.decorators, "read") || o.methods.iter().any(|m| owner(&m.decorators, "allow")) {
+            self.error(Diagnostic::new(format!("{} mixes a list of several people's entries with data of one person (an \"owner\" rule or a @pii field without @by)", o.name), d.span).hint("keep each person's own data in an object whose id is theirs, and the shared list in another object"));
+        }
         Some((Rc::from(*who), at.map(Rc::from)))
     }
 

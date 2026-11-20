@@ -173,10 +173,11 @@ impl Runtime {
                     let Value::Rec(r) = e else { return false };
                     let r = r.borrow();
                     match older {
-                        Some((_, before)) => at.as_ref().and_then(|at| match r.get(&**at) {
-                            Some(Value::Num(t)) => Some(*t < before),
-                            _ => None,
-                        }) == Some(true),
+                        // A missing or broken time fails closed: the entry is erased.
+                        Some((_, before)) => at.as_ref().is_some_and(|at| match r.get(&**at) {
+                            Some(Value::Num(t)) if t.is_finite() => *t < before,
+                            _ => true,
+                        }),
                         None => matches!(r.get(&*by), Some(Value::Str(s)) if &**s == subject),
                     }
                 };
@@ -233,14 +234,15 @@ impl Runtime {
             erased.push(key);
         }
         // Their entries in lists of several people's go too. These lists live under the
-        // store's own key, not the person's, so backups keep them until `tj store rekey`.
+        // store's own key, not the person's, so backups keep them until those backups expire.
         for (o, field, _) in self.take_entries(subject, None, true).map_err(|e| (503, e))? {
             erased.push(format!("{}#{field}", o.key()));
         }
         self.drop_alarms_of(subject, &held);
         // First the stored copies' keys, so copies in backups cannot be read either; then the
         // blank, under a new key.
-        for key in &erased {
+        // Entries taken out of shared lists (`Class/id#field`) have no key of their own.
+        for key in erased.iter().filter(|k| !k.contains('#')) {
             self.store.forget(key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; nothing was erased; try again")))?;
         }
         if !self.flush() {

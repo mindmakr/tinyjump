@@ -2428,7 +2428,21 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
     assert!(msg("@server @read(\"staff\") object R {\n  @by(\"customer\") e: { customer: string }[] = []\n}\n").contains("fields take @pii"));
     // A copy of personal data is kept only where it is marked as personal data.
     let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
-    assert!(e.contains("is kept in `Cache.names`, which is not marked as personal data") && e.contains("@by"), "{e}");
+    assert!(e.contains("is kept in `Cache.names`, where export and erasure cannot find whose it is") && e.contains("@by"), "{e}");
+    // Marked @pii but not a @by list: export and erasure still could not find it.
+    let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  @pii(\"contact\", \"booking\") names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
+    assert!(e.contains("where export and erasure cannot find whose it is"), "{e}");
+    // A device object may hold what the server revealed: it is cleared at sign-out.
+    let e = msg("@server @read(\"owner\") object P {\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") mine(): string { return reveal(this.name, \"booking\") }\n}\nobject Screen {\n  shown: string = \"\"\n  async load() { this.shown = await P.get(caller.id).mine() }\n}\n");
+    assert_eq!(e, "", "a device object may show it");
+    let mixed = |rest: &str| msg(&format!("@server @read(\"staff\") object R {{
+  @pii(\"contact\", \"b\") @by(\"customer\") e: {{ customer: string }}[] = []
+{rest}}}
+"));
+    assert!(mixed("  @pii(\"contact\", \"b\") phone: string = \"\"
+").contains("mixes a list of several people's entries"));
+    assert!(mixed("  @allow(\"owner\") f() {}
+").contains("mixes a list of several people's entries"));
 }
 
 #[test]

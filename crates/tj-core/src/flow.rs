@@ -89,6 +89,10 @@ fn clean() -> Val {
 struct Class {
     /// Field -> (category, purposes).
     pii: HashMap<Rc<str>, (String, Vec<String>)>,
+    /// `@server`: kept on the server, where export and erasure reach it.
+    server: bool,
+    /// `@pii` fields that are lists of several people's entries (`@by`).
+    shared: HashSet<Rc<str>>,
     /// Method -> (declaration, `@allow` words).
     methods: HashMap<String, (Rc<FnDecl>, Option<Vec<String>>)>,
 }
@@ -282,20 +286,25 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
                 }
                 Item::Object(o) => {
                     let mut pii = HashMap::new();
+                    let mut shared = HashSet::new();
                     for f in &o.fields {
                         if let Some(d) = f.decorators.iter().find(|d| d.name == "pii") {
                             let w = words(d);
                             if let Some((cat, purposes)) = w.split_first() {
                                 pii.insert(Rc::from(f.name.as_str()), (cat.clone(), purposes.to_vec()));
                             }
+                            if f.decorators.iter().any(|d| d.name == "by") {
+                                shared.insert(Rc::from(f.name.as_str()));
+                            }
                         }
                     }
+                    let server = o.decorators.iter().any(|d| d.name == "server");
                     for m in &o.methods {
                         let needs: Vec<String> = m.decorators.iter().filter(|d| d.name == "needs").flat_map(words).filter_map(|w| w.strip_prefix("consent:").map(str::to_string)).collect();
                         c.needs_of.insert(Rc::as_ptr(&m.func), needs);
                     }
                     let methods = o.methods.iter().map(|m| (m.func.name.clone(), (m.func.clone(), m.decorators.iter().find(|d| d.name == "allow").map(words)))).collect();
-                    c.classes.insert(Rc::from(o.name.as_str()), Class { pii, methods });
+                    c.classes.insert(Rc::from(o.name.as_str()), Class { pii, server, shared, methods });
                 }
                 Item::TypeAlias { .. } => {}
             }
@@ -747,12 +756,14 @@ impl Checker {
         let t = self.flatten(v);
         if !t.revealed.is_empty() {
             self.field_revealed.entry((class.clone(), Rc::from(field))).or_default().extend(t.revealed.iter().cloned());
-            // A copy of personal data is personal data: kept only where retention, export and
-            // erasure reach it.
-            if !self.classes.get(class).is_some_and(|c| c.pii.contains_key(field)) {
+            // A copy of personal data is personal data: on the server it is kept only where
+            // retention, export and erasure reach it, which is a `@by` list, or a personal field
+            // of the object the code runs on. Device objects are cleared at sign-out.
+            let reached = self.classes.get(class).map_or(true, |c| !c.server || c.shared.contains(field) || (own && c.pii.contains_key(field)));
+            if !reached {
                 let place = if own { format!("this.{field}") } else { format!("{class}.{field}") };
-                let d = Diagnostic::new(format!("personal data ({}) is kept in `{place}`, which is not marked as personal data", t.revealed.iter().map(|(c, f)| format!("{c}.{f}")).collect::<Vec<_>>().join(", ")), span)
-                    .hint(format!("mark `{field}` with @pii; for a list of several people's entries add @by(\"<field naming whose each entry is>\"), so retention, export and erasure reach the copies"));
+                let d = Diagnostic::new(format!("personal data ({}) is kept in `{place}`, where export and erasure cannot find whose it is", t.revealed.iter().map(|(c, f)| format!("{c}.{f}")).collect::<Vec<_>>().join(", ")), span)
+                    .hint(format!("keep it in a list of entries that names the person: `@pii(category, purpose) @by(\"customer\") {field}: {{ customer: string, ... }}[]`"));
                 self.report(d);
             }
         }
