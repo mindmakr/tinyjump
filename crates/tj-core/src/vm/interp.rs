@@ -399,11 +399,11 @@ impl Runtime {
                     Op::Return => {
                         let mut v = pop!();
                         let fr = f.frames.pop().expect("frame");
-                        // A method handing one of its own fields to code outside its object
-                        // hands a read-only view (`list() { return this.items }`).
+                        // A method handing its own containers to code outside its object hands
+                        // read-only views (`list() { return this.items }`).
                         if let (Some(o), Some(caller)) = (&fr.this, f.frames.last()) {
-                            if caller.this.as_deref() != Some(&**o) && self.is_own_field(o, &v) {
-                                v = v.read_only();
+                            if caller.this.as_deref() != Some(&**o) {
+                                v = self.protect_returned(o, v);
                             }
                         }
                         if let (true, Some(o)) = (fr.exclusive, &fr.this) {

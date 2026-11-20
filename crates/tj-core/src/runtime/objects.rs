@@ -324,16 +324,52 @@ impl Runtime {
         }
     }
 
-    /// Whether `v` is one of `o`'s own containers (one of its fields), which a method must not
-    /// hand out for others to change.
-    pub(crate) fn is_own_field(&self, o: &ObjRef, v: &Value) -> bool {
-        let Some(inst) = self.instances.get(&(o.class, o.id.clone())) else { return false };
-        let state = inst.state.borrow();
-        match v {
-            Value::Arr(a) => state.values().any(|f| matches!(f, Value::Arr(x) if Rc::ptr_eq(x, a))),
-            Value::Rec(r) => state.values().any(|f| matches!(f, Value::Rec(x) if Rc::ptr_eq(x, r))),
-            _ => false,
+    /// What a method of `o` returns to code outside `o`: every container of `o`'s state in it,
+    /// at any depth (`this.items`, `this.items[0]`, `{ list: this.items }`), becomes a
+    /// read-only view. New containers around them stay the caller's to change.
+    pub(crate) fn protect_returned(&self, o: &ObjRef, v: Value) -> Value {
+        if !matches!(v, Value::Arr(_) | Value::Rec(_)) {
+            return v;
         }
+        let Some(inst) = self.instances.get(&(o.class, o.id.clone())) else { return v };
+        // State is plain data without cycles, so this walk ends.
+        fn owned(v: &Value, out: &mut std::collections::HashSet<usize>) {
+            match v {
+                Value::Arr(a) => {
+                    out.insert(Rc::as_ptr(a) as *const () as usize);
+                    a.borrow().iter().for_each(|x| owned(x, out));
+                }
+                Value::Rec(r) => {
+                    out.insert(Rc::as_ptr(r) as *const () as usize);
+                    r.borrow().values().for_each(|x| owned(x, out));
+                }
+                _ => {}
+            }
+        }
+        fn protect(v: Value, own: &std::collections::HashSet<usize>) -> Value {
+            match &v {
+                Value::Arr(a) if !a.readonly => {
+                    if own.contains(&(Rc::as_ptr(a) as *const () as usize)) {
+                        return v.read_only();
+                    }
+                    let items: Vec<Value> = a.borrow().iter().cloned().collect();
+                    *a.borrow_mut() = items.into_iter().map(|x| protect(x, own)).collect();
+                    v
+                }
+                Value::Rec(r) if !r.readonly => {
+                    if own.contains(&(Rc::as_ptr(r) as *const () as usize)) {
+                        return v.read_only();
+                    }
+                    let fields: Vec<(Rc<str>, Value)> = r.borrow().iter().map(|(k, x)| (k.clone(), x.clone())).collect();
+                    *r.borrow_mut() = fields.into_iter().map(|(k, x)| (k, protect(x, own))).collect();
+                    v
+                }
+                _ => v,
+            }
+        }
+        let mut own = std::collections::HashSet::new();
+        owned(&Value::Rec(inst.state.clone().into()), &mut own);
+        protect(v, &own)
     }
 
     pub(crate) fn set_obj_field(&mut self, this: Option<&ObjRef>, o: &Rc<ObjRef>, name: &str, v: Value) -> Result<(), Exc> {

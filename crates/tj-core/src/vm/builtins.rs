@@ -127,9 +127,9 @@ fn json_parse(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     serde_json::from_str(&s).map(|j| Value::from_json(&j)).map_err(|e| Exc::msg(format!("JSON.parse: {e}")))
 }
 
-fn record_arg(a: &[Value], what: &str) -> Result<Rc<std::cell::RefCell<Record>>, Exc> {
+fn record_arg<'a>(a: &'a [Value], what: &str) -> Result<&'a super::value::Shared<Record>, Exc> {
     match arg(a, 0) {
-        Value::Rec(r) => Ok(Rc::clone(r)),
+        Value::Rec(r) => Ok(r),
         v => Err(Exc::msg(format!("{what} expects a record, got {}", v.type_name()))),
     }
 }
@@ -142,13 +142,13 @@ fn object_keys(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 
 fn object_values(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let r = record_arg(a, "Object.values")?;
-    let values = r.borrow().values().cloned().collect();
+    let values = r.borrow().values().map(|v| Value::inside(r.readonly, v.clone())).collect();
     Ok(Value::arr(values))
 }
 
 fn object_entries(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let r = record_arg(a, "Object.entries")?;
-    let entries = r.borrow().iter().map(|(k, v)| Value::arr(vec![Value::Str(k.clone()), v.clone()])).collect();
+    let entries = r.borrow().iter().map(|(k, v)| Value::arr(vec![Value::Str(k.clone()), Value::inside(r.readonly, v.clone())])).collect();
     Ok(Value::arr(entries))
 }
 
