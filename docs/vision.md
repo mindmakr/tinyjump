@@ -45,10 +45,17 @@ Next, agreed with the owner on 2026-11-20:
 
 1. **Sign-in tokens (done)** from OpenID Connect providers, proven against a built-in test
    issuer (no real accounts needed in tests).
-2. **The agent library (`tj:agent`):** an agent's tools are the app's own methods, called
-   under the same access rules as the person it acts for.
-3. **Servers talking to each other:** replicas of another server's objects, then webhooks.
-4. Alongside: **rewrite the marketing site** as one plain page for three readers (founders,
+2. **The agent library (`tj:agent`, done):** an agent's tools are the app's own methods,
+   called under the same access rules as the person it acts for.
+3. **Trust (added by the owner on 2026-11-20; `docs/trust.md`):**
+   - objects as actors (one call at a time);
+   - a built-in, tamper-evident audit log;
+   - runtime statistics;
+   - personal data with subject rights;
+   - encryption at rest and in transit, and compression;
+   - region compliance packs (GDPR, KSA PDPL, MENA, US) that third parties can extend.
+4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
+5. Alongside: **rewrite the marketing site** as one plain page for three readers (founders,
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 

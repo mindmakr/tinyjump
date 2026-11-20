@@ -1,26 +1,41 @@
 // A shop assistant: ask in plain words ("two teas, please") and it changes the shared cart
-// through the same methods the screen uses. It calls a language model through the tj:ai
-// plugin, on the server, so the API key never reaches a device (see plugins.json).
+// through the app's own methods. It runs on tj:agent, so every tool call is checked as the
+// person who asked: anyone may shop through it, but only staff may restock, exactly as
+// without it. The model runs through the tj:ai plugin on the server, so the API key never
+// reaches a device (see plugins.json).
 
-import { complete, Message, Tool, ToolCall, ToolResult } from "tj:ai"
+import { act, Skill } from "tj:agent"
+import { Message } from "tj:ai"
 import { Cart } from "./cart"
 import { Shelf } from "./shelf"
 
 type ChatLine = { who: string, text: string }
 
 const SKU = { type: "object", properties: { sku: { type: "string", description: "the product's sku" } }, required: ["sku"] }
-const TOOLS: Tool[] = [
-  { name: "add", description: "Put one unit of a product in the shared cart.", input: SKU },
-  { name: "remove", description: "Take one unit of a product out of the shared cart.", input: SKU },
-]
+const RESTOCK = {
+  type: "object",
+  properties: { sku: { type: "string", description: "the product's sku" }, qty: { type: "number", description: "units to add, 1 to 100" } },
+  required: ["sku", "qty"],
+}
 const MAX_STEPS = 6
 const STUCK_MS = 2 * 60 * 1000
+
+/// What the assistant may do, for a shopper called `name`: the cart's own methods. The
+/// shopper's name is fixed here, so the model cannot choose it.
+function skills(name: string): Skill[] {
+  const by = { name: `${name} (via the assistant)` }
+  return [
+    { name: "add", object: "Cart/demo", method: "add", description: "Put one unit of a product in the shared cart.", params: ["sku", "name"], input: SKU, fixed: by },
+    { name: "remove", object: "Cart/demo", method: "remove", description: "Take one unit of a product out of the shared cart.", params: ["sku", "name"], input: SKU, fixed: by },
+    { name: "restock", object: "Shelf/main", method: "stock", description: "Add units of a product to the shelf. Only staff may.", params: ["sku", "qty"], input: RESTOCK, fixed: {} },
+  ]
+}
 
 /// The model's side of the conversation. It holds the model's raw turns, so it has no
 /// @read rule: only server code sees it.
 @server object AssistantMemory {
   messages: Message[] = []
-  remember(m: Message) { this.messages.push(m) }
+  keep(messages: Message[]) { this.messages = messages }
   forget() { this.messages = [] }
 }
 
@@ -39,47 +54,23 @@ export @server @read("anyone") object Assistant {
     this.startedAt = Date.now()
     this.say(name, q)
     const memory = AssistantMemory.get(this.id)
-    memory.remember({ role: "user", text: q })
     try {
-      for (let step = 0; step < MAX_STEPS; step += 1) {
-        const reply = await complete(this.instructions(), memory.messages, TOOLS)
-        memory.remember({ role: "assistant", raw: reply.raw })
-        if (reply.text !== "") { this.say("assistant", reply.text) }
-        if (reply.stop === "refusal") { this.say("assistant", "I can't help with that.") }
-        if (reply.calls.length === 0) { break }
-        const results: ToolResult[] = []
-        for (const call of reply.calls) { results.push(this.use(call, name)) }
-        memory.remember({ role: "user", results })
-      }
+      const turn = await act(this.instructions(), memory.messages.concat([{ role: "user", text: q }]), skills(name), MAX_STEPS)
+      memory.keep(turn.messages)
+      this.say("assistant", turn.text === "" ? "Done." : turn.text)
     } catch (e) {
-      // A broken turn would leave a tool call without its result; start the conversation over.
+      // A broken turn could leave a tool call without its result; start the conversation over.
       memory.forget()
       this.say("assistant", `Sorry, I could not answer: ${e.message}`)
     }
     this.busy = false
   }
 
-  private use(call: ToolCall, name: string): ToolResult {
-    const cart = Cart.get("demo")
-    try {
-      if (call.name === "add") {
-        cart.add(call.input.sku, `${name} (via the assistant)`)
-      } else if (call.name === "remove") {
-        cart.remove(call.input.sku, `${name} (via the assistant)`)
-      } else {
-        return { id: call.id, output: `there is no tool ${call.name}`, error: true }
-      }
-      return { id: call.id, output: `done; the cart total is ${cart.total}` }
-    } catch (e) {
-      return { id: call.id, output: e.message, error: true }
-    }
-  }
-
   private instructions(): string {
     const products = Shelf.get("main").products.map(p => ({ sku: p.sku, name: p.name, price: p.price, stock: p.stock }))
     return "You are the assistant of a small tea shop. Change the shared cart with the tools when asked. " +
       `Products: ${JSON.stringify(products)}. Cart now: ${JSON.stringify(Cart.get("demo").lines)}. ` +
-      "Answer in one or two short sentences."
+      "If a tool says you are not allowed, say so plainly. Answer in one or two short sentences."
   }
 
   private say(who: string, text: string) {

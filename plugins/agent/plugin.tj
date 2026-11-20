@@ -1,0 +1,46 @@
+// tj:agent: an agent loop whose tools are the app's own methods (docs/plugins.md). Each tool
+// call runs as the caller the agent acts for, under the app's access rules: an agent can do
+// what that person can, and no more. Built on tj:ai, so it runs on the server.
+
+import { complete, Message, ToolResult } from "tj:ai"
+
+/// A method the agent may use. `params` names the method's parameters in order; the model
+/// fills them from `input`, a JSON Schema of the arguments it may choose, and `fixed`
+/// supplies the rest (e.g. `{ name: "Ana" }`), so the model cannot choose them.
+export type Skill = { name: string, object: string, method: string, description: string, params: string[], input: any, fixed: any }
+
+/// The agent's answer for people, and the whole conversation to keep for next time.
+export type Turn = { text: string, messages: Message[], steps: number }
+
+/// Runs the agent on `messages`, which end with the person's request, for at most `maxSteps`
+/// model turns.
+export async function act(system: string, messages: Message[], skills: Skill[], maxSteps: number): Promise<Turn> {
+  const tools = skills.map(s => ({ name: s.name, description: s.description, input: s.input }))
+  const log = messages.slice()
+  let text = ""
+  let steps = 0
+  while (steps < maxSteps) {
+    steps += 1
+    const reply = await complete(system, log, tools)
+    log.push({ role: "assistant", raw: reply.raw })
+    if (reply.text !== "") { text = text === "" ? reply.text : `${text}\n${reply.text}` }
+    if (reply.stop === "refusal" && text === "") { text = "I can't help with that." }
+    if (reply.calls.length === 0) { break }
+    const results: ToolResult[] = []
+    for (const call of reply.calls) {
+      const skill = skills.find(s => s.name === call.name)
+      if (skill === null) {
+        results.push({ id: call.id, output: `there is no tool ${call.name}`, error: true })
+        continue
+      }
+      try {
+        const out = await invoke(skill.object, skill.method, skill.params.map(p => skill.fixed[p] ?? call.input[p]))
+        results.push({ id: call.id, output: out === null ? "done" : JSON.stringify(out) })
+      } catch (e) {
+        results.push({ id: call.id, output: e.message, error: true })
+      }
+    }
+    log.push({ role: "user", results })
+  }
+  return { text, messages: log, steps }
+}

@@ -1,8 +1,8 @@
 # Plugins
 
 How tinyjump gains capabilities (AI models, email, payments, device sensors) without
-growing its core. Status: server plugins and `tj:ai` are built, and the durable cart's shop
-assistant shows them. The `tj:agent` library and device plugins come next.
+growing its core. Status: server plugins, `tj:ai` and the `tj:agent` library are built, and
+the durable cart's shop assistant shows them. Device plugins come next.
 
 ## Goals
 
@@ -107,6 +107,12 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
 4. **Done: showcase.** `examples/durable-cart/assistant.tj` is a shop assistant. It adds
    and removes items on the shopper's behalf, keeps the model's raw conversation in a
    server-only object, and shows a public transcript.
-5. **Next: `tj:agent`.** A library that offers an app's methods as tools by name and
-   runs each tool call as the agent's caller under the access rules. The assistant
-   currently calls the cart from server code, which the rules do not check.
+5. **Done: `tj:agent`** (`plugins/agent/plugin.tj`). `act(system, messages, skills,
+   maxSteps)` offers an app's methods as tools and sends each call through
+   `invoke(object, method, args)`:
+   - each tool call runs as the current caller, under the access rules;
+   - arguments the app fixes (`fixed`) cannot be chosen by the model;
+   - the assistant may add tea for a shopper but may not restock, unless the shopper is
+     staff;
+   - `invoke` is allowed only in plugin modules, so app code cannot use it to act as
+     someone else.

@@ -25,8 +25,9 @@ pub const GLOBALS: &[Global] = &[
     ("parseFloat", || native("parseFloat", |_, a| Ok(Value::Num(parse_float_prefix(&arg(a, 0).display()))))),
     ("Error", || native("Error", |_, a| Ok(error_record(&arg(a, 0).display())))),
     ("__fetch", || native("fetch", fetch)),
-    // Only plugin modules (`tj:<name>`) may call it; apps import their typed functions.
+    // Only plugin modules (`tj:<name>`) may call these; apps import their typed functions.
     ("plugin", || native("plugin", plugin)),
+    ("invoke", || native("invoke", invoke)),
     ("__sort", || native("sort", sort)),
 ];
 
@@ -236,6 +237,19 @@ fn plugin(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let method = text(a, 1, "plugin")?.to_string();
     let args = arg(a, 2).to_json().map_err(|e| Exc::msg(format!("plugin arguments must be data: {e}")))?;
     Ok(Value::Promise(rt.plugin_call(name, method, args)))
+}
+
+/// `invoke(object, method, args)`: calls an app method as the current caller, under the
+/// same access rules as a request from them (docs/plugins.md, `tj:agent`).
+fn invoke(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let object = text(a, 0, "invoke")?.to_string();
+    let method = text(a, 1, "invoke")?.to_string();
+    let args = match arg(a, 2) {
+        Value::Arr(items) => items.borrow().clone(),
+        Value::Null => Vec::new(),
+        _ => return Err(Exc::msg("invoke(object, method, args) takes the arguments as an array")),
+    };
+    Ok(Value::Promise(rt.invoke_as_caller(object, method, args)))
 }
 
 fn sort(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
