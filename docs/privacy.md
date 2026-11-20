@@ -51,9 +51,41 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
   replicas and devices receive the erasure like any other change, including devices that
   reconnect later. It is refused (409) while a call is part way through one of the objects,
   and when it cannot be saved, nothing is erased and it says so (503).
+- Erase also drops the alarms the person scheduled on other objects (a reminder on a
+  shared board, say). Shared objects never held their id in readable form: a call made
+  once keeps a keyed hash of the caller, and only for 72 hours.
+- An object under a legal hold (below) is kept, and the answer says until when; it is
+  erased when the hold ends.
 - Both are admin requests (`/_tj/privacy`), written to the audit log before they run. Erase
   then forgets the person's pseudonym in the audit log, so the entries about them become
   anonymous without the log being edited.
+
+## Keeping data no longer than needed
+
+```tsx
+@server @read("owner") @retain("90d") object Visit { ... }          // 90 days after the last change
+@server @read("owner") @retain("1y", "created") object Signup { ... } // a year after creation
+@server @read("owner") @legalHold("6y") object Invoice { ... }        // kept 6 years after the last change
+```
+
+- `@retain(duration, "created" | "changed")` erases an object that long after it was
+  created or last changed ("changed" if not given), exactly like `tj privacy erase` does,
+  and writes `erased` with the reason to the audit log. Durations: `"30d"`, `"6y"`, and the
+  others `@every` takes.
+- `@legalHold(duration)` keeps an object that long after its last change, even when its
+  person is erased or its retention has run out; the erasure then happens when the hold
+  ends. Use it for records the law requires, such as invoices.
+- One sweep runs every hour. It reads stored records 500 at a time, so the server keeps
+  answering, and never loads an object it does not erase. Objects stored before these times
+  were kept count from the first sweep that sees them, so an upgrade erases nothing at once.
+
+## What stays on the person's own devices
+
+A device that held the person's own objects keeps its cached copy until it connects again:
+then it receives the blank state. A device whose sign-in can no longer be refreshed (a
+deleted account) cannot connect, so the app should call `signOut()` when refreshing the
+token fails; that clears the cached copies. A device that never comes back keeps its copy;
+that is outside what a server can reach.
 
 ## The audit log
 
@@ -94,9 +126,8 @@ Devices do not run the check: they run apps the command line has checked.
 
 These are designed (trust.md, section 6) and not built. Until they are, the app's code is
 responsible for them:
-- **Retention** (`@retain`) and legal holds (`@legalHold`).
 - **Backups:** erase blanks the live data; copies in backups keep it until per-person keys
-  make them unreadable (crypto-shredding). With a plain store, file names hold object ids;
-  `TJ_KEY_FILE` hashes them.
+  make them unreadable (crypto-shredding, next). With a plain store, file names hold object
+  ids; `TJ_KEY_FILE` hashes them.
 - **App code** cannot export or erase yet (planned behind a `privacy` role).
 - The record of processing (GDPR article 30).

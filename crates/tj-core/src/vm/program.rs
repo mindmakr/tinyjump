@@ -153,6 +153,19 @@ pub struct ObjectDef {
     pub read: Option<Rc<[Rc<str>]>>,
     /// `@pii(category, purpose, ...)` fields (docs/privacy.md).
     pub pii: Vec<Pii>,
+    /// `@retain(duration, "created" | "changed")`: objects are erased this long after they
+    /// were created or last changed.
+    pub retain: Option<Retain>,
+    /// `@legalHold(duration)`: objects are kept this long after their last change, even when
+    /// erased or past retention.
+    pub hold: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Retain {
+    pub ms: f64,
+    /// Counted from creation rather than from the last change.
+    pub from_created: bool,
 }
 
 /// A field that holds personal data about the object's subject: the person whose id is the

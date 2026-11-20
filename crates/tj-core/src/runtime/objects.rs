@@ -16,22 +16,30 @@ const CHANGE_SEQ_KEY: &str = "tj:seq";
 const MAX_ID_LEN: usize = 128;
 /// How many recent call ids an object remembers, so retries of them do not run twice.
 const MAX_CALL_RECORDS: usize = 100;
+/// How long the result of a call made once is kept for repeats (72 hours). After that,
+/// repeating the call id runs it again.
+pub(crate) const CALL_RECORD_MS: f64 = 72.0 * 3_600_000.0;
 
 pub(crate) struct Instance {
-    handle: Rc<ObjRef>,
+    pub(crate) handle: Rc<ObjRef>,
     /// A device-side replica of an `@server` object: methods run on the server.
     remote: bool,
-    state: Rc<RefCell<Record>>,
-    alarms: Vec<Alarm>,
+    pub(crate) state: Rc<RefCell<Record>>,
+    pub(crate) alarms: Vec<Alarm>,
     /// The change number of the current state: assigned here for objects this runtime owns,
     /// the server's for replicas. Streams resume from it and replicas ignore older states.
     seq: u64,
     /// Results of recent calls made with an id (see `calls.rs`), oldest first.
-    calls: Vec<CallRecord>,
+    pub(crate) calls: Vec<CallRecord>,
     /// The last persisted record, to skip unchanged writes.
     saved: String,
     /// The state part of it: only a new state gets a change number and is broadcast.
     state_text: String,
+    /// When it was created and last changed (epoch ms), for `@retain` and `@legalHold`.
+    pub(crate) created: f64,
+    pub(crate) changed: f64,
+    /// Just erased: saving the blank does not start its clock; the next change does.
+    pub(crate) cleared: bool,
 }
 
 /// A call made with an id: who made it and with what, so a repeat is recognised, and its
@@ -39,7 +47,12 @@ pub(crate) struct Instance {
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct CallRecord {
     id: String,
+    /// Who made it: a keyed hash of the caller's id (`Runtime::caller_tag`), so shared
+    /// objects keep no readable ids.
     by: String,
+    /// When it was made (epoch ms); kept for `CALL_RECORD_MS`.
+    #[serde(default)]
+    at: f64,
     method: String,
     /// A hash of the arguments.
     args: String,
@@ -50,16 +63,15 @@ pub(crate) struct CallRecord {
 }
 
 impl CallRecord {
-    pub(crate) fn new(id: &str, who: &Who, method: &str, args: &[Json]) -> CallRecord {
-        let by = match who {
-            Who::Remote { id, .. } => id.to_string(),
-            Who::System => "system".into(),
-            Who::Local => String::new(),
-        };
+    pub(crate) fn new(id: &str, by: String, method: &str, args: &[Json], at: f64) -> CallRecord {
         let text = serde_json::to_string(args).expect("JSON values serialize");
         // FNV-1a: telling one call's arguments from another's, not hiding them.
         let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-        CallRecord { id: id.to_string(), by, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None }
+        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None }
+    }
+
+    fn expired(&self, now: f64) -> bool {
+        self.at + CALL_RECORD_MS < now
     }
 
     /// The same caller, method and arguments.
@@ -96,14 +108,20 @@ pub(crate) struct Alarm {
 }
 
 #[derive(Serialize, Deserialize)]
-struct Stored {
-    state: Map<String, Json>,
+pub(crate) struct Stored {
+    pub(crate) state: Map<String, Json>,
     #[serde(default)]
-    alarms: Vec<Alarm>,
+    pub(crate) alarms: Vec<Alarm>,
     #[serde(default)]
     seq: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    calls: Vec<CallRecord>,
+    pub(crate) calls: Vec<CallRecord>,
+    /// When the object was created and last changed (epoch ms); 0 in records from before
+    /// they were kept, which then count from the first time they are seen.
+    #[serde(default)]
+    pub(crate) created: f64,
+    #[serde(default)]
+    pub(crate) changed: f64,
 }
 
 impl Runtime {
@@ -124,6 +142,8 @@ impl Runtime {
         let mut seq = 0;
         let mut calls = Vec::new();
         let mut saved = String::new();
+        let (mut created, mut changed) = (self.now, self.now);
+        let mut dated = true;
         if let Some(text) = self.store.load(&handle.key()).map_err(|e| Exc::msg(format!("{} could not be read: {e}", handle.key())))? {
             let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::msg(format!("{} has unreadable stored state: {e}", handle.key())))?;
             // Stored fields override defaults; fields no longer declared are dropped.
@@ -135,8 +155,12 @@ impl Runtime {
             }
             alarms = stored.alarms;
             seq = stored.seq;
-            calls = stored.calls;
+            calls = stored.calls.into_iter().filter(|c| !c.expired(self.now)).collect();
             saved = text;
+            dated = stored.created > 0.0 && stored.changed > 0.0;
+            if dated {
+                (created, changed) = (stored.created, stored.changed);
+            }
         }
         let remote = def.server && !self.server;
         if remote {
@@ -157,7 +181,11 @@ impl Runtime {
             }
         }
         let state_text = Value::Rec(state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
-        self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text });
+        self.instances.insert(key.clone(), Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text, created, changed, cleared: false });
+        if !dated && !remote && self.server {
+            // Saved with the times from now on, so retention never counts from zero.
+            self.touched.insert(key);
+        }
         Ok(handle)
     }
 
@@ -214,7 +242,9 @@ impl Runtime {
 
     /// Remembers a finished call; it is saved with the object's state.
     pub(crate) fn record_call(&mut self, o: &ObjRef, record: CallRecord) {
+        let now = self.now;
         let calls = &mut self.inst_mut(o).calls;
+        calls.retain(|c| !c.expired(now));
         calls.push(record);
         if calls.len() > MAX_CALL_RECORDS {
             calls.remove(0);
@@ -258,7 +288,7 @@ impl Runtime {
         self.instance(c, id).map_err(|e| e.message())
     }
 
-    fn inst(&self, o: &ObjRef) -> &Instance {
+    pub(crate) fn inst(&self, o: &ObjRef) -> &Instance {
         self.instances.get(&(o.class, o.id.clone())).expect("object handles always refer to loaded instances")
     }
 
@@ -459,12 +489,24 @@ impl Runtime {
 
     /// Gives an object a new state and drops its alarms and call records (erasure). A failed
     /// save puts all of it back (see `revert`).
+    #[cfg(feature = "server")]
     pub(crate) fn reset(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) {
         let inst = self.inst_mut(o);
         inst.state = state;
         inst.calls.clear();
         inst.alarms.clear();
+        // No clock until it holds something again, so a person who comes back starts afresh.
+        inst.created = 0.0;
+        inst.changed = 0.0;
+        inst.cleared = true;
         self.touched.insert((o.class, o.id.clone()));
+    }
+
+    /// Whether `o` holds nothing: default state, no alarms, no call records.
+    #[cfg(feature = "server")]
+    pub(crate) fn is_blank(&self, o: &ObjRef, defaults: &Json) -> Result<bool, String> {
+        let inst = self.inst(o);
+        Ok(inst.alarms.is_empty() && inst.calls.is_empty() && &Value::Rec(inst.state.clone().into()).to_json()? == defaults)
     }
 
     /// Persists every object touched by the last input whose record changed. Whether every
@@ -506,7 +548,7 @@ impl Runtime {
             let state_text = serde_json::to_string(&state).expect("JSON values serialize");
             let state_changed = state_text != inst.state_text;
             let remote = inst.remote;
-            let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone() };
+            let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone(), created: inst.created, changed: inst.changed };
             let mut text = serde_json::to_string(&record).expect("JSON values serialize");
             if text == inst.saved {
                 continue;
@@ -517,6 +559,12 @@ impl Runtime {
                 self.change_seq += 1;
                 seq_changed = true;
                 record.seq = self.change_seq;
+                if !inst.cleared {
+                    record.changed = self.now;
+                    if record.created <= 0.0 {
+                        record.created = self.now;
+                    }
+                }
                 text = serde_json::to_string(&record).expect("JSON values serialize");
             }
             if let Err(e) = self.store.save(&object, &text) {
@@ -531,6 +579,9 @@ impl Runtime {
                 inst.saved = text;
                 inst.seq = record.seq;
                 inst.state_text = state_text;
+                inst.changed = record.changed;
+                inst.created = record.created;
+                inst.cleared = false;
             }
             // Objects joined the index above; leaving it can wait, as a stale entry only loads
             // an object without alarms at boot.

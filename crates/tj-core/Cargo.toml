@@ -22,7 +22,10 @@ layout = ["dep:taffy"]
 # Checks that only the command line runs (`tj check`, `dev`, `serve`): the personal-data
 # flow check (flow.rs), about 60 KB that devices, which run apps the CLI checked, leave out.
 check = []
+# What only `tj serve` runs: exporting and erasing people, and the retention sweep. Devices
+# leave it out.
+server = []
 
 [dev-dependencies]
-# The core's own tests cover the checks too.
-tj-core = { path = ".", features = ["check"] }
+# The core's own tests cover the checks and the server parts too.
+tj-core = { path = ".", features = ["check", "server"] }

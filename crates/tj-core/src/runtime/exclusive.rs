@@ -269,6 +269,7 @@ impl Runtime {
     }
 
     /// Whether a call holds the object, or waits to.
+    #[cfg(feature = "server")]
     pub(crate) fn exclusive_busy(&self, class: u16, id: &str) -> bool {
         self.locks.iter().any(|l| l.key.0 == class && &*l.key.1 == id)
     }

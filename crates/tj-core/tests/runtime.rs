@@ -895,7 +895,8 @@ fn a_person_can_be_exported_and_erased() {
     rt.handle(3.0, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
 
     // Erase: back to the defaults, alarms gone, and the blank state goes out as a change.
-    let (erased, out) = rt.erase_subject("user:ana").unwrap();
+    let e = rt.erase_subject("user:ana").unwrap();
+    let (erased, out) = (e.erased, e.outputs);
     assert_eq!(erased, ["Account/user:ana"]);
     let change = out.iter().find_map(|o| if let Output::Changed { object, state, seq } = o { Some((object.clone(), state.clone(), *seq)) } else { None }).expect("replicas hear of it");
     assert_eq!((change.0.as_str(), &change.1), ("Account/user:ana", &json!({ "email": "", "notes": "", "plan": "free" })));
@@ -1136,6 +1137,164 @@ type Msg = { text: string }
     assert_eq!(room["meta"], json!({ "tags": [] }));
 }
 
+const DAY: f64 = 86_400_000.0;
+
+const KEPT: &str = r#"
+@server @read("owner") @retain("1d") object Visit {
+  @pii("location", "service") place: string = ""
+  @allow("owner") set(p: string) { this.place = p }
+  @allow("owner") async check() { await fetch("https://maps.example.com/") }
+}
+@server @read("owner") @retain("1d", "created") object Signup {
+  note: string = ""
+  @allow("owner") set(n: string) { this.note = n }
+}
+@server @read("owner") @legalHold("30d") object Invoice {
+  @pii("financial", "billing") amount: number = 0
+  @allow("owner") bill(n: number) { this.amount = n }
+}
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") set(e: string) { this.email = e }
+}
+@server @read("anyone") object Board {
+  pings: number = 0
+  @allow("signedIn") later() { this.schedule(5 * 86400000, "ping") }
+  private ping() { this.pings += 1 }
+}
+"#;
+
+fn kept(store: &Shared, now: f64) -> Runtime {
+    Runtime::boot(compile(KEPT).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(now, 7) }).unwrap().0
+}
+
+fn erased_outputs(out: &[Output]) -> Vec<(String, String)> {
+    out.iter().filter_map(|o| if let Output::Erased { object, reason } = o { Some((object.clone(), reason.clone())) } else { None }).collect()
+}
+
+#[test]
+fn retention_erases_on_time_and_never_twice() {
+    let store = Shared::default();
+    let mut rt = kept(&store, 0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Visit/user:ana", "set", json!(["Riyadh"]), ana()).unwrap();
+    call_as(&mut rt, 1000.0, "Signup/user:ana", "set", json!(["a"]), ana()).unwrap();
+    // "changed" counts from the last change; "created" does not move.
+    call_as(&mut rt, 0.8 * DAY, "Visit/user:ana", "set", json!(["Jeddah"]), ana()).unwrap();
+    call_as(&mut rt, 0.8 * DAY, "Signup/user:ana", "set", json!(["b"]), ana()).unwrap();
+    let out = rt.handle(1.2 * DAY, Input::Tick);
+    assert_eq!(erased_outputs(&out), [("Signup/user:ana".into(), "retain".into())]);
+    let out = rt.handle(1.9 * DAY, Input::Tick);
+    assert_eq!(erased_outputs(&out), [("Visit/user:ana".into(), "retain".into())]);
+    // Someone who comes back starts a fresh clock, even when it counts from creation.
+    call_as(&mut rt, 3.5 * DAY, "Signup/user:ana", "set", json!(["back"]), ana()).unwrap();
+    assert!(erased_outputs(&rt.handle(4.0 * DAY, Input::Tick)).is_empty(), "not erased the day after coming back");
+    assert_eq!(erased_outputs(&rt.handle(4.6 * DAY, Input::Tick)), [("Signup/user:ana".into(), "retain".into())]);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Visit/user:ana"]["place"], json!(""));
+    // A blank object is not erased again every hour.
+    for hour in 1..30 {
+        assert!(erased_outputs(&rt.handle(1.9 * DAY + f64::from(hour) * 3_600_000.0, Input::Tick)).is_empty());
+    }
+}
+
+#[test]
+fn retention_reads_records_without_loading_them_and_dates_old_ones() {
+    let store = Shared::default();
+    call_as(&mut kept(&store, 0.0), 1000.0, "Visit/user:bo", "set", json!(["Dammam"]), who("user:bo", &[])).unwrap();
+    // A record from before times were kept counts from when it is first seen.
+    store.0.borrow_mut().data.insert("Visit/user:old".into(), r#"{"state":{"place":"Abha"},"seq":1}"#.into());
+
+    let mut rt = kept(&store, 2.0 * DAY);
+    let out = rt.handle(2.0 * DAY, Input::Tick);
+    assert_eq!(erased_outputs(&out), [("Visit/user:bo".into(), "retain".into())]);
+    assert!(rt.inspect()["objects"].as_array().unwrap().is_empty(), "nothing was loaded into memory");
+    let bo: Json = serde_json::from_str(&store.0.borrow().data["Visit/user:bo"]).unwrap();
+    assert_eq!(bo["state"], json!({ "place": "" }));
+    let old: Json = serde_json::from_str(&store.0.borrow().data["Visit/user:old"]).unwrap();
+    assert_eq!((old["state"]["place"].clone(), old["created"].as_f64()), (json!("Abha"), Some(2.0 * DAY)), "dated, not erased");
+    let out = rt.handle(3.1 * DAY, Input::Tick);
+    assert_eq!(erased_outputs(&out), [("Visit/user:old".into(), "retain".into())]);
+}
+
+#[test]
+fn retention_waits_for_a_call_part_way_through_and_an_erase_typo_spares_shared_objects() {
+    let store = Shared::default();
+    let mut rt = kept(&store, 0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Visit/user:ana", "set", json!(["Riyadh"]), ana()).unwrap();
+    let out = rt.handle(2000.0, Input::Call { object: "Visit/user:ana".into(), method: "check".into(), args: vec![], reply: Some(9), call: None, caller: ana() });
+    let effect = fetches(&out)[0];
+    assert!(erased_outputs(&rt.handle(1.5 * DAY, Input::Tick)).is_empty(), "not while a call is part way through");
+    rt.handle(1.5 * DAY, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
+    assert_eq!(erased_outputs(&rt.handle(1.5 * DAY + 3_600_000.0, Input::Tick)), [("Visit/user:ana".into(), "retain".into())]);
+
+    // `tj privacy erase main` by mistake: Board/main belongs to nobody, so it is untouched.
+    call_as(&mut rt, 2.0 * DAY, "Board/main", "later", json!([]), ana()).unwrap();
+    assert!(rt.erase_subject("main").unwrap().erased.is_empty());
+}
+
+#[test]
+fn retention_works_in_batches_so_the_server_keeps_answering() {
+    let store = Shared::default();
+    for i in 0..1100 {
+        store.0.borrow_mut().data.insert(format!("Visit/user:{i}"), r#"{"state":{"place":"x"},"seq":1,"created":1000,"changed":1000}"#.into());
+    }
+    let mut rt = kept(&store, 2.0 * DAY);
+    let mut per_tick = Vec::new();
+    for step in 0..4 {
+        per_tick.push(erased_outputs(&rt.handle(2.0 * DAY + f64::from(step), Input::Tick)).len());
+    }
+    assert_eq!(per_tick, [500, 500, 100, 0]);
+}
+
+#[test]
+fn a_legal_hold_keeps_records_until_it_ends_then_the_erasure_happens() {
+    let store = Shared::default();
+    let mut rt = kept(&store, 0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Invoice/user:ana", "bill", json!([120]), ana()).unwrap();
+    call_as(&mut rt, 1000.0, "Account/user:ana", "set", json!(["ana@example.com"]), ana()).unwrap();
+    let e = rt.erase_subject("user:ana").unwrap();
+    assert_eq!(e.erased, ["Account/user:ana"]);
+    assert_eq!(e.held, [("Invoice/user:ana".to_string(), 1000.0 + 30.0 * DAY)]);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Invoice/user:ana"]["amount"], json!(120), "kept while held");
+
+    // The waiting erasure survives a restart, and happens when the hold ends.
+    let mut rt = kept(&store, 10.0 * DAY);
+    assert!(erased_outputs(&rt.handle(10.0 * DAY, Input::Tick)).is_empty());
+    let out = rt.handle(31.0 * DAY, Input::Tick);
+    assert_eq!(erased_outputs(&out), [("Invoice/user:ana".into(), "erase after hold".into())]);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Invoice/user:ana"]["amount"], json!(0));
+}
+
+#[test]
+fn erasing_a_person_reaches_shared_objects() {
+    let store = Shared::default();
+    let mut rt = kept(&store, 0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Board/main", "later", json!([]), ana()).unwrap();
+    // A call made once keeps a keyed hash of the caller, not the id, and still matches repeats.
+    let add = |reply: u64| Input::Call { object: "Account/user:ana".into(), method: "set".into(), args: vec![json!("a@example.com")], reply: Some(reply), call: Some("c-1".into()), caller: ana() };
+    rt.handle(1000.0, add(1));
+    assert!(replies(&rt.handle(2000.0, add(2)))[0].3.is_none(), "a repeat gets the first result");
+    let record = store.0.borrow().data["Account/user:ana"].clone();
+    assert!(record.contains("\"calls\"") && !record.contains("user:ana"), "{record}");
+
+    rt.erase_subject("user:ana").unwrap();
+    let board = store.0.borrow().data["Board/main"].clone();
+    assert!(!board.contains("user:ana") && board.contains("\"alarms\":[]"), "the person's alarm on a shared object is gone: {board}");
+    rt.handle(6.0 * DAY, Input::Tick);
+    assert_eq!(state(&mut rt, 6.0 * DAY, "Board/main")["pings"], json!(0));
+
+    // Call records are kept 72 hours; after that a repeat runs again.
+    let mut rt = kept(&store, 0.0);
+    rt.handle(10.0 * DAY, add(3));
+    let calls = |s: &Shared| s.0.borrow().data["Account/user:ana"].matches("\"id\":\"c-1\"").count();
+    assert_eq!(calls(&store), 1);
+    rt.handle(14.0 * DAY, Input::Call { object: "Account/user:ana".into(), method: "set".into(), args: vec![json!("b@example.com")], reply: Some(4), call: Some("c-2".into()), caller: ana() });
+    assert_eq!(calls(&store), 0, "the old record aged out");
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
@@ -1201,6 +1360,11 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("@server object A { @pii(contact, \"x\") email: string = \"\" }").contains("as strings"));
     assert!(msg("@server object A { @pii(\"contact\", \"a\") @pii(\"contact\", \"b\") email: string = \"\" }").contains("repeated field decorator"));
     assert!(msg("@server object A { @every(\"1s\") n: number = 0 }").contains("fields take one @pii"));
+    // Retention and legal holds.
+    assert!(msg("@retain(\"30d\") object A { n: number = 0 }").contains("@retain is for @server objects"));
+    assert!(msg("@server @retain(\"soon\") object A { n: number = 0 }").contains("@retain takes a duration"));
+    assert!(msg("@server @retain(\"30d\", \"opened\") object A { n: number = 0 }").contains("\"created\" or \"changed\""));
+    assert!(msg("@server @legalHold() object A { n: number = 0 }").contains("@legalHold needs one duration"));
 }
 
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
