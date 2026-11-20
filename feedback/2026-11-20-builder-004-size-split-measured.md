@@ -35,3 +35,27 @@ post the top 20 items here, and target the largest that devices do not need at r
 
 ## Not checked
 Android `.so` sizes moved by about 1 KB as well; not profiled.
+
+## Profile (added the same day, `twiggy`, web runtime with names kept)
+
+| Area | Bytes |
+|---|---|
+| compiler (parser, type checker, code generator) | 199,139 |
+| serde (JSON, the protocol's generated code) | 121,906 |
+| read-only data (strings, tables) | 98,154 |
+| standard library (alloc, str, collections) | 93,462 |
+| runtime | 58,945 |
+| VM | 52,519 |
+| number and text formatting | 41,571 |
+| host glue | 19,719 |
+| UI tree and diff | 8,210 |
+
+Largest single functions: `Input`'s derived `Deserialize` (30,405), `run_steps` (30,380),
+`Runtime::handle` (18,298), `compile` (15,281).
+
+**Plan (owner approved "profile, then cut"):**
+1. Next: parse `Input` and `Target` by hand from a JSON value behind the same serde API
+   (`#[serde(try_from = ...)]`), replacing about 35 KB of generated code. Measured before
+   and after.
+2. Later, the big one: devices drop the compiler (about 199 KB) once `tj build` ships
+   ahead-of-time bytecode, as `docs/vision.md` plans.
