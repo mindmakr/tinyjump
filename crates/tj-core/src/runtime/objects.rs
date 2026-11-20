@@ -209,6 +209,33 @@ impl Runtime {
         }
     }
 
+    /// Resets the device's own objects (drafts, screen state, anything not `@server`) to their
+    /// defaults, loaded or only stored, after a signed-in user signed out or another signed
+    /// in: what one person typed or viewed must not stay for the next on a shared device.
+    pub(crate) fn clear_device_objects(&mut self) {
+        for class in 0..self.program.objects.len() as u16 {
+            let def = &self.program.objects[class as usize];
+            if def.server {
+                continue;
+            }
+            let prefix = format!("{}/", def.name);
+            let mut ids: Vec<String> = self.store.keys(&prefix).unwrap_or_default().into_iter().filter_map(|k| k.strip_prefix(&prefix).map(str::to_string)).collect();
+            ids.extend(self.instances.values().filter(|i| i.handle.class == class).map(|i| i.handle.id.to_string()));
+            ids.sort();
+            ids.dedup();
+            for id in ids {
+                let (Ok(o), Ok(fresh)) = (self.instance(class, &id), self.defaults(class)) else { continue };
+                let fresh = fresh.borrow().clone();
+                let inst = self.inst_mut(&o);
+                *inst.state.borrow_mut() = fresh;
+                // Its alarms were set for the person who left; their timers find nothing.
+                inst.alarms.clear();
+                self.touch(&o);
+                self.ran_code = true;
+            }
+        }
+    }
+
     /// Resets every replica to its defaults and resubscribes from scratch, after the device's
     /// user changed: what one user could read must not stay for the next.
     pub(crate) fn clear_replicas(&mut self) {

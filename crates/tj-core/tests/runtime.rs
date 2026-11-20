@@ -2111,3 +2111,59 @@ fn needs_consent_is_checked_where_it_must_be() {
 ";
     assert!(msg(own).contains("add import { consented } from \"tj:consent\""), "{}", msg(own));
 }
+
+#[test]
+fn the_privacy_check_follows_callbacks_over_the_same_list_without_crashing() {
+    // Found by the Milestone 1 builder: these crashed the compiler (a container merged into
+    // itself while the check followed an arrow callback).
+    let src = r#"@server @read("owner") object Profile { @pii("contact", "booking") name: string = "" }
+function f(parts: string[], s: string) { const q = [s]; const ok = parts.every(p => p === "") }
+@server object Roster {
+  entries: string[] = []
+  has(id: string): boolean { return this.entries.some(e => e === id) }
+  drop(id: string) { this.entries = this.entries.filter(e => e !== id) }
+}
+@server @read("owner") object Customer {
+  @allow("owner") leave() { const r = Roster.get("main"); if (r.has(this.id)) { r.drop(this.id) } }
+}
+"#;
+    assert_eq!(errors(src), "");
+}
+
+#[test]
+fn number_of_text_that_is_not_a_number_is_nan() {
+    let mut rt = boot("object T {\n  n: string = \"\"\n  f() { const x = Number(\"abc\"); const y = Number(\"42\"); this.n = (x !== x ? \"nan\" : \"num\") + \",\" + String(y) }\n}\n");
+    call(&mut rt, 1.0, "T/t", "f", json!([])).unwrap();
+    assert_eq!(state(&mut rt, 2.0, "T/t")["n"], json!("nan,42"));
+}
+
+#[test]
+fn a_press_is_answered_once_its_handler_starts_waiting() {
+    // Found in Milestone 1: an agent's tap whose handler awaited a server call hung until the
+    // server came back.
+    let src = "@server object Board {\n  notes: string[] = []\n  add(text: string) { this.notes.push(text) }\n}\nfunction App() {\n  return <Button id=\"add\" onPress={async () => { await Board.get(\"b\").add(\"x\") }}>Add</Button>\n}\n";
+    let (mut device, _) = boot_as(src, Shared::default(), 0.0, false);
+    let out = device.handle(1.0, Input::Ui { target: Target::Id { id: "add".into() }, event: "onPress".into(), value: Json::Null, reply: Some(9) });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 9, error: None, .. })), "answered now: {out:?}");
+    assert_eq!(server_calls(&out).len(), 1, "and the call went out");
+}
+
+#[test]
+fn signing_out_clears_what_the_device_kept_for_that_person() {
+    let src = "object Screen {\n  draft: string = \"\"\n  type(t: string) { this.draft = t }\n}\nfunction App() {\n  return <Text id=\"d\">{Screen.get(\"main\").draft}</Text>\n}\n";
+    let store = Shared::default();
+    let (mut device, _) = boot_as(src, store.clone(), 0.0, false);
+    device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    call(&mut device, 1.0, "Screen/main", "type", json!(["ana's phone 555"])).unwrap();
+    device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!(""), "gone from memory");
+    let (mut later, _) = boot_as(src, store.clone(), 4.0, false);
+    assert_eq!(state(&mut later, 5.0, "Screen/main")["draft"], json!(""), "and from the device's storage");
+
+    // An app nobody signs in to keeps its state.
+    let kept = Shared::default();
+    let (mut device, _) = boot_as(src, kept.clone(), 0.0, false);
+    call(&mut device, 1.0, "Screen/main", "type", json!(["my list"])).unwrap();
+    device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!("my list"));
+}

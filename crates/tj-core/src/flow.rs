@@ -227,12 +227,29 @@ pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
 /// in source order.
 pub fn reveals_and_transfers(files: &[(&str, &Program)]) -> (Vec<Reveal>, Vec<Transfer>) {
     let Some(c) = analyze(files) else { return Default::default() };
-    let (mut r, mut t) = (c.reveals, c.transfers);
-    r.sort_by_key(|x| x.at);
-    r.dedup();
-    t.sort_by(|a, b| (a.at, &a.to).cmp(&(b.at, &b.to)));
-    t.dedup();
-    (r, t)
+    // The check follows each path through the code, so one place is seen many times: one
+    // entry per place (and purpose or destination), with every field it lets out.
+    let mut reveals: Vec<Reveal> = Vec::new();
+    for r in c.reveals {
+        match reveals.iter_mut().find(|x| x.at == r.at && x.purpose == r.purpose) {
+            Some(x) => x.fields.extend(r.fields),
+            None => reveals.push(r),
+        }
+    }
+    let mut transfers: Vec<Transfer> = Vec::new();
+    for t in c.transfers {
+        match transfers.iter_mut().find(|x| x.at == t.at && x.to == t.to) {
+            Some(x) => x.fields.extend(t.fields),
+            None => transfers.push(t),
+        }
+    }
+    for f in reveals.iter_mut().map(|r| &mut r.fields).chain(transfers.iter_mut().map(|t| &mut t.fields)) {
+        f.sort();
+        f.dedup();
+    }
+    reveals.sort_by_key(|x| x.at);
+    transfers.sort_by(|a, b| (a.at, &a.to).cmp(&(b.at, &b.to)));
+    (reveals, transfers)
 }
 
 fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
@@ -470,7 +487,9 @@ impl Checker {
         match old {
             None => new,
             Some(Val::Cell(c)) => {
-                c.borrow_mut().join(&self.flatten(&new));
+                // Read first: `new` may be this same container.
+                let t = self.flatten(&new);
+                c.borrow_mut().join(&t);
                 Val::Cell(c.clone())
             }
             Some(old) => {
@@ -777,7 +796,8 @@ impl Checker {
                     let merged = self.merge(fr.vars.get(n), v);
                     fr.vars.insert(n.clone(), merged);
                 } else if let Some(Val::Cell(c)) = fr.vars.get(n) {
-                    c.borrow_mut().join(&self.flatten(&v));
+                    let t = self.flatten(&v);
+                    c.borrow_mut().join(&t);
                 } else {
                     let merged = self.merge(fr.vars.get(n), Val::Data(self.flatten(&v)));
                     fr.vars.insert(n.clone(), merged);

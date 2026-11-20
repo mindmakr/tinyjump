@@ -36,8 +36,8 @@ enum Msg {
     EffectDone(u32, Result<Json, String>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
-    /// Whether `caller` may read every one of `objects` (for stream tickets).
-    MayRead { objects: Vec<String>, caller: Caller, done: Sender<Result<(), Failure>> },
+    /// Which of `objects` `caller` may read (for stream tickets).
+    MayRead { objects: Vec<String>, caller: Caller, done: Sender<Result<Vec<String>, Failure>> },
     /// The core's statistics (`Runtime::stats`).
     Stats(Sender<Json>),
     /// Export (`erase: false`) or erase everything held about a person.
@@ -127,20 +127,33 @@ impl Engine {
     /// allowed to read (`None`: the admin, and every object if `objects` is empty). It starts
     /// with the current state of each of `objects` that changed after change number `since`,
     /// so a client that reconnects resumes where it left off instead of refetching.
-    pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<Arc<Mailbox>, Failure> {
+    /// Also returns the listed objects the caller may not read, for the audit log.
+    pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<(Arc<Mailbox>, Vec<String>), Failure> {
         let reader = match &caller {
             Some(Caller::Remote { id, .. }) => Some(id.clone()),
             _ => None,
         };
-        let events = Arc::new(Mailbox::new(objects.clone(), Some(self.stats.clone())).read_by(reader));
+        // Only what the caller may read goes into the mailbox, so no change to anything else
+        // can reach it. Objects refused are named, so the device stops asking for them.
+        let readable = match &caller {
+            Some(c) => self.may_read(objects.clone(), c.clone())?,
+            None => objects.clone(),
+        };
+        // The admin's stream with no list is every object; any other is exactly what it may read.
+        let only = (caller.is_some() || !objects.is_empty()).then(|| readable.clone());
+        let events = Arc::new(Mailbox::new(only, Some(self.stats.clone())).read_by(reader));
+        let refused: Vec<String> = objects.iter().filter(|o| !readable.contains(o)).cloned().collect();
+        if !refused.is_empty() {
+            events.push(Event::new(String::new(), None, format!("event: refused\ndata: {}\n\n", json!({ "objects": refused }))));
+        }
         let (done, r) = channel();
-        self.tx.send(Msg::Subscribe { events: events.clone(), objects, since, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        self.tx.send(Msg::Subscribe { events: events.clone(), objects: readable, since, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
         Self::wait(&r)??;
-        Ok(events)
+        Ok((events, refused))
     }
 
-    /// Whether `caller` may read every one of `objects`.
-    pub fn may_read(&self, objects: Vec<String>, caller: Caller) -> Result<(), Failure> {
+    /// The `objects` that `caller` may read (see [`may_read`]).
+    pub fn may_read(&self, objects: Vec<String>, caller: Caller) -> Result<Vec<String>, Failure> {
         let (done, r) = channel();
         self.tx.send(Msg::MayRead { objects, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
         Self::wait(&r)?
@@ -200,8 +213,11 @@ struct Waiter {
 }
 
 /// Whether `caller` may read every one of `objects`, checked on the runtime thread.
-fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Failure> {
-    objects.iter().try_for_each(|o| rt.may_read(o, caller).map_err(|why| (403, why)))
+/// The `objects` that `caller` may read. Refusals are not a failure: a device still listing
+/// objects from before its user changed gets a stream of what it may read (perhaps nothing)
+/// that names the rest, so it stops asking instead of retrying a 403 for ever.
+fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<Vec<String>, Failure> {
+    Ok(objects.iter().filter(|o| rt.may_read(o, caller).is_ok()).cloned().collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -273,7 +289,9 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 continue;
             }
             Ok(Msg::Subscribe { events, objects, since, caller, done }) => {
-                if let Some(Err(refused)) = caller.as_ref().map(|c| may_read(&rt, &objects, c)) {
+                // Checked again here, in turn with every change: `objects` were all readable
+                // when `subscribe` asked, and a rule may have changed since.
+                if let Some(Err(refused)) = caller.as_ref().map(|c| may_read(&rt, &objects, c).and_then(|ok| if ok.len() == objects.len() { Ok(ok) } else { Err((403, "access changed".into())) })) {
                     let _ = done.send(Err(refused));
                     continue;
                 }
@@ -587,14 +605,57 @@ mod tests {
         post("one").expect("posted");
 
         // A new client catches up on the current state first.
-        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0, None).expect("admin may stream"));
+        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0, None).expect("admin may stream").0);
         assert!(msg.contains("\"one\""), "{msg}");
 
         // A client that already has that change gets nothing old, only what happens next.
-        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq, None).expect("admin may stream");
+        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq, None).expect("admin may stream").0;
         post("two").expect("posted");
         let (next, msg) = next_change(&resumed);
         assert!(next > seq && msg.contains("\"two\""), "{msg}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_stream_serves_what_the_caller_may_read_and_names_the_rest() {
+        let data = std::env::temp_dir().join(format!("tj-engine-refused-{}", std::process::id()));
+        let source = "@server @read(\"owner\") object Profile {
+  name: string = \"\"
+  @allow(\"owner\") set(n: string) { this.name = n }
+}
+".to_string();
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
+        let who = |id: &str| Some(Caller::Remote { id: id.into(), roles: Vec::new() });
+        let set = |id: &str, n: &str| engine.request(Input::Call { object: format!("Profile/{id}"), method: "set".into(), args: vec![json!(n)], reply: None, call: None, caller: who(id) }).expect("set");
+        set("user:ana", "Ana");
+        set("user:bo", "Bo");
+        // A device still listing ana's profile from before bo signed in: bo gets his own, and
+        // ana's is named as refused instead of the whole stream failing.
+        let (events, refused) = engine.subscribe(vec!["Profile/user:ana".into(), "Profile/user:bo".into()], 0, who("user:bo")).expect("bo may stream his own");
+        assert_eq!(refused, ["Profile/user:ana"], "named for the audit log");
+        // Everything that arrives until `until` shows up (or two seconds pass).
+        let read = |until: &str| {
+            let (mut text, start) = (String::new(), std::time::Instant::now());
+            while !text.contains(until) && start.elapsed() < Duration::from_secs(2) {
+                text.extend(events.take(Duration::from_millis(200)).into_iter().map(|e| e.text));
+            }
+            text
+        };
+        let text = read("\"Bo\"");
+        assert!(text.contains("event: refused") && text.contains("Profile/user:ana"), "{text}");
+        assert!(text.contains("\"Bo\"") && !text.contains("\"Ana\""), "{text}");
+        // Later changes to ana's profile never reach bo's stream.
+        set("user:ana", "Ana again");
+        set("user:bo", "Bo again");
+        let later = read("Bo again");
+        assert!(later.contains("Bo again") && !later.contains("Ana again"), "{later}");
+        // Nothing readable: a stream that only names the refusals, and carries nothing else.
+        let (events, refused) = engine.subscribe(vec!["Profile/user:ana".into()], 0, who("user:bo")).expect("opens");
+        assert_eq!(refused, ["Profile/user:ana"]);
+        set("user:ana", "Ana once more");
+        let text: String = events.take(Duration::from_secs(1)).into_iter().map(|e| e.text).collect();
+        assert!(text.contains("event: refused") && !text.contains("Ana once more"), "{text}");
         let _ = std::fs::remove_dir_all(&data);
     }
 

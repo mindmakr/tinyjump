@@ -30,8 +30,9 @@ impl Event {
 }
 
 pub struct Mailbox {
-    /// Only events about these objects are kept; empty means all.
-    only: Vec<String>,
+    /// Only events about these objects are kept; `None`: every object (the admin's stream).
+    /// Events about no object (`refused`, `reload`) are always kept.
+    only: Option<Vec<String>>,
     /// Who reads it: their own objects come with personal data, others masked. `None`: the
     /// admin or an anonymous caller, who own nothing.
     reader: Option<String>,
@@ -47,7 +48,7 @@ struct Queue {
 }
 
 impl Mailbox {
-    pub fn new(only: Vec<String>, stats: Option<Arc<Stats>>) -> Mailbox {
+    pub fn new(only: Option<Vec<String>>, stats: Option<Arc<Stats>>) -> Mailbox {
         Mailbox { only, reader: None, stats, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
     }
 
@@ -68,7 +69,7 @@ impl Mailbox {
         if q.closed {
             return false;
         }
-        if !self.only.is_empty() && !self.only.contains(&e.object) {
+        if !e.object.is_empty() && self.only.as_ref().is_some_and(|only| !only.contains(&e.object)) {
             return true;
         }
         if e.merge.is_some() {
@@ -135,7 +136,7 @@ mod tests {
     #[test]
     fn a_slow_client_gets_the_latest_states_in_order_and_a_bounded_backlog() {
         let stats = Arc::new(Stats::default());
-        let m = Mailbox::new(Vec::new(), Some(stats.clone()));
+        let m = Mailbox::new(None, Some(stats.clone()));
         for e in [state("A/a", 1), state("B/b", 2), state("A/a", 3)] {
             assert!(m.push(e));
         }
@@ -160,7 +161,7 @@ mod tests {
 
     #[test]
     fn keeps_only_the_objects_asked_for() {
-        let m = Mailbox::new(vec!["A/a".into()], None);
+        let m = Mailbox::new(Some(vec!["A/a".into()]), None);
         m.push(state("B/b", 1));
         m.push(state("A/a", 2));
         let texts: Vec<String> = m.take(Duration::ZERO).into_iter().map(|e| e.text).collect();

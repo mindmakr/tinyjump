@@ -157,6 +157,15 @@ fn parse_args() -> Result<Args, String> {
 fn main() -> ExitCode {
     // `tj plugin <name> [file]` speaks MCP on stdio; it has its own arguments.
     let raw: Vec<String> = std::env::args().collect();
+    // `tj`, `tj --help`, `tj help` and `--help` after any command print the usage.
+    if raw.iter().skip(1).any(|a| matches!(a.as_str(), "--version" | "-V" | "version")) {
+        println!("tj {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    if raw.len() < 2 || raw.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     if raw.get(1).map(String::as_str) == Some("privacy") {
         return match privacy::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,

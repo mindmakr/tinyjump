@@ -386,7 +386,7 @@ fn handle(mut req: Request, front: &Front) {
         })),
         (Method::Get, ["_tj", "reload"]) if front.dev.is_some() => {
             let dev = front.dev.as_ref().expect("checked");
-            let events = Arc::new(Mailbox::new(Vec::new(), None));
+            let events = Arc::new(Mailbox::new(Some(Vec::new()), None));
             if let Ok(mut tabs) = dev.tabs.lock() {
                 tabs.push(events.clone());
             }
@@ -468,6 +468,15 @@ fn query_values(url: &str, name: &str) -> Result<Vec<String>, Failure> {
         .collect()
 }
 
+/// The classes of refused objects, for the audit log. Object ids are never written: they can
+/// be anything a caller makes up, and a person's object id is their id.
+fn classes(objects: &[String]) -> String {
+    let mut classes: Vec<&str> = objects.iter().map(|o| o.split_once('/').map_or("?", |(c, _)| c)).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.join(" ")
+}
+
 /// `POST /api/events/ticket`: a one-time ticket for a stream of the listed objects, bound to
 /// the caller and those objects, stored only by its hash.
 fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Result<Json, Failure> {
@@ -477,7 +486,16 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
         return Err((400, "list the objects to stream: {\"objects\": [\"Class/id\", ...]}".into()));
     }
     let verified = front.identity.verify(authorization)?;
-    front.engine.may_read(objects.clone(), verified.caller.clone())?;
+    // The stream checks again when it opens, and names any it refuses.
+    let readable = front.engine.may_read(objects.clone(), verified.caller.clone())?;
+    if readable.len() < objects.len() {
+        let who = match &verified.caller {
+            Caller::Remote { id, .. } => Actor::id(Some(id)),
+            Caller::Trusted(_) => Actor::Admin,
+        };
+        let refused: Vec<String> = objects.iter().filter(|o| !readable.contains(o)).cloned().collect();
+        let _ = front.audit.security(Entry::new("refused").who(who).text("request", "ticket").text("classes", &classes(&refused)).num("status", 403));
+    }
     let value = hex(&random::<32>().map_err(|e| (500, e))?);
     let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
     tickets.retain(|_, t| t.expires > Instant::now());
@@ -538,7 +556,14 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
             _ => None,
         };
         match front.engine.subscribe(objects, since, caller) {
-            Ok(events) => Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) }),
+            Ok((events, refused)) => {
+                // Partly refused is still a refusal, written to the audit log.
+                if !refused.is_empty() {
+                    let who = caller_id.as_deref().map_or(Actor::Anonymous, |id| Actor::id(Some(id)));
+                    let _ = front.audit.security(Entry::new("refused").who(who).text("request", "stream").text("classes", &classes(&refused)).num("status", 403));
+                }
+                Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) })
+            }
             Err(e) => {
                 release(front, slot.as_deref());
                 Err(e)
@@ -623,7 +648,7 @@ mod tests {
     fn agents_reach_the_open_tab_and_the_server_answers_when_none_is_open() {
         let dev = Arc::new(Dev::default());
         assert!(dev.ask("inspect", &Json::Null).is_none(), "no tab: the server answers");
-        let tab = Arc::new(Mailbox::new(Vec::new(), None));
+        let tab = Arc::new(Mailbox::new(Some(Vec::new()), None));
         dev.tabs.lock().unwrap().push(tab.clone());
         // The tab reads the question and posts its answer.
         let answering = {
