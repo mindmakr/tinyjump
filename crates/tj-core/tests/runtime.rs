@@ -1081,6 +1081,11 @@ type Msg = { text: string }
   fresh(): Msg[] { return this.messages.filter(m => m.text !== "") }
   first(): Msg { return this.messages[0] }
   wrapped(): { list: Msg[] } { return { list: this.messages } }
+  looped(): any {
+    const w: any = { list: this.messages }
+    w.self = w
+    return w
+  }
 }
 @server @read("anyone") object Poster {
   @allow("anyone") direct() { Room.get("lobby").messages.push({ text: "x" }) }
@@ -1094,6 +1099,7 @@ type Msg = { text: string }
     w.list.push({ text: "x" })
     return 0
   }
+  @allow("anyone") looped() { Room.get("lobby").looped().self.list.push({ text: "x" }) }
   @allow("anyone") values() { Object.values(Room.get("lobby").meta)[0].push("x") }
   @allow("anyone") entries() { Object.entries(Room.get("lobby").meta)[0][1].push("x") }
   @allow("anyone") sorted() { Room.get("lobby").meta.tags.sort((a, b) => 0) }
@@ -1117,7 +1123,7 @@ type Msg = { text: string }
 "#;
     let mut rt = server(src, false);
     let anyone = || who("", &[]);
-    for method in ["direct", "alias", "nested", "element", "returned", "copyInside", "firstOne", "wrapper", "values", "entries", "sorted"] {
+    for method in ["direct", "alias", "nested", "element", "returned", "copyInside", "firstOne", "wrapper", "looped", "values", "entries", "sorted"] {
         let err = call_as(&mut rt, 1.0, "Poster/p", method, json!([]), anyone()).unwrap_err().1;
         assert!(err.contains("only that object's own methods can change it"), "{method}: {err}");
     }

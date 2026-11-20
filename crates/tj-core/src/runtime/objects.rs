@@ -332,44 +332,45 @@ impl Runtime {
             return v;
         }
         let Some(inst) = self.instances.get(&(o.class, o.id.clone())) else { return v };
-        // State is plain data without cycles, so this walk ends.
-        fn owned(v: &Value, out: &mut std::collections::HashSet<usize>) {
+        // Containers can refer to themselves in memory (`w.self = w`): each is visited once.
+        type Seen = std::collections::HashSet<usize>;
+        fn owned(v: &Value, out: &mut Seen) {
             match v {
-                Value::Arr(a) => {
-                    out.insert(Rc::as_ptr(a) as *const () as usize);
-                    a.borrow().iter().for_each(|x| owned(x, out));
-                }
-                Value::Rec(r) => {
-                    out.insert(Rc::as_ptr(r) as *const () as usize);
-                    r.borrow().values().for_each(|x| owned(x, out));
-                }
+                Value::Arr(a) if out.insert(Rc::as_ptr(a) as *const () as usize) => a.borrow().iter().for_each(|x| owned(x, out)),
+                Value::Rec(r) if out.insert(Rc::as_ptr(r) as *const () as usize) => r.borrow().values().for_each(|x| owned(x, out)),
                 _ => {}
             }
         }
-        fn protect(v: Value, own: &std::collections::HashSet<usize>) -> Value {
+        fn protect(v: Value, own: &Seen, seen: &mut Seen) -> Value {
             match &v {
                 Value::Arr(a) if !a.readonly => {
-                    if own.contains(&(Rc::as_ptr(a) as *const () as usize)) {
+                    let ptr = Rc::as_ptr(a) as *const () as usize;
+                    if own.contains(&ptr) {
                         return v.read_only();
                     }
-                    let items: Vec<Value> = a.borrow().iter().cloned().collect();
-                    *a.borrow_mut() = items.into_iter().map(|x| protect(x, own)).collect();
+                    if seen.insert(ptr) {
+                        let items: Vec<Value> = a.borrow().iter().cloned().collect();
+                        *a.borrow_mut() = items.into_iter().map(|x| protect(x, own, seen)).collect();
+                    }
                     v
                 }
                 Value::Rec(r) if !r.readonly => {
-                    if own.contains(&(Rc::as_ptr(r) as *const () as usize)) {
+                    let ptr = Rc::as_ptr(r) as *const () as usize;
+                    if own.contains(&ptr) {
                         return v.read_only();
                     }
-                    let fields: Vec<(Rc<str>, Value)> = r.borrow().iter().map(|(k, x)| (k.clone(), x.clone())).collect();
-                    *r.borrow_mut() = fields.into_iter().map(|(k, x)| (k, protect(x, own))).collect();
+                    if seen.insert(ptr) {
+                        let fields: Vec<(Rc<str>, Value)> = r.borrow().iter().map(|(k, x)| (k.clone(), x.clone())).collect();
+                        *r.borrow_mut() = fields.into_iter().map(|(k, x)| (k, protect(x, own, seen))).collect();
+                    }
                     v
                 }
                 _ => v,
             }
         }
-        let mut own = std::collections::HashSet::new();
+        let mut own = Seen::new();
         owned(&Value::Rec(inst.state.clone().into()), &mut own);
-        protect(v, &own)
+        protect(v, &own, &mut Seen::new())
     }
 
     pub(crate) fn set_obj_field(&mut self, this: Option<&ObjRef>, o: &Rc<ObjRef>, name: &str, v: Value) -> Result<(), Exc> {
