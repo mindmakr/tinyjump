@@ -243,6 +243,8 @@ impl Runtime {
     /// Resets every replica to its defaults and resubscribes from scratch, after the device's
     /// user changed: what one user could read must not stay for the next.
     pub(crate) fn clear_replicas(&mut self) {
+        // Class streams start over too: the screen asks again for what this user may list.
+        self.class_streams.clear();
         let replicas: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.remote).map(|i| i.handle.clone()).collect();
         for o in replicas {
             let Ok(fresh) = self.defaults(o.class) else { continue };
@@ -528,14 +530,21 @@ impl Runtime {
     /// changed after change number `since`, oldest change first. Unknown objects are skipped.
     pub fn changed_since(&mut self, objects: &[String], since: u64) -> Vec<Output> {
         let mut out = Vec::new();
-        // A class stream (`Slot/*`) starts with the class's objects.
+        // A class stream (`Slot/*`) starts with the class's objects that changed: the most
+        // recent CLASS_STREAM_CAP of them, so a client resuming never misses a new change.
         let mut keys: Vec<String> = Vec::new();
+        let mut streamed: Vec<String> = Vec::new();
         for key in objects {
             match key.strip_suffix("/*").and_then(|c| self.program.object(c).map(|class| (c, class))) {
-                Some((name, class)) => keys.extend(self.class_ids(class).into_iter().take(CLASS_STREAM_CAP).map(|id| format!("{name}/{id}"))),
+                Some((name, class)) => {
+                    streamed.push(format!("{name}/"));
+                    keys.extend(self.class_ids(class).into_iter().map(|id| format!("{name}/{id}")));
+                }
                 None => keys.push(key.clone()),
             }
         }
+        keys.sort();
+        keys.dedup();
         for key in &keys {
             let Ok(o) = self.resolve_object(key) else { continue };
             let seq = self.inst(&o).seq;
@@ -546,6 +555,14 @@ impl Runtime {
             }
         }
         out.sort_by_key(|(seq, _)| *seq);
+        // Over the cap: drop the oldest changes of class streams, never a listed object.
+        let in_class = |o: &Output| matches!(o, Output::Changed { object, .. } if streamed.iter().any(|p| object.starts_with(p.as_str())));
+        let mut extra = out.iter().filter(|(_, o)| in_class(o)).count().saturating_sub(CLASS_STREAM_CAP);
+        out.retain(|(_, o)| {
+            let drop = extra > 0 && in_class(o);
+            extra -= usize::from(drop);
+            !drop
+        });
         out.into_iter().map(|(_, o)| o).collect()
     }
 
@@ -566,9 +583,16 @@ impl Runtime {
         let def = &self.program.objects[class as usize];
         if def.server && !self.server {
             if self.class_streams.insert(class) {
-                self.outputs.push(Output::Subscribe { object: format!("{}/*", def.name), seq: 0 });
+                let stream = format!("{}/*", def.name);
+                // The replicas kept on the device come first, so the list shows offline too.
+                for id in self.class_ids(class) {
+                    self.instance(class, &id)?;
+                }
+                self.outputs.push(Output::Subscribe { object: stream, seq: 0 });
             }
-            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote).map(|i| i.handle.clone()).collect();
+            // A replica the server never sent (seq 0) is not a member: one left blank by a
+            // change of user, or asked for by id and not there.
+            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote && i.seq > 0).map(|i| i.handle.clone()).collect();
             list.sort_by(|a, b| a.id.cmp(&b.id));
             return Ok(list);
         }

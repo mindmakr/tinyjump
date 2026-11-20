@@ -1050,6 +1050,11 @@ function tools(o: string) { return [{ name: "email", object: o, method: "myEmail
     assert!(e.contains("is returned here to callers who do not own it"), "{e}");
     let e = flow(r#"@allow("signedIn") plans(): string[] { return Account.all().filter(a => a.plan !== "").map(a => a.plan) }"#, "");
     assert_eq!(e, "", "plain fields of anyone's objects are not personal data");
+    // reduce's callback takes the accumulator first: the element is still anyone's object.
+    let e = flow(r#"@allow("signedIn") joined(): string { return Account.all().reduce((acc, a) => acc + a.email, "") }"#, "");
+    assert!(e.contains("is returned here to callers who do not own it"), "{e}");
+    let e = flow(r#"@allow("signedIn") both(): any { return Account.all().concat(Account.all().map(a => a.email)) }"#, "");
+    assert!(e.contains("is returned here"), "concat's argument is checked: {e}");
 
     // Purposes are enforced, and mixing fields for different purposes is refused.
     assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
@@ -2420,4 +2425,37 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
     // A copy of personal data is kept only where it is marked as personal data.
     let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
     assert!(e.contains("is kept in `Cache.names`, which is not marked as personal data") && e.contains("@by"), "{e}");
+}
+
+#[test]
+fn a_class_stream_resumes_with_the_newest_changes_and_starts_over_for_a_new_user() {
+    // Over the cap, catching up keeps the most recent changes, whatever the ids.
+    let mut rt = server(SLOTS, false);
+    for i in 0..1005 {
+        call_as(&mut rt, 1.0 + i as f64, &format!("Slot/s{:04}", 1005 - i), "name", json!(["x"]), who("", &[])).unwrap();
+    }
+    let seq = |o: &Output| match o {
+        Output::Changed { seq, .. } => *seq,
+        _ => 0,
+    };
+    let all = rt.changed_since(&["Slot/*".into()], 0);
+    assert_eq!(all.len(), 1000);
+    let newest = all.iter().map(seq).max().unwrap();
+    assert!(all.iter().any(|o| matches!(o, Output::Changed { object, .. } if object == "Slot/s0001")), "the last one changed is sent");
+    let resumed = rt.changed_since(&["Slot/*".into(), "Slot/s0001".into()], newest - 1);
+    assert_eq!(resumed.len(), 1, "resuming sends the newest change once: {resumed:?}");
+
+    // A device lists the replicas it kept, offline, before the server answers.
+    let src = format!("{SLOTS}\nfunction App() {{\n  return <Column>{{Slot.all().map(s => <Text key={{s.id}}>{{s.title}}</Text>)}}</Column>\n}}\n");
+    let store = Shared::default();
+    let (mut device, _) = boot_as(&src, store.clone(), 0.0, false);
+    device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
+    device.handle(1.5, Input::Tick);
+    let (mut device, out) = boot_as(&src, store, 2.0, false);
+    assert!(format!("{out:?}").contains("Beard"), "kept replicas are listed offline: {out:?}");
+    // Another user signs in: the class is asked for again, and the old replicas are not members.
+    let out = device.handle(3.0, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, .. } if object == "Slot/*")), "{out:?}");
+    assert!(!format!("{out:?}").contains("Beard"), "{out:?}");
+    assert!(!tj_core::runtime::access::owns("*", "*"), "nobody owns a whole class");
 }
