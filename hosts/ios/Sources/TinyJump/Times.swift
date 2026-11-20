@@ -64,7 +64,8 @@ enum Times {
     static func picker(_ type: String, _ zone: String?, _ value: Any?) -> UIDatePicker {
         let p = UIDatePicker()
         p.datePickerMode = type == "date" ? .date : type == "time" ? .time : .dateAndTime
-        p.preferredDatePickerStyle = .wheels
+        // Wheels, as the keyboard's place suits them; older systems only have wheels.
+        if #available(iOS 13.4, *) { p.preferredDatePickerStyle = .wheels }
         p.timeZone = type == "time" ? TimeZone(identifier: "UTC")! : self.zone(zone)
         if let ms = (value as? NSNumber)?.doubleValue, ms.isFinite { p.date = Date(timeIntervalSince1970: ms / 1000) }
         return p
