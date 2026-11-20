@@ -105,7 +105,13 @@ impl Client {
             "inspect" => {
                 let s = self.inspect()?;
                 let objects = serde_json::to_string_pretty(&s["objects"]).unwrap_or_default();
-                text(format!("{}\nobjects:\n{objects}\nmetrics: {}", review::outline(&s["tree"]), s["metrics"]))
+                // Under `tj dev`, the screen's objects come from the tab and the server's own
+                // from the server.
+                let server = match s.get("serverObjects") {
+                    Some(o) => format!("\nserver objects:\n{}", serde_json::to_string_pretty(o).unwrap_or_default()),
+                    None => String::new(),
+                };
+                text(format!("{}\nobjects:\n{objects}{server}\nmetrics: {}", review::outline(&s["tree"]), s["metrics"]))
             }
             "review" => {
                 let s = self.inspect()?;
