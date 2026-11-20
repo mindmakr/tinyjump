@@ -24,7 +24,9 @@ impl FileStore {
 fn encode(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') {
+        // Upper-case letters are encoded too: keys differing only in case must stay apart on
+        // case-insensitive filesystems (Windows, macOS), or the `owner` rule could be bypassed.
+        if b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.') {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -86,7 +88,11 @@ mod tests {
         s.save("Other/z", "3").unwrap();
         assert_eq!(s.load("Counter/main").as_deref(), Some("{\"a\":1}"));
         assert_eq!(s.keys("Counter/"), vec!["Counter/../x".to_string(), "Counter/main".to_string()]);
-        assert!(dir.join("Counter%2F..%2Fx.json").exists(), "keys never become paths");
+        assert!(dir.join("%43ounter%2F..%2Fx.json").exists(), "keys never become paths");
+        // Keys that differ only in case stay apart, even where the filesystem ignores case.
+        s.save("Cart/Alice", "\"A\"").unwrap();
+        s.save("Cart/alice", "\"a\"").unwrap();
+        assert_eq!((s.load("Cart/Alice").as_deref(), s.load("Cart/alice").as_deref()), (Some("\"A\""), Some("\"a\"")));
         fs::remove_dir_all(dir).unwrap();
     }
 }

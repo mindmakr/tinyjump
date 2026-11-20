@@ -3,7 +3,7 @@
 // Events that drive it:
 //   timer    @every("5s") the meter samples its load
 //   action   a person (or agent) records a reading, changes the limit or acknowledges an alert
-//   API      a gateway posts readings: curl -X POST localhost:4700/api/Meter/home/record -d '[7.2, "gateway"]'
+//   API      a gateway posts readings: curl -X POST localhost:4700/api/Meter/home/record //              -H 'content-type: application/json' -d '[7.2, "gateway"]'
 //   alarm    durable timers: "still high after 15s?" and "nobody acknowledged after 30s?"
 //   read     every API read of the meter is published to subscribers as a `read` event
 //
@@ -16,7 +16,8 @@ type State = "normal" | "high" | "alert"
 const CONFIRM_MS = 15000
 const ESCALATE_MS = 30000
 
-@server object Meter {
+// Anyone may watch and operate this demo meter; a real one would use @allow("operator").
+@server @read("anyone") object Meter {
   state: State = "normal"
   limitKw: number = 5
   readings: Reading[] = []
@@ -32,23 +33,24 @@ const ESCALATE_MS = 30000
   }
 
   // Action or API: a reading from anywhere.
-  record(kw: number, source: string) {
+  @allow("anyone") record(kw: number, source: string) {
     this.readings.push({ at: Date.now(), kw, source })
     if (this.readings.length > 24) { this.readings.shift() }
     this.step(kw)
   }
 
-  setLimit(kw: number, by: string) {
+  // `name` is the operator's display name.
+  @allow("anyone") setLimit(kw: number, name: string) {
     if (kw <= 0) { throw new Error("the limit must be above 0 kW") }
     this.limitKw = kw
-    this.notify("info", `${by} set the limit to ${kw} kW`)
+    this.notify("info", `${name} set the limit to ${kw} kW`)
   }
 
-  acknowledge(by: string) {
+  @allow("anyone") acknowledge(name: string) {
     if (this.acknowledged) { return }
     this.acknowledged = true
     this.escalations = 0
-    this.notify("info", `${by} acknowledged the alert`)
+    this.notify("info", `${name} acknowledged the alert`)
   }
 
   // The workflow: each reading may move the meter between states.

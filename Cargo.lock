@@ -621,6 +621,7 @@ dependencies = [
 name = "tj-cli"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "serde_json",
  "tiny_http",
  "tj-core",

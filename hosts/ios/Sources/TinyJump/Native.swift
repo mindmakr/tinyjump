@@ -9,11 +9,12 @@ final class FileStore {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 
-    /// Percent-encodes everything but [A-Za-z0-9._-], so keys never become paths.
+    /// Percent-encodes everything but [a-z0-9._-], so keys never become paths, and upper-case
+    /// letters too, so keys differing only in case stay apart (APFS ignores case).
     static func encode(_ key: String) -> String {
         var out = ""
         for b in key.utf8 {
-            let safe = (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) || b == 0x2D || b == 0x5F || b == 0x2E
+            let safe = (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x7A) || b == 0x2D || b == 0x5F || b == 0x2E
             out += safe ? String(UnicodeScalar(b)) : String(format: "%%%02X", Int(b))
         }
         return out

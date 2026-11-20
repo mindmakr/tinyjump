@@ -35,7 +35,7 @@ impl JsonHost {
             }
         };
         // Foreign-language hosts are devices: `@server` objects are replicas.
-        match Runtime::boot(program, store, Options { now, seed, render, server: false }) {
+        match Runtime::boot(program, store, Options { render, ..Options::new(now, seed) }) {
             Ok((mut rt, outputs)) => {
                 if let Some(m) = measure {
                     rt.set_measure(m);

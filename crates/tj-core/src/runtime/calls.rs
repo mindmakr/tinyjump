@@ -5,11 +5,17 @@
 //! `await` simply waits), and the outbox survives restarts. Calls to one object are sent one
 //! at a time, so they arrive in the order they were made.
 //!
-//! Servers: a call that carries an id runs once. The object records the id and the result
-//! with its state, in the same write, so a retry gets the first result without running
-//! again, even after a restart. A repeat that arrives while the first is still running waits
-//! for it.
+//! Servers: a call that carries an id runs once. The object records the id, who made the
+//! call, the method, a hash of the arguments and the result with its state, in the same
+//! write. A retry gets the first result without running again, even after a restart; the
+//! same id from another caller or for another call gets 422 and never the stored result.
+//! A repeat that arrives while the first is still running waits for it.
+//!
+//! Devices scope the outbox to the signed-in user (the `identity` input): calls queued by
+//! someone else are dropped, never sent as the new user.
 
+use super::access::Who;
+use super::objects::CallRecord;
 use super::protocol::{Effect, Output};
 use super::{Runtime, TimerKind};
 use crate::vm::value::{ObjRef, Value};
@@ -23,6 +29,7 @@ const FIRST_RETRY_MS: f64 = 1000.0;
 const MAX_RETRY_MS: f64 = 30_000.0;
 /// Reply ids from here up are the runtime's own: the results of calls made once.
 pub(crate) const CALL_REPLY_BASE: u64 = 1 << 62;
+const MAX_CALL_ID: usize = 128;
 
 #[derive(Serialize, Deserialize, Default)]
 pub(crate) struct Outbox {
@@ -30,6 +37,9 @@ pub(crate) struct Outbox {
     device: String,
     next: u64,
     pending: Vec<Pending>,
+    /// The signed-in user calls are queued for (`identity`).
+    #[serde(default)]
+    user: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -38,6 +48,9 @@ struct Pending {
     object: String,
     method: String,
     args: Vec<Json>,
+    /// The user it was queued for; it is never sent as anyone else.
+    #[serde(default)]
+    user: Option<String>,
     /// The promise the caller awaits. Callers do not survive a restart, so this is not stored.
     #[serde(skip)]
     promise: Option<u32>,
@@ -59,10 +72,19 @@ fn mix(mut x: u64) -> u64 {
 }
 
 impl Runtime {
-    /// Loads the outbox at boot and sends what is still pending.
+    /// Loads the outbox at boot. What is still pending is sent on the first input, not at
+    /// boot: if that input says a different user signed in (`identity`), their calls are
+    /// dropped first, so nothing queued by one user leaves under another's token.
     pub(crate) fn load_outbox(&mut self) {
-        if let Some(outbox) = self.store.load(OUTBOX_KEY).and_then(|t| serde_json::from_str(&t).ok()) {
+        if let Some(outbox) = self.store.load(OUTBOX_KEY).and_then(|t| serde_json::from_str::<Outbox>(&t).ok()) {
+            self.outbox_held = !outbox.pending.is_empty();
             self.outbox = outbox;
+        }
+    }
+
+    /// The first input after boot releases the held outbox (see [`Runtime::load_outbox`]).
+    pub(crate) fn release_outbox(&mut self) {
+        if std::mem::take(&mut self.outbox_held) {
             self.dispatch_calls();
         }
     }
@@ -77,13 +99,16 @@ impl Runtime {
     /// Queues a call to an `@server` object and returns the promise its caller awaits.
     pub(crate) fn queue_call(&mut self, object: String, method: String, args: Vec<Json>) -> u32 {
         if self.outbox.device.is_empty() {
-            self.outbox.device = format!("{:016x}", mix(self.rng ^ self.now.to_bits()));
+            // 128 bits from the host's seed, which hosts take from a secure random source.
+            let a = mix(self.rng ^ self.now.to_bits());
+            self.outbox.device = format!("{a:016x}{:016x}", mix(a));
         }
         self.outbox.next += 1;
         let call = format!("{}-{}", self.outbox.device, self.outbox.next);
         self.next_effect += 1;
         let promise = self.next_effect;
-        self.outbox.pending.push(Pending { call, object, method, args, promise: Some(promise), effect: None, attempts: 0, retry_at: 0.0 });
+        let user = self.outbox.user.clone();
+        self.outbox.pending.push(Pending { call, object, method, args, user, promise: Some(promise), effect: None, attempts: 0, retry_at: 0.0 });
         self.save_outbox();
         self.dispatch_calls();
         promise
@@ -150,33 +175,69 @@ impl Runtime {
         self.dispatch_calls();
     }
 
+    /// The signed-in user changed: calls queued by anyone else are dropped (each reported
+    /// to its caller, or as an error), and replicas read as the previous user are cleared.
+    pub(crate) fn set_identity(&mut self, user: Option<String>) {
+        if self.outbox.user == user {
+            self.release_outbox();
+            return;
+        }
+        let (keep, dropped): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.outbox.pending).into_iter().partition(|p| p.user == user);
+        self.outbox.pending = keep;
+        self.outbox.user = user;
+        for p in dropped {
+            let why = format!("{}.{} was queued by another user and was not sent", p.object, p.method);
+            match p.promise {
+                Some(promise) => self.resume(promise, None, Some(why)),
+                None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
+            }
+        }
+        self.save_outbox();
+        self.clear_replicas();
+        self.release_outbox();
+    }
+
     /// Pending server calls, for automation.
     pub(crate) fn outbox_json(&self) -> Json {
         Json::Array(self.outbox.pending.iter().map(|p| json!({ "call": p.call, "object": p.object, "method": p.method, "attempts": p.attempts })).collect())
     }
 
     /// Runs a call that carries an id at most once (see the module docs).
-    pub(crate) fn call_once(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, reply: Option<u64>, call: String) {
-        if let Some(r) = self.call_result(&obj, &call) {
-            self.reply(reply, r);
+    pub(crate) fn call_once(&mut self, obj: Rc<ObjRef>, method: &str, args: &[Json], reply: Option<u64>, call: String, who: Who) {
+        if call.is_empty() || call.len() > MAX_CALL_ID {
+            self.reply_status(reply, 400, format!("a call id must be 1-{MAX_CALL_ID} characters"));
             return;
         }
-        if let Some(waiting) = self.running_calls.get_mut(&call) {
-            waiting.push(reply);
+        let mine = CallRecord::new(&call, &who, method, args);
+        if let Some(done) = self.call_record(&obj, &call) {
+            match done.same_call(&mine) {
+                true => self.reply(reply, done.result()),
+                false => self.reply_status(reply, 422, "this call id was already used for another call".into()),
+            }
+            return;
+        }
+        if let Some((running, waiting)) = self.running_calls.get_mut(&call) {
+            if running.same_call(&mine) {
+                waiting.push(reply);
+            } else {
+                self.reply_status(reply, 422, "this call id was already used for another call".into());
+            }
             return;
         }
         self.next_call_reply += 1;
         let internal = CALL_REPLY_BASE + self.next_call_reply;
         self.call_replies.insert(internal, (obj.clone(), call.clone()));
-        self.running_calls.insert(call, vec![reply]);
-        self.invoke(obj, method, args, true, Some(internal));
+        self.running_calls.insert(call, (mine, vec![reply]));
+        let args = args.iter().map(Value::from_json).collect();
+        self.invoke(obj, method, args, true, Some(internal), who);
     }
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.
     pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, String>) {
         let Some((obj, call)) = self.call_replies.remove(&internal) else { return };
-        self.record_call(&obj, &call, &r);
-        for reply in self.running_calls.remove(&call).unwrap_or_default() {
+        let Some((record, waiting)) = self.running_calls.remove(&call) else { return };
+        self.record_call(&obj, record.with_result(&r));
+        for reply in waiting {
             self.reply(reply, r.clone());
         }
     }

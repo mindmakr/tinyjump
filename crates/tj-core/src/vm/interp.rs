@@ -17,6 +17,8 @@ pub struct Fiber {
     pub stack: Vec<Value>,
     pub frames: Vec<Frame>,
     handlers: Vec<Handler>,
+    /// Who the call belongs to: `caller` in code, and alarms it schedules.
+    pub caller: crate::runtime::access::Who,
 }
 
 pub struct Frame {
@@ -399,6 +401,7 @@ impl Runtime {
                         let elem = Elem { kind: desc.kind.clone(), props: desc.props.iter().cloned().zip(props.iter().cloned()).collect(), children: children.to_vec() };
                         f.stack.push(Value::Elem(Rc::new(elem)));
                     }
+                    Op::Caller => f.stack.push(f.caller.record()),
                     Op::Await => {
                         let v = pop!();
                         if let Value::Promise(id) = v {
@@ -499,7 +502,7 @@ impl Runtime {
                     "schedule" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
-                        self.schedule_alarm(o, &args)?;
+                        self.schedule_alarm(o, &args, &f.caller)?;
                         f.stack.push(Value::Null);
                         Ok(())
                     }

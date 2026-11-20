@@ -15,6 +15,11 @@ final class Sync: NSObject, URLSessionDataDelegate {
     private var stream: URLSessionDataTask?
     private var buffer = Data()
     private var generation = 0
+    /// Sent as `Authorization: Bearer` (docs/access-control.md); nil when signed out.
+    private var token: String?
+    private var user: String?
+    /// Called when the server answers 401, so the embedding app can refresh the token.
+    var onTokenExpired: (() -> Void)?
 
     init(tj: TinyJump, server: String?) {
         self.tj = tj
@@ -52,11 +57,14 @@ final class Sync: NSObject, URLSessionDataDelegate {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue(effect["call"] as? String, forHTTPHeaderField: "Idempotency-Key")
+        authorize(&req)
         req.httpBody = try? JSONSerialization.data(withJSONObject: effect["args"] as? [Any] ?? [])
         URLSession.shared.dataTask(with: req) { data, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            let reply = status < 500 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
+            // A 401 is retried too, once the embedding app has refreshed the token.
+            let reply = status < 500 && status != 401 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
             DispatchQueue.main.async {
+                if status == 401 { self.onTokenExpired?() }
                 if let reply = reply, reply["error"] == nil {
                     done(reply["ok"], nil, false)
                 } else if let message = reply?["error"] as? String {
@@ -85,6 +93,28 @@ final class Sync: NSObject, URLSessionDataDelegate {
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 
+    /// Sets the token; returns true if the user changed, in which case replicas start over (the
+    /// runtime drops what the previous user queued, and resubscribes).
+    func setToken(_ newToken: String?, user newUser: String?) -> Bool {
+        token = newToken
+        let changed = newUser != user
+        user = newUser
+        if changed {
+            replicas = [:]
+            cursor = 0
+            generation += 1
+            stream?.cancel()
+            stream = nil
+        } else if !replicas.isEmpty {
+            connect()
+        }
+        return changed
+    }
+
+    private func authorize(_ req: inout URLRequest) {
+        if let token = token { req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+    }
+
     /// One stream for all replicas, replaced when the set grows, resuming from `cursor`.
     private func connect() {
         generation += 1
@@ -92,14 +122,18 @@ final class Sync: NSObject, URLSessionDataDelegate {
         buffer = Data()
         let query = replicas.keys.map { "object=" + Sync.encode($0) }.joined(separator: "&")
         guard let url = URL(string: (server ?? "") + "/api/events?" + query + "&since=\(cursor)") else { return }
-        stream = session.dataTask(with: url)
+        var req = URLRequest(url: url)
+        authorize(&req)
+        stream = session.dataTask(with: req)
         stream?.resume()
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        if dataTask === stream, (response as? HTTPURLResponse)?.statusCode == 200 {
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if dataTask === stream, status == 200 {
             tj?.send(["type": "online"]) // reachable again: queued calls go now, not after their backoff
         }
+        if dataTask === stream, status == 401 { onTokenExpired?() }
         completionHandler(.allow)
     }
 

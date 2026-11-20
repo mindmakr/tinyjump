@@ -3,14 +3,16 @@
 
 type Message = { author: string, text: string, at: number }
 
-@server object Room {
+// Anyone may read and post: an open lobby. `name` is a display name people choose, not an
+// identity; with sign-in, use `caller.id` (docs/access-control.md).
+@server @read("anyone") object Room {
   messages: Message[] = []
 
-  post(author: string, text: string) {
-    const name = author.trim()
+  @allow("anyone") post(name: string, text: string) {
+    const shown = name.trim()
     const body = text.trim()
-    if (name === "" || body === "") { throw new Error("name and message are required") }
-    this.messages.push({ author: name, text: body, at: Date.now() })
+    if (shown === "" || body === "") { throw new Error("name and message are required") }
+    this.messages.push({ author: shown, text: body, at: Date.now() })
     if (this.messages.length > 100) { this.messages.shift() }
   }
 }

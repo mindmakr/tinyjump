@@ -2,7 +2,7 @@
 // Change it from any of them and every subscribed screen updates at once.
 //
 //   UI:      any browser, Android or iOS device running this app
-//   API:     curl -X POST localhost:4700/api/Cart/demo/add -d '["tea", "curl"]'
+//   API:     curl -X POST localhost:4700/api/Cart/demo/add -H 'content-type: application/json' //                 -d '["tea", "curl"]'   (staff with an API key may also restock: see shelf.tj)
 //   Agent:   tj mcp, then call Cart/demo add ["mug", "agent"]
 //   Backend: held stock returns to the shelf when a cart is left alone,
 //            and the shelf restocks itself every minute

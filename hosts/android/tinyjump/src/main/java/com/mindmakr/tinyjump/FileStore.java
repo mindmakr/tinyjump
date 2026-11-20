@@ -23,12 +23,15 @@ final class FileStore {
         dir.mkdirs();
     }
 
-    /** Percent-encodes everything but [A-Za-z0-9._-], so keys never become paths. */
+    /**
+     * Percent-encodes everything but [a-z0-9._-], so keys never become paths, and upper-case
+     * letters too, so keys differing only in case stay apart on case-insensitive filesystems.
+     */
     static String encode(String key) {
         StringBuilder out = new StringBuilder();
         for (byte b : key.getBytes(UTF8)) {
             int c = b & 0xff;
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+            if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
                 out.append((char) c);
             } else {
                 out.append('%').append(String.format("%02X", c));

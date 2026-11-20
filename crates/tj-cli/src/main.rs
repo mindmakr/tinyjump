@@ -1,10 +1,12 @@
 //! `tj`: the tinyjump command line.
 
+mod access;
 mod app;
 mod auth;
 mod bench;
 mod engine;
 mod http;
+mod identity;
 mod mailbox;
 mod stats;
 mod mcp;
@@ -27,13 +29,15 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj>              compile and report errors
+  tj check <app.tj> [--access]   compile and report errors; --access prints who may read and call what
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
   tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
+  tj key <name> --keys <file> [--role <r>]...
+                                 make an API key (printed once; only its hash is stored in the file)
 
 OPTIONS:
   --port <n>      port to listen on (default 4700)
@@ -41,6 +45,14 @@ OPTIONS:
   --data <dir>    where objects are stored (default: .tj-data next to the app)
   --wasm <file>   web runtime for `dev` (default: the workspace's `cargo web` output)
   --target <url>  app automation endpoint (default http://127.0.0.1:4700; Android/iOS debug: :4701)
+  --as <name:role,role>
+                  `dev` only: requests without credentials act as this user (dev:<name>)
+
+ENVIRONMENT (tj serve):
+  TJ_KEYS         file of API key hashes (see `tj key`)
+  TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
+  TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
+  TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
 ";
 
 struct Args {
@@ -53,6 +65,10 @@ struct Args {
     target: String,
     budget: Option<PathBuf>,
     json: bool,
+    access: bool,
+    as_user: Option<String>,
+    keys: Option<PathBuf>,
+    roles: Vec<String>,
 }
 
 impl Args {
@@ -65,7 +81,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new() };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -76,6 +92,10 @@ fn parse_args() -> Result<Args, String> {
             "--target" => args.target = value()?,
             "--budget" => args.budget = Some(PathBuf::from(value()?)),
             "--json" => args.json = true,
+            "--access" => args.access = true,
+            "--as" => args.as_user = Some(value()?),
+            "--keys" => args.keys = Some(PathBuf::from(value()?)),
+            "--role" => args.roles.push(value()?),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -95,7 +115,8 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(check),
+        "check" => args.file().and_then(|f| check(f, args.access)),
+        "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
         "dev" => serve(&args, true),
@@ -156,16 +177,28 @@ fn read_source(file: &Path) -> Result<String, String> {
     app::read(file).map(|a| a.source)
 }
 
-fn check(file: &Path) -> Result<(), String> {
+fn check(file: &Path, access: bool) -> Result<(), String> {
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
         Ok(_) => {
             println!("ok: {name}");
+            if access {
+                print!("{}", access::report(&src));
+            }
             Ok(())
         }
         Err(errs) => Err(errs.iter().map(|d| d.render(&name, &src)).collect::<Vec<_>>().join("\n\n")),
     }
+}
+
+fn new_key(args: &Args) -> Result<(), String> {
+    let name = args.file.as_ref().map(|p| p.display().to_string()).ok_or("`tj key` needs a name: tj key <name> --keys keys.json --role staff")?;
+    let file = args.keys.as_deref().ok_or("`tj key` needs --keys <file>, the file TJ_KEYS will name")?;
+    let key = identity::new_key(&name, &args.roles, file)?;
+    eprintln!("Added key:{name} to {}. The key, shown only now:", file.display());
+    println!("{key}");
+    Ok(())
 }
 
 fn workspace_dir() -> PathBuf {
@@ -176,8 +209,14 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let file = args.file()?;
     let source = read_source(file)?;
     let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
-    // In dev mode the browser runs the UI; the server keeps the backend objects.
-    let engine = Engine::start(source, data.clone(), false)?;
+    let loopback = matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if args.as_user.is_some() && !(dev_mode && loopback) {
+        return Err("--as is for `tj dev` on this machine only (with --host 127.0.0.1)".into());
+    }
+    let identity = identity::Identity::new(args.as_user.as_deref())?;
+    // In dev mode the browser runs the UI; the server keeps the backend objects. Dev also
+    // explains refusals, which a real server must not.
+    let engine = Engine::start(source, data.clone(), false, dev_mode)?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     let dev = if dev_mode {
@@ -191,8 +230,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     } else {
         None
     };
-    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe());
-    http::serve(&addr, engine, dev, automation)
+    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
+    http::serve(&addr, http::Front::new(engine, dev, automation, identity))
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.

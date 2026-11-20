@@ -1,36 +1,52 @@
 //! HTTP front door. Every public object method is an API endpoint, object changes
-//! stream as server-sent events, and the automation surface is under `/_tj/`.
+//! stream as server-sent events, and the automation surface is under `/_tj/`. Every API
+//! request carries a caller, checked against the app's rules (docs/access-control.md).
 //!
-//!   POST /api/{Class}/{id}/{method}   body: JSON array of arguments -> {"ok": result} | {"error": msg}
-//!                                     an Idempotency-Key header makes repeats return the first result
+//!   POST /api/{Class}/{id}/{method}   body (application/json): array of arguments
+//!                                     -> {"ok": result} | {"error": msg}; an Idempotency-Key
+//!                                     header makes repeats return the first result
 //!   GET  /api/{Class}/{id}            -> {"ok": state}
 //!   GET  /api/events?object=Class/id&since=N
 //!                                     -> SSE stream of `emit` and `changed`; it starts with
 //!                                        the listed objects changed after N (or after the
 //!                                        `Last-Event-ID` header), then streams live
+//!   POST /api/events/ticket           body: {"objects": [...]} -> {"ok": {"ticket": t}}, for
+//!                                     browsers, whose EventSource cannot send Authorization:
+//!                                     then GET /api/events?ticket=t&since=N
 //!   GET  /_tj/inspect                 -> semantic tree + object states
 //!   POST /_tj/input                   body: one protocol Input
 //!   (`/_tj/*` needs the admin key on `tj serve`; see auth.rs)
 //!
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
-//! plus `/_tj/reload` (SSE) for live reload.
+//! plus `/_tj/reload` (SSE) for live reload, and answers only loopback `Host`s.
 
 use crate::auth::Automation;
-use crate::engine::Engine;
+use crate::engine::{Engine, Failure};
+use crate::identity::{sha256_hex, Identity};
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server};
+use tj_core::runtime::protocol::Caller;
 use tj_core::Input;
 
 const MAX_BODY: u64 = 1 << 20;
 const MAX_CONNECTIONS: usize = 512;
 const SSE_KEEPALIVE: Duration = Duration::from_secs(15);
+/// How often an open stream re-checks its credential (expiry, revoked keys).
+const RECHECK_EVERY: Duration = Duration::from_secs(60);
+/// Open streams per caller, or per IP address for anonymous callers.
+const STREAMS_PER_CALLER: usize = 8;
+const TICKET_LIFETIME: Duration = Duration::from_secs(60);
+const MAX_TICKETS: usize = 1000;
+
+type Body = Response<std::io::Cursor<Vec<u8>>>;
 
 /// Files served in dev mode.
 pub struct Dev {
@@ -43,24 +59,51 @@ pub struct Dev {
 impl Dev {
     pub fn notify_reload(&self) {
         if let Ok(mut subs) = self.reload.lock() {
-            subs.retain(|s| s.push(Event::new(String::new(), false, "event: reload\ndata: {}\n\n".into())));
+            subs.retain(|s| s.push(Event::new(String::new(), None, "event: reload\ndata: {}\n\n".into())));
         }
     }
 }
 
-pub fn serve(addr: &str, engine: Engine, dev: Option<Arc<Dev>>, automation: Automation) -> Result<(), String> {
+/// A one-time stream ticket, stored by the hash of its value.
+struct Ticket {
+    caller: Caller,
+    objects: Vec<String>,
+    credential: Option<String>,
+    expires: Instant,
+}
+
+/// Everything a request handler needs.
+pub struct Front {
+    pub engine: Engine,
+    pub dev: Option<Arc<Dev>>,
+    pub automation: Automation,
+    pub identity: Identity,
+    /// Behind a proxy: take the client address from `X-Forwarded-For` (`TJ_TRUST_PROXY=1`).
+    pub trust_proxy: bool,
+    streams: Mutex<HashMap<String, usize>>,
+    tickets: Mutex<HashMap<String, Ticket>>,
+}
+
+impl Front {
+    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity) -> Front {
+        let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
+        Front { engine, dev, automation, identity, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+    }
+}
+
+pub fn serve(addr: &str, front: Front) -> Result<(), String> {
     let server = Server::http(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     let active = Arc::new(AtomicUsize::new(0));
-    let automation = Arc::new(automation);
+    let front = Arc::new(front);
     for req in server.incoming_requests() {
         if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
             let _ = req.respond(json_response(503, &json!({ "error": "busy" })));
             continue;
         }
         active.fetch_add(1, Ordering::Relaxed);
-        let (engine, dev, counter, automation) = (engine.clone(), dev.clone(), active.clone(), automation.clone());
+        let (front, counter) = (front.clone(), active.clone());
         let spawned = thread::Builder::new().name("tj-http".into()).spawn(move || {
-            handle(req, &engine, dev.as_deref(), &automation);
+            handle(req, &front);
             counter.fetch_sub(1, Ordering::Relaxed);
         });
         if spawned.is_err() {
@@ -70,7 +113,7 @@ pub fn serve(addr: &str, engine: Engine, dev: Option<Arc<Dev>>, automation: Auto
     Ok(())
 }
 
-fn json_response(status: u16, body: &Json) -> Response<std::io::Cursor<Vec<u8>>> {
+fn json_response(status: u16, body: &Json) -> Body {
     Response::from_data(body.to_string()).with_status_code(status).with_header(header("Content-Type", "application/json"))
 }
 
@@ -78,10 +121,10 @@ fn header(k: &str, v: &str) -> Header {
     Header::from_bytes(k.as_bytes(), v.as_bytes()).expect("static header is valid")
 }
 
-fn result_response(r: Result<Json, String>) -> Response<std::io::Cursor<Vec<u8>>> {
+fn result_response(r: Result<Json, Failure>) -> Body {
     match r {
         Ok(v) => json_response(200, &json!({ "ok": v })),
-        Err(e) => json_response(400, &json!({ "error": e })),
+        Err((status, e)) => json_response(status, &json!({ "error": e })),
     }
 }
 
@@ -101,19 +144,36 @@ fn percent_decode(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn read_json(req: &mut Request) -> Result<Json, String> {
+/// A JSON body. Requests that change things must say `Content-Type: application/json`,
+/// which a cross-site form cannot send without the browser asking first.
+fn read_json(req: &mut Request) -> Result<Json, Failure> {
+    if !header_value(req, "Content-Type").is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("application/json")) {
+        return Err((415, "send the body as JSON, with `Content-Type: application/json`".into()));
+    }
     let mut body = String::new();
-    req.as_reader().take(MAX_BODY + 1).read_to_string(&mut body).map_err(|e| format!("cannot read body: {e}"))?;
+    req.as_reader().take(MAX_BODY + 1).read_to_string(&mut body).map_err(|e| (400, format!("cannot read body: {e}")))?;
     if body.len() as u64 > MAX_BODY {
-        return Err("body too large".into());
+        return Err((413, "body too large".into()));
     }
     if body.trim().is_empty() {
         return Ok(Json::Null);
     }
-    serde_json::from_str(&body).map_err(|e| format!("body is not JSON: {e}"))
+    serde_json::from_str(&body).map_err(|e| (400, format!("body is not JSON: {e}")))
 }
 
-fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>, automation: &Automation) {
+/// `tj dev` answers only requests addressed to `localhost` or to an IP address, so a web page
+/// cannot reach it through a DNS name of its own that points at this machine (DNS
+/// rebinding). Devices and emulators still connect by address (e.g. 10.0.2.2).
+fn trusted_host(req: &Request) -> bool {
+    let Some(host) = header_value(req, "Host") else { return false };
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    name == "localhost" || name.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn handle(mut req: Request, front: &Front) {
     let started = Instant::now();
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let segs: Option<Vec<String>> = path.trim_start_matches('/').split('/').map(percent_decode).collect();
@@ -122,41 +182,57 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>, automation: &Aut
         return;
     };
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
-    if segs.first() == Some(&"_tj") {
-        if let Err((status, e)) = automation.check(header_value(&req, "Authorization").as_deref()) {
-            let _ = req.respond(json_response(status, &json!({ "error": e })));
-            engine.stats().request(started.elapsed(), false);
-            return;
-        }
+    let authorization = header_value(&req, "Authorization");
+    let early = if front.dev.is_some() && !trusted_host(&req) {
+        Some((403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
+    } else if segs.first() == Some(&"_tj") {
+        front.automation.check(authorization.as_deref()).err()
+    } else {
+        None
+    };
+    if let Some((status, e)) = early {
+        let _ = req.respond(json_response(status, &json!({ "error": e })));
+        front.engine.stats().request(started.elapsed(), false);
+        return;
     }
     let method = req.method().clone();
+    let engine = &front.engine;
     let response = match (&method, segs.as_slice()) {
-        (Method::Get, ["api", "events"]) => {
-            let only = query_values(req.url(), "object");
-            // A browser's EventSource reconnects with the id of the last event it saw.
-            let resume = header_value(&req, "Last-Event-ID");
-            let since = resume.into_iter().chain(query_values(req.url(), "since")).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
-            return sse(req, &engine.subscribe(only, since));
+        (Method::Get, ["api", "events"]) => return stream(req, front, authorization),
+        (Method::Post, ["api", "events", "ticket"]) => result_response(ticket(&mut req, front, authorization.as_deref())),
+        (Method::Get, ["api", class, id]) => {
+            let object = format!("{class}/{id}");
+            result_response(front.identity.verify(authorization.as_deref()).and_then(|v| engine.request(Input::Get { object, reply: None, caller: Some(v.caller) })))
         }
-        (Method::Get, ["api", class, id]) => result_response(engine.request(Input::Get { object: format!("{class}/{id}"), reply: None })),
-        (Method::Post, ["api", class, id, name]) => match (read_json(&mut req), header_value(&req, "Idempotency-Key")) {
+        (Method::Post, ["api", class, id, name]) => {
+            let object = format!("{class}/{id}");
             // With an Idempotency-Key, a repeated request returns the first result without running again.
-            (Ok(Json::Null), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args: Vec::new(), reply: None, call })),
-            (Ok(Json::Array(args)), call) => result_response(engine.request(Input::Call { object: format!("{class}/{id}"), method: name.to_string(), args, reply: None, call })),
-            (Ok(_), _) => json_response(400, &json!({ "error": "body must be a JSON array of arguments" })),
-            (Err(e), _) => json_response(400, &json!({ "error": e })),
-        },
+            let call = header_value(&req, "Idempotency-Key");
+            let r = read_json(&mut req).and_then(|body| match body {
+                Json::Null => Ok(Vec::new()),
+                Json::Array(args) => Ok(args),
+                _ => Err((400, "body must be a JSON array of arguments".into())),
+            });
+            result_response(r.and_then(|args| {
+                let caller = front.identity.verify(authorization.as_deref())?.caller;
+                engine.request(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
+            }))
+        }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
         (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None }).map(|mut s| {
             s["server"] = engine.stats().json();
             s
         })),
-        (Method::Post, ["_tj", "input"]) => match read_json(&mut req).and_then(|j| serde_json::from_value::<Input>(j).map_err(|e| format!("not a protocol input: {e}"))) {
-            Ok(input) => result_response(engine.request(input)),
-            Err(e) => json_response(400, &json!({ "error": e })),
-        },
-        (Method::Get, rest) if dev.is_some() => {
-            let dev = dev.expect("checked");
+        (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
+            let mut input = serde_json::from_value::<Input>(j).map_err(|e| (400, format!("not a protocol input: {e}")))?;
+            // Automation is trusted (it already passed the admin key), so it says so explicitly.
+            if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
+                *c = Some(Caller::trusted());
+            }
+            engine.request(input)
+        })),
+        (Method::Get, rest) if front.dev.is_some() => {
+            let dev = front.dev.as_deref().expect("checked");
             match rest {
                 [""] | ["index.html"] => file(dev.web_dir.join("index.html"), "text/html; charset=utf-8"),
                 ["tinyjump.js"] => file(dev.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
@@ -171,43 +247,196 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>, automation: &Aut
                     if let Ok(mut subs) = dev.reload.lock() {
                         subs.push(events.clone());
                     }
-                    return sse(req, &events);
+                    return sse(req, &events, || true);
                 }
                 _ => json_response(404, &json!({ "error": "not found" })),
             }
         }
         _ => json_response(404, &json!({ "error": "not found" })),
     };
-    let ok = response.status_code().0 < 400;
+    let status = response.status_code().0;
+    if segs.first() == Some(&"api") && matches!(status, 401 | 403 | 422) {
+        audit(front, &authorization, &method, &path, status);
+    }
     let _ = req.respond(response);
-    engine.stats().request(started.elapsed(), ok);
+    engine.stats().request(started.elapsed(), status < 400);
+}
+
+/// One line per refused API request, for operators: never credentials, bodies or arguments.
+fn audit(front: &Front, authorization: &Option<String>, method: &Method, path: &str, status: u16) {
+    let who = match front.identity.verify(authorization.as_deref()) {
+        Ok(v) => match v.caller {
+            Caller::Remote { id, .. } if !id.is_empty() => id,
+            _ => "anonymous".into(),
+        },
+        Err(_) => "invalid credential".into(),
+    };
+    let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    eprintln!("{}", json!({ "audit": "refused", "at": at, "caller": who, "request": format!("{method} {path}"), "status": status }));
 }
 
 fn header_value(req: &Request, name: &'static str) -> Option<String> {
     req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str().to_string())
 }
 
-fn file(path: PathBuf, content_type: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+fn file(path: PathBuf, content_type: &str) -> Body {
     match std::fs::read(&path) {
         Ok(bytes) => Response::from_data(bytes).with_header(header("Content-Type", content_type)).with_header(header("Cache-Control", "no-store")),
         Err(e) => json_response(404, &json!({ "error": format!("{}: {e}", path.display()) })),
     }
 }
 
-/// All values of a query parameter, percent-decoded.
-fn query_values(url: &str, name: &str) -> Vec<String> {
-    let Some((_, query)) = url.split_once('?') else { return Vec::new() };
-    query.split('&').filter_map(|pair| pair.split_once('=')).filter(|(k, _)| *k == name).filter_map(|(_, v)| percent_decode(&v.replace('+', " "))).collect()
+/// All values of a query parameter, percent-decoded; a value that does not decode is an
+/// error, never silently dropped (a dropped `object=` must not widen a stream).
+fn query_values(url: &str, name: &str) -> Result<Vec<String>, Failure> {
+    let Some((_, query)) = url.split_once('?') else { return Ok(Vec::new()) };
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(k, _)| *k == name)
+        .map(|(_, v)| percent_decode(&v.replace('+', " ")).ok_or_else(|| (400, format!("bad {name}= value"))))
+        .collect()
 }
 
-/// Streams server-sent events from `events` until the client goes away.
-fn sse(req: Request, events: &Mailbox) {
+/// `POST /api/events/ticket`: a one-time ticket for a stream of the listed objects, bound to
+/// the caller and those objects, stored only by its hash.
+fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Result<Json, Failure> {
+    let body = read_json(req)?;
+    let objects: Vec<String> = body["objects"].as_array().map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect()).unwrap_or_default();
+    if objects.is_empty() {
+        return Err((400, "list the objects to stream: {\"objects\": [\"Class/id\", ...]}".into()));
+    }
+    let verified = front.identity.verify(authorization)?;
+    front.engine.may_read(objects.clone(), verified.caller.clone())?;
+    let mut bytes = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| (500, "no secure random source".to_string()))?;
+    let value: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
+    tickets.retain(|_, t| t.expires > Instant::now());
+    if tickets.len() >= MAX_TICKETS {
+        return Err((503, "too many pending stream tickets; try again shortly".into()));
+    }
+    let credential = authorization.map(str::to_string);
+    tickets.insert(sha256_hex(&value), Ticket { caller: verified.caller, objects, credential, expires: Instant::now() + TICKET_LIFETIME });
+    Ok(json!({ "ticket": value }))
+}
+
+/// An admitted stream: its events, its slot in the per-caller cap, and the credential to
+/// re-check while it is open.
+struct Opened {
+    events: Arc<Mailbox>,
+    slot: Option<String>,
+    credential: Option<String>,
+}
+
+/// `GET /api/events`: checks who may stream what, caps streams per caller, then streams.
+fn stream(req: Request, front: &Front, authorization: Option<String>) {
+    let opened = (|| -> Result<Opened, Failure> {
+        let since_header = header_value(&req, "Last-Event-ID");
+        let since = since_header.into_iter().chain(query_values(req.url(), "since")?).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
+        let ticket = query_values(req.url(), "ticket")?.into_iter().next();
+        let (caller, objects, credential) = match ticket {
+            Some(value) => {
+                let t = front.tickets.lock().ok().and_then(|mut m| m.remove(&sha256_hex(&value))).filter(|t| t.expires > Instant::now());
+                let t = t.ok_or((401, "this stream ticket is unknown, used or expired; get a new one".to_string()))?;
+                (Some(t.caller), t.objects, t.credential)
+            }
+            None => {
+                let objects = query_values(req.url(), "object")?;
+                if objects.is_empty() {
+                    // Every object, unfiltered, is for the admin only.
+                    front.automation.check(authorization.as_deref()).map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
+                    (None, objects, None)
+                } else {
+                    (Some(front.identity.verify(authorization.as_deref())?.caller), objects, authorization.clone())
+                }
+            }
+        };
+        let slot = match &caller {
+            Some(Caller::Remote { id, .. }) if !id.is_empty() => Some(id.clone()),
+            Some(_) => Some(format!("ip:{}", client_ip(&req, front.trust_proxy))),
+            None => None,
+        };
+        if let Some(slot) = &slot {
+            let mut open = front.streams.lock().map_err(|_| (500, "streams unavailable".to_string()))?;
+            let n = open.entry(slot.clone()).or_insert(0);
+            if *n >= STREAMS_PER_CALLER {
+                return Err((429, format!("at most {STREAMS_PER_CALLER} open streams per caller")));
+            }
+            *n += 1;
+        }
+        let caller_id = match &caller {
+            Some(Caller::Remote { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        match front.engine.subscribe(objects, since, caller) {
+            Ok(events) => Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) }),
+            Err(e) => {
+                release(front, slot.as_deref());
+                Err(e)
+            }
+        }
+    })();
+    match opened {
+        Ok(Opened { events, slot, credential }) => {
+            // Re-check the credential while the stream is open: expired tokens and revoked
+            // keys must not keep receiving changes.
+            let first = credential.as_deref().map(|c| front.identity.verify(Some(c)).ok().map(|v| (v.caller, v.expires)));
+            let still_valid = || match (&credential, &first) {
+                (Some(c), Some(Some((caller, expires)))) => {
+                    expires.map_or(true, |t| SystemTime::now() < t) && front.identity.verify(Some(c)).is_ok_and(|v| v.caller == *caller)
+                }
+                (Some(_), _) => false,
+                (None, _) => true,
+            };
+            sse(req, &events, still_valid);
+            release(front, slot.as_deref());
+        }
+        Err((status, e)) => {
+            if matches!(status, 401 | 403) {
+                audit(front, &authorization, &Method::Get, "/api/events", status);
+            }
+            let _ = req.respond(json_response(status, &json!({ "error": e })));
+        }
+    }
+}
+
+fn release(front: &Front, slot: Option<&str>) {
+    if let (Some(slot), Ok(mut open)) = (slot, front.streams.lock()) {
+        if let Some(n) = open.get_mut(slot) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                open.remove(slot);
+            }
+        }
+    }
+}
+
+fn client_ip(req: &Request, trust_proxy: bool) -> String {
+    if trust_proxy {
+        if let Some(first) = header_value(req, "X-Forwarded-For").and_then(|v| v.split(',').next().map(|s| s.trim().to_string())) {
+            return first;
+        }
+    }
+    req.remote_addr().map_or_else(|| "unknown".into(), |a| a.ip().to_string())
+}
+
+/// Streams server-sent events from `events` until the client goes away or `still_valid`
+/// says its credential no longer is (checked every minute).
+fn sse(req: Request, events: &Mailbox, still_valid: impl Fn() -> bool) {
     let mut w = req.into_writer();
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
     let mut ok = w.write_all(head.as_bytes()).and_then(|()| w.flush()).is_ok();
     events.connected(true);
+    let mut checked = Instant::now();
     while ok {
         let batch = events.take(SSE_KEEPALIVE);
+        if checked.elapsed() >= RECHECK_EVERY {
+            checked = Instant::now();
+            if !still_valid() {
+                break;
+            }
+        }
         let chunk: String = if batch.is_empty() { ":\n\n".to_string() } else { batch.iter().map(|e| e.text.as_str()).collect() };
         ok = w.write_all(chunk.as_bytes()).and_then(|()| w.flush()).is_ok();
         if ok {
@@ -216,4 +445,16 @@ fn sse(req: Request, events: &Mailbox) {
     }
     events.connected(false);
     events.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bad_object_values_are_errors_not_dropped() {
+        assert_eq!(query_values("/api/events?object=Room%2Flobby&object=A/b", "object").unwrap(), ["Room/lobby", "A/b"]);
+        assert_eq!(query_values("/api/events?object=%zz", "object").unwrap_err().0, 400);
+        assert!(query_values("/api/events", "object").unwrap().is_empty());
+    }
 }

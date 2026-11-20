@@ -11,19 +11,28 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tj_core::runtime::protocol::Effect;
+use tj_core::runtime::protocol::{Caller, Effect};
 use tj_core::{compile, Input, Options, Output, Runtime};
 
 const EFFECT_WORKERS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-type Reply = Sender<Result<Json, String>>;
+/// A refused or failed request: its HTTP status and message.
+pub type Failure = (u16, String);
+
+type Reply = Sender<Result<Json, Failure>>;
+
+/// Remote requests may load at most this many objects at once (`TJ_MAX_OBJECTS`).
+const MAX_OBJECTS: usize = 100_000;
 
 enum Msg {
     Input(Input, Option<Reply>),
     EffectDone(u32, Result<Json, String>),
-    Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64 },
+    /// `caller: None` is the admin: every object, unchecked.
+    Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
+    /// Whether `caller` may read every one of `objects` (for stream tickets).
+    MayRead { objects: Vec<String>, caller: Caller, done: Sender<Result<(), Failure>> },
     Reload(String),
 }
 
@@ -37,26 +46,30 @@ pub fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
-/// Compiles and boots `source`, rendering compile errors for a terminal.
-fn boot(source: &str, data: &Path, render: bool) -> Result<(Runtime, Vec<Output>), String> {
+/// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
+/// requests are refused (`tj dev` only).
+fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runtime, Vec<Output>), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let store = FileStore::open(data).map_err(|e| format!("cannot open data dir {}: {e}", data.display()))?;
-    let seed = now_ms() as u64;
-    Runtime::boot(program, Box::new(store), Options { now: now_ms(), seed, render, server: true }).map_err(|e| format!("boot failed: {e}"))
+    let mut seed = [0u8; 8];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed).map_err(|_| "no secure random source")?;
+    let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
+    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
+    Runtime::boot(program, Box::new(store), opts).map_err(|e| format!("boot failed: {e}"))
 }
 
 impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
-    pub fn start(source: String, data: PathBuf, render: bool) -> Result<Engine, String> {
+    pub fn start(source: String, data: PathBuf, render: bool, explain: bool) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
         thread::Builder::new()
             .name("tj-runtime".into())
-            .spawn(move || match boot(&source, &data, render) {
+            .spawn(move || match boot(&source, &data, render, explain) {
                 Ok((rt, out)) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(rt, out, rx, back, data, render);
+                    run(rt, out, rx, back, data, render, explain);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -68,26 +81,41 @@ impl Engine {
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
-    pub fn request(&self, input: Input) -> Result<Json, String> {
+    pub fn request(&self, input: Input) -> Result<Json, Failure> {
+        let stopped = || (503, "runtime stopped".to_string());
         if !has_reply(&input) {
-            self.tx.send(Msg::Input(input, None)).map_err(|_| "runtime stopped")?;
+            self.tx.send(Msg::Input(input, None)).map_err(|_| stopped())?;
             return Ok(Json::Null);
         }
         let (t, r) = channel();
-        self.tx.send(Msg::Input(input, Some(t))).map_err(|_| "runtime stopped")?;
-        r.recv_timeout(REQUEST_TIMEOUT).map_err(|e| match e {
-            RecvTimeoutError::Timeout => "timed out waiting for the app".to_string(),
-            RecvTimeoutError::Disconnected => "the app restarted before answering".to_string(),
-        })?
+        self.tx.send(Msg::Input(input, Some(t))).map_err(|_| stopped())?;
+        Self::wait(&r)?
     }
 
-    /// Realtime stream of `emit` and `changed` events about `objects` (all if empty). It
-    /// starts with the current state of each of `objects` that changed after change number
-    /// `since`, so a client that reconnects resumes where it left off instead of refetching.
-    pub fn subscribe(&self, objects: Vec<String>, since: u64) -> Arc<Mailbox> {
+    fn wait<T>(r: &Receiver<T>) -> Result<T, Failure> {
+        r.recv_timeout(REQUEST_TIMEOUT).map_err(|e| match e {
+            RecvTimeoutError::Timeout => (503, "timed out waiting for the app".to_string()),
+            RecvTimeoutError::Disconnected => (503, "the app restarted before answering".to_string()),
+        })
+    }
+
+    /// Realtime stream of `emit` and `changed` events about `objects`, which `caller` must be
+    /// allowed to read (`None`: the admin, and every object if `objects` is empty). It starts
+    /// with the current state of each of `objects` that changed after change number `since`,
+    /// so a client that reconnects resumes where it left off instead of refetching.
+    pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<Arc<Mailbox>, Failure> {
         let events = Arc::new(Mailbox::new(objects.clone(), Some(self.stats.clone())));
-        let _ = self.tx.send(Msg::Subscribe { events: events.clone(), objects, since });
-        events
+        let (done, r) = channel();
+        self.tx.send(Msg::Subscribe { events: events.clone(), objects, since, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)??;
+        Ok(events)
+    }
+
+    /// Whether `caller` may read every one of `objects`.
+    pub fn may_read(&self, objects: Vec<String>, caller: Caller) -> Result<(), Failure> {
+        let (done, r) = channel();
+        self.tx.send(Msg::MayRead { objects, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)?
     }
 
     /// The server's work counters.
@@ -108,7 +136,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Tick => {}
     }
 }
 
@@ -119,7 +147,12 @@ struct Dispatch {
     effects: Sender<(u32, Effect)>,
 }
 
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool) {
+/// Whether `caller` may read every one of `objects`, checked on the runtime thread.
+fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Failure> {
+    objects.iter().try_for_each(|o| rt.may_read(o, caller).map_err(|why| (403, why)))
+}
+
+fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool) {
     let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back) };
     d.outputs(boot_out);
     loop {
@@ -143,7 +176,16 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 };
                 rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false })
             }
-            Ok(Msg::Subscribe { events, objects, since }) => {
+            Ok(Msg::MayRead { objects, caller, done }) => {
+                let _ = done.send(may_read(&rt, &objects, &caller));
+                continue;
+            }
+            Ok(Msg::Subscribe { events, objects, since, caller, done }) => {
+                if let Some(Err(refused)) = caller.as_ref().map(|c| may_read(&rt, &objects, c)) {
+                    let _ = done.send(Err(refused));
+                    continue;
+                }
+                let _ = done.send(Ok(()));
                 // Catch-up and live changes come from this one thread, so the client sees every
                 // change once, in order.
                 for o in rt.changed_since(&objects, since) {
@@ -154,7 +196,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 d.subscribers.push(events);
                 continue;
             }
-            Ok(Msg::Reload(source)) => match boot(&source, &data, render) {
+            Ok(Msg::Reload(source)) => match boot(&source, &data, render, explain) {
                 Ok((new_rt, out)) => {
                     rt = new_rt;
                     // Requests waiting on the old runtime get a "restarted" error.
@@ -178,10 +220,10 @@ impl Dispatch {
     fn outputs(&mut self, out: Vec<Output>) {
         for o in out {
             match o {
-                Output::Reply { reply, ok, error } => {
+                Output::Reply { reply, ok, error, status } => {
                     if let Some(r) = self.replies.remove(&reply) {
                         let _ = r.send(match error {
-                            Some(e) => Err(e),
+                            Some(e) => Err((status.unwrap_or(400), e)),
                             None => Ok(ok.unwrap_or(Json::Null)),
                         });
                     }
@@ -191,7 +233,9 @@ impl Dispatch {
                 }
                 Output::Emit { object, name, data } => {
                     let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
-                    self.broadcast(Event::new(object, false, text));
+                    // A slow client gets one `read` per object, not one per request.
+                    let merge = (name == "read").then_some("read");
+                    self.broadcast(Event::new(object, merge, text));
                 }
                 Output::Changed { object, state, seq } => self.broadcast(changed_event(&object, &state, seq)),
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
@@ -217,7 +261,7 @@ impl Dispatch {
 /// resumes from it by itself (`Last-Event-ID`).
 fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
     let text = format!("id: {seq}\nevent: changed\ndata: {}\n\n", json!({ "object": object, "state": state, "seq": seq }));
-    Event::new(object.to_string(), true, text)
+    Event::new(object.to_string(), Some("state"), text)
 }
 
 /// A small pool of threads that perform effects and post the results back.
@@ -291,16 +335,16 @@ mod tests {
     fn streams_resume_from_the_clients_change_number() {
         let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
-        let engine = Engine::start(source, data.clone(), false).expect("boots");
-        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None });
+        let engine = Engine::start(source, data.clone(), false, false).expect("boots");
+        let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None, caller: Some(Caller::trusted()) });
         post("one").expect("posted");
 
         // A new client catches up on the current state first.
-        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0));
+        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0, None).expect("admin may stream"));
         assert!(msg.contains("\"one\""), "{msg}");
 
         // A client that already has that change gets nothing old, only what happens next.
-        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq);
+        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq, None).expect("admin may stream");
         post("two").expect("posted");
         let (next, msg) = next_change(&resumed);
         assert!(next > seq && msg.contains("\"two\""), "{msg}");

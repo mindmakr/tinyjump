@@ -21,13 +21,15 @@ cargo tj dev examples/todo/app.tj          # open http://127.0.0.1:4700
 
 Edit `examples/todo/app.tj` and the page reloads. Objects keep their state.
 
-The same objects are a backend:
+The same objects are a backend, open only as far as their rules say
+(`@read(...)` and `@allow(...)`, see [access control](docs/access-control.md)):
 
 ```sh
-curl -X POST localhost:4700/api/Todos/main/setDraft -d '["Write docs"]'
-curl -X POST localhost:4700/api/Todos/main/add
-curl localhost:4700/api/Todos/main
-curl -N localhost:4700/api/events          # realtime: emit + changed
+cargo tj dev examples/durable-cart/app.tj
+curl -X POST localhost:4700/api/Cart/demo/add -H 'content-type: application/json' -d '["tea", "curl"]'
+curl localhost:4700/api/Cart/demo
+curl -N 'localhost:4700/api/events?object=Cart/demo'   # realtime: emit + changed
+cargo tj check examples/durable-cart/app.tj --access   # who may read and call what
 ```
 
 Examples (`cargo tj dev examples/<name>/app.tj`):

@@ -1,6 +1,7 @@
 //! The I/O-free runtime: boots a program, takes [`Input`]s with the current time,
 //! and returns [`Output`]s for the host to carry out.
 
+pub mod access;
 mod calls;
 mod objects;
 pub mod protocol;
@@ -16,6 +17,7 @@ use crate::vm::interp::{Failure, Fiber, Run};
 use crate::vm::program::Program;
 use crate::vm::value::{Closure, Exc, ObjRef, Value};
 use indexmap::IndexSet;
+use access::Who;
 use calls::{Outbox, CALL_REPLY_BASE};
 use objects::Instance;
 use protocol::{Effect, Input, Output};
@@ -36,6 +38,18 @@ pub struct Options {
     pub render: bool,
     /// This runtime is the server: `@server` objects live here instead of being replicas.
     pub server: bool,
+    /// Say why a request was refused (`tj dev`). Off on real servers, so a refusal does not
+    /// reveal which objects and methods exist.
+    pub explain: bool,
+    /// Remote requests may not load more objects than this at once (0: no limit).
+    pub max_objects: usize,
+}
+
+impl Options {
+    /// A device or test runtime at time `now`.
+    pub fn new(now: f64, seed: u64) -> Options {
+        Options { now, seed, render: true, server: false, explain: true, max_objects: 0 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +98,11 @@ enum TimerKind {
     Outbox,
 }
 
+/// Why a request was refused, with its HTTP status.
+fn refused(status: u16, message: impl Into<String>) -> Result<Json, (u16, String)> {
+    Err((status, message.into()))
+}
+
 impl PartialEq for Timer {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
@@ -124,8 +143,10 @@ pub struct Runtime {
     waiting: HashMap<u32, (Fiber, Option<u64>)>,
     /// Devices: server calls not yet answered (see `calls.rs`).
     outbox: Outbox,
+    /// Calls loaded at boot wait for the first input (see `calls.rs`).
+    outbox_held: bool,
     /// Servers: calls with an id that are still running, and who waits for each.
-    running_calls: HashMap<String, Vec<Option<u64>>>,
+    running_calls: HashMap<String, (objects::CallRecord, Vec<Option<u64>>)>,
     call_replies: HashMap<u64, (Rc<ObjRef>, String)>,
     next_call_reply: u64,
     tree: Tree,
@@ -135,6 +156,8 @@ pub struct Runtime {
     measure: Option<Box<dyn Measure>>,
     render: bool,
     server: bool,
+    explain: bool,
+    max_objects: usize,
     ran_code: bool,
     now: f64,
     rng: u64,
@@ -172,6 +195,7 @@ impl Runtime {
             next_effect: 0,
             waiting: HashMap::new(),
             outbox: Outbox::default(),
+            outbox_held: false,
             running_calls: HashMap::new(),
             call_replies: HashMap::new(),
             next_call_reply: 0,
@@ -181,6 +205,8 @@ impl Runtime {
             measure: None,
             render: opts.render,
             server: opts.server,
+            explain: opts.explain,
+            max_objects: opts.max_objects,
             ran_code: false,
             now: opts.now,
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
@@ -210,29 +236,42 @@ impl Runtime {
             self.now = now;
         }
         self.metrics.inputs += 1;
+        if !matches!(input, Input::Identity { .. }) {
+            self.release_outbox();
+        }
         match input {
-            Input::Call { object, method, args, reply, call } => {
-                let args = args.iter().map(Value::from_json).collect();
-                match (self.resolve_object(&object), call) {
-                    (Ok(obj), Some(call)) => self.call_once(obj, &method, args, reply, call),
-                    (Ok(obj), None) => self.invoke(obj, &method, args, true, reply),
+            Input::Call { object, method, args, reply, call, caller } => match self.admit(&object, Some(&method), caller) {
+                Err((status, why)) => self.reply_status(reply, status, why),
+                Ok(who) => match (self.resolve_object(&object), call) {
+                    (Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
+                    (Ok(obj), None) => {
+                        let args = args.iter().map(Value::from_json).collect();
+                        self.invoke(obj, &method, args, true, reply, who)
+                    }
                     (Err(e), _) => self.reply(reply, Err(e)),
+                },
+            },
+            Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
+                Err((status, why)) => self.reply_status(reply, status, why),
+                Ok(_) => {
+                    let state = self.resolve_object(&object).and_then(|o| self.object_state(&o));
+                    if state.is_ok() {
+                        // Reading is an event too: subscribers learn who is looking. It never
+                        // changes state, so a replica fetching state cannot start a loop.
+                        self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                    }
+                    self.reply(reply, state);
                 }
-            }
-            Input::Get { object, reply } => {
-                let state = self.resolve_object(&object).and_then(|o| self.object_state(&o));
-                if state.is_ok() {
-                    // Reading is an event too: subscribers learn who is looking. It never changes
-                    // state, so a replica fetching state cannot start a change/fetch loop.
-                    self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
-                }
-                self.reply(reply, state);
-            }
+            },
+            Input::Identity { user } => self.set_identity(user),
             Input::Ui { target, event, value, reply } => {
                 let handler = self.tree.find(&target).and_then(|node| self.tree.handler(node, &event).cloned());
                 match handler {
                     Some(h) => match self.fiber_for(&h, vec![Value::from_json(&value)]) {
-                        Ok(f) => self.drive(f, reply),
+                        Ok(mut f) => {
+                            f.caller = self.local();
+                            self.drive(f, reply)
+                        }
                         Err(e) => self.reply(reply, Err(e.message())),
                     },
                     None => self.reply(reply, Err(format!("no {event} handler on {target:?}"))),
@@ -341,9 +380,38 @@ impl Runtime {
         }
     }
 
-    fn invoke(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, external: bool, reply: Option<u64>) {
+    /// Who a `call` or `get` comes from, after the access rules and the object cap; or the
+    /// refusal. Checked before anything is loaded.
+    fn admit(&self, object: &str, method: Option<&str>, caller: Option<protocol::Caller>) -> Result<Who, (u16, String)> {
+        let who = match caller {
+            Some(c) => Who::from_caller(&c, self.server),
+            None if self.server => return refused(400, "a request to a server must say who is calling (caller)").map(|_| Who::System),
+            None => Who::Local,
+        };
+        if let Some(why) = self.refusal(object, method, &who) {
+            return refused(403, why).map(|_| Who::System);
+        }
+        if matches!(who, Who::Remote { .. }) && self.max_objects > 0 && self.instances.len() >= self.max_objects && !self.is_loaded(object) {
+            return refused(503, "too many objects are loaded; try again later").map(|_| Who::System);
+        }
+        Ok(who)
+    }
+
+    /// Who runs code that no request started: the system on a server, the user on a device.
+    fn local(&self) -> Who {
+        if self.server {
+            Who::System
+        } else {
+            Who::Local
+        }
+    }
+
+    fn invoke(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, external: bool, reply: Option<u64>, who: Who) {
         match self.method_fiber(obj, method, args, external) {
-            Ok(f) => self.drive(f, reply),
+            Ok(mut f) => {
+                f.caller = who;
+                self.drive(f, reply)
+            }
             Err(e) => self.reply(reply, Err(e.message())),
         }
     }
@@ -386,6 +454,15 @@ impl Runtime {
         }
     }
 
+    /// Refuses a request with an HTTP-like status (see `Output::Reply`).
+    fn reply_status(&mut self, reply: Option<u64>, status: u16, why: String) {
+        match reply {
+            Some(id) if id >= CALL_REPLY_BASE => self.finish_call(id, Err(why)),
+            Some(id) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(why), status: Some(status) }),
+            None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
+        }
+    }
+
     /// Answers a request; without a reply id, errors are reported and results dropped.
     fn reply(&mut self, reply: Option<u64>, r: Result<Json, String>) {
         if let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) {
@@ -393,8 +470,8 @@ impl Runtime {
             return;
         }
         match (reply, r) {
-            (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None }),
-            (Some(id), Err(e)) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e) }),
+            (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None, status: None }),
+            (Some(id), Err(e)) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), status: None }),
             (None, Err(e)) => self.outputs.push(Output::Error { message: e, trace: Vec::new() }),
             (None, Ok(_)) => {}
         }
@@ -418,12 +495,14 @@ impl Runtime {
                         next = self.now + interval;
                     }
                     self.push_timer(next, TimerKind::Every { obj: obj.clone(), method: method.clone(), interval });
-                    self.invoke(obj, &method, Vec::new(), false, None);
+                    self.invoke(obj, &method, Vec::new(), false, None, Who::System);
                 }
                 TimerKind::Alarm { obj, alarm } => {
                     if let Some(a) = self.take_alarm(&obj, alarm) {
                         let args = a.args.iter().map(Value::from_json).collect();
-                        self.invoke(obj, &a.method, args, false, None);
+                        // An alarm runs as whoever scheduled it, so rules on data still hold.
+                        let who = a.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
+                        self.invoke(obj, &a.method, args, false, None, who);
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),

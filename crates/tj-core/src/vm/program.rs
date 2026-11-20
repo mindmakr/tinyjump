@@ -86,6 +86,8 @@ pub enum Op {
     /// Builds a UI element from the element descriptor: `props.. children..` -> `elem`.
     Elem(u32),
     Await,
+    /// Pushes the `caller` record of the running call.
+    Caller,
     Throw,
     /// Installs an exception handler that jumps to the operand.
     TryBegin(u32),
@@ -132,6 +134,8 @@ pub struct MethodDef {
     pub private: bool,
     /// `@every("…")` interval in milliseconds.
     pub every: Option<f64>,
+    /// `@allow(...)`: who may call it remotely; `None` means nobody (see `runtime/access.rs`).
+    pub allow: Option<Rc<[Rc<str>]>>,
 }
 
 #[derive(Debug)]
@@ -143,6 +147,8 @@ pub struct ObjectDef {
     pub methods: IndexMap<Rc<str>, MethodDef>,
     /// `@server`: lives on the server; device runtimes hold a synced replica.
     pub server: bool,
+    /// `@read(...)`: who may read it remotely; `None` means nobody.
+    pub read: Option<Rc<[Rc<str>]>>,
 }
 
 pub struct Program {

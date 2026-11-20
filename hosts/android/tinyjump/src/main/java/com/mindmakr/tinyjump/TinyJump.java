@@ -76,11 +76,38 @@ public final class TinyJump {
         TinyJump tj = new TinyJump(context, root, server);
         Host host = new Host(new FileStore(new File(context.getFilesDir(), "tinyjump")));
         host.renderer = tj.renderer;
-        int code = Native.boot(host, source, now(), System.nanoTime(), true);
+        // A secure seed: device and call ids derive from it, so they must not be guessable.
+        int code = Native.boot(host, source, now(), new java.security.SecureRandom().nextLong(), true);
         String out = Native.out();
         if (code != 0) throw new IllegalStateException(describeFailure(code, out));
         tj.apply(out);
         return tj;
+    }
+
+    /**
+     * The signed-in user's token for the server and their id. Call it right after
+     * {@link #start} and whenever the token is refreshed. A new user id drops the server calls
+     * the previous user queued and the replicas they saw (docs/access-control.md).
+     */
+    public void setToken(String token, String userId) {
+        assertMain();
+        if (sync.setToken(token, userId)) {
+            try {
+                send(input("identity").put("user", userId == null ? JSONObject.NULL : userId));
+            } catch (JSONException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+    }
+
+    /** Forgets the token, the replicas and every queued server call. */
+    public void signOut() {
+        setToken(null, null);
+    }
+
+    /** Runs on the main thread when the server answers 401: refresh the token, then setToken. */
+    public void setOnTokenExpired(Runnable listener) {
+        sync.onTokenExpired = listener;
     }
 
     /** Serves /_tj/inspect and /_tj/input on 127.0.0.1:port. Reach it with `adb forward tcp:port tcp:port`. */

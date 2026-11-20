@@ -3,7 +3,7 @@
 use serde_json::{json, Value as Json};
 use std::cell::RefCell;
 use std::rc::Rc;
-use tj_core::runtime::protocol::Effect;
+use tj_core::runtime::protocol::{Caller, Effect};
 use tj_core::{compile, Input, MemStore, Options, Output, PatchOp, Runtime, Store, Target};
 
 /// A store the test can still read after handing it to a runtime.
@@ -28,7 +28,7 @@ fn boot_with(src: &str, store: Shared, now: f64) -> (Runtime, Vec<Output>) {
 
 fn boot_as(src: &str, store: Shared, now: f64, server: bool) -> (Runtime, Vec<Output>) {
     let program = compile(src).unwrap_or_else(|errs| panic!("{}", errs.iter().map(|e| e.render("test.tj", src)).collect::<Vec<_>>().join("\n")));
-    Runtime::boot(program, Box::new(store), Options { now, seed: 7, render: !server, server }).unwrap_or_else(|e| panic!("boot: {e}"))
+    Runtime::boot(program, Box::new(store), Options { render: !server, server, ..Options::new(now, 7) }).unwrap_or_else(|e| panic!("boot: {e}"))
 }
 
 fn boot(src: &str) -> Runtime {
@@ -49,7 +49,7 @@ fn reply(outputs: &[Output]) -> Result<Json, String> {
 
 fn call(rt: &mut Runtime, now: f64, object: &str, method: &str, args: Json) -> Result<Json, String> {
     let args = args.as_array().cloned().unwrap_or_default();
-    reply(&rt.handle(now, Input::Call { object: object.into(), method: method.into(), args, reply: Some(1), call: None }))
+    reply(&rt.handle(now, Input::Call { object: object.into(), method: method.into(), args, reply: Some(1), call: None, caller: Some(Caller::trusted()) }))
 }
 
 /// Runs `body` as a method and returns its result.
@@ -167,13 +167,13 @@ fn objects_persist_across_reboots() {
     let store = Shared::default();
     let (mut rt, _) = boot_with(COUNTER, store.clone(), 0.0);
     assert_eq!(call(&mut rt, 1.0, "Counter/main", "increment", json!([2])).unwrap(), json!(2));
-    let out = rt.handle(2.0, Input::Call { object: "Counter/main".into(), method: "increment".into(), args: vec![], reply: None, call: None });
+    let out = rt.handle(2.0, Input::Call { object: "Counter/main".into(), method: "increment".into(), args: vec![], reply: None, call: None, caller: Some(Caller::trusted()) });
     assert!(out.iter().any(|o| matches!(o, Output::Emit { name, data, .. } if name == "changed" && data == &json!({ "count": 3 }))));
     assert!(out.iter().any(|o| matches!(o, Output::Changed { object, .. } if object == "Counter/main")));
     drop(rt);
 
     let (mut rt, _) = boot_with(COUNTER, store, 3.0);
-    let state = reply(&rt.handle(3.0, Input::Get { object: "Counter/main".into(), reply: Some(1) })).unwrap();
+    let state = reply(&rt.handle(3.0, Input::Get { object: "Counter/main".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(state, json!({ "count": 3, "history": [2, 3] }));
 }
 
@@ -196,7 +196,7 @@ fn every_timers_and_durable_alarms() {
     assert_eq!(rt.next_wake(), Some(1000.0));
     rt.handle(1000.0, Input::Tick);
     rt.handle(2000.0, Input::Tick);
-    let state = reply(&rt.handle(2000.0, Input::Get { object: "Counter/c".into(), reply: Some(1) })).unwrap();
+    let state = reply(&rt.handle(2000.0, Input::Get { object: "Counter/c".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(state["count"], json!(200));
     drop(rt);
 
@@ -205,7 +205,7 @@ fn every_timers_and_durable_alarms() {
     for t in [3500.0, 4500.0, 5000.0] {
         rt.handle(t, Input::Tick);
     }
-    let state = reply(&rt.handle(5000.0, Input::Get { object: "Counter/c".into(), reply: Some(1) })).unwrap();
+    let state = reply(&rt.handle(5000.0, Input::Get { object: "Counter/c".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(state["count"], json!(200 + 200 + 10), "two more beats after restart plus the alarm");
 }
 
@@ -287,7 +287,7 @@ fn fetch_suspends_and_resumes() {
     }
     "#;
     let mut rt = boot(src);
-    let out = rt.handle(0.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("Oslo")], reply: Some(9), call: None });
+    let out = rt.handle(0.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("Oslo")], reply: Some(9), call: None, caller: Some(Caller::trusted()) });
     let (id, url) = out
         .iter()
         .find_map(|o| match o {
@@ -301,11 +301,11 @@ fn fetch_suspends_and_resumes() {
     let out = rt.handle(1.0, Input::EffectDone { id, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"temp\": 21.5}" })), error: None, unreachable: false });
     assert_eq!(reply(&out).unwrap(), json!(21.5));
 
-    let out = rt.handle(2.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("X")], reply: Some(10), call: None });
+    let out = rt.handle(2.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("X")], reply: Some(10), call: None, caller: Some(Caller::trusted()) });
     let id = out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
     let out = rt.handle(3.0, Input::EffectDone { id, ok: None, error: Some("network down".into()), unreachable: false });
     assert_eq!(reply(&out).unwrap(), Json::Null);
-    let state = reply(&rt.handle(4.0, Input::Get { object: "Weather/w".into(), reply: Some(1) })).unwrap();
+    let state = reply(&rt.handle(4.0, Input::Get { object: "Weather/w".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(state["error"], json!("network down"));
 }
 
@@ -359,7 +359,7 @@ fn server_objects_replicate_to_devices() {
     assert_eq!((object.as_str(), method.as_str(), &args), ("Room/lobby", "post", &vec![json!("ana"), json!("hi")]));
 
     // The server runs it, persists it, and reports the change.
-    let out = server.handle(2.0, Input::Call { object, method, args, reply: Some(1), call: None });
+    let out = server.handle(2.0, Input::Call { object, method, args, reply: Some(1), call: None, caller: Some(Caller::trusted()) });
     assert_eq!(reply(&out).unwrap(), json!(1));
     let state = out
         .iter()
@@ -379,13 +379,13 @@ fn server_objects_replicate_to_devices() {
 
     // The replica is cached, so the device shows it when it starts offline.
     let (mut again, _) = boot_as(CHAT, device_store, 5.0, false);
-    let cached = reply(&again.handle(5.0, Input::Get { object: "Room/lobby".into(), reply: Some(1) })).unwrap();
+    let cached = reply(&again.handle(5.0, Input::Get { object: "Room/lobby".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(cached["messages"][0]["text"], json!("hi"));
 }
 
 #[test]
 fn change_numbers_order_replicas_and_resume_streams() {
-    let post = |text: &str| Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: Some(1), call: None };
+    let post = |text: &str| Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: Some(1), call: None, caller: Some(Caller::trusted()) };
     let changed = |out: Vec<Output>| {
         out.into_iter()
             .find_map(|o| match o {
@@ -460,7 +460,7 @@ fn server_calls(out: &[Output]) -> Vec<(u32, String, Json)> {
 }
 
 fn note(text: &str) -> Input {
-    Input::Call { object: "Me/me".into(), method: "note".into(), args: vec![json!(text)], reply: None, call: None }
+    Input::Call { object: "Me/me".into(), method: "note".into(), args: vec![json!(text)], reply: None, call: None, caller: Some(Caller::trusted()) }
 }
 
 fn answered(id: u32, ok: Json) -> Input {
@@ -494,8 +494,10 @@ fn device_calls_wait_out_outages_in_order_and_survive_restarts() {
     assert_eq!((now.len(), &now[0].1), (1, &first[0].1));
 
     // Restarted before the server answered: the outbox survives, with the same ids, in order.
+    // It is held until the first input, which might say another user signed in.
     let (mut device, out) = boot_as(BOARD, store, 4000.0, false);
-    let resent = server_calls(&out);
+    assert!(server_calls(&out).is_empty(), "held at boot");
+    let resent = server_calls(&device.handle(4000.0, Input::Tick));
     assert_eq!((resent.len(), &resent[0].1, &resent[0].2), (1, &first[0].1, &json!(["one"])));
     let waiting = reply(&device.handle(4000.0, Input::Inspect { reply: Some(1) })).unwrap()["outbox"].clone();
     assert_eq!(waiting.as_array().map(Vec::len), Some(2), "automation sees what is waiting");
@@ -508,7 +510,7 @@ fn device_calls_wait_out_outages_in_order_and_survive_restarts() {
 
 #[test]
 fn calls_with_an_id_run_once_even_after_restarts_and_while_running() {
-    let add = |call: &str, reply: u64| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!("one")], reply: Some(reply), call: Some(call.into()) };
+    let add = |call: &str, reply: u64| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!("one")], reply: Some(reply), call: Some(call.into()), caller: Some(Caller::trusted()) };
     let changed = |out: &[Output]| out.iter().any(|o| matches!(o, Output::Changed { .. }));
     let store = Shared::default();
     let (mut server, _) = boot_as(BOARD, store.clone(), 0.0, true);
@@ -525,7 +527,7 @@ fn calls_with_an_id_run_once_even_after_restarts_and_while_running() {
     assert_eq!(state(&mut server, 3.0, "Board/b")["notes"], json!(["one"]));
 
     // A repeat that arrives while the first is still running waits for its result.
-    let slow = |reply: u64| Input::Call { object: "Board/b".into(), method: "slow".into(), args: vec![json!("two")], reply: Some(reply), call: Some("d-2".into()) };
+    let slow = |reply: u64| Input::Call { object: "Board/b".into(), method: "slow".into(), args: vec![json!("two")], reply: Some(reply), call: Some("d-2".into()), caller: Some(Caller::trusted()) };
     let out = server.handle(4.0, slow(4));
     let fetch = out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).expect("a fetch");
     let out = server.handle(5.0, slow(5));
@@ -561,7 +563,7 @@ fn apps_can_be_split_into_files() {
     // Runtime errors point at the right file and line.
     let failing = files(&[("app.tj", "import { fail } from \"./lib/format\"\nobject T {\n  run() { fail() }\n}\n"), ("lib/format.tj", "export function fail() {\n  throw new Error(\"boom\")\n}\n")]);
     let mut rt = boot(&failing);
-    let out = rt.handle(1.0, Input::Call { object: "T/t".into(), method: "run".into(), args: vec![], reply: None, call: None });
+    let out = rt.handle(1.0, Input::Call { object: "T/t".into(), method: "run".into(), args: vec![], reply: None, call: None, caller: Some(Caller::trusted()) });
     let trace = out.iter().find_map(|o| if let Output::Error { trace, .. } = o { Some(trace.join(" ")) } else { None }).expect("an error");
     assert!(trace.contains("lib/format.tj:2:") && trace.contains("app.tj:3:"), "{trace}");
 }
@@ -597,6 +599,169 @@ fn module_mistakes_say_how_to_fix_them() {
     }
 }
 
+const GUARDED: &str = r#"
+@server @read("anyone") object Board {
+  notes: string[] = []
+  by: string[] = []
+  lastTick: string = ""
+  @allow("anyone") add(text: string) {
+    this.notes.push(text)
+    this.by.push(caller.id)
+  }
+  @allow("staff") clear() { this.notes = [] }
+  @allow("signedIn") later(ms: number) { this.schedule(ms, "stamp") }
+  @allow("anyone") async slow() {
+    await fetch("https://example.com/slow")
+    this.by.push("slow:" + caller.id)
+  }
+  private stamp() { this.by.push("alarm:" + caller.id) }
+  @every("1s") tick() { this.lastTick = caller.id }
+  tidy() { this.notes = [] }
+}
+
+@server @read("owner") object Inbox {
+  items: string[] = []
+  @allow("owner") put(item: string) { this.items.push(item) }
+}
+
+@server object Ledger { total: number = 0 }
+"#;
+
+/// A remote caller: `id` empty for anonymous.
+fn who(id: &str, roles: &[&str]) -> Option<Caller> {
+    Some(Caller::Remote { id: id.into(), roles: roles.iter().map(|r| r.to_string()).collect() })
+}
+
+fn call_as(rt: &mut Runtime, now: f64, object: &str, method: &str, args: Json, caller: Option<Caller>) -> Result<Json, (Option<u16>, String)> {
+    let args = args.as_array().cloned().unwrap_or_default();
+    let out = rt.handle(now, Input::Call { object: object.into(), method: method.into(), args, reply: Some(1), call: None, caller });
+    for o in out {
+        if let Output::Reply { ok, error, status, .. } = o {
+            return match error {
+                Some(e) => Err((status, e)),
+                None => Ok(ok.unwrap_or(Json::Null)),
+            };
+        }
+    }
+    panic!("no reply")
+}
+
+fn server(src: &str, explain: bool) -> Runtime {
+    let program = compile(src).unwrap_or_else(|e| panic!("{}", e[0].message));
+    Runtime::boot(program, Box::new(Shared::default()), Options { server: true, render: false, explain, ..Options::new(0.0, 7) }).unwrap().0
+}
+
+#[test]
+fn remote_callers_get_only_what_the_rules_allow() {
+    let mut rt = server(GUARDED, false);
+    let anon = || who("", &[]);
+    assert_eq!(call_as(&mut rt, 1.0, "Board/main", "add", json!(["hi"]), anon()), Ok(Json::Null));
+    assert_eq!(state(&mut rt, 2.0, "Board/main")["by"], json!([""]), "`caller` is the remote caller");
+
+    // Refusals look the same for a missing rule, a private method, an unknown method or class,
+    // and they come with status 403 and no details on a real server.
+    for (object, method) in [("Board/main", "tidy"), ("Board/main", "stamp"), ("Board/main", "nope"), ("Nope/x", "add"), ("Board/main", "clear")] {
+        assert_eq!(call_as(&mut rt, 3.0, object, method, json!([]), anon()), Err((Some(403), "not allowed".into())), "{object}.{method}");
+    }
+    assert_eq!(call_as(&mut rt, 3.0, "Board/main", "clear", json!([]), who("key:sync", &["staff"])), Ok(Json::Null), "roles");
+    assert!(call_as(&mut rt, 3.0, "Board/main", "later", json!([10]), anon()).is_err(), "signedIn needs a credential");
+
+    // Reading follows @read; objects without it cannot be read remotely, and refused reads
+    // load nothing.
+    let get = |rt: &mut Runtime, object: &str, caller: Option<Caller>| {
+        let out = rt.handle(4.0, Input::Get { object: object.into(), reply: Some(1), caller });
+        out.iter().find_map(|o| if let Output::Reply { status, error, .. } = o { Some((*status, error.is_none())) } else { None }).unwrap()
+    };
+    assert_eq!(get(&mut rt, "Board/main", anon()), (None, true));
+    assert_eq!(get(&mut rt, "Ledger/main", anon()), (Some(403), false));
+    assert_eq!(get(&mut rt, "Inbox/user:ana", who("user:bo", &[])), (Some(403), false), "owner only");
+    assert_eq!(get(&mut rt, "Inbox/user:ana", who("user:ana", &[])), (None, true));
+    assert_eq!(call_as(&mut rt, 5.0, "Inbox/user:ana", "put", json!(["x"]), who("user:bo", &[])).unwrap_err().0, Some(403));
+    assert!(call_as(&mut rt, 5.0, "Inbox/user:ana", "put", json!(["x"]), who("user:ana", &[])).is_ok());
+
+    // A server refuses requests that do not say who is calling: forgetting fails closed.
+    assert_eq!(call_as(&mut rt, 6.0, "Board/main", "add", json!(["x"]), None).unwrap_err().0, Some(400));
+
+    // Explaining runtimes (tj dev) say why.
+    let mut dev = server(GUARDED, true);
+    assert_eq!(call_as(&mut dev, 1.0, "Board/main", "clear", json!([]), anon()).unwrap_err().1, "not allowed: Board/main.clear needs role staff");
+}
+
+#[test]
+fn caller_belongs_to_each_call_alarms_and_timers() {
+    let mut rt = server(GUARDED, false);
+    // Two interleaved async calls from different callers keep their own caller.
+    let slow = |rt: &mut Runtime, now: f64, id: &str| {
+        let out = rt.handle(now, Input::Call { object: "Board/main".into(), method: "slow".into(), args: vec![], reply: None, call: None, caller: who(id, &[]) });
+        out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap()
+    };
+    let (a, b) = (slow(&mut rt, 1.0, "user:ana"), slow(&mut rt, 1.0, "user:bo"));
+    rt.handle(2.0, answered(b, json!({ "status": 200, "headers": {}, "body": "" })));
+    rt.handle(3.0, answered(a, json!({ "status": 200, "headers": {}, "body": "" })));
+    // An alarm runs as whoever scheduled it; @every timers run as the system.
+    call_as(&mut rt, 4.0, "Board/main", "later", json!([10]), who("user:cy", &[])).unwrap();
+    rt.handle(1100.0, Input::Tick);
+    let s = state(&mut rt, 1200.0, "Board/main");
+    assert_eq!(s["by"], json!(["slow:user:bo", "slow:user:ana", "alarm:user:cy"]));
+    assert_eq!(s["lastTick"], json!("system"));
+}
+
+#[test]
+fn a_call_id_belongs_to_one_caller_and_one_call() {
+    let mut rt = server(GUARDED, false);
+    let add = |caller: Option<Caller>, text: &str, reply: u64| Input::Call { object: "Board/main".into(), method: "add".into(), args: vec![json!(text)], reply: Some(reply), call: Some("c-1".into()), caller };
+    let status = |out: Vec<Output>| out.into_iter().find_map(|o| if let Output::Reply { status, error, .. } = o { Some((status, error)) } else { None }).unwrap();
+    assert_eq!(status(rt.handle(1.0, add(who("user:ana", &[]), "a", 1))), (None, None));
+    assert_eq!(status(rt.handle(2.0, add(who("user:ana", &[]), "a", 2))), (None, None), "a true repeat gets the first result");
+    assert_eq!(status(rt.handle(3.0, add(who("user:bo", &[]), "a", 3))).0, Some(422), "another caller never gets the stored result");
+    assert_eq!(status(rt.handle(4.0, add(who("user:ana", &[]), "b", 4))).0, Some(422), "nor do other arguments");
+    assert_eq!(state(&mut rt, 5.0, "Board/main")["notes"], json!(["a"]));
+    // A refused call is not recorded: the id stays free.
+    let clear = Input::Call { object: "Board/main".into(), method: "clear".into(), args: vec![], reply: Some(6), call: Some("c-2".into()), caller: who("", &[]) };
+    assert_eq!(status(rt.handle(6.0, clear)).0, Some(403));
+    assert_eq!(status(rt.handle(7.0, Input::Call { object: "Board/main".into(), method: "clear".into(), args: vec![], reply: Some(7), call: Some("c-2".into()), caller: who("key:sync", &["staff"]) })), (None, None));
+}
+
+#[test]
+fn remote_requests_cannot_load_unlimited_objects() {
+    let program = compile(GUARDED).unwrap();
+    let opts = Options { server: true, render: false, max_objects: 2, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(program, Box::new(Shared::default()), opts).unwrap().0;
+    let anon = || who("", &[]);
+    assert!(call_as(&mut rt, 1.0, "Board/a", "add", json!(["x"]), anon()).is_ok());
+    assert!(call_as(&mut rt, 1.0, "Board/b", "add", json!(["x"]), anon()).is_ok());
+    assert_eq!(call_as(&mut rt, 1.0, "Board/c", "add", json!(["x"]), anon()).unwrap_err().0, Some(503));
+    assert!(call_as(&mut rt, 1.0, "Board/a", "add", json!(["y"]), anon()).is_ok(), "loaded objects stay reachable");
+}
+
+#[test]
+fn signing_in_as_someone_else_drops_their_queued_calls_and_replicas() {
+    let store = Shared::default();
+    let (mut device, _) = boot_as(BOARD, store.clone(), 0.0, false);
+    device.handle(0.0, Input::Identity { user: Some("user:ana".into()) });
+    device.handle(1.0, Input::Sync { object: "Board/b".into(), state: json!({ "notes": ["ana's"] }), seq: Some(5) });
+    let sent = server_calls(&device.handle(2.0, note("from ana")));
+    device.handle(3.0, Input::EffectDone { id: sent[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+
+    let out = device.handle(4.0, Input::Identity { user: Some("user:bo".into()) });
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Board/b")), "replicas start over: {out:?}");
+    assert_eq!(state(&mut device, 5.0, "Board/b")["notes"], json!([]), "ana's data is gone");
+    assert!(server_calls(&device.handle(9000.0, Input::Tick)).is_empty(), "ana's queued call is never sent as bo");
+    assert_eq!(reply(&device.handle(9000.0, Input::Inspect { reply: Some(1) })).unwrap()["outbox"], json!([]));
+}
+
+#[test]
+fn rule_mistakes_are_compile_errors() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| format!("{} | {}", d.message, d.hint.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    assert!(msg("@server object A { @allow(\"anyone\") f() {} }").contains("can be called remotely but not read"));
+    assert!(msg("@read(\"everyone!\") object A {}").contains("is not a rule word or role"));
+    assert!(msg("@read(\"system\") object A {}").contains("reserved"));
+    assert!(msg("@read() object A {}").contains("at least one rule word"));
+    assert!(msg("@read(\"anyone\") object A { @allow(\"anyone\") private f() {} }").contains("private methods cannot be called remotely"));
+    assert!(msg("object A { f() { caller = 1 } }").contains("'caller' cannot be changed"));
+    assert!(msg("const caller = 1").contains("'caller' is built in"));
+}
+
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
 fn example(name: &str) -> String {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples").join(name);
@@ -627,7 +792,7 @@ fn every_example_compiles() {
 }
 
 fn state(rt: &mut Runtime, now: f64, object: &str) -> Json {
-    reply(&rt.handle(now, Input::Get { object: object.into(), reply: Some(1) })).unwrap()
+    reply(&rt.handle(now, Input::Get { object: object.into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap()
 }
 
 #[test]
@@ -651,7 +816,7 @@ fn durable_cart_holds_stock_and_the_backend_releases_it() {
     assert!(call(&mut server, 700_000.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap_err().contains("released"));
     call(&mut server, 700_000.0, "Cart/demo", "startOver", json!(["bo"])).unwrap();
     call(&mut server, 700_001.0, "Cart/demo", "add", json!(["tea", "bo"])).unwrap();
-    let out = server.handle(700_002.0, Input::Call { object: "Cart/demo".into(), method: "checkout".into(), args: vec![json!("bo")], reply: Some(1), call: None });
+    let out = server.handle(700_002.0, Input::Call { object: "Cart/demo".into(), method: "checkout".into(), args: vec![json!("bo")], reply: Some(1), call: None, caller: Some(Caller::trusted()) });
     assert_eq!(reply(&out).unwrap(), json!(4.5));
     assert!(out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "checkedOut")));
 }
@@ -677,6 +842,6 @@ fn smart_meter_workflow_moves_through_states() {
     assert!(s["notices"][0]["text"].as_str().unwrap().contains("ops acknowledged"));
 
     // Reading the meter is an event too.
-    let out = meter.handle(18_000.0, Input::Get { object: "Meter/home".into(), reply: Some(1) });
+    let out = meter.handle(18_000.0, Input::Get { object: "Meter/home".into(), reply: Some(1), caller: Some(Caller::trusted()) });
     assert!(out.iter().any(|o| matches!(o, Output::Emit { object, name, .. } if object == "Meter/home" && name == "read")));
 }

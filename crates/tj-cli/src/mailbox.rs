@@ -14,8 +14,9 @@ const MAX_EVENTS: usize = 1000;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Event {
     pub object: String,
-    /// A `changed` event: a newer one for the same object replaces it.
-    pub state: bool,
+    /// Events of one kind (`"state"`, `"read"`) about one object replace each other: a slow
+    /// client gets the latest. `None`: every one is kept.
+    pub merge: Option<&'static str>,
     /// The server-sent-event text.
     pub text: String,
     /// When it happened, to measure how long it took to reach the client.
@@ -23,8 +24,8 @@ pub struct Event {
 }
 
 impl Event {
-    pub fn new(object: String, state: bool, text: String) -> Event {
-        Event { object, state, text, at: Instant::now() }
+    pub fn new(object: String, merge: Option<&'static str>, text: String) -> Event {
+        Event { object, merge, text, at: Instant::now() }
     }
 }
 
@@ -56,17 +57,17 @@ impl Mailbox {
         if !self.only.is_empty() && !self.only.contains(&e.object) {
             return true;
         }
-        if e.state {
+        if e.merge.is_some() {
             let before = q.events.len();
-            q.events.retain(|old| !(old.state && old.object == e.object));
+            q.events.retain(|old| !(old.merge == e.merge && old.object == e.object));
             if q.events.len() < before {
                 self.stats.iter().for_each(|s| s.coalesced());
             }
         }
         q.events.push_back(e);
         if q.events.len() > MAX_EVENTS {
-            // States are bounded by the number of objects; drop the oldest other event.
-            if let Some(i) = q.events.iter().position(|old| !old.state) {
+            // Merged events are bounded by the number of objects; drop the oldest other event.
+            if let Some(i) = q.events.iter().position(|old| old.merge.is_none()) {
                 q.events.remove(i);
                 self.stats.iter().for_each(|s| s.dropped());
             }
@@ -110,11 +111,11 @@ mod tests {
     use super::*;
 
     fn state(object: &str, seq: u64) -> Event {
-        Event::new(object.into(), true, format!("{object}@{seq}"))
+        Event::new(object.into(), Some("state"), format!("{object}@{seq}"))
     }
 
     fn emit(n: usize) -> Event {
-        Event::new("A/a".into(), false, format!("emit {n}"))
+        Event::new("A/a".into(), None, format!("emit {n}"))
     }
 
     #[test]

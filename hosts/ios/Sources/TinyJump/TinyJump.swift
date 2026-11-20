@@ -32,10 +32,31 @@ public final class TinyJump {
         tj.sync = Sync(tj: tj, server: server)
         tj.renderer.tj = tj
         tj.renderer.root.onResize = { [weak tj] in tj?.layout() }
-        let (code, out) = tj.native.boot(source: source, now: now(), seed: UInt64(now()))
+        // A secure seed: device and call ids derive from it, so they must not be guessable.
+        let (code, out) = tj.native.boot(source: source, now: now(), seed: UInt64.random(in: 1...UInt64.max))
         guard code == 0 else { throw BootError(description: describeFailure(code, out)) }
         tj.apply(out)
         return tj
+    }
+
+    /// The signed-in user's token for the server and their id. Call it right after `start` and
+    /// whenever the token is refreshed. A new user id drops the server calls the previous user
+    /// queued and the replicas they saw (docs/access-control.md).
+    public func setToken(_ token: String?, userId: String?) {
+        if sync.setToken(token, user: userId) {
+            send(["type": "identity", "user": userId.map { $0 as Any } ?? NSNull()])
+        }
+    }
+
+    /// Forgets the token, the replicas and every queued server call.
+    public func signOut() {
+        setToken(nil, userId: nil)
+    }
+
+    /// Called on the main thread when the server answers 401: refresh the token, then setToken.
+    public var onTokenExpired: (() -> Void)? {
+        get { sync.onTokenExpired }
+        set { sync.onTokenExpired = newValue }
     }
 
     /// Serves /_tj/inspect, /_tj/input and /_tj/screenshot on 127.0.0.1:port.
