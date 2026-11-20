@@ -747,6 +747,14 @@ impl Checker {
         let t = self.flatten(v);
         if !t.revealed.is_empty() {
             self.field_revealed.entry((class.clone(), Rc::from(field))).or_default().extend(t.revealed.iter().cloned());
+            // A copy of personal data is personal data: kept only where retention, export and
+            // erasure reach it.
+            if !self.classes.get(class).is_some_and(|c| c.pii.contains_key(field)) {
+                let place = if own { format!("this.{field}") } else { format!("{class}.{field}") };
+                let d = Diagnostic::new(format!("personal data ({}) is kept in `{place}`, which is not marked as personal data", t.revealed.iter().map(|(c, f)| format!("{c}.{f}")).collect::<Vec<_>>().join(", ")), span)
+                    .hint(format!("mark `{field}` with @pii; for a list of several people's entries add @by(\"<field naming whose each entry is>\"), so retention, export and erasure reach the copies"));
+                self.report(d);
+            }
         }
         if t.is_clean() {
             return;

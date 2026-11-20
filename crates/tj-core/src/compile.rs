@@ -457,8 +457,15 @@ impl Compiler {
                 self.error(Diagnostic::new(format!("'{}' is declared twice", f.name), f.span));
             }
             for (i, d) in f.decorators.iter().enumerate() {
-                if d.name != "pii" || i > 0 {
-                    self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take one @pii(category, purpose); other decorators go on methods"));
+                let by_after_pii = d.name == "by" && i == 1 && f.decorators[0].name == "pii";
+                if !(d.name == "pii" && i == 0) && !by_after_pii {
+                    self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take @pii(category, purpose), and @by(field) after it for a list of several people's entries; other decorators go on methods"));
+                } else if by_after_pii {
+                    if let Some(by) = self.by(d, f, o) {
+                        if let Some(p) = pii.last_mut().filter(|p: &&mut Pii| *p.field == *f.name) {
+                            p.by = Some(by);
+                        }
+                    }
                 } else if !server {
                     self.error(Diagnostic::new("personal data lives in @server objects", d.span).hint(format!("add @server to {}: the server is where it can be exported and erased", o.name)));
                 } else if let Some(p) = self.pii(d, &f.name) {
@@ -577,7 +584,53 @@ impl Compiler {
             self.error(Diagnostic::new(format!("say what '{field}' is for: @pii needs a purpose after the category"), d.span).hint(hint));
             return None;
         }
-        Some(Pii { field: Rc::from(field), category: Rc::from(*category), purposes: purposes.iter().map(|p| Rc::from(*p)).collect() })
+        Some(Pii { field: Rc::from(field), category: Rc::from(*category), purposes: purposes.iter().map(|p| Rc::from(*p)).collect(), by: None })
+    }
+
+    /// `@by("customer", "at")` on a `@pii` list: whose each entry is, and its own time.
+    fn by(&mut self, d: &Decorator, f: &crate::syntax::ast::Field, o: &ObjectDecl) -> Option<(Rc<str>, Option<Rc<str>>)> {
+        let words: Option<Vec<&str>> = d.args.iter().map(|a| if let ExprKind::Str(w) = &a.kind { Some(w.as_str()) } else { None }).collect();
+        let hint = "e.g. @by(\"customer\", \"at\"): the entry field naming whose it is, and its time in milliseconds";
+        let Some([who, rest @ ..]) = words.as_deref() else {
+            self.error(Diagnostic::new("@by takes the field naming whose each entry is", d.span).hint(hint));
+            return None;
+        };
+        let at = rest.first().copied();
+        if rest.len() > 1 {
+            self.error(Diagnostic::new("@by takes at most two fields", d.span).hint(hint));
+        }
+        // The entries' type must have them: a record with `who: string` (and `at: number`).
+        let entry = match f.ty.as_ref() {
+            Some(TypeExpr::Array(t)) => Some(&**t),
+            Some(TypeExpr::Named(n, args)) if n == "Array" && args.len() == 1 => args.first(),
+            _ => None,
+        };
+        let fields = entry.and_then(|t| match t {
+            TypeExpr::Record(fs) => Some(fs.clone()),
+            TypeExpr::Named(n, _) => match self.aliases.get(n) {
+                Some(Some(TypeExpr::Record(fs))) => Some(fs.clone()),
+                _ => None,
+            },
+            _ => None,
+        });
+        let has = |name: &str, ty: &str| fields.as_ref().is_some_and(|fs| fs.iter().any(|(k, opt, t)| k == name && !opt && matches!(t, TypeExpr::Named(n, _) if n == ty)));
+        if !has(who, "string") {
+            self.error(Diagnostic::new(format!("@by(\"{who}\") needs {}'s entries to be records with `{who}: string`", f.name), d.span).hint(format!("declare it as a list of records, e.g. `{}: {{ {who}: string, name: string }}[]`", f.name)));
+        }
+        if let Some(at) = at.filter(|at| !has(at, "number")) {
+            self.error(Diagnostic::new(format!("@by's time field `{at}` must be a `number` in each entry"), d.span).hint("milliseconds, e.g. Date.now() when the entry is added"));
+        }
+        let rule = |name: &str| o.decorators.iter().filter(|d| d.name == name).flat_map(|d| &d.args).any(|a| matches!(&a.kind, ExprKind::Str(w) if w == "anyone"));
+        if rule("read") {
+            self.error(Diagnostic::new(format!("{} holds several people's personal data and cannot be read by anyone", o.name), d.span).hint("name who may read it, e.g. @read(\"staff\")"));
+        }
+        if o.decorators.iter().any(|d| d.name == "retain") && at.is_none() {
+            self.error(Diagnostic::new(format!("{} has @retain, so each entry needs its own time", o.name), d.span).hint(format!("add the time field: @by(\"{who}\", \"at\"), with `at: number` in each entry")));
+        }
+        if o.decorators.iter().any(|d| d.name == "legalHold") {
+            self.error(Diagnostic::new("@legalHold is not supported with @by lists yet", d.span).hint("keep held records in an object per person, whose id is theirs"));
+        }
+        Some((Rc::from(*who), at.map(Rc::from)))
     }
 
     // ---------- functions and scopes ----------

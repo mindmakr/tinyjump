@@ -58,6 +58,11 @@ impl Mailbox {
     }
 
     /// Whether this reader owns `object` (`Class/id`), and so sees its personal data.
+    /// Whether a signed-in person reads it (not the admin or an anonymous caller).
+    pub fn is_person(&self) -> bool {
+        self.reader.as_deref().is_some_and(|r| !r.is_empty())
+    }
+
     pub fn owns(&self, object: &str) -> bool {
         let id = object.split_once('/').map_or("", |(_, id)| id);
         self.reader.as_deref().is_some_and(|r| tj_core::runtime::access::owns(r, id))

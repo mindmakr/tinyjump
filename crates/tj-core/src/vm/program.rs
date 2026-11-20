@@ -269,6 +269,9 @@ pub struct Pii {
     pub field: Rc<str>,
     pub category: Rc<str>,
     pub purposes: Rc<[Rc<str>]>,
+    /// `@by("customer", "at")`: the field holds several people's entries, each belonging to
+    /// the person its `customer` names; `at` is the entry's own time, for `@retain`.
+    pub by: Option<(Rc<str>, Option<Rc<str>>)>,
 }
 
 /// Personal-data categories, after GDPR articles 9 and 10 and the Saudi PDPL.
@@ -285,9 +288,11 @@ impl ObjectDef {
 
     /// Whether its objects can belong to a person (the one whose id is the object id): it
     /// holds `@pii`, or has an `"owner"` rule. Erasure and per-person keys cover these.
+    /// Whether the object itself is one person's (its id is theirs). A list of several
+    /// people's entries (`@by`) does not make it so.
     pub fn belongs_to_a_person(&self) -> bool {
         let owner = |r: &Option<Rc<[Rc<str>]>>| r.as_ref().is_some_and(|r| r.iter().any(|w| &**w == "owner"));
-        !self.pii.is_empty() || owner(&self.read) || self.methods.values().any(|m| owner(&m.allow))
+        self.pii.iter().any(|p| p.by.is_none()) || owner(&self.read) || self.methods.values().any(|m| owner(&m.allow))
     }
 }
 

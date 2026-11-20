@@ -305,7 +305,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 // change once, in order.
                 for o in rt.changed_since(&objects, since) {
                     if let Output::Changed { object, state, seq } = o {
-                        let state = if events.owns(&object) { None } else { rt.masked(&object, &state) }.unwrap_or(state);
+                        let state = if events.owns(&object) { None } else { rt.masked(&object, &state, events.is_person()) }.unwrap_or(state);
                         events.push(changed_event(&object, &state, seq));
                     }
                 }
@@ -424,13 +424,22 @@ impl Dispatch {
                 }
                 Output::Changed { object, state, seq } => {
                     let full = changed_event(&object, &state, seq);
-                    match rt.masked(&object, &state) {
-                        // Personal data goes to its owner only.
-                        Some(masked) => {
-                            let masked = changed_event(&object, &masked, seq);
-                            self.subscribers.retain(|s| s.push(if s.owns(&object) { full.clone() } else { masked.clone() }));
+                    match (rt.masked(&object, &state, true), rt.masked(&object, &state, false)) {
+                        // Personal data goes to its owner; lists of several people's also to
+                        // the people the rules let read them; tools see it masked.
+                        (Some(for_readers), Some(for_tools)) => {
+                            let (for_readers, for_tools) = (changed_event(&object, &for_readers, seq), changed_event(&object, &for_tools, seq));
+                            self.subscribers.retain(|s| {
+                                s.push(if s.owns(&object) {
+                                    full.clone()
+                                } else if s.is_person() {
+                                    for_readers.clone()
+                                } else {
+                                    for_tools.clone()
+                                })
+                            });
                         }
-                        None => self.broadcast(full),
+                        _ => self.broadcast(full),
                     }
                 }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
@@ -689,6 +698,32 @@ mod tests {
         assert!(read("Cut").contains("\"object\":\"Slot/s1\""), "it starts with the class's objects");
         name("s2", "Shave");
         assert!(read("Shave").contains("\"object\":\"Slot/s2\""), "and carries new ones");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_list_of_several_peoples_entries_streams_to_its_readers_and_masked_to_tools() {
+        let data = std::env::temp_dir().join(format!("tj-engine-roster-{}", std::process::id()));
+        let source = "@server @read(\"staff\") object Roster {
+  @pii(\"contact\", \"booking\") @by(\"customer\") entries: { customer: string, name: string }[] = []
+  @allow(\"signedIn\") add(name: string) { this.entries.push({ customer: caller.id, name }) }
+}
+".to_string();
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
+        let (staff, _) = engine.subscribe(vec!["Roster/main".into()], 0, Some(Caller::Remote { id: "key:sam".into(), roles: vec!["staff".into()] })).expect("staff may read it");
+        let (tool, _) = engine.subscribe(vec!["Roster/main".into()], 0, None).expect("the admin's stream");
+        engine.request(Input::Call { object: "Roster/main".into(), method: "add".into(), args: vec![json!("Ana")], reply: None, call: None, caller: Some(Caller::Remote { id: "user:ana".into(), roles: Vec::new() }) }).expect("added");
+        let read = |m: &Mailbox| {
+            let (mut text, start) = (String::new(), std::time::Instant::now());
+            while !text.contains("entries") && start.elapsed() < Duration::from_secs(2) {
+                text.extend(m.take(Duration::from_millis(200)).into_iter().map(|e| e.text));
+            }
+            text
+        };
+        assert!(read(&staff).contains("\"Ana\""), "staff read the list");
+        let masked = read(&tool);
+        assert!(masked.contains("entries") && !masked.contains("Ana"), "{masked}");
         let _ = std::fs::remove_dir_all(&data);
     }
 
