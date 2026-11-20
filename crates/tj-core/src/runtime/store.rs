@@ -21,6 +21,12 @@ pub trait Store {
     fn forget(&mut self, _key: &str) -> Result<(), String> {
         Ok(())
     }
+    /// Whether the record of `key` cannot be read because its key was destroyed (`forget`):
+    /// an erasure that could not finish, or a copy restored from a backup. Any other failure
+    /// to read is an error, never this.
+    fn is_erased(&mut self, _key: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// In-memory store, for tests and ephemeral runs.

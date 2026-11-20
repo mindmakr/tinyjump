@@ -97,9 +97,16 @@ impl Runtime {
                 continue;
             }
             let key = format!("{}/{subject}", def.name);
-            // A record that cannot be read (its key already destroyed by an erasure that could
-            // not finish, or a copy from a backup) still counts: erasing overwrites it.
-            if self.is_loaded(&key) || !matches!(self.store.load(&key), Ok(None)) {
+            let present = self.is_loaded(&key)
+                || match self.store.load(&key) {
+                    Ok(found) => found.is_some(),
+                    // A record whose key was already destroyed (an erasure that could not
+                    // finish, a copy from a backup) still counts, and erasing overwrites it.
+                    // Any other failure to read fails the erasure.
+                    Err(e) if !self.store.is_erased(&key)? => return Err(e),
+                    Err(_) => true,
+                };
+            if present {
                 held.push((class, key));
             }
         }
@@ -132,7 +139,8 @@ impl Runtime {
         }
         let (mut erased, mut held, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
         for (class, key) in objects {
-            if !self.is_loaded(&key) && self.store.load(&key).is_err() {
+            // Its key is gone, so it cannot be kept, held or not: it is overwritten.
+            if !self.is_loaded(&key) && self.store.is_erased(&key).map_err(|e| (503, e))? {
                 unreadable.push((class, key));
                 continue;
             }

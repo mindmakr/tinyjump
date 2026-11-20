@@ -1287,10 +1287,11 @@ impl Store for Forgetful {
     }
 }
 
-/// A store with one record that cannot be read until it is written again (an erasure that
-/// could not finish, or a copy restored from a backup).
+/// A store with one record that cannot be read until it is written again: because its key
+/// was destroyed (an erasure that could not finish, or a copy restored from a backup) when
+/// the flag says so, or because the disk fails.
 #[derive(Clone, Default)]
-struct Spoiled(Shared, Rc<RefCell<Option<String>>>);
+struct Spoiled(Shared, Rc<RefCell<Option<String>>>, Rc<std::cell::Cell<bool>>);
 
 impl Store for Spoiled {
     fn load(&mut self, key: &str) -> Result<Option<String>, String> {
@@ -1308,6 +1309,9 @@ impl Store for Spoiled {
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.keys(prefix)
     }
+    fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        Ok(self.2.get() && self.1.borrow().as_deref() == Some(key))
+    }
 }
 
 #[test]
@@ -1317,6 +1321,11 @@ fn erasing_again_overwrites_a_record_that_cannot_be_read() {
     call_as(&mut boot(), 1000.0, "Account/user:ana", "set", json!(["a@example.com"]), who("user:ana", &[])).unwrap();
     *store.1.borrow_mut() = Some("Account/user:ana".into());
     let mut rt = boot();
+    // A disk that fails to read is not an erased record: nothing is destroyed or overwritten.
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    assert!(store.0 .0.borrow().data["Account/user:ana"].contains("a@example.com"), "kept as it was");
+    // A record whose key is gone is overwritten.
+    store.2.set(true);
     let e = rt.erase_subject("user:ana").unwrap();
     assert_eq!(e.erased, ["Account/user:ana"]);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""));

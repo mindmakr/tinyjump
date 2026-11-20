@@ -320,6 +320,14 @@ impl<S: Store> Store for Sealed<S> {
         }
     }
 
+    fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        let Some(text) = self.inner.load(&self.keys.name(key))? else { return Ok(false) };
+        match serde_json::from_str::<Json>(&text).ok().and_then(|e| e["own"].as_str().map(str::to_string)) {
+            Some(own) => Ok(self.own_for(&own)?.is_none()),
+            None => Ok(false),
+        }
+    }
+
     /// Lists by class: `prefix` must start with `Class/`, as the runtime's always do.
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         let (class, _) = prefix.split_once('/').ok_or("a sealed store lists keys by class: the prefix must be `Class/...`")?;
