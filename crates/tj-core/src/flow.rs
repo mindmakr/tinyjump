@@ -979,11 +979,21 @@ impl Checker {
         // A list of objects keeps being one through filter, sort and slice; its elements are
         // handles in callbacks and through find.
         if let Val::Handles { class } = &recv {
-            if CALLBACK_METHODS.contains(&name) || matches!(name, "slice" | "concat") {
+            if CALLBACK_METHODS.contains(&name) || name == "slice" {
                 let elem = Val::Handle { class: class.clone(), other: true };
                 if let (Some(ExprKind::Arrow(f)), true) = (args.first().map(|a| &a.kind), CALLBACK_METHODS.contains(&name)) {
                     let this = fr.this.clone();
-                    let ret = self.call(f, vec![elem.clone(), clean(), recv.clone()], this, Endpoint::Internal, Some(&mut fr.vars));
+                    // reduce's callback takes the accumulator first, then the element; what
+                    // it returns becomes the accumulator, so both run through it.
+                    let cb_args = if name == "reduce" {
+                        let init = args.get(1).map(|a| self.expr(a, fr)).unwrap_or_else(clean);
+                        let mut acc = self.flatten(&init);
+                        acc.join(&self.whole(class, true));
+                        vec![Val::Data(acc), elem.clone(), clean(), recv.clone()]
+                    } else {
+                        vec![elem.clone(), clean(), recv.clone()]
+                    };
+                    let ret = self.call(f, cb_args, this, Endpoint::Internal, Some(&mut fr.vars));
                     return match name {
                         "map" | "flatMap" | "reduce" => Val::Data(ret),
                         "some" | "every" | "findIndex" | "forEach" => clean(),

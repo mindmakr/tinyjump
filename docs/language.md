@@ -73,8 +73,9 @@ object Cart {
   (`Slot.all().filter(s => s.open)`), so each fact is kept once and found when needed,
   not copied into a second object.
   - On a server it reads the store, leaving out erased objects.
-  - On a device, a `@server` class's list fills as the server sends the class (the first
-    call subscribes to `Slot/*`).
+  - On a device, a `@server` class's list starts with the copies kept on the device (so
+    it shows offline) and fills as the server sends the class (the first call subscribes
+    to `Slot/*`). When another user signs in, it starts over.
   - A class whose `@read` rule lets each person read only their own objects (`"owner"`)
     is listed only to roles the rule names; query it in a server method instead.
 - Fields are saved after every change and survive restarts. When you add a field, its

@@ -57,9 +57,16 @@ final class Sync {
     /** Starts keeping {@code key} current; {@code seq} is the change number of its cached state. */
     void subscribe(String key, long seq) {
         if (server == null || replicas.containsKey(key)) return;
-        replicas.put(key, seq);
         // Already in a class stream (`Slot/*`): nothing new to ask for.
         if (!key.endsWith("/*") && replicas.containsKey(key.split("/", 2)[0] + "/*")) return;
+        if (key.endsWith("/*")) {
+            // The class stream covers the objects of the class asked for one by one.
+            String prefix = key.substring(0, key.length() - 1);
+            for (java.util.Iterator<String> i = replicas.keySet().iterator(); i.hasNext(); ) {
+                if (i.next().startsWith(prefix)) i.remove();
+            }
+        }
+        replicas.put(key, seq);
         connect(new ArrayList<>(replicas.keySet()), Collections.min(replicas.values()));
     }
 
@@ -163,10 +170,13 @@ final class Sync {
         tj.main.post(new Runnable() {
             @Override
             public void run() {
-                Long have = replicas.get(key);
-                // An object of a class streamed whole (`Slot/*`) is new to the device: keep it.
-                if (have == null && !replicas.containsKey(key.split("/", 2)[0] + "/*")) return;
-                replicas.put(key, have == null ? seq : Math.max(have, seq));
+                // An object of a class streamed whole (`Slot/*`): the class's entry keeps the
+                // change number, so a reconnect resumes and the stream address stays short.
+                String whole = key.split("/", 2)[0] + "/*";
+                String entry = replicas.containsKey(whole) ? whole : key;
+                Long have = replicas.get(entry);
+                if (have == null) return;
+                replicas.put(entry, Math.max(have, seq));
                 try {
                     tj.send(TinyJump.input("sync").put("object", key).put("state", state).put("seq", seq));
                 } catch (JSONException e) {
