@@ -10,10 +10,12 @@
 //!                                        `Last-Event-ID` header), then streams live
 //!   GET  /_tj/inspect                 -> semantic tree + object states
 //!   POST /_tj/input                   body: one protocol Input
+//!   (`/_tj/*` needs the admin key on `tj serve`; see auth.rs)
 //!
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
 //! plus `/_tj/reload` (SSE) for live reload.
 
+use crate::auth::Automation;
 use crate::engine::Engine;
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
@@ -46,18 +48,19 @@ impl Dev {
     }
 }
 
-pub fn serve(addr: &str, engine: Engine, dev: Option<Arc<Dev>>) -> Result<(), String> {
+pub fn serve(addr: &str, engine: Engine, dev: Option<Arc<Dev>>, automation: Automation) -> Result<(), String> {
     let server = Server::http(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
     let active = Arc::new(AtomicUsize::new(0));
+    let automation = Arc::new(automation);
     for req in server.incoming_requests() {
         if active.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
             let _ = req.respond(json_response(503, &json!({ "error": "busy" })));
             continue;
         }
         active.fetch_add(1, Ordering::Relaxed);
-        let (engine, dev, counter) = (engine.clone(), dev.clone(), active.clone());
+        let (engine, dev, counter, automation) = (engine.clone(), dev.clone(), active.clone(), automation.clone());
         let spawned = thread::Builder::new().name("tj-http".into()).spawn(move || {
-            handle(req, &engine, dev.as_deref());
+            handle(req, &engine, dev.as_deref(), &automation);
             counter.fetch_sub(1, Ordering::Relaxed);
         });
         if spawned.is_err() {
@@ -110,7 +113,7 @@ fn read_json(req: &mut Request) -> Result<Json, String> {
     serde_json::from_str(&body).map_err(|e| format!("body is not JSON: {e}"))
 }
 
-fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
+fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>, automation: &Automation) {
     let started = Instant::now();
     let path = req.url().split('?').next().unwrap_or("/").to_string();
     let segs: Option<Vec<String>> = path.trim_start_matches('/').split('/').map(percent_decode).collect();
@@ -119,6 +122,13 @@ fn handle(mut req: Request, engine: &Engine, dev: Option<&Dev>) {
         return;
     };
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
+    if segs.first() == Some(&"_tj") {
+        if let Err((status, e)) = automation.check(header_value(&req, "Authorization").as_deref()) {
+            let _ = req.respond(json_response(status, &json!({ "error": e })));
+            engine.stats().request(started.elapsed(), false);
+            return;
+        }
+    }
     let method = req.method().clone();
     let response = match (&method, segs.as_slice()) {
         (Method::Get, ["api", "events"]) => {

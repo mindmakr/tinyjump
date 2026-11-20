@@ -47,7 +47,7 @@ live, offline-cached replica of it.
 
 Other commands: `tj docs` (the language reference, for agents), `tj check app.tj` (compile
 errors with fix hints and types), `tj bench app.tj` (timings and work counters) and
-`tj serve app.tj` (backend only; add `--host 0.0.0.0` to expose it). Apps can span several
+`tj serve app.tj` (backend only; add `--host 0.0.0.0` to expose it; its automation needs `TJ_ADMIN_KEY`). Apps can span several
 files with `import { Cart } from "./cart"`.
 
 Testing and agents: `tj review --target <url>` checks a running app for layout,

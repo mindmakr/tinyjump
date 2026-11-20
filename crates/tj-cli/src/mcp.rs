@@ -10,7 +10,7 @@ use std::time::Duration;
 const MAX_IMAGE: u64 = 20 << 20;
 
 pub fn run(target: &str) -> Result<(), String> {
-    let client = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(), target: target.trim_end_matches('/').to_string() };
+    let client = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(), target: target.trim_end_matches('/').to_string(), auth: crate::auth::client_header() };
     let mut stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -71,6 +71,8 @@ fn target(s: &str) -> Json {
 struct Client {
     agent: ureq::Agent,
     target: String,
+    /// `Authorization` for a `tj serve` target, from `TJ_ADMIN_KEY`.
+    auth: Option<String>,
 }
 
 impl Client {
@@ -150,16 +152,25 @@ impl Client {
         }
     }
 
+    /// A request to the app's automation endpoint `path`.
+    fn request(&self, method: &str, path: &str) -> ureq::Request {
+        let req = self.agent.request(method, &self.url(path));
+        match &self.auth {
+            Some(h) => req.set("Authorization", h),
+            None => req,
+        }
+    }
+
     fn inspect(&self) -> Result<Json, String> {
-        self.result(self.agent.get(&self.url("/_tj/inspect")).call())
+        self.result(self.request("GET", "/_tj/inspect").call())
     }
 
     fn input(&self, input: &Json) -> Result<Json, String> {
-        self.result(self.agent.post(&self.url("/_tj/input")).set("Content-Type", "application/json").send_string(&input.to_string()))
+        self.result(self.request("POST", "/_tj/input").set("Content-Type", "application/json").send_string(&input.to_string()))
     }
 
     fn screenshot(&self) -> Result<Vec<u8>, String> {
-        let resp = match self.agent.get(&self.url("/_tj/screenshot")).call() {
+        let resp = match self.request("GET", "/_tj/screenshot").call() {
             Ok(r) => r,
             Err(ureq::Error::Status(404, _)) => return Err("this host cannot take screenshots yet".into()),
             Err(e) => return Err(self.unreachable(e)),
@@ -207,7 +218,7 @@ mod tests {
 
     #[test]
     fn speaks_mcp_without_a_running_app() {
-        let c = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_millis(200)).build(), target: "http://127.0.0.1:9".into() };
+        let c = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_millis(200)).build(), target: "http://127.0.0.1:9".into(), auth: None };
         let init = c.handle("initialize", &json!({ "protocolVersion": "2025-06-18" })).unwrap();
         assert_eq!(init["capabilities"]["tools"], json!({}));
         let names: Vec<String> = c.handle("tools/list", &json!({})).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
