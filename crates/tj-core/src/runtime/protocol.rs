@@ -100,9 +100,13 @@ pub enum Input {
     Online,
     /// Devices: the signed-in user changed (`null` when signed out). Server calls queued by
     /// someone else are dropped, never sent as the new user, and replicas are cleared.
+    /// `roles` are the user's roles as the server verified them, for the UI to show or hide
+    /// controls; the server checks every call itself.
     Identity {
         #[serde(default)]
         user: Option<String>,
+        #[serde(default)]
+        roles: Vec<String>,
     },
     /// Secure random bytes from the host (hex, at least 32 bytes), sent once right after
     /// boot. They are mixed into the generator behind `crypto.randomId()` and device ids.
@@ -261,6 +265,14 @@ impl Fields {
         Some(self.take(key)).filter(|v| !v.is_null())
     }
 
+    fn roles(&mut self) -> Result<Vec<String>, String> {
+        match self.take("roles") {
+            Json::Null => Ok(Vec::new()),
+            Json::Array(a) => a.into_iter().map(|r| r.as_str().map(str::to_string).ok_or_else(|| "`roles` must be strings".to_string())).collect(),
+            _ => Err("`roles` must be an array of strings".into()),
+        }
+    }
+
     fn caller(&mut self) -> Result<Option<Caller>, String> {
         match self.take("caller") {
             Json::Null => Ok(None),
@@ -302,7 +314,7 @@ impl TryFrom<Json> for Input {
                 "sync" => Input::Sync { object: f.string("object")?, state: f.take("state"), seq: f.opt_u64("seq")? },
                 "layout" => Input::Layout { width: f.number("width")? as f32, height: f.number("height")? as f32, rtl: f.flag("rtl")? },
                 "online" => Input::Online,
-                "identity" => Input::Identity { user: f.opt_string("user")? },
+                "identity" => Input::Identity { user: f.opt_string("user")?, roles: f.roles()? },
                 "entropy" => Input::Entropy { bytes: f.string("bytes")? },
                 "tick" => Input::Tick,
                 "inspect" => Input::Inspect { reply: f.opt_u64("reply")? },
@@ -336,11 +348,7 @@ impl TryFrom<Json> for Caller {
             return Ok(Caller::trusted());
         }
         let mut f = object(v, "`caller`")?;
-        let roles = match f.take("roles") {
-            Json::Null => Vec::new(),
-            Json::Array(a) => a.into_iter().map(|r| r.as_str().map(str::to_string).ok_or("`roles` must be strings")).collect::<Result<_, _>>()?,
-            _ => return Err("`roles` must be an array of strings".into()),
-        };
+        let roles = f.roles()?;
         Ok(Caller::Remote { id: f.string("id")?, roles })
     }
 }
@@ -364,8 +372,8 @@ mod tests {
             Input::Sync { object: "A/b".into(), state: json!({ "n": 1 }), seq: Some(9) },
             Input::Layout { width: 390.0, height: 844.5, rtl: true },
             Input::Online,
-            Input::Identity { user: Some("user:ana".into()) },
-            Input::Identity { user: None },
+            Input::Identity { user: Some("user:ana".into()), roles: vec!["staff".into()] },
+            Input::Identity { user: None, roles: Vec::new() },
             Input::Entropy { bytes: "ab".repeat(32) },
             Input::Tick,
             Input::Inspect { reply: Some(5) },

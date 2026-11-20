@@ -188,8 +188,19 @@ impl Runtime {
 
     /// The signed-in user changed: calls queued by anyone else are dropped (each reported
     /// to its caller, or as an error), and replicas read as the previous user are cleared.
-    pub(crate) fn set_identity(&mut self, user: Option<String>) {
+    pub(crate) fn set_identity(&mut self, user: Option<String>, roles: Vec<String>) {
+        let roles: Rc<[Rc<str>]> = roles.iter().map(|r| Rc::from(r.as_str())).collect();
+        let new_roles = roles != self.device_roles;
+        if new_roles {
+            self.device_roles = roles;
+            self.ran_code = true;
+        }
         if self.outbox.user == user {
+            // Same person, other roles: what only the old roles could read goes; their queued
+            // calls stay, as the server checks each one again.
+            if new_roles {
+                self.clear_replicas();
+            }
             self.release_outbox();
             return;
         }

@@ -24,10 +24,10 @@ use engine::Engine;
 
 /// The language reference (docs/language.md), for agents: `tj docs` and the MCP `language` tool.
 pub const LANGUAGE: &str = include_str!("../../../docs/language.md");
-use http::Dev;
+use http::{Dev, Web};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -70,6 +70,7 @@ OPTIONS:
                   run plugin <name> as a scripted fake (tests, demos without keys)
   --compliance <pack.json>
                   `serve`: refuse to start while a control of the pack is not met
+  --web           `serve`: also serve the web app, with a sign-in bar for API keys
   --as <name:role,role>
                   `dev` only: requests without credentials act as this user (dev:<name>)
 
@@ -108,6 +109,7 @@ struct Args {
     privacy: bool,
     record: bool,
     compliance: Option<PathBuf>,
+    web: bool,
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
@@ -125,7 +127,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, compliance: None, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -140,6 +142,7 @@ fn parse_args() -> Result<Args, String> {
             "--privacy" => args.privacy = true,
             "--record" => args.record = true,
             "--compliance" => args.compliance = Some(PathBuf::from(value()?)),
+            "--web" => args.web = true,
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
@@ -357,17 +360,21 @@ not starting: some controls of the compliance pack are not met (above)"));
     let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
-    let dev = if dev_mode {
+    // The web app: always under `tj dev`, and under `tj serve` with --web.
+    let web = if dev_mode || args.web {
         let wasm = args.wasm.clone().unwrap_or_else(|| workspace_dir().join("target/wasm32-unknown-unknown/small/tj_wasm.wasm"));
         if !wasm.exists() {
             return Err(format!("web runtime not found at {}\nbuild it with: cargo web", wasm.display()));
         }
-        let dev = Arc::new(Dev { source: file.to_path_buf(), web_dir: workspace_dir().join("hosts/web"), wasm, reload: Mutex::new(Vec::new()) });
-        watch(file.to_path_buf(), engine.clone(), dev.clone());
-        Some(dev)
+        Some(Arc::new(Web { source: file.to_path_buf(), web_dir: workspace_dir().join("hosts/web"), wasm }))
     } else {
         None
     };
+    let dev = dev_mode.then(|| {
+        let dev = Arc::new(Dev::default());
+        watch(file.to_path_buf(), engine.clone(), dev.clone());
+        dev
+    });
     let names = plugins.names();
     let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
     eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
@@ -376,7 +383,7 @@ not starting: some controls of the compliance pack are not met (above)"));
     if tls {
         eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", args.host, http::TLS_TERMINATED_ENV);
     }
-    http::serve(&addr, http::Front::new(engine, dev, automation, identity, audit, tls))
+    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, tls))
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.

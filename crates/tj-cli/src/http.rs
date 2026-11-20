@@ -34,7 +34,8 @@ use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -58,18 +59,76 @@ const MAX_TICKETS: usize = 1000;
 
 type Body = Response<std::io::Cursor<Vec<u8>>>;
 
-/// Files served in dev mode.
-pub struct Dev {
+/// The web host's files: served by `tj dev`, and by `tj serve --web`.
+pub struct Web {
     pub source: PathBuf,
     pub web_dir: PathBuf,
     pub wasm: PathBuf,
-    pub reload: Mutex<Vec<Arc<Mailbox>>>,
 }
+
+/// What only `tj dev` has: the open browser tabs, told to reload when the app changes and
+/// asked to answer `/_tj/inspect` and `/_tj/input`, so agents drive the real web screen.
+#[derive(Default)]
+pub struct Dev {
+    tabs: Mutex<Vec<Arc<Mailbox>>>,
+    asks: Mutex<HashMap<u64, Sender<Result<Json, String>>>>,
+    next_ask: AtomicU64,
+}
+
+/// How long a browser tab has to answer an agent. An open tab answers in milliseconds; one
+/// that closed is only noticed when this runs out.
+const TAB_ANSWER: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(3) };
 
 impl Dev {
     pub fn notify_reload(&self) {
-        if let Ok(mut subs) = self.reload.lock() {
-            subs.retain(|s| s.push(Event::new(String::new(), None, "event: reload\ndata: {}\n\n".into())));
+        if let Ok(mut tabs) = self.tabs.lock() {
+            tabs.retain(|s| s.push(Event::new(String::new(), None, "event: reload\ndata: {}\n\n".into())));
+        }
+    }
+
+    /// Asks the newest open tab to `inspect` or take an `input`; `None` when no tab is open,
+    /// and the server answers itself. A tab that does not answer is dropped, and the question
+    /// goes to the next open tab, or to the server.
+    fn ask(&self, kind: &str, input: &Json) -> Option<Result<Json, Failure>> {
+        let id = self.next_ask.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = channel();
+        self.asks.lock().ok()?.insert(id, tx);
+        let text = format!("event: ask\ndata: {}\n\n", json!({ "id": id, "kind": kind, "input": input }));
+        let tab = {
+            let mut tabs = self.tabs.lock().ok()?;
+            loop {
+                match tabs.last() {
+                    Some(tab) if tab.push(Event::new(String::new(), None, text.clone())) => break Some(tab.clone()),
+                    Some(_) => drop(tabs.pop()),
+                    None => break None,
+                }
+            }
+        };
+        let answer = tab.as_ref().map(|_| rx.recv_timeout(TAB_ANSWER));
+        if let Ok(mut asks) = self.asks.lock() {
+            asks.remove(&id);
+        }
+        Some(match answer? {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => Err((400, e)),
+            Err(_) => {
+                self.forget_tab(tab.as_ref().expect("asked a tab"));
+                return self.ask(kind, input);
+            }
+        })
+    }
+
+    /// A tab that closed (its stream ended) or stopped answering.
+    fn forget_tab(&self, tab: &Arc<Mailbox>) {
+        tab.close();
+        if let Ok(mut tabs) = self.tabs.lock() {
+            tabs.retain(|t| !Arc::ptr_eq(t, tab));
+        }
+    }
+
+    fn answer(&self, id: u64, r: Result<Json, String>) {
+        if let Some(tx) = self.asks.lock().ok().and_then(|mut a| a.remove(&id)) {
+            let _ = tx.send(r);
         }
     }
 }
@@ -85,6 +144,7 @@ struct Ticket {
 /// Everything a request handler needs.
 pub struct Front {
     pub engine: Engine,
+    pub web: Option<Arc<Web>>,
     pub dev: Option<Arc<Dev>>,
     pub automation: Automation,
     pub identity: Identity,
@@ -99,9 +159,9 @@ pub struct Front {
 }
 
 impl Front {
-    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, credentials_need_tls: bool) -> Front {
+    pub fn new(engine: Engine, web: Option<Arc<Web>>, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, credentials_need_tls: bool) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, dev, automation, identity, audit, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        Front { engine, web, dev, automation, identity, audit, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
     }
 }
 
@@ -260,9 +320,29 @@ fn handle(mut req: Request, front: &Front) {
             }))
         }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
-        (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| engine.request(Input::Inspect { reply: None })).map(|mut s| {
+        // Under `tj dev` the screen is in the browser tab, which answers when it is open; the
+        // server's objects, which it holds for real, come from the server either way.
+        (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| {
+            let server = engine.request(Input::Inspect { reply: None })?;
+            match front.dev.as_ref().and_then(|d| d.ask("inspect", &Json::Null)) {
+                Some(screen) => screen.map(|mut s| {
+                    s["serverObjects"] = server["objects"].clone();
+                    s
+                }),
+                None => Ok(server),
+            }
+        }).map(|mut s| {
             s["server"] = engine.stats().json();
             s
+        })),
+        // Who the credentials (or their absence) say the caller is: the web host signs in
+        // with it. Outside `/_tj/`, so a person's own key is enough.
+        (Method::Get, ["api", "whoami"]) => result_response({
+            asked = Some(("whoami", None, None));
+            front.identity.verify(authorization.as_deref())
+        }.map(|v| match v.caller {
+            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some() }),
+            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
         (Method::Get, ["_tj", "metrics"]) => match engine.core_stats() {
@@ -278,32 +358,53 @@ fn handle(mut req: Request, front: &Front) {
             engine.privacy(subject.to_string(), action == "erase")
         })),
         (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
-            let mut input = serde_json::from_value::<Input>(j).map_err(|e| (400, format!("not a protocol input: {e}")))?;
+            let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
+            front.audit.security(admin_input(&input))?;
+            // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
+            // reads stay here, where the server's objects live.
+            if matches!(input, Input::Ui { .. } | Input::Layout { .. }) {
+                if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
+                    return r;
+                }
+            }
             // Automation is trusted (it already passed the admin key), so it says so explicitly.
             if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
                 *c = Some(Caller::trusted());
             }
-            front.audit.security(admin_input(&input))?;
             engine.request(input)
         })),
-        (Method::Get, rest) if front.dev.is_some() => {
-            let dev = front.dev.as_deref().expect("checked");
+        // A tab's answer to an agent's question (dev only; JSON only, so another site's form
+        // cannot post one).
+        (Method::Post, ["_tj", "answer", id]) if front.dev.is_some() => result_response(read_json(&mut req).and_then(|j| {
+            let id = id.parse().map_err(|_| (400, "bad answer id".to_string()))?;
+            let r = match j["error"].as_str() {
+                Some(e) => Err(e.to_string()),
+                None => Ok(j["ok"].clone()),
+            };
+            front.dev.as_ref().expect("checked").answer(id, r);
+            Ok(json!(null))
+        })),
+        (Method::Get, ["_tj", "reload"]) if front.dev.is_some() => {
+            let dev = front.dev.as_ref().expect("checked");
+            let events = Arc::new(Mailbox::new(Vec::new(), None));
+            if let Ok(mut tabs) = dev.tabs.lock() {
+                tabs.push(events.clone());
+            }
+            sse(req, &events, || true);
+            dev.forget_tab(&events);
+            return;
+        }
+        (Method::Get, rest) if front.web.is_some() => {
+            let web = front.web.as_deref().expect("checked");
             match rest {
-                [""] | ["index.html"] => file(dev.web_dir.join("index.html"), "text/html; charset=utf-8"),
-                ["tinyjump.js"] => file(dev.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
-                ["tinyjump.wasm"] => file(dev.wasm.clone(), "application/wasm"),
+                [""] | ["index.html"] => file(web.web_dir.join("index.html"), "text/html; charset=utf-8"),
+                ["tinyjump.js"] => file(web.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
+                ["tinyjump.wasm"] => file(web.wasm.clone(), "application/wasm"),
                 // The whole app as one bundle: the entry and the files it imports.
-                ["app.tj"] => match crate::app::read(&dev.source) {
+                ["app.tj"] => match crate::app::read(&web.source) {
                     Ok(app) => Response::from_data(app.source).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Cache-Control", "no-store")),
                     Err(e) => json_response(404, &json!({ "error": e })),
                 },
-                ["_tj", "reload"] => {
-                    let events = Arc::new(Mailbox::new(Vec::new(), None));
-                    if let Ok(mut subs) = dev.reload.lock() {
-                        subs.push(events.clone());
-                    }
-                    return sse(req, &events, || true);
-                }
                 _ => json_response(404, &json!({ "error": "not found" })),
             }
         }
@@ -517,6 +618,32 @@ fn sse(req: Request, events: &Mailbox, still_valid: impl Fn() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agents_reach_the_open_tab_and_the_server_answers_when_none_is_open() {
+        let dev = Arc::new(Dev::default());
+        assert!(dev.ask("inspect", &Json::Null).is_none(), "no tab: the server answers");
+        let tab = Arc::new(Mailbox::new(Vec::new(), None));
+        dev.tabs.lock().unwrap().push(tab.clone());
+        // The tab reads the question and posts its answer.
+        let answering = {
+            let dev = dev.clone();
+            thread::spawn(move || {
+                let asked = tab.take(Duration::from_secs(5));
+                let text = &asked[0].text;
+                let data: Json = serde_json::from_str(text.split("data: ").nth(1).unwrap().trim()).unwrap();
+                assert_eq!(data["kind"], json!("input"));
+                dev.answer(data["id"].as_u64().unwrap(), Ok(json!({ "pressed": data["input"]["target"]["id"] })));
+            })
+        };
+        let r = dev.ask("input", &json!({ "type": "ui", "target": { "id": "add" }, "event": "onPress" }));
+        answering.join().unwrap();
+        assert_eq!(r, Some(Ok(json!({ "pressed": "add" }))));
+
+        // A tab that stops answering (closed, reloading) is dropped, and the server answers.
+        assert!(dev.ask("inspect", &Json::Null).is_none());
+        assert!(dev.tabs.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn credentials_need_tls_on_reachable_servers_only() {

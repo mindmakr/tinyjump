@@ -16,6 +16,10 @@ const CSS = [
   '.tj-spacer{flex:1}',
   '.tj-text{white-space:pre-wrap}',
   '.tj-toggle{display:inline-flex;gap:8px;align-items:center}',
+  // Touch targets of at least 44px, as on Android and iOS (and as `tj review` checks).
+  '.tj-button,.tj-input,.tj-toggle{min-height:44px;box-sizing:border-box;font:inherit}',
+  '.tj-button{min-width:44px;padding:0 14px}',
+  '.tj-input{padding:0 10px}',
   // Each text reads in its own script's direction (English stays "3 left" in an Arabic
   // screen) while aligning to the layout's start, like Android and iOS.
   '.tj-text,.tj-input,.tj-toggle span,.tj-input::placeholder{unicode-bidi:plaintext;text-align:left}',
@@ -177,6 +181,7 @@ export async function start(opts) {
   let reconnect = null;
   let token = opts.token || null; // sent as `Authorization: Bearer` (docs/access-control.md)
   let user = opts.user || null;
+  let roles = opts.roles || []; // as the server verified them: for showing the right screen
   const auth = (headers) => (token ? Object.assign({ authorization: 'Bearer ' + token }, headers) : headers);
   // A 401: the embedding app should refresh the token and call setToken.
   const tokenExpired = () => window.dispatchEvent(new CustomEvent('tinyjump:tokenExpired'));
@@ -233,15 +238,19 @@ export async function start(opts) {
   }
 
   // The signed-in user changed: calls queued by the previous one are dropped and replicas
-  // start over, so nothing one user could see or send carries over to the next.
-  function setToken(newToken, newUser) {
+  // start over, so nothing one user could see or send carries over to the next. `newRoles`
+  // are the roles the server reports for them (`GET /api/whoami`), for the UI only.
+  function setToken(newToken, newUser, newRoles) {
     token = newToken || null;
-    if ((newUser || null) !== user) {
+    const sameRoles = (newRoles || []).join(',') === roles.join(',');
+    if ((newUser || null) !== user || !sameRoles) {
       user = newUser || null;
+      roles = newRoles || [];
+      // Another user or other roles: replicas start over, as the runtime's do.
       replicas.clear();
       if (events) events.close();
       events = null;
-      send({ type: 'identity', user });
+      send({ type: 'identity', user, roles });
     } else {
       clearTimeout(reconnect);
       reconnect = setTimeout(connectRealtime, 0);
@@ -428,11 +437,17 @@ export async function start(opts) {
     act: (target, event, value) => request({ type: 'ui', target, event, value: value === undefined ? null : value }),
     call: (object, method, args) => request({ type: 'call', object, method, args: args || [] }),
     get: (object) => request({ type: 'get', object }),
+    /** Any protocol input (docs/host-protocol.md): those that take a reply resolve with it. */
+    input: (i) => {
+      if (['call', 'get', 'ui', 'inspect'].indexOf(i.type) >= 0) return request(Object.assign({}, i));
+      send(Object.assign({}, i));
+      return Promise.resolve(null);
+    },
     tick: () => send({ type: 'tick' }),
     /** The signed-in user's token and id; a new id drops what the previous user queued or saw. */
     setToken,
     /** Forgets the token, the replicas and every queued server call. */
-    signOut: () => setToken(null, null),
+    signOut: () => setToken(null, null, []),
   };
 
   // ---------- boot ----------
@@ -457,7 +472,7 @@ export async function start(opts) {
   const entropy = crypto.getRandomValues(new Uint8Array(32));
   send({ type: 'entropy', bytes: Array.from(entropy, (b) => ('0' + b.toString(16)).slice(-2)).join('') });
   // Before any other input, so calls held from the last session are checked against it.
-  if (opts.user !== undefined) send({ type: 'identity', user: opts.user || null });
+  if (opts.user !== undefined) send({ type: 'identity', user: opts.user || null, roles });
   window.tinyjump = api;
   return api;
 }
