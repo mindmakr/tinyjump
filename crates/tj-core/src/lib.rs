@@ -10,6 +10,8 @@ pub mod crypto;
 pub mod flow;
 pub mod host;
 pub mod modules;
+#[cfg(feature = "check")]
+pub mod lawful_basis;
 pub mod runtime;
 pub mod syntax;
 pub mod typeck;
@@ -18,7 +20,7 @@ pub mod vm;
 
 pub use compile::compile;
 #[cfg(feature = "check")]
-pub use {compile::reveals, flow::Reveal};
+pub use {compile::lawful_bases, compile::reveals, flow::Reveal};
 pub use runtime::protocol::{Input, Output, PatchOp, Target};
 pub use runtime::store::{MemStore, Store};
 pub use runtime::{BootError, Options, Runtime};

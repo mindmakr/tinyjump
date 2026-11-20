@@ -538,10 +538,10 @@ impl Runtime {
     /// Who a `call` or `get` comes from, after the access rules and the object cap; or the
     /// refusal. Checked before anything is loaded.
     fn admit(&self, object: &str, method: Option<&str>, caller: Option<protocol::Caller>) -> Result<Who, (u16, String)> {
-        let who = match caller {
-            Some(c) => Who::from_caller(&c, self.server),
-            None if self.server => return refused(400, "a request to a server must say who is calling (caller)").map(|_| Who::System),
-            None => Who::Local,
+        let who = match caller.map(|c| Who::from_caller(&c, self.server)) {
+            Some(Who::Local(_)) | None if !self.server => self.local(),
+            Some(who) => who,
+            None => return refused(400, "a request to a server must say who is calling (caller)").map(|_| Who::System),
         };
         if let Some(why) = self.refusal(object, method, &who) {
             return refused(403, why).map(|_| Who::System);
@@ -552,12 +552,13 @@ impl Runtime {
         Ok(who)
     }
 
-    /// Who runs code that no request started: the system on a server, the user on a device.
+    /// Who runs code that no request started: the system on a server, the signed-in user on
+    /// a device.
     fn local(&self) -> Who {
         if self.server {
             Who::System
         } else {
-            Who::Local
+            Who::Local(Rc::from(self.outbox.user.as_deref().unwrap_or_default()))
         }
     }
 
@@ -618,7 +619,7 @@ impl Runtime {
         let method = self.program.objects[class as usize].methods.get_index(m as usize).map_or("", |(name, _)| name).to_string();
         let caller = match &f.caller {
             Who::Remote { id, .. } => Some(id.to_string()),
-            Who::System | Who::Local => None,
+            Who::System | Who::Local(_) => None,
         };
         self.outputs.push(Output::Ran { object: o.obj.key(), method, by: o.by.into(), caller, ok, ms: (self.now - o.at).max(0.0) as u64 });
     }

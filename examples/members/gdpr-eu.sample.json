@@ -1,0 +1,29 @@
+{
+  "name": "gdpr-eu-sample",
+  "title": "EU GDPR (sample pack)",
+  "reviewedBy": null,
+  "effective": "2018-05-25",
+  "special": ["health", "genetic", "biometric", "ethnicity", "religion", "politics", "union", "sexual"],
+  "controls": [
+    { "check": "lawful-basis", "source": "GDPR art. 6(1)" },
+    { "check": "special-basis", "source": "GDPR art. 9(1)-(2)" },
+    { "check": "retention", "source": "GDPR art. 5(1)(e)" },
+    { "check": "subject-rights", "source": "GDPR arts. 15, 17 and 20" },
+    { "check": "records", "source": "GDPR art. 30" },
+    { "check": "audit-log", "source": "GDPR arts. 5(2) and 32(1)(b)" },
+    { "check": "encryption-at-rest", "source": "GDPR art. 32(1)(a)" },
+    { "check": "encryption-in-transit", "source": "GDPR art. 32(1)(a)" },
+    { "person": "Tell people what you hold, why, on what basis and for how long, when you collect it (a privacy notice)", "source": "GDPR arts. 13-14" },
+    { "person": "Have a contract with every processor: hosting, email, AI and other providers", "source": "GDPR art. 28" },
+    { "person": "Notify the supervisory authority of a personal data breach within 72 hours where required, tell the people affected when the risk to them is high, and keep a log of breaches", "source": "GDPR arts. 33-34" },
+    { "person": "Assess high-risk processing before it starts (DPIA)", "source": "GDPR art. 35" },
+    { "person": "Appoint a data protection officer where required", "source": "GDPR art. 37" }
+  ],
+  "notCovered": [
+    "criminal convictions and offences (art. 10)",
+    "automated decisions and profiling (art. 22)",
+    "children's consent (art. 8)",
+    "the right to object and to restrict processing (arts. 18 and 21)",
+    "rectification, where the app gives people no way to correct their data (art. 16)"
+  ]
+}

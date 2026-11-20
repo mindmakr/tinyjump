@@ -52,7 +52,7 @@ pub(crate) struct Outbox {
     pending: Vec<Pending>,
     /// The signed-in user calls are queued for (`identity`).
     #[serde(default)]
-    user: Option<String>,
+    pub(crate) user: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,6 +196,8 @@ impl Runtime {
         let (keep, dropped): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.outbox.pending).into_iter().partition(|p| p.user == user);
         self.outbox.pending = keep;
         self.outbox.user = user;
+        // `caller.id` changed: the UI is drawn again for the new user.
+        self.ran_code = true;
         for p in dropped {
             let why = format!("{}.{} was queued by another user and was not sent", p.object, p.method);
             match p.promise {

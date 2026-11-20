@@ -16,7 +16,8 @@ the order of work are in [trust.md](trust.md), section 6.
 - `@pii(category, purpose, ...)` marks a field as personal data: a category, then what the
   data is for (one or more words such as `account`, `billing`, `care`).
 - Categories: `contact`, `identifier`, `online-id`, `location`, `financial`, `health`,
-  `genetic`, `biometric`, `religion`, `politics`, `union`, `sexual`, `criminal`, `other`.
+  `genetic`, `biometric`, `ethnicity`, `religion`, `politics`, `union`, `sexual`,
+  `criminal`, `other`.
   From `health` to `sexual` are GDPR article 9's special categories (the Saudi PDPL's
   sensitive data); `criminal` is article 10's.
 - Only `@server` objects hold personal data: the server is where it can be exported and
@@ -162,6 +163,12 @@ fine, and so is testing whether a field is empty. A call it cannot follow (a fun
 in a variable) is refused only when personal data goes into it.
 
 Devices do not run the check: they run apps the command line has checked.
+
+## Lawful basis and compliance packs
+
+`const lawfulBasis = { account: "contract" }` names the lawful basis of each purpose. Apps
+can be checked against a region's rules with `tj check --compliance <pack.json>`. Both
+are described in [compliance.md](compliance.md).
 
 ## The record of processing
 

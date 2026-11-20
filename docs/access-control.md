@@ -119,8 +119,11 @@ through calls into other objects. Two interleaved calls never see each other's c
 - An alarm set with `this.schedule` runs as the caller who scheduled it, so data rules
   such as a ban list still hold.
 - `@every` timers and boot run as `{ id: "system", roles: ["system"] }`.
-- On a device, local code runs as `{ id: "", roles: [] }`. The device does not verify
-  identity; the server does.
+- On a device, local code (the UI and its handlers) runs as `{ id, roles: [] }`:
+  - `id` is the user the host signed in (the `identity` input, `setToken` on the web), or
+    `""` before anyone signs in;
+  - the UI is drawn again when that changes, so `Member.get(caller.id)` follows the user;
+  - the device does not verify identity; the server does, on every call.
 
 ```ts
 @allow("signedIn") post(text: string) {

@@ -135,7 +135,11 @@ the code says why: `reveal(this.email, "account")`, with a purpose the field dec
 `tj privacy erase` act on everything held about one person; from app code,
 `import { exportData, erase } from "tj:privacy"` does the same for the person themselves or
 the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `--record`
-the record of processing. Details: [personal data](privacy.md).
+the record of processing. Optionally, `const lawfulBasis = { account: "contract" }` gives each
+purpose its lawful basis (`consent`, `contract`, `legal-obligation`, `vital-interest`,
+`public-task`, `legitimate-interest`), and `tj check --compliance <pack.json>` checks the
+app against a region's rules. Details: [personal data](privacy.md),
+[compliance packs](compliance.md).
 
 ## Plugins
 

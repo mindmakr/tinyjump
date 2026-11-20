@@ -178,11 +178,11 @@ pub struct Pii {
 }
 
 /// Personal-data categories, after GDPR articles 9 and 10 and the Saudi PDPL.
-pub const PII_CATEGORIES: &[&str] = &["contact", "identifier", "online-id", "location", "financial", "health", "genetic", "biometric", "religion", "politics", "union", "sexual", "criminal", "other"];
+pub const PII_CATEGORIES: &[&str] = &["contact", "identifier", "online-id", "location", "financial", "health", "genetic", "biometric", "ethnicity", "religion", "politics", "union", "sexual", "criminal", "other"];
 
 /// The special categories, with stricter rules: GDPR article 9 (and the PDPL's sensitive
 /// data), and criminal records under article 10.
-pub const SPECIAL_CATEGORIES: &[&str] = &["health", "genetic", "biometric", "religion", "politics", "union", "sexual", "criminal"];
+pub const SPECIAL_CATEGORIES: &[&str] = &["health", "genetic", "biometric", "ethnicity", "religion", "politics", "union", "sexual", "criminal"];
 
 impl ObjectDef {
     pub fn pii(&self, field: &str) -> Option<&Pii> {

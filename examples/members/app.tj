@@ -1,0 +1,36 @@
+// A members' club that holds personal data the way the law expects: each purpose names its
+// lawful basis, records are erased after two years, and members can download or delete
+// their own data. Check it against the sample GDPR pack:
+//   tj check examples/members/app.tj --compliance examples/members/gdpr-eu.sample.json
+
+import { erase, exportData } from "tj:privacy"
+
+const lawfulBasis = { account: "contract" }
+
+@server @read("owner") @retain("2y") object Member {
+  @pii("contact", "account") name: string = ""
+  @pii("contact", "account") email: string = ""
+
+  @allow("owner") setName(name: string) { this.name = name.trim() }
+  @allow("owner") setEmail(email: string) { this.email = email.trim() }
+
+  @allow("owner") async myData(): any { return await exportData(caller.id) }
+
+  @allow("owner") async leave() { await erase(caller.id) }
+}
+
+function App() {
+  if (caller.id === "") {
+    return <Column padding={24}><Text>Sign in to see your membership.</Text></Column>
+  }
+  const me = Member.get(caller.id)
+  return <Column padding={24} gap={12}>
+    <Text size={24} weight="bold">Members</Text>
+    <Input id="name" value={me.name} placeholder="Your name" onSubmit={(t) => me.setName(t)} />
+    <Input id="email" value={me.email} placeholder="Your email" onSubmit={(t) => me.setEmail(t)} />
+    <Row gap={8}>
+      <Button id="download" onPress={() => me.myData()}>Download my data</Button>
+      <Button id="leave" onPress={() => me.leave()}>Delete my account</Button>
+    </Row>
+  </Column>
+}
