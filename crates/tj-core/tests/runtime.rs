@@ -891,11 +891,11 @@ fn a_person_can_be_exported_and_erased() {
     // Not while a call is part way through the object.
     let pending = rt.handle(2.0, Input::Call { object: "Account/user:ana".into(), method: "check".into(), args: vec![], reply: Some(5), call: None, caller: ana() });
     let effect = pending.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
-    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(409));
+    assert_eq!(rt.erase_subject("user:ana", None).err().map(|e| e.0), Some(409));
     rt.handle(3.0, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
 
     // Erase: back to the defaults, alarms gone, and the blank state goes out as a change.
-    let e = rt.erase_subject("user:ana").unwrap();
+    let e = rt.erase_subject("user:ana", None).unwrap();
     let (erased, out) = (e.erased, e.outputs);
     assert_eq!(erased, ["Account/user:ana"]);
     let change = out.iter().find_map(|o| if let Output::Changed { object, state, seq } = o { Some((object.clone(), state.clone(), *seq)) } else { None }).expect("replicas hear of it");
@@ -914,7 +914,7 @@ fn a_failed_erasure_erases_nothing() {
     let mut rt = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
     call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", ""]), who("user:ana", &[])).unwrap();
     store.1.set(true);
-    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    assert_eq!(rt.erase_subject("user:ana", None).err().map(|e| e.0), Some(503));
     store.1.set(false);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!("ana@example.com"), "and says so, rather than claiming it worked");
     rt.handle(61_000.0, Input::Tick);
@@ -1034,6 +1034,13 @@ const tools = [{ name: "email", object: "Account/me", method: "myEmail", descrip
     let e = flow(r#"@allow("owner") myEmail(): string { return this.email }"#, r#"
 function tools(o: string) { return [{ name: "email", object: o, method: "myEmail", description: "", params: [], input: {}, fixed: {} }] }"#);
     assert!(e.contains("cannot follow this tool's object"), "{e}");
+
+    // What tj:privacy exports is all of a person's data: theirs to them, nobody else's.
+    let export = "import { exportData } from \"tj:privacy\"\n";
+    let e = flow(r#"@allow("owner") async mine(): any { return await exportData(caller.id) }"#, export);
+    assert_eq!(e, "", "a person's own data, to them");
+    let e = flow(r#"@allow("support") async look(id: string): any { return await exportData(id) }"#, export);
+    assert!(e.contains("exportData(...)") && e.contains("is returned here to callers who do not own it"), "{e}");
 
     // Purposes are enforced, and mixing fields for different purposes is refused.
     assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
@@ -1230,7 +1237,7 @@ fn retention_waits_for_a_call_part_way_through_and_an_erase_typo_spares_shared_o
 
     // `tj privacy erase main` by mistake: Board/main belongs to nobody, so it is untouched.
     call_as(&mut rt, 2.0 * DAY, "Board/main", "later", json!([]), ana()).unwrap();
-    assert!(rt.erase_subject("main").unwrap().erased.is_empty());
+    assert!(rt.erase_subject("main", None).unwrap().erased.is_empty());
 }
 
 #[test]
@@ -1254,7 +1261,7 @@ fn a_legal_hold_keeps_records_until_it_ends_then_the_erasure_happens() {
     let ana = || who("user:ana", &[]);
     call_as(&mut rt, 1000.0, "Invoice/user:ana", "bill", json!([120]), ana()).unwrap();
     call_as(&mut rt, 1000.0, "Account/user:ana", "set", json!(["ana@example.com"]), ana()).unwrap();
-    let e = rt.erase_subject("user:ana").unwrap();
+    let e = rt.erase_subject("user:ana", None).unwrap();
     assert_eq!(e.erased, ["Account/user:ana"]);
     assert_eq!(e.held, [("Invoice/user:ana".to_string(), 1000.0 + 30.0 * DAY)]);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Invoice/user:ana"]["amount"], json!(120), "kept while held");
@@ -1322,11 +1329,11 @@ fn erasing_again_overwrites_a_record_that_cannot_be_read() {
     *store.1.borrow_mut() = Some("Account/user:ana".into());
     let mut rt = boot();
     // A disk that fails to read is not an erased record: nothing is destroyed or overwritten.
-    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    assert_eq!(rt.erase_subject("user:ana", None).err().map(|e| e.0), Some(503));
     assert!(store.0 .0.borrow().data["Account/user:ana"].contains("a@example.com"), "kept as it was");
     // A record whose key is gone is overwritten.
     store.2.set(true);
-    let e = rt.erase_subject("user:ana").unwrap();
+    let e = rt.erase_subject("user:ana", None).unwrap();
     assert_eq!(e.erased, ["Account/user:ana"]);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""));
 }
@@ -1339,7 +1346,7 @@ fn erasing_destroys_the_stored_copies_keys_and_holds_wait() {
     let ana = || who("user:ana", &[]);
     call_as(&mut rt, 1000.0, "Invoice/user:ana", "bill", json!([120]), ana()).unwrap();
     call_as(&mut rt, 1000.0, "Account/user:ana", "set", json!(["a@example.com"]), ana()).unwrap();
-    rt.erase_subject("user:ana").unwrap();
+    rt.erase_subject("user:ana", None).unwrap();
     assert_eq!(*store.1.borrow(), ["Account/user:ana"], "the held invoice keeps its key");
 
     // When the hold ends, its key goes too, and the audit log may forget the person.
@@ -1374,7 +1381,7 @@ fn erasing_a_person_reaches_shared_objects() {
     let record = store.0.borrow().data["Account/user:ana"].clone();
     assert!(record.contains("\"calls\"") && !record.contains("user:ana"), "{record}");
 
-    rt.erase_subject("user:ana").unwrap();
+    rt.erase_subject("user:ana", None).unwrap();
     let board = store.0.borrow().data["Board/main"].clone();
     assert!(!board.contains("user:ana") && board.contains("\"alarms\":[]"), "the person's alarm on a shared object is gone: {board}");
     rt.handle(6.0 * DAY, Input::Tick);

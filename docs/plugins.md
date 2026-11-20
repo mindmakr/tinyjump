@@ -122,3 +122,6 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
      staff;
    - `invoke` is allowed only in plugin modules, so app code cannot use it to act as
      someone else.
+6. **Done: `tj:privacy`** (`plugins/privacy/plugin.tj`): a person's export and erasure
+   from app code (docs/privacy.md). The server carries it out itself rather than through an
+   MCP server, because it acts on the runtime's own objects.

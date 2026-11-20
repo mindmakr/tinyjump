@@ -1,0 +1,17 @@
+// tj:privacy: a person's data, from app code (docs/privacy.md). The server carries it out
+// exactly as `tj privacy export|erase` does: audited, keys destroyed, held records kept.
+// Allowed for the person themselves (`caller.id === id`), callers with the "privacy" role,
+// and the server's own code (timers, alarms). Servers only.
+
+/// Everything held about the person with this id: every object whose id is theirs,
+/// unmasked. The privacy check treats what it returns as all of their personal data.
+export async function exportData(id: string): Promise<any> {
+  return await plugin("privacy", "export", { id: id })
+}
+
+/// Erases the person with this id, as `tj privacy erase` does: `{ erased, held }`, held
+/// listing objects under a legal hold and until when. A method of the person's own object
+/// may erase them; it sees the blank state afterwards.
+export async function erase(id: string): Promise<any> {
+  return await plugin("privacy", "erase", { id: id })
+}

@@ -22,6 +22,21 @@ const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule"];
 const MAX_ERRORS: usize = 20;
 
 /// Compiles a source file (plus the prelude) to a program.
+/// Every place an app lets personal data out with `reveal(value, purpose)`, for the record
+/// of processing (`tj check --privacy --record`). Offsets are into `src` with the built-in
+/// modules it imports added, as `modules::with_built_ins` gives it.
+#[cfg(feature = "check")]
+pub fn reveals(src: &str) -> Vec<crate::flow::Reveal> {
+    let src = &*modules::with_built_ins(src);
+    let files = modules::files(src);
+    let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
+    if parsed.len() != files.len() {
+        return Vec::new();
+    }
+    let named: Vec<(&str, &crate::syntax::ast::Program)> = files.iter().map(|f| f.name.as_str()).zip(&parsed).collect();
+    crate::flow::reveals(&named)
+}
+
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
     // Plugins that ship with tinyjump come with the compiler (see `modules::BUILT_IN`).

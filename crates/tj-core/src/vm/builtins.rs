@@ -239,7 +239,11 @@ fn fetch(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 fn plugin(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let name = text(a, 0, "plugin")?.to_string();
     let method = text(a, 1, "plugin")?.to_string();
-    let args = arg(a, 2).to_json().map_err(|e| Exc::msg(format!("plugin arguments must be data: {e}")))?;
+    let mut args = arg(a, 2).to_json().map_err(|e| Exc::msg(format!("plugin arguments must be data: {e}")))?;
+    // tj:privacy acts for the running call's caller, which code cannot choose.
+    if name == "privacy" {
+        args["caller"] = rt.running_caller.record().to_json().map_err(Exc::msg)?;
+    }
     Ok(Value::Promise(rt.plugin_call(name, method, args)))
 }
 

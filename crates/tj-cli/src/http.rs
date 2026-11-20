@@ -252,18 +252,12 @@ fn handle(mut req: Request, front: &Front) {
                 Json::Array(args) => Ok(args),
                 _ => Err((400, "body must be a JSON array of arguments".into())),
             });
-            let mut who = None;
-            let r = r.and_then(|args| {
+            // The engine writes the call to the audit log as it answers it; refusals are
+            // written below, as security events.
+            result_response(r.and_then(|args| {
                 let caller = front.identity.verify(authorization.as_deref())?.caller;
-                who = Some(Actor::of(&caller));
-                engine.request(Input::Call { object: object.clone(), method: name.to_string(), args, reply: None, call, caller: Some(caller) })
-            });
-            let status = r.as_ref().map_or_else(|(status, _)| *status, |_| 200);
-            // Refusals are written below, as security events.
-            if let Some(who) = who.filter(|_| !matches!(status, 401 | 403)) {
-                front.audit.record(Entry::new("call").who(who).object(&object).text("method", name).num("status", status.into()).num("ms", started.elapsed().as_millis() as u64));
-            }
-            result_response(r)
+                engine.request(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
+            }))
         }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
         (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| engine.request(Input::Inspect { reply: None })).map(|mut s| {
