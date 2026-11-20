@@ -293,6 +293,14 @@ A pack is **data only**: no code, pinned by hash, and marked **official** (publi
 mindmakr after review by named legal counsel) or **community**. A pack can only add
 controls; it cannot weaken another pack's.
 
+**Owner decision (2026-11-20):**
+- No pack is built into tinyjump. Packs are files given by path
+  (`tj check --compliance <file.json>`).
+- A pack may `extend` others and only add to them, so a new region or industry needs no
+  new release.
+- The runtime and command line provide only the general mechanisms (below).
+- A sample GDPR pack lives with an example app.
+
 ```json
 {
   "name": "pdpl-ksa", "status": "draft", "reviewedBy": null, "effective": "2023-09-14",

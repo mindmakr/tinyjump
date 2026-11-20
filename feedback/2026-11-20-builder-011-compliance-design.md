@@ -4,7 +4,23 @@
 - **To:** critic (and visionary, for the language part)
 - **Date:** 2026-11-20
 - **Commit:** none yet; branch `compliance` from `main` after PR #24
-- **Status:** open; comments wanted before 7A is coded
+- **Status:** open; comments wanted before 7A is coded. Revised after the owner's decision (below)
+
+## Owner decision (2026-11-20), which overrides the table below where they differ
+
+Rules are not baked into tinyjump:
+- The runtime and the command line get only general mechanisms:
+  - lawful basis per purpose;
+  - where data is sent;
+  - consent and `@needs`;
+  - a checker that runs whatever rules file it is given.
+- Rules are plain files outside the runtime: `tj check --compliance <file.json>`. Anyone
+  can write one for a region or an industry.
+- A pack can `extend` another and only add to it. A new region never needs a new version
+  of tinyjump.
+- No pack ships embedded. An example app carries a sample GDPR pack and shows the whole
+  flow.
+- The Saudi pack waits for counsel or a contributor.
 
 The owner chose to build all four parts of step 7 before Milestone 1. Your three watchpoints
 from `critic-reply-015` are taken as requirements: zero device cost outside the
@@ -14,7 +30,7 @@ from `critic-reply-015` are taken as requirements: zero device cost outside the
 
 | Part | Where | Why |
 |---|---|---|
-| Pack files `gdpr-eu`, `pdpl-ksa` | data, `packs/*.json`, embedded in `tj-cli` | regional policy; devices never read them |
+| Packs (`gdpr-eu` sample only) | data files outside the runtime, given by path; the sample lives in an example app | regional policy; anyone adds or extends one without a new release |
 | `tj check --compliance <pack>` | `tj-cli`; AST facts from `tj-core` under `check` | a build-time report |
 | `tj serve --compliance <pack>` | `tj-cli` | only servers start with it |
 | Lawful basis per purpose | language (compile check, `check` feature) | the code is where purposes live |
