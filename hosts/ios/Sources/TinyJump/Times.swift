@@ -72,7 +72,8 @@ enum Times {
 
     /// The picker's choice as a value: a time of day counts from midnight.
     static func picked(_ p: UIDatePicker) -> Double {
-        let ms = (p.date.timeIntervalSince1970 * 1000).rounded()
+        // Whole minutes, as the other hosts give: a picker that started empty holds seconds.
+        let ms = (p.date.timeIntervalSince1970 / 60).rounded(.down) * 60_000
         guard p.datePickerMode == .time else { return ms }
         let day = 86_400_000.0
         return ms - (ms / day).rounded(.down) * day

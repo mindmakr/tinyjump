@@ -104,6 +104,10 @@ pub fn parts(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 /// the parts are not a real date and time (February 30, 24:00).
 pub fn from(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let p = a.first().unwrap_or(&Value::Null);
+    let has = |k: &str| matches!(p, Value::Rec(r) if matches!(r.borrow().get(k), Some(Value::Num(_))));
+    if !(has("year") && has("month") && has("day")) {
+        return Ok(Value::Null);
+    }
     let (year, month, day) = (field(p, "year", "Time.from")?, field(p, "month", "Time.from")?, field(p, "day", "Time.from")?);
     let (hour, minute, second) = (field(p, "hour", "Time.from")?, field(p, "minute", "Time.from")?, field(p, "second", "Time.from")?);
     let date = (|| {

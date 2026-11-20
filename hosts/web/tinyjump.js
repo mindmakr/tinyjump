@@ -329,11 +329,18 @@ export async function start(opts) {
 
   // ---------- times: the platform formats and parses them (docs/language.md, Time) ----------
 
-  // A time as `YYYY-MM-DD HH:MM` in `zone` ("UTC", or the viewer's when absent), as the
-  // platform writes it (Swedish dates are ISO-shaped).
+  // A time as `YYYY-MM-DD HH:MM` in `zone` ("UTC", or the viewer's when absent), from the
+  // platform's own calendar (no locale data needed).
   function isoParts(ms, zone) {
-    const f = new Intl.DateTimeFormat('sv-SE', { timeZone: zone || undefined, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
-    return f.format(new Date(ms)); // "2026-12-01 14:30"
+    const d = new Date(ms);
+    const utc = zone === 'UTC';
+    const two = (n) => (n < 10 ? '0' : '') + n;
+    const year = utc ? d.getUTCFullYear() : d.getFullYear();
+    const month = (utc ? d.getUTCMonth() : d.getMonth()) + 1;
+    const day = utc ? d.getUTCDate() : d.getDate();
+    const hour = utc ? d.getUTCHours() : d.getHours();
+    const minute = utc ? d.getUTCMinutes() : d.getMinutes();
+    return year + '-' + two(month) + '-' + two(day) + ' ' + two(hour) + ':' + two(minute);
   }
 
   // What a `<Time>` shows.
@@ -344,9 +351,10 @@ export async function start(opts) {
       const iso = isoParts(t.value, t.zone);
       return show === 'date' ? iso.slice(0, 10) : show === 'time' ? iso.slice(11) : iso;
     }
+    // Component options, which browsers have had since 2015 (dateStyle came in 2020-21).
     const opts = { timeZone: t.zone || undefined };
-    if (show !== 'time') opts.dateStyle = 'medium';
-    if (show !== 'date') opts.timeStyle = 'short';
+    if (show !== 'time') { opts.year = 'numeric'; opts.month = 'short'; opts.day = 'numeric'; }
+    if (show !== 'date') { opts.hour = 'numeric'; opts.minute = '2-digit'; }
     return new Intl.DateTimeFormat(undefined, opts).format(new Date(t.value));
   }
 
@@ -360,14 +368,14 @@ export async function start(opts) {
     let ms = NaN;
     if (type === 'number') {
       ms = Number(v);
-    } else if (type === 'time') {
-      const d = new Date('1970-01-01T' + v + 'Z');
-      ms = d.getTime();
-    } else if (type === 'date' || type === 'datetime') {
-      const full = type === 'date' ? v + 'T00:00' : v;
-      ms = new Date(full + (zone === 'UTC' ? 'Z' : '')).getTime();
-      // The platform rolls 2026-02-30 over into March: a date that does not exist is null.
-      if (isFinite(ms) && isoParts(ms, zone).replace(' ', 'T') !== full.slice(0, 16)) ms = NaN;
+    } else if (type === 'time' || type === 'date' || type === 'datetime') {
+      // Exactly the shape, as on Android and iOS: no seconds, offsets or trailing text.
+      const length = { time: 5, date: 10, datetime: 16 }[type];
+      if (v.length !== length) return null;
+      ms = type === 'time' ? new Date('1970-01-01T' + v + 'Z').getTime() : new Date((type === 'date' ? v + 'T00:00' : v) + (zone === 'UTC' ? 'Z' : '')).getTime();
+      // The platform reads 24:00 as the next midnight and rolls 2026-02-30 into March: a
+      // value that does not show again as what was typed does not exist.
+      if (isFinite(ms) && typedText(type, zone, ms) !== v) ms = NaN;
     } else {
       return text;
     }
@@ -386,6 +394,7 @@ export async function start(opts) {
   function setProp(el, kind, k, v) {
     const s = el.style;
     const none = v === null || v === undefined;
+    if (kind === 'Input' && k === 'value') el.__value = v;
     if (kind === 'Time' && (k === 'value' || k === 'show' || k === 'style' || k === 'zone')) {
       el.__time[k] = none ? undefined : v;
       el.textContent = showTime(el.__time);
@@ -398,7 +407,6 @@ export async function start(opts) {
       return;
     }
     if (kind === 'Input' && k === 'value' && el.__type && el.__type !== 'text') {
-      el.__value = v;
       const text = typedText(el.__type, el.__zone, v);
       if (el.value !== text) el.value = text;
       return;
@@ -517,6 +525,8 @@ export async function start(opts) {
     let el = null;
     if (input.target.node !== undefined) el = nodes.get(input.target.node);
     else if (input.target.id !== undefined) nodes.forEach((n) => { if (n.dataset && n.dataset.tjId === input.target.id) el = n; });
+    // Or the text an agent sees on it: its label or placeholder.
+    else if (input.target.text !== undefined) nodes.forEach((n) => { if (n.getAttribute && (n.getAttribute('aria-label') === input.target.text || n.placeholder === input.target.text)) el = n; });
     if (el && el.__tj && el.__tj.kind === 'Input' && el.__type && el.__type !== 'text') input.value = typedValue(el.__type, el.__zone, input.value);
     return input;
   }

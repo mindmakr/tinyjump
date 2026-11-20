@@ -270,8 +270,8 @@ final class Renderer {
     private func setProp(_ n: Node, _ k: String, _ v: Any?) {
         let view = n.view
         let label = (view as? UILabel) ?? (view as? ToggleView)?.label
-        if n.kind == "Time" {
-            if ["value", "show", "style", "zone"].contains(k) { label?.text = Times.show(n.props) }
+        if n.kind == "Time", ["value", "show", "style", "zone"].contains(k) {
+            label?.text = Times.show(n.props)
             return
         }
         if let f = view as? UITextField, k == "type" || k == "zone" || (k == "value" && Times.typed(n.props["type"] as? String)) {
@@ -408,7 +408,9 @@ final class Renderer {
     /// person's entry does (`POST /_tj/input`).
     func forAgent(_ input: [String: Any]) -> [String: Any] {
         guard input["type"] as? String == "ui", let text = input["value"] as? String, let target = input["target"] as? [String: Any] else { return input }
-        let node: Node? = (target["node"] as? Int).flatMap { nodes[$0] } ?? (target["id"] as? String).flatMap { id in nodes.values.first { $0.props["id"] as? String == id } }
+        // By node, id, or the text an agent sees on it: its label or placeholder.
+        let byText: (String) -> Node? = { t in self.nodes.values.first { $0.props["label"] as? String == t || $0.props["placeholder"] as? String == t } }
+        let node: Node? = (target["node"] as? Int).flatMap { nodes[$0] } ?? (target["id"] as? String).flatMap { id in nodes.values.first { $0.props["id"] as? String == id } } ?? (target["text"] as? String).flatMap(byText)
         guard let n = node, n.kind == "Input", let type = n.props["type"] as? String, Times.typed(type) else { return input }
         var out = input
         out["value"] = Times.value(type, n.props["zone"] as? String, text)
