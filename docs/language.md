@@ -332,8 +332,23 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
 `Date.now()` may be used anywhere, the UI included; a screen that shows the time is drawn
-again when something changes, so add an `@every` timer to redraw it on a clock. There is
-no date parsing or formatting yet: work in UTC milliseconds. `Number(x)` is `NaN` when `x`
+again when something changes, so add an `@every` timer to redraw it on a clock.
+
+Times are plain numbers: milliseconds since 1970 in UTC, in fields, JSON and the HTTP API
+alike. Compare them with `<` and subtract them. For the calendar, use `Time`:
+
+- `Time.add(t, { years, months, weeks, days, hours, minutes, seconds })`: any of them.
+  A month later than January 31 is the last day of February.
+- `Time.startOf(t, "minute" | "hour" | "day" | "week" | "month" | "year")`: in UTC; weeks
+  start on Monday.
+- `Time.parts(t)`: `{ year, month, day, hour, minute, second, weekday }` in UTC. Months
+  count from 1; weekdays run from 1 (Monday) to 7 (Sunday).
+- `Time.from({ year, month, day, hour, minute, second })`: the time in UTC, or `null` when
+  the parts are not a real date (February 30, hour 24).
+- `Time.daysBetween(a, b)`: whole calendar days from `a` to `b`.
+
+Do not format or parse dates in code: show a time with `<Time>`, and let people pick one
+with `<Input type="date">` (see UI). `Number(x)` is `NaN` when `x`
 is not a number (`Number.isNaN` is not available; `n !== n` is true only for `NaN`).
 
 For secrets, use `crypto`, never `Math.random()`:

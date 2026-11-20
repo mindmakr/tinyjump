@@ -12,6 +12,9 @@ rust-version.workspace = true
 indexmap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Calendar arithmetic for `Time` (vm/time.rs): the calendar only, about 5 KB on devices.
+# Showing and picking times is the host's job, with the platform's own formatter.
+time = { version = "0.3", default-features = false }
 # CSS flexbox layout for native hosts; the browser does the same layout natively.
 taffy = { version = "0.15", default-features = false, features = ["std", "flexbox", "taffy_tree", "content_size"], optional = true }
 

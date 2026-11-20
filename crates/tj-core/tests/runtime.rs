@@ -2167,3 +2167,37 @@ fn signing_out_clears_what_the_device_kept_for_that_person() {
     device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
     assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!("my list"));
 }
+
+#[test]
+fn time_does_calendar_arithmetic_on_plain_milliseconds() {
+    let src = r#"object T {
+  out: any = null
+  run() {
+    const t = Time.from({ year: 2026, month: 1, day: 31, hour: 14, minute: 30 })
+    const p = Time.parts(t === null ? 0 : t)
+    const nextMonth = Time.add(t === null ? 0 : t, { months: 1 })
+    this.out = {
+      parts: p,
+      nextMonth: Time.parts(nextMonth),
+      later: Time.parts(Time.add(t === null ? 0 : t, { days: 2, minutes: 45 })),
+      day: Time.parts(Time.startOf(t === null ? 0 : t, "day")),
+      week: Time.parts(Time.startOf(t === null ? 0 : t, "week")),
+      bad: Time.from({ year: 2026, month: 2, day: 30 }),
+      between: Time.daysBetween(t === null ? 0 : t, nextMonth),
+      plain: (t === null ? 0 : t) + 60000 - (t === null ? 0 : t),
+    }
+  }
+}
+"#;
+    let mut rt = boot(src);
+    call(&mut rt, 1.0, "T/t", "run", json!([])).unwrap();
+    let out = state(&mut rt, 2.0, "T/t")["out"].clone();
+    assert_eq!(out["parts"], json!({ "year": 2026, "month": 1, "day": 31, "hour": 14, "minute": 30, "second": 0, "weekday": 6 }));
+    assert_eq!((&out["nextMonth"]["month"], &out["nextMonth"]["day"]), (&json!(2), &json!(28)), "January 31 plus a month is February's last day");
+    assert_eq!((&out["later"]["day"], &out["later"]["hour"], &out["later"]["minute"]), (&json!(2), &json!(15), &json!(15)), "February 2, 15:15");
+    assert_eq!((&out["day"]["hour"], &out["day"]["minute"]), (&json!(0), &json!(0)));
+    assert_eq!((&out["week"]["day"], &out["week"]["weekday"]), (&json!(26), &json!(1)), "the Monday before");
+    assert_eq!(out["bad"], json!(null), "February 30 is not a date");
+    assert_eq!(out["between"], json!(28));
+    assert_eq!(out["plain"], json!(60000), "times are plain numbers");
+}

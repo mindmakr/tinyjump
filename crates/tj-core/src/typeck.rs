@@ -122,6 +122,18 @@ fn builtin(name: &str) -> Option<Ty> {
             ("entries", func(&[("record", Ty::Any, false)], None, Ty::Arr(Box::new(Ty::Any)))),
         ]),
         "Date" => rec(&[("now", func(&[], None, Ty::Num))]),
+        "Time" => {
+            let opt = |names: &[&str]| Ty::Rec(Rc::new(RecTy { fields: names.iter().map(|k| (Rc::from(*k), (Ty::Num, true))).collect(), open: false }));
+            let parts = rec(&[("year", Ty::Num), ("month", Ty::Num), ("day", Ty::Num), ("hour", Ty::Num), ("minute", Ty::Num), ("second", Ty::Num), ("weekday", Ty::Num)]);
+            let unit = Ty::Union(["minute", "hour", "day", "week", "month", "year"].iter().map(|u| Ty::StrLit(Rc::from(*u))).collect());
+            rec(&[
+                ("add", func(&[("time", Ty::Num, false), ("by", opt(&["years", "months", "weeks", "days", "hours", "minutes", "seconds"]), false)], None, Ty::Num)),
+                ("startOf", func(&[("time", Ty::Num, false), ("unit", unit, false)], None, Ty::Num)),
+                ("parts", func(&[("time", Ty::Num, false)], None, parts)),
+                ("from", func(&[("parts", opt(&["year", "month", "day", "hour", "minute", "second"]), false)], None, Ty::Union(vec![Ty::Num, Ty::Null]))),
+                ("daysBetween", func(&[("from", Ty::Num, false), ("to", Ty::Num, false)], None, Ty::Num)),
+            ])
+        }
         "reveal" => func(&[("value", Ty::Any, false), ("purpose", Ty::Str, false)], None, Ty::Any),
         "crypto" => rec(&[
             ("hmac", func(&[("key", Ty::Str, false), ("text", Ty::Str, false)], None, Ty::Str)),
