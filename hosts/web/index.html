@@ -7,21 +7,105 @@
   <title>tinyjump</title>
   <style>
     html, body { margin: 0; height: 100%; font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-    #app { min-height: 100%; display: flex; flex-direction: column; }
+    body { display: flex; flex-direction: column; }
+    #app { flex: 1; display: flex; flex-direction: column; }
+    #signin { display: none; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #ddd; font-size: 14px; }
+    #signin input { flex: 1; min-width: 0; padding: 8px; font: inherit; }
+    #signin button { min-height: 44px; padding: 0 14px; font: inherit; }
   </style>
 </head>
 <body>
+  <!-- `tj serve --web` only: sign in with an API key. An app with its own sign-in calls
+       window.tinyjump.setToken(token, id, roles) instead (docs/access-control.md). -->
+  <form id="signin">
+    <span id="signin-who"></span>
+    <input id="signin-key" type="password" autocomplete="off" placeholder="API key" aria-label="API key">
+    <button id="signin-go" type="submit">Sign in</button>
+  </form>
   <div id="app"></div>
   <script type="module">
     import { start } from './tinyjump.js';
 
+    const KEY = 'tj:key';
+
+    function stored() {
+      try { return sessionStorage.getItem(KEY); } catch (e) { return null; }
+    }
+
+    // Who the server says a credential belongs to (anonymous without one).
+    async function whoami(token) {
+      const r = await fetch('api/whoami', { headers: token ? { Authorization: 'Bearer ' + token } : {} });
+      const body = await r.json();
+      if (!r.ok) throw new Error(body.error || r.statusText);
+      return body.ok;
+    }
+
     async function main() {
       const source = await (await fetch('app.tj', { cache: 'no-store' })).text();
-      // The dev server is also the backend for `@server` objects.
-      await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), server: '', devOverlay: true });
-      // Dev server: reload when the app source changes. Objects keep their state.
-      if (window.EventSource) new EventSource('_tj/reload').addEventListener('reload', () => location.reload());
+      let token = stored();
+      let me = await whoami(token).catch(() => { token = null; return whoami(null); });
+      // The server is also the backend for `@server` objects.
+      const app = await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), server: '', devOverlay: me.dev, token, user: me.id || null, roles: me.roles });
+      if (me.dev) devTools(app);
+      else signInBar(app, me);
     }
+
+    // `tj dev`: reload when the app source changes (objects keep their state), and answer
+    // agents (`tj mcp`, `tj review`) with this tab's real screen.
+    function devTools(app) {
+      if (!window.EventSource) return;
+      const channel = new EventSource('_tj/reload');
+      channel.addEventListener('reload', () => location.reload());
+      channel.addEventListener('ask', async (e) => {
+        const ask = JSON.parse(e.data);
+        let answer;
+        try {
+          answer = { ok: await (ask.kind === 'inspect' ? app.inspect() : app.input(ask.input)) };
+        } catch (err) {
+          answer = { error: String(err && err.message || err) };
+        }
+        fetch('_tj/answer/' + ask.id, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(answer) });
+      });
+    }
+
+    // `tj serve --web`: sign in and out with an API key, kept for this tab only.
+    function signInBar(app, me) {
+      const bar = document.getElementById('signin');
+      const who = document.getElementById('signin-who');
+      const key = document.getElementById('signin-key');
+      const go = document.getElementById('signin-go');
+      const show = (m) => {
+        const signedIn = !!m.id;
+        who.textContent = signedIn ? 'Signed in as ' + m.id : '';
+        key.style.display = signedIn ? 'none' : '';
+        go.textContent = signedIn ? 'Sign out' : 'Sign in';
+      };
+      bar.style.display = 'flex';
+      show(me);
+      bar.addEventListener('submit', async (e) => {
+        e.preventDefault();
+        if (me.id) {
+          try { sessionStorage.removeItem(KEY); } catch (err) { /* private mode */ }
+          app.signOut();
+          me = { id: '', roles: [] };
+          return show(me);
+        }
+        const k = key.value.trim();
+        if (!k) return;
+        try {
+          const m = await whoami(k);
+          if (!m.id) throw new Error('that key is not signed in to anyone');
+          try { sessionStorage.setItem(KEY, k); } catch (err) { /* private mode */ }
+          app.setToken(k, m.id, m.roles);
+          key.value = '';
+          me = m;
+          show(me);
+        } catch (err) {
+          who.textContent = String(err.message || err);
+        }
+      });
+    }
+
     main();
   </script>
 </body>
