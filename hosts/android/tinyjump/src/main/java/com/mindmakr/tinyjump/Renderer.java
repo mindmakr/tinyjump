@@ -348,15 +348,16 @@ final class Renderer {
         TextView text = view instanceof TextView ? (TextView) view : null;
         n.quiet = true;
         try {
-            if ("Time".equals(n.kind)) {
-                if (text != null && ("value".equals(k) || "show".equals(k) || "style".equals(k) || "zone".equals(k))) text.setText(Times.show(n.props));
+            if ("Time".equals(n.kind) && ("value".equals(k) || "show".equals(k) || "style".equals(k) || "zone".equals(k))) {
+                if (text != null) text.setText(Times.show(n.props));
                 return;
             }
             String type = n.props.optString("type", "");
             if (view instanceof EditText && ("type".equals(k) || "zone".equals(k) || ("value".equals(k) && Times.typed(type)))) {
                 typed((EditText) view, n, type);
-                if (!"value".equals(k)) return;
-                String s = Times.text(type, n.props.optString("zone", ""), v);
+                // Shown again whichever of type, zone or value changed.
+                Object value = n.props.opt("value");
+                String s = Times.typed(type) ? Times.text(type, n.props.optString("zone", ""), value) : value == null ? "" : String.valueOf(value);
                 if (!s.contentEquals(((EditText) view).getText())) ((EditText) view).setText(s);
                 return;
             }
@@ -574,7 +575,12 @@ final class Renderer {
         if (target == null) return;
         Node node = null;
         if (target.has("node")) node = nodes.get(target.getInt("node"));
-        for (Node c : nodes.values()) if (node == null && target.optString("id", "\u0000").equals(c.props.optString("id"))) node = c;
+        // By id, or by the text an agent sees on it: its label or placeholder.
+        String text = target.optString("text", "\u0000");
+        for (Node c : nodes.values()) {
+            if (node != null) break;
+            if (target.optString("id", "\u0000").equals(c.props.optString("id")) || text.equals(c.props.optString("label")) || text.equals(c.props.optString("placeholder"))) node = c;
+        }
         if (node == null || !"Input".equals(node.kind) || !Times.typed(node.props.optString("type", ""))) return;
         input.put("value", Times.value(node.props.optString("type"), node.props.optString("zone", ""), input.getString("value")));
     }

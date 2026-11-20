@@ -2183,6 +2183,7 @@ fn time_does_calendar_arithmetic_on_plain_milliseconds() {
       day: Time.parts(Time.startOf(t === null ? 0 : t, "day")),
       week: Time.parts(Time.startOf(t === null ? 0 : t, "week")),
       bad: Time.from({ year: 2026, month: 2, day: 30 }),
+      partial: Time.from({ year: 2026, month: 2, day: null }),
       plain: (t === null ? 0 : t) + 60000 - (t === null ? 0 : t),
     }
   }
@@ -2197,6 +2198,7 @@ fn time_does_calendar_arithmetic_on_plain_milliseconds() {
     assert_eq!((&out["day"]["hour"], &out["day"]["minute"]), (&json!(0), &json!(0)));
     assert_eq!((&out["week"]["day"], &out["week"]["weekday"]), (&json!(26), &json!(1)), "the Monday before");
     assert_eq!(out["bad"], json!(null), "February 30 is not a date");
+    assert_eq!(out["partial"], json!(null), "a missing day is not a date either");
     assert_eq!(out["plain"], json!(60000), "times are plain numbers");
 }
 
