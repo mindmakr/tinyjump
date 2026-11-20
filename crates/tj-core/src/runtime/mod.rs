@@ -6,6 +6,7 @@ mod calls;
 mod objects;
 pub mod protocol;
 mod render;
+mod stats;
 pub mod store;
 
 #[cfg(feature = "layout")]
@@ -167,6 +168,7 @@ pub struct Runtime {
     rng: u64,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
+    stats: stats::Table,
 }
 
 impl Runtime {
@@ -218,6 +220,7 @@ impl Runtime {
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
             outputs: Vec::new(),
             metrics: Metrics::default(),
+            stats: stats::table(&program),
         };
         for &main in &program.main {
             let closure = Rc::new(Closure { proto: main, upvals: Vec::new(), this: None });
@@ -247,7 +250,12 @@ impl Runtime {
         }
         match input {
             Input::Call { object, method, args, reply, call, caller } => match self.admit(&object, Some(&method), caller) {
-                Err((status, why)) => self.reply_status(reply, status, why),
+                Err((status, why)) => {
+                    if status == 403 {
+                        self.count_refused(&object, &method);
+                    }
+                    self.reply_status(reply, status, why)
+                }
                 Ok(who) => match (self.resolve_object(&object), call) {
                     (Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
                     (Ok(obj), None) => {
@@ -447,10 +455,13 @@ impl Runtime {
                     self.reply(reply, v.to_json());
                 }
             }
-            Err(fail) => match reply {
-                Some(_) => self.reply(reply, Err(fail.message)),
-                None => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
-            },
+            Err(fail) => {
+                self.count_error(f.stat);
+                match reply {
+                    Some(_) => self.reply(reply, Err(fail.message)),
+                    None => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
+                }
+            }
         }
     }
 

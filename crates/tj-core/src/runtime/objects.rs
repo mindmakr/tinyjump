@@ -287,6 +287,10 @@ impl Runtime {
         }
         self.touch(&obj);
         let mut f = Fiber::default();
+        f.stat = self.program.objects[obj.class as usize].methods.get_index_of(name).map(|m| (obj.class, m as u16));
+        if let Some(slot) = f.stat {
+            self.count_call(slot);
+        }
         f.stack.push(Value::Obj(obj.clone()));
         f.stack.extend(args);
         self.push_frame(&mut f, closure, 0, 0, Some(obj))?;

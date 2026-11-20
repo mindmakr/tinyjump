@@ -212,6 +212,15 @@ Every snapshot carries `metrics`: `inputs`, `renders`, `patchOps`, `vmSteps`, `n
 `objects`. These are work counters, not timings, so they are the same on every run and make
 reliable performance tests.
 
+Every snapshot also carries `stats`, the runtime statistics:
+
+- `stats.methods["Cart.add"]` holds `calls`, `errors`, `refused` (by the access rules) and
+  `steps`, the VM steps the method ran, nested calls included.
+  - Calls from requests, timers, alarms and `invoke` all count.
+  - Methods that never ran are left out.
+  - Unknown method names are never counted, so requests cannot grow the table.
+- `stats.objects["Cart"]` holds the number of objects loaded.
+
 Two tools build on this:
 
 - **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
@@ -221,6 +230,16 @@ Two tools build on this:
   (count, errors, average and slowest time) and realtime (connected clients, events sent,
   average and worst fan-out lag from a change to its event being written, and states
   coalesced or events dropped for slow clients). `tj review` prints them.
+  - `server.methods["Cart.add"]` is the wall-clock time of calls arriving as requests, from
+    reaching the runtime to the answer, awaits included: `count`, `failed`, `avgMs`,
+    `p50Ms`, `p95Ms` and `maxMs`. Quantiles are accurate to fixed buckets (1 ms to 30 s).
+  - `server.effects` gives the same for each kind of effect: `http` and `plugin.<name>`.
+- **`tj stats --target <url>`** prints the methods, slowest first and then the busiest. It
+  shows calls, errors, refusals, steps per call and latency, plus the objects loaded and
+  the effects.
+- **`/_tj/metrics`** on `tj serve` (admin key) serves the statistics as OpenMetrics text,
+  for Prometheus and Grafana. It is cheaper than `inspect`, and its labels are class, method
+  and effect names only, never object ids, which can identify people.
 - **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
   language reference, to load before writing code), `inspect`, `act`, `call`, `get`,
   `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.

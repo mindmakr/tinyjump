@@ -691,6 +691,44 @@ fn remote_callers_get_only_what_the_rules_allow() {
 }
 
 #[test]
+fn statistics_count_calls_errors_refusals_and_steps() {
+    let src = r#"
+@server @read("anyone") object Till {
+  total: number = 0
+  @allow("anyone") pay(n: number) {
+    if (n <= 0) { throw new Error("pay something") }
+    this.total += n
+  }
+  @allow("staff") refund() { this.total = 0 }
+  @every("1s") check() { }
+}
+"#;
+    let mut rt = server(src, false);
+    let anon = || who("", &[]);
+    assert!(call_as(&mut rt, 1.0, "Till/a", "pay", json!([5]), anon()).is_ok());
+    assert!(call_as(&mut rt, 2.0, "Till/a", "pay", json!([0]), anon()).is_err());
+    assert_eq!(call_as(&mut rt, 3.0, "Till/a", "refund", json!([]), anon()).unwrap_err().0, Some(403));
+    // Unknown names are refused like any other, but never counted, so requests cannot grow
+    // the table.
+    assert!(call_as(&mut rt, 4.0, "Till/a", "nope", json!([]), anon()).is_err());
+    assert!(call_as(&mut rt, 4.0, "Nope/a", "pay", json!([1]), anon()).is_err());
+    rt.handle(1500.0, Input::Tick);
+
+    let s = rt.stats();
+    let pay = &s["methods"]["Till.pay"];
+    assert_eq!((pay["calls"].clone(), pay["errors"].clone(), pay["refused"].clone()), (json!(2), json!(1), json!(0)));
+    assert!(pay["steps"].as_u64().unwrap() > 0, "{s}");
+    assert_eq!(s["methods"]["Till.refund"], json!({ "calls": 0, "errors": 0, "refused": 1, "steps": 0 }));
+    assert_eq!(s["methods"]["Till.check"]["calls"], json!(1), "timers count too");
+    assert_eq!(s["methods"].as_object().unwrap().len(), 3, "{s}");
+    assert_eq!(s["objects"], json!({ "Till": 1 }));
+    assert_eq!(rt.inspect()["stats"], s, "inspect carries them on every host");
+
+    assert_eq!(rt.method_name("Till/x", "pay").as_deref(), Some("Till.pay"));
+    assert_eq!((rt.method_name("Till/x", "nope"), rt.method_name("Nope/x", "pay")), (None, None));
+}
+
+#[test]
 fn caller_belongs_to_each_call_alarms_and_timers() {
     let mut rt = server(GUARDED, false);
     // Two interleaved async calls from different callers keep their own caller.

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tj_core::runtime::protocol::{Caller, Effect};
 use tj_core::{compile, Input, Options, Output, Runtime};
 
@@ -28,12 +28,15 @@ type Reply = Sender<Result<Json, Failure>>;
 const MAX_OBJECTS: usize = 100_000;
 
 enum Msg {
-    Input(Input, Option<Reply>),
+    /// An input, who waits for its reply, and when it was sent (for latency).
+    Input(Input, Option<Reply>, Instant),
     EffectDone(u32, Result<Json, String>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
     /// Whether `caller` may read every one of `objects` (for stream tickets).
     MayRead { objects: Vec<String>, caller: Caller, done: Sender<Result<(), Failure>> },
+    /// The core's statistics (`Runtime::stats`).
+    Stats(Sender<Json>),
     Reload(String),
 }
 
@@ -65,12 +68,14 @@ impl Engine {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
+        let stats = Arc::new(Stats::default());
+        let measured = stats.clone();
         thread::Builder::new()
             .name("tj-runtime".into())
             .spawn(move || match boot(&source, &data, render, explain) {
                 Ok((rt, out)) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(rt, out, rx, back, data, render, explain, plugins);
+                    run(rt, out, rx, back, data, render, explain, plugins, measured);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -78,19 +83,27 @@ impl Engine {
             })
             .map_err(|e| e.to_string())?;
         ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
-        Ok(Engine { tx, stats: Arc::new(Stats::default()) })
+        Ok(Engine { tx, stats })
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
     pub fn request(&self, input: Input) -> Result<Json, Failure> {
         let stopped = || (503, "runtime stopped".to_string());
         if !has_reply(&input) {
-            self.tx.send(Msg::Input(input, None)).map_err(|_| stopped())?;
+            self.tx.send(Msg::Input(input, None, Instant::now())).map_err(|_| stopped())?;
             return Ok(Json::Null);
         }
         let (t, r) = channel();
-        self.tx.send(Msg::Input(input, Some(t))).map_err(|_| stopped())?;
+        self.tx.send(Msg::Input(input, Some(t), Instant::now())).map_err(|_| stopped())?;
         Self::wait(&r)?
+    }
+
+    /// The core's statistics: calls, errors, refusals and VM steps per method, and objects
+    /// loaded per class. Cheaper than `inspect`, for metrics scrapers.
+    pub fn core_stats(&self) -> Result<Json, Failure> {
+        let (done, r) = channel();
+        self.tx.send(Msg::Stats(done)).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)
     }
 
     fn wait<T>(r: &Receiver<T>) -> Result<T, Failure> {
@@ -142,10 +155,17 @@ fn set_reply(input: &mut Input, id: u64) {
 }
 
 struct Dispatch {
-    replies: HashMap<u64, Reply>,
+    replies: HashMap<u64, Waiter>,
     next_reply: u64,
     subscribers: Vec<Arc<Mailbox>>,
     effects: Sender<(u32, Effect)>,
+    stats: Arc<Stats>,
+}
+
+/// Who waits for a reply, and for calls, the method and when the call was sent.
+struct Waiter {
+    reply: Reply,
+    timed: Option<(String, Instant)>,
 }
 
 /// Whether `caller` may read every one of `objects`, checked on the runtime thread.
@@ -154,8 +174,8 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Fai
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>) {
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back, plugins) };
+fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>) {
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back, plugins, stats.clone()), stats };
     d.outputs(boot_out);
     loop {
         let msg = match rt.next_wake() {
@@ -163,13 +183,22 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
         let out = match msg {
-            Ok(Msg::Input(mut input, reply)) => {
-                if let Some(r) = reply {
+            Ok(Msg::Input(mut input, reply, sent)) => {
+                if let Some(reply) = reply {
+                    // Only methods that exist are timed, so request paths cannot grow the table.
+                    let timed = match &input {
+                        Input::Call { object, method, .. } => rt.method_name(object, method).map(|name| (name, sent)),
+                        _ => None,
+                    };
                     d.next_reply += 1;
-                    d.replies.insert(d.next_reply, r);
+                    d.replies.insert(d.next_reply, Waiter { reply, timed });
                     set_reply(&mut input, d.next_reply);
                 }
                 rt.handle(now_ms(), input)
+            }
+            Ok(Msg::Stats(done)) => {
+                let _ = done.send(rt.stats());
+                continue;
             }
             Ok(Msg::EffectDone(id, result)) => {
                 let (ok, error) = match result {
@@ -223,8 +252,11 @@ impl Dispatch {
         for o in out {
             match o {
                 Output::Reply { reply, ok, error, status } => {
-                    if let Some(r) = self.replies.remove(&reply) {
-                        let _ = r.send(match error {
+                    if let Some(w) = self.replies.remove(&reply) {
+                        if let Some((name, sent)) = &w.timed {
+                            self.stats.method(name, sent.elapsed(), error.is_none());
+                        }
+                        let _ = w.reply.send(match error {
                             Some(e) => Err((status.unwrap_or(400), e)),
                             None => Ok(ok.unwrap_or(Json::Null)),
                         });
@@ -267,16 +299,24 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>) -> Sender<(u32, Effect)> {
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>) -> Sender<(u32, Effect)> {
     let (tx, rx) = channel::<(u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     for i in 0..EFFECT_WORKERS {
-        let (rx, back, agent, plugins) = (rx.clone(), back.clone(), agent.clone(), plugins.clone());
+        let (rx, back, agent, plugins, stats) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
             let Ok((id, effect)) = job else { return };
-            if back.send(Msg::EffectDone(id, perform(&agent, &plugins, effect))).is_err() {
+            let kind = match &effect {
+                Effect::Http { .. } => "http".to_string(),
+                Effect::Plugin { plugin, .. } => format!("plugin.{plugin}"),
+                Effect::Call { .. } => "call".to_string(),
+            };
+            let started = Instant::now();
+            let result = perform(&agent, &plugins, effect);
+            stats.effect(&kind, started.elapsed(), result.is_ok());
+            if back.send(Msg::EffectDone(id, result)).is_err() {
                 return;
             }
         });
@@ -352,6 +392,25 @@ mod tests {
         post("two").expect("posted");
         let (next, msg) = next_change(&resumed);
         assert!(next > seq && msg.contains("\"two\""), "{msg}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn calls_are_timed_by_method_and_counted_by_the_core() {
+        let data = std::env::temp_dir().join(format!("tj-engine-stats-{}", std::process::id()));
+        let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default()).expect("boots");
+        let call = |method: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: method.into(), args: vec![json!("ana"), json!("hi")], reply: None, call: None, caller: Some(Caller::trusted()) });
+        call("post").expect("posted");
+        call("post").expect("posted");
+        assert!(call("nope").is_err());
+
+        let timed = engine.stats().json()["methods"].clone();
+        assert_eq!(timed["Room.post"]["count"], json!(2), "{timed}");
+        assert_eq!(timed.as_object().map(|m| m.len()), Some(1), "unknown methods are not timed: {timed}");
+        let core = engine.core_stats().expect("stats");
+        assert_eq!(core["methods"]["Room.post"]["calls"], json!(2), "{core}");
+        assert!(engine.stats().openmetrics(&core).contains("tj_method_duration_seconds_count{class=\"Room\",method=\"post\"} 2"));
         let _ = std::fs::remove_dir_all(&data);
     }
 }

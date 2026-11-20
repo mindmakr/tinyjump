@@ -223,6 +223,11 @@ fn handle(mut req: Request, front: &Front) {
             s["server"] = engine.stats().json();
             s
         })),
+        // Prometheus and Grafana: the same statistics, without the tree and object states.
+        (Method::Get, ["_tj", "metrics"]) => match engine.core_stats() {
+            Ok(core) => Response::from_data(engine.stats().openmetrics(&core).into_bytes()).with_header(header("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")),
+            Err((status, e)) => json_response(status, &json!({ "error": e })),
+        },
         (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
             let mut input = serde_json::from_value::<Input>(j).map_err(|e| (400, format!("not a protocol input: {e}")))?;
             // Automation is trusted (it already passed the admin key), so it says so explicitly.

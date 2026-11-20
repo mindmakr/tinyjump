@@ -215,6 +215,7 @@ impl Runtime {
         while let Some((promise, object, method, args, who)) = self.invocations.pop_front() {
             let reply = Some(INVOKE_REPLY_BASE + u64::from(promise));
             if let Some(why) = self.refusal(&object, Some(&method), &who) {
+                self.count_refused(&object, &method);
                 self.reply_status(reply, 403, why);
                 continue;
             }
