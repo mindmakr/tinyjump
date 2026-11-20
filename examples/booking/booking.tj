@@ -1,0 +1,165 @@
+// The business's slots, its settings, who booked what, and each customer's own record.
+
+import { exportData, erase } from "tj:privacy"
+
+type Booker = { slot: string, customer: string, name: string, phone: string, at: number }
+type Reminder = { slot: string, title: string, start: number }
+
+/// The rules for a slot, shared by the publish form and the server.
+export function validSlot(title: string, start: number | null, minutes: number | null) {
+  check(title.trim() !== "", "title", "Give the slot a title")
+  check(title.trim().length <= 80, "title", "A title is at most 80 characters")
+  check(start !== null && start > Date.now(), "start", "The start must be a future time (YYYY-MM-DD HH:MM, UTC)")
+  check(minutes !== null && minutes >= 5 && minutes <= 480 && Math.floor(minutes) === minutes,
+    "minutes", "A slot lasts 5 to 480 whole minutes")
+}
+
+export function validProfile(name: string, phone: string) {
+  check(name.trim() !== "", "name", "Give your name")
+  check(phone.trim() !== "", "phone", "Give your phone number")
+}
+
+/// One appointment slot. Its id is the number Settings handed out.
+export @server @read("anyone") object Slot {
+  title: string = ""
+  start: number = 0
+  minutes: number = 0
+  state: "new" | "open" | "booked" | "removed" = "new"
+  booking: number = 0          // counts bookings, so an old reminder knows it is stale
+  reminder: number = 0         // the alarm handle of the current booking's reminder
+
+  @exclusive open(title: string, start: number, minutes: number) {
+    this.title = title.trim()
+    this.start = start
+    this.minutes = minutes
+    this.state = "open"
+  }
+
+  @allow("staff") @exclusive remove() {
+    if (this.state !== "open") { throw new Error("Only an open slot can be removed") }
+    if (this.start <= Date.now()) { throw new Error("A past slot stays in the list") }
+    this.state = "removed"
+  }
+
+  @allow("signedIn") @exclusive async book() {
+    this.mustBeOpen()
+    const me = Customer.get(caller.id)
+    if (me.name === "" || me.phone === "") {
+      throw new Error("Add your name and phone in your profile before booking")
+    }
+    const url = Settings.get("main").checkUrl
+    if (url !== "") {
+      let status = 0
+      try {
+        const res = await fetch(url + (url.includes("?") ? "&" : "?") + "slot=" + encodeURIComponent(this.id))
+        status = res.status
+      } catch (e) {
+        throw new Error("The business could not be reached to confirm this booking")
+      }
+      if (status !== 200) { throw new Error(`The business did not accept this booking (${status})`) }
+    }
+    this.mustBeOpen()
+    this.state = "booked"
+    this.booking += 1
+    Roster.get("main").add({ slot: this.id, customer: caller.id, name: reveal(me.name, "booking"),
+      phone: reveal(me.phone, "booking"), at: Date.now() })
+    me.addBooking(this.id)
+    const due = this.start - Settings.get("main").reminderMinutes * 60000 - Date.now()
+    this.reminder = this.schedule(Math.max(10, due), "remind", this.booking)
+  }
+
+  @allow("signedIn") @exclusive cancel() {
+    if (this.state !== "booked") { throw new Error("This slot is not booked") }
+    if (this.start <= Date.now()) { throw new Error("This appointment has started; its booking is final") }
+    const roster = Roster.get("main")
+    const holder = roster.holder(this.id)
+    if (holder !== caller.id && !caller.roles.includes("staff")) {
+      throw new Error("You can cancel only your own booking")
+    }
+    roster.drop(this.id)
+    Customer.get(holder).dropBooking(this.id)
+    this.unschedule(this.reminder)
+    this.state = "open"
+  }
+
+  private remind(booking: number) {
+    if (this.state !== "booked" || this.booking !== booking) { return }
+    Customer.get(Roster.get("main").holder(this.id)).remind(this.id, this.title, this.start)
+  }
+
+  private mustBeOpen() {
+    if (this.start <= Date.now()) { throw new Error("This slot is in the past") }
+    if (this.state === "booked") { throw new Error("Sorry, this slot was just taken") }
+    if (this.state !== "open") { throw new Error("This slot is no longer offered") }
+  }
+}
+
+/// The business's settings, and the counter that numbers slots.
+export @server @read("staff") object Settings {
+  checkUrl: string = ""
+  reminderMinutes: number = 60
+  nextId: number = 1
+
+  @allow("staff") publish(title: string, start: number, minutes: number): string {
+    validSlot(title, start, minutes)
+    const id = String(this.nextId)
+    this.nextId += 1
+    Slot.get(id).open(title, start, minutes)
+    return id
+  }
+
+  @allow("staff") setCheckUrl(url: string) {
+    const u = url.trim()
+    check(u === "" || u.startsWith("https://") || u.startsWith("http://"), "url",
+      "The check address starts with https:// (leave it empty to accept every booking)")
+    this.checkUrl = u
+  }
+
+  @allow("staff") setReminderMinutes(minutes: number) {
+    check(minutes !== null && minutes >= 1 && minutes <= 1440 && Math.floor(minutes) === minutes,
+      "minutes", "Reminders go 1 to 1440 whole minutes before")
+    this.reminderMinutes = minutes
+  }
+}
+
+/// Who booked which slot, with the name and phone staff need. Staff only.
+export @server @read("staff") @retain("1y") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+
+  add(entry: Booker) { this.entries.push(entry) }
+  drop(slot: string) {
+    this.entries = reveal(this.entries.filter(e => e.slot !== slot), "booking")
+  }
+  holder(slot: string): string {
+    const e = this.entries.find(x => x.slot === slot)
+    return e === null ? "" : e.customer
+  }
+}
+
+/// One customer's own record: their profile, their bookings and their reminders.
+export @server @read("owner") @retain("1y") object Customer {
+  @pii("contact", "booking") name: string = ""
+  @pii("contact", "booking") phone: string = ""
+  bookings: string[] = []
+  reminders: Reminder[] = []
+
+  @allow("owner") saveProfile(name: string, phone: string) {
+    validProfile(name, phone)
+    this.name = name.trim()
+    this.phone = phone.trim()
+  }
+
+  addBooking(slot: string) { this.bookings.push(slot) }
+  dropBooking(slot: string) { this.bookings = this.bookings.filter(s => s !== slot) }
+  remind(slot: string, title: string, start: number) { this.reminders.push({ slot, title, start }) }
+
+  @allow("owner") async myData(): any { return await exportData(caller.id) }
+
+  @allow("owner") async deleteAccount() {
+    for (const id of this.bookings.slice()) {
+      const slot = Slot.get(id)
+      if (slot.state === "booked" && slot.start > Date.now()) { await slot.cancel() }
+    }
+    await erase(caller.id)
+  }
+}

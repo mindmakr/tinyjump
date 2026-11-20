@@ -1,0 +1,252 @@
+// Booking: a small business publishes appointment slots, customers book and cancel them,
+// and get a reminder before their appointment. Spec: milestones/m1-booking/spec.md.
+//
+// booking.tj holds the server objects; this file holds the screen and its drafts.
+
+import { Field } from "tj:ui"
+import { Slot, Settings, Roster, Customer, validSlot, validProfile } from "./booking"
+
+const lawfulBasis = { booking: "contract" }
+
+/// This device's drafts and messages. `null` drafts show the saved value.
+object Screen {
+  title: string = ""
+  start: number | null = null
+  minutes: number | null = null
+  publishError: string = ""
+  checkUrl: string | null = null
+  reminderMinutes: number | null = null
+  settingsError: string = ""
+  name: string | null = null
+  phone: string | null = null
+  profileError: string = ""
+  bookError: string = ""
+  myData: string = ""
+
+  setTitle(t: string) { this.title = t }
+  setStart(ms: number | null) { this.start = ms }
+  setMinutes(n: number | null) { this.minutes = n }
+  setCheckUrl(t: string) { this.checkUrl = t }
+  setReminderMinutes(n: number | null) { this.reminderMinutes = n }
+  setName(t: string) { this.name = t }
+  setPhone(t: string) { this.phone = t }
+
+  async publish() {
+    try {
+      validSlot(this.title, this.start, this.minutes)
+      await Settings.get("main").publish(this.title, this.start, this.minutes)
+      this.title = ""
+      this.start = null
+      this.minutes = null
+      this.publishError = ""
+    } catch (e) {
+      this.publishError = e.message
+    }
+  }
+
+  async saveCheck(saved: string) {
+    try {
+      await Settings.get("main").setCheckUrl(this.checkUrl ?? saved)
+      this.checkUrl = null
+      this.settingsError = ""
+    } catch (e) {
+      this.settingsError = e.message
+    }
+  }
+
+  async saveReminder(saved: number) {
+    try {
+      await Settings.get("main").setReminderMinutes(this.reminderMinutes ?? saved)
+      this.reminderMinutes = null
+      this.settingsError = ""
+    } catch (e) {
+      this.settingsError = e.message
+    }
+  }
+
+  async saveProfile(me: Customer) {
+    const name = this.name ?? me.name
+    const phone = this.phone ?? me.phone
+    try {
+      validProfile(name, phone)
+      await me.saveProfile(name, phone)
+      this.name = null
+      this.phone = null
+      this.profileError = ""
+    } catch (e) {
+      this.profileError = e.message
+    }
+  }
+
+  async book(slot: Slot) {
+    try {
+      await slot.book()
+      this.bookError = ""
+    } catch (e) {
+      this.bookError = e.message
+    }
+  }
+
+  async cancel(slot: Slot) {
+    try {
+      await slot.cancel()
+      this.bookError = ""
+    } catch (e) {
+      this.bookError = e.message
+    }
+  }
+
+  async remove(slot: Slot) {
+    try {
+      await slot.remove()
+      this.publishError = ""
+    } catch (e) {
+      this.publishError = e.message
+    }
+  }
+
+  async showMyData(me: Customer) {
+    this.myData = JSON.stringify(await me.myData(), null, 2)
+  }
+
+  async deleteAccount(me: Customer) {
+    try {
+      await me.deleteAccount()
+      this.myData = ""
+      this.profileError = ""
+    } catch (e) {
+      this.profileError = e.message
+    }
+  }
+}
+
+function stateOf(s: Slot): string {
+  return s.start <= Date.now() ? "past" : s.state
+}
+
+function SlotRow(props: { key: string, s: Slot, mine: boolean, staff: boolean, signedIn: boolean, who: string }) {
+  const { s, mine, staff, signedIn, who } = props
+  const ui = Screen.get("main")
+  const state = stateOf(s)
+  return <Row id={`slot-${s.id}`} gap={8} align="center">
+    <Column grow={1}>
+      <Text weight="bold">{s.title}</Text>
+      <Row gap={6}>
+        <Time value={s.start} zone="UTC" style="iso" />
+        <Text color="#555">{s.minutes} min</Text>
+      </Row>
+      {who !== "" && <Text id={`who-${s.id}`} color="#555">{who}</Text>}
+    </Column>
+    <Text id={`state-${s.id}`} color="#333">{state}</Text>
+    {state === "open" && signedIn && !staff &&
+      <Button id={`book-${s.id}`} onPress={() => ui.book(s)}>Book</Button>}
+    {state === "booked" && (mine || staff) &&
+      <Button id={`cancel-${s.id}`} onPress={() => ui.cancel(s)}>Cancel</Button>}
+    {state === "open" && staff &&
+      <Button id={`remove-${s.id}`} onPress={() => ui.remove(s)}>Remove</Button>}
+  </Row>
+}
+
+function StaffPanel() {
+  const ui = Screen.get("main")
+  const settings = Settings.get("main")
+  return <Column gap={10}>
+    <Text size={18} weight="bold">Publish a slot</Text>
+    <Field label="Title">
+      <Input id="new-title" label="Title" value={ui.title} placeholder="Haircut" onChange={(t) => ui.setTitle(t)} />
+    </Field>
+    <Field label="Start (UTC, YYYY-MM-DD HH:MM)">
+      <Input id="new-start" label="Start" type="datetime" zone="UTC" value={ui.start} onChange={(ms) => ui.setStart(ms)} />
+    </Field>
+    <Field label="Length in minutes">
+      <Input id="new-minutes" label="Length in minutes" type="number" value={ui.minutes} onChange={(n) => ui.setMinutes(n)} />
+    </Field>
+    <Button id="publish" onPress={() => ui.publish()}>Publish</Button>
+    {ui.publishError !== "" && <Text id="publish-error" color="#b00020">{ui.publishError}</Text>}
+
+    <Text size={18} weight="bold">Settings</Text>
+    <Field label="Booking check address">
+      <Input id="check-url" label="Booking check address" value={ui.checkUrl ?? settings.checkUrl}
+        placeholder="https://example.com/check" onChange={(t) => ui.setCheckUrl(t)} />
+    </Field>
+    <Button id="save-check" onPress={() => ui.saveCheck(settings.checkUrl)}>Save check address</Button>
+    <Field label="Reminder, minutes before">
+      <Input id="reminder-minutes" label="Reminder, minutes before" type="number"
+        value={ui.reminderMinutes ?? settings.reminderMinutes} onChange={(n) => ui.setReminderMinutes(n)} />
+    </Field>
+    <Button id="save-reminder" onPress={() => ui.saveReminder(settings.reminderMinutes)}>Save reminder</Button>
+    {ui.settingsError !== "" && <Text id="settings-error" color="#b00020">{ui.settingsError}</Text>}
+  </Column>
+}
+
+function CustomerPanel(props: { me: Customer }) {
+  const me = props.me
+  const ui = Screen.get("main")
+  return <Column gap={10}>
+    <Text size={18} weight="bold">My bookings</Text>
+    <Column id="my-bookings" gap={6}>
+      {me.bookings.map(id => Slot.get(id)).map(s => <Row key={s.id} id={`mine-${s.id}`} gap={8}>
+        <Text grow={1}>{s.title}</Text>
+        <Time value={s.start} zone="UTC" style="iso" />
+        <Text>{stateOf(s)}</Text>
+      </Row>)}
+      {me.bookings.length === 0 && <Text color="#555">No bookings yet.</Text>}
+    </Column>
+
+    <Text size={18} weight="bold">Reminders</Text>
+    <Column id="reminders" gap={6}>
+      {me.reminders.map(r => <Row key={r.slot} id={`reminder-${r.slot}`} gap={4}>
+        <Text>{r.title} at</Text>
+        <Time value={r.start} show="time" zone="UTC" style="iso" />
+      </Row>)}
+    </Column>
+
+    <Text size={18} weight="bold">Profile</Text>
+    <Field label="Name">
+      <Input id="profile-name" label="Name" value={ui.name ?? me.name} onChange={(t) => ui.setName(t)} />
+    </Field>
+    <Field label="Phone">
+      <Input id="profile-phone" label="Phone" value={ui.phone ?? me.phone} onChange={(t) => ui.setPhone(t)} />
+    </Field>
+    <Button id="save-profile" onPress={() => ui.saveProfile(me)}>Save profile</Button>
+    {ui.profileError !== "" && <Text id="profile-error" color="#b00020">{ui.profileError}</Text>}
+
+    <Row gap={8}>
+      <Button id="my-data" onPress={() => ui.showMyData(me)}>My data</Button>
+      <Button id="delete-account" onPress={() => ui.deleteAccount(me)}>Delete my account</Button>
+    </Row>
+    {ui.myData !== "" && <Text id="my-data-view" size={12}>{ui.myData}</Text>}
+  </Column>
+}
+
+function App() {
+  const ui = Screen.get("main")
+  const signedIn = caller.id !== ""
+  const staff = caller.roles.includes("staff")
+  const me = signedIn && !staff ? Customer.get(caller.id) : null
+  const roster = staff ? Roster.get("main") : null
+  const slots = Slot.all()
+    .filter(s => s.state === "open" || s.state === "booked")
+    .sort((a, b) => a.start - b.start)
+
+  const who = (s: Slot): string => {
+    if (roster === null || s.state !== "booked") { return "" }
+    const b = roster.entries.find(e => e.slot === s.id)
+    return b === null ? "" : `${b.name}, ${b.phone}`
+  }
+
+  return <Scroll>
+    <Column padding={16} gap={14}>
+      <Text size={24} weight="bold">Appointments</Text>
+      {!signedIn && <Text id="signin-prompt">Sign in to book an appointment.</Text>}
+      <Column id="slots" gap={8}>
+        {slots.map(s => <SlotRow key={s.id} s={s} staff={staff} signedIn={signedIn}
+          mine={me !== null && me.bookings.includes(s.id)} who={who(s)} />)}
+        {slots.length === 0 && <Text color="#555">No slots yet.</Text>}
+      </Column>
+      {ui.bookError !== "" && <Text id="book-error" color="#b00020">{ui.bookError}</Text>}
+      {staff && <StaffPanel />}
+      {me !== null && <CustomerPanel me={me} />}
+    </Column>
+  </Scroll>
+}
