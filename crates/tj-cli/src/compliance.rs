@@ -133,6 +133,11 @@ impl Pack {
         for (i, t) in json["transfers"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
             let bad = |what: &str| bad(&format!("transfer {}: {what}", i + 1));
             let to = t["to"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| bad("needs \"to\": a host, *.domain, or a plugin such as tj:ai"))?;
+            // A wildcard covers the subdomains of one registered domain, never a whole suffix.
+            let rest = to.strip_prefix("*.").unwrap_or(to);
+            if rest.contains('*') || (to.starts_with("*.") && (rest.split('.').count() < 2 || rest.split('.').any(str::is_empty))) {
+                return Err(bad(&format!("\"{to}\" is too broad: name a host, or *.domain.tld for the subdomains of one domain")));
+            }
             let basis = t["basis"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| bad("needs \"basis\": why this transfer is allowed (adequacy, safeguards, a contract)"))?;
             self.transfers.push((to.to_ascii_lowercase(), basis.to_string()));
         }
@@ -241,6 +246,10 @@ impl Pack {
             let what = t.fields.join(", ");
             let name = match &t.to {
                 tj_core::Destination::Host(h) => h.clone(),
+                tj_core::Destination::Cleartext(h) => {
+                    problems.push(format!("{at} sends {what} to {h} over plain HTTP, readable on the way; use https://"));
+                    continue;
+                }
                 tj_core::Destination::Plugin(m) => m.clone(),
                 tj_core::Destination::Unknown => {
                     problems.push(format!("{at} sends {what} to a URL whose host the code does not fix; write the host out, as in fetch(`https://api.example.com/...`)"));
@@ -382,6 +391,10 @@ mod tests {
         assert!(r.contains("app.tj:8 sends Member.email to a URL whose host the code does not fix"), "{r}");
         assert!(r.contains("app.tj:9 sends Member.email to evil.example"), "{r}");
         assert!(matches("*.mailer.example", "eu.mailer.example") && !matches("*.mailer.example", "mailer.example") && !matches("*.mailer.example", "evilmailer.example"));
+        for broad in ["*", "*.", "*.com", "a*.example.com", "*..com"] {
+            std::fs::write(d.join("broad.json"), format!(r#"{{ "name": "b", "effective": "2025-01-01", "controls": [], "transfers": [{{ "to": "{broad}", "basis": "x" }}] }}"#)).unwrap();
+            assert!(Pack::load(&d.join("broad.json")).unwrap_err().contains("too broad"), "{broad}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

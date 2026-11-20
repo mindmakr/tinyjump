@@ -47,6 +47,11 @@ impl Taint {
         self.fields.is_empty()
     }
 
+    /// Nothing personal at all, revealed or not.
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.revealed.is_empty()
+    }
+
     fn join(&mut self, o: &Taint) {
         self.revealed.extend(o.revealed.iter().cloned());
         if o.is_clean() {
@@ -117,13 +122,18 @@ struct Checker {
     reveals: Vec<Reveal>,
     /// Every place revealed personal data leaves the server.
     transfers: Vec<Transfer>,
+    /// Revealed data written into fields that are not personal (a queue, a cache): read
+    /// back from them, it is still followed.
+    field_revealed: HashMap<Field, BTreeSet<Field>>,
 }
 
 /// Where personal data goes when it leaves the server.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Destination {
-    /// A `fetch` to this host, written as a constant in the code.
+    /// A `fetch` over HTTPS to this host, written as a constant in the code.
     Host(String),
+    /// A `fetch` over plain HTTP to this host: readable on the way.
+    Cleartext(String),
     /// A plugin module, such as `tj:ai`.
     Plugin(String),
     /// A `fetch` whose host is not a constant in the code.
@@ -138,26 +148,47 @@ pub struct Transfer {
     pub fields: Vec<String>,
 }
 
-/// The host a `fetch` URL names, when the code fixes it: a string, or a template whose
-/// text up to the host is written out.
+/// The host a `fetch` URL names, when the code fixes it: a string, or a template or `+`
+/// whose text up to the end of the host is written out.
 fn destination(url: &Expr) -> Destination {
-    let start = match &url.kind {
-        ExprKind::Str(s) => s.as_str(),
-        ExprKind::Template(pieces) => match pieces.first() {
-            Some(crate::syntax::ast::TplPiece::Str(s)) => s.as_str(),
-            _ => "",
-        },
-        _ => "",
+    let (start, whole) = constant_start(url);
+    let (rest, secure) = match (start.strip_prefix("https://"), start.strip_prefix("http://")) {
+        (Some(rest), _) => (rest, true),
+        (None, Some(rest)) => (rest, false),
+        _ => return Destination::Unknown,
     };
-    let Some(rest) = start.strip_prefix("https://").or_else(|| start.strip_prefix("http://")) else { return Destination::Unknown };
-    // The host must end inside the constant text, before a path, query, port or the end of
-    // a plain string; a template that goes on after the host's first part is not fixed.
-    let end = rest.find(['/', '?', '#', ':']);
-    let whole = matches!(url.kind, ExprKind::Str(_));
-    match end {
-        Some(i) if i > 0 => Destination::Host(rest[..i].to_ascii_lowercase()),
-        None if whole && !rest.is_empty() => Destination::Host(rest.to_ascii_lowercase()),
-        _ => Destination::Unknown,
+    // The authority runs to the path, query or fragment, which must be in the constant
+    // text (or the text must be the whole URL); a user part (`a@b`) could hide the real host.
+    let authority = match rest.find(['/', '?', '#']) {
+        Some(i) => &rest[..i],
+        None if whole => rest,
+        None => return Destination::Unknown,
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Destination::Unknown;
+    }
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map(|(h, _)| format!("[{h}]")),
+        None => authority.split(':').next().map(str::to_string),
+    };
+    match host.filter(|h| !h.is_empty()) {
+        Some(h) if secure => Destination::Host(h.to_ascii_lowercase()),
+        Some(h) => Destination::Cleartext(h.to_ascii_lowercase()),
+        None => Destination::Unknown,
+    }
+}
+
+/// The constant text an expression starts with, and whether that text is all of it.
+fn constant_start(e: &Expr) -> (&str, bool) {
+    match &e.kind {
+        ExprKind::Str(s) => (s, true),
+        ExprKind::Template(pieces) => match pieces.as_slice() {
+            [crate::syntax::ast::TplPiece::Str(s)] => (s, true),
+            [crate::syntax::ast::TplPiece::Str(s), ..] => (s, false),
+            _ => ("", false),
+        },
+        ExprKind::Binary(crate::syntax::ast::BinOp::Add, left, _) => (constant_start(left).0, false),
+        _ => ("", false),
     }
 }
 
@@ -202,7 +233,7 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
         return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new() };
     let user: Vec<&Program> = files.iter().filter(|(name, _)| !name.starts_with("tj:")).map(|(_, p)| *p).collect();
     for (name, p) in files.iter().filter(|(name, _)| name.starts_with("tj:")) {
         for item in &p.items {
@@ -268,9 +299,14 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     for f in c.functions.values() {
         entries.push((f.clone(), None, Endpoint::Internal));
     }
-    for (decl, this, endpoint) in entries {
-        let args = vec![clean(); decl.params.len()];
-        c.call(&decl, args, this, endpoint, None);
+    // Twice, so data parked in a field or module variable by one entry point is followed
+    // when another reads it; the second pass starts afresh but keeps what was parked.
+    for _ in 0..2 {
+        c.memo.clear();
+        for (decl, this, endpoint) in &entries {
+            let args = vec![clean(); decl.params.len()];
+            c.call(decl, args, this.clone(), *endpoint, None);
+        }
     }
     c.errors.sort_by_key(|d| d.span.start);
     Some(c)
@@ -421,11 +457,11 @@ impl Checker {
             }
             Some(old) => {
                 let t = self.flatten(&new);
-                if t.is_clean() {
+                if t.is_empty() {
                     return old.clone();
                 }
                 let mut o = self.flatten(old);
-                if o.is_clean() {
+                if o.is_empty() {
                     return new;
                 }
                 o.join(&t);
@@ -571,7 +607,9 @@ impl Checker {
                     Val::Handle { class, other } => {
                         let personal = self.classes.get(&class).is_some_and(|c| c.pii.contains_key(name.as_str()));
                         if !personal {
-                            return clean();
+                            // Revealed data written here earlier (a queue of mail to send, say).
+                            let revealed = self.field_revealed.get(&(class.clone(), Rc::from(name.as_str()))).cloned().unwrap_or_default();
+                            return Val::Data(Taint { revealed, ..Taint::default() });
                         }
                         let from = if matches!(obj.kind, ExprKind::This) { format!("this.{name}") } else { format!("{class}.{name}") };
                         let fields = BTreeSet::from([(class.clone(), Rc::from(name.as_str()))]);
@@ -659,6 +697,9 @@ impl Checker {
     /// `v` written into `field` of an object: its own (`this`), or another through a handle.
     fn write_field(&mut self, class: &Rc<str>, own: bool, field: &str, v: &Val, span: crate::syntax::Span) {
         let t = self.flatten(v);
+        if !t.revealed.is_empty() {
+            self.field_revealed.entry((class.clone(), Rc::from(field))).or_default().extend(t.revealed.iter().cloned());
+        }
         if t.is_clean() {
             return;
         }
@@ -707,7 +748,14 @@ impl Checker {
                     fr.vars.insert(n.clone(), merged);
                 }
             }
-            ExprKind::Ident(n) if self.globals.contains(n) => self.sink(&v, span, &format!("the module-level variable `{n}`, which every caller shares")),
+            ExprKind::Ident(n) if self.globals.contains(n) => {
+                self.sink(&v, span, &format!("the module-level variable `{n}`, which every caller shares"));
+                let revealed = self.flatten(&v).revealed;
+                if !revealed.is_empty() {
+                    let merged = self.merge(self.global_vals.get(n), Val::Data(Taint { revealed, ..Taint::default() }));
+                    self.global_vals.insert(n.clone(), merged);
+                }
+            }
             _ => {}
         }
     }
@@ -827,9 +875,25 @@ impl Checker {
                     return clean();
                 }
                 "schedule" => {
+                    let mut vals = Vec::new();
                     for a in args.iter().skip(2) {
                         let v = self.expr(a, fr);
                         self.sink(&v, a.span, "an alarm's arguments, which are stored with the alarm");
+                        vals.push(v);
+                    }
+                    // Follow the alarm into its method, so where it sends revealed data is seen.
+                    if vals.iter().any(|v| !self.flatten(v).revealed.is_empty()) {
+                        let class = fr.this.as_ref().map(|(c, _)| c.clone());
+                        let target = match args.get(1).map(|a| &a.kind) {
+                            Some(ExprKind::Str(m)) => class.as_ref().and_then(|c| self.classes.get(c)).and_then(|c| c.methods.get(m.as_str())).map(|(d, _)| d.clone()),
+                            _ => None,
+                        };
+                        match target {
+                            Some(decl) => {
+                                self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, None);
+                            }
+                            None => self.report(Diagnostic::new("the privacy check cannot follow this alarm to its method", span).hint("name the method as a string, e.g. this.schedule(60000, \"remind\", ...)")),
+                        }
                     }
                     return clean();
                 }
@@ -956,6 +1020,8 @@ impl Checker {
         };
         let args = vec![clean(); decl.params.len()];
         let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, None);
+        // What the tool returns goes to the AI model.
+        self.transfer(&Val::Data(ret.clone()), span, &Destination::Plugin("tj:ai".into()));
         if !ret.is_clean() {
             let d = Diagnostic::new(format!("the tool {class}.{method} returns {}, which the agent sends to the AI model", self.describe(&ret)), span).hint(format!("reveal it in {method} with the purpose the model needs it for, or return something else"));
             self.report(d);

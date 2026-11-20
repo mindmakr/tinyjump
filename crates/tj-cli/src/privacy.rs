@@ -88,6 +88,7 @@ pub fn place(src: &str, at: u32) -> String {
 pub fn destination(to: &tj_core::Destination) -> String {
     match to {
         tj_core::Destination::Host(h) => h.clone(),
+        tj_core::Destination::Cleartext(h) => format!("{h} over plain HTTP"),
         tj_core::Destination::Plugin(m) => format!("the plugin {m}"),
         tj_core::Destination::Unknown => "a URL whose host the code does not fix".into(),
     }

