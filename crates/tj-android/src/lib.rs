@@ -102,6 +102,13 @@ impl Store for JavaHost {
             _ => Ok(Vec::new()),
         }
     }
+
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        match self.call("remove", &[key], true) {
+            Some(Ret::Bool(true)) => Ok(()),
+            _ => Err(format!("could not delete {key}")),
+        }
+    }
 }
 
 fn finish((code, body): (i32, String)) -> jint {

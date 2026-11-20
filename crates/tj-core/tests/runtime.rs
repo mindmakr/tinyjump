@@ -20,6 +20,9 @@ impl Store for Shared {
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.borrow_mut().keys(prefix)
     }
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        self.0.borrow_mut().remove(key)
+    }
 }
 
 fn boot_with(src: &str, store: Shared, now: f64) -> (Runtime, Vec<Output>) {
@@ -2177,6 +2180,7 @@ fn signing_out_clears_what_the_device_kept_for_that_person() {
     device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
     call(&mut device, 1.0, "Screen/main", "type", json!(["ana's phone 555"])).unwrap();
     device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert!(store.0.borrow().data.keys().all(|k| !k.starts_with("Screen/")), "the record is deleted, key and all: {:?}", store.0.borrow().data.keys().collect::<Vec<_>>());
     assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!(""), "gone from memory");
     let (mut later, _) = boot_as(src, store.clone(), 4.0, false);
     assert_eq!(state(&mut later, 5.0, "Screen/main")["draft"], json!(""), "and from the device's storage");

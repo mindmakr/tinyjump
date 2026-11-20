@@ -27,6 +27,13 @@ const SECRET_KEY: &str = "tj:secret";
 /// What a personal-data field shows to anyone but its owner, and to every tool.
 pub const MASK: &str = "•••";
 
+/// A list of several people's entries (`@by`): class, field, whose field, time field.
+#[cfg(feature = "server")]
+type SharedList = (u16, Rc<str>, Rc<str>, Option<Rc<str>>);
+/// Entries found in one object's list: the object, the field, the entries.
+#[cfg(feature = "server")]
+type Entries = (Rc<crate::vm::value::ObjRef>, Rc<str>, Vec<Json>);
+
 impl Runtime {
     /// Masks the personal-data fields of `state`, an object of class `class`.
     /// Masks the personal fields of `state`. `reader`: a person the object's `@read` rule
@@ -133,7 +140,7 @@ impl Runtime {
     }
 
     /// Lists holding several people's entries (`@by`): class, field, whose field, time field.
-    fn shared_lists(&self) -> Vec<(u16, Rc<str>, Rc<str>, Option<Rc<str>>)> {
+    fn shared_lists(&self) -> Vec<SharedList> {
         let mut out = Vec::new();
         for (class, def) in self.program.objects.iter().enumerate() {
             for p in &def.pii {
@@ -148,11 +155,11 @@ impl Runtime {
     /// Entries of `@by` lists that belong to `subject` (or, with `older`, any person's entry
     /// whose time is before it), with where they are: for export, erasure and retention.
     /// `remove` takes them out of the lists as well.
-    fn entries_of(&mut self, subject: &str, older: Option<(u16, f64)>) -> Result<Vec<(Rc<crate::vm::value::ObjRef>, Rc<str>, Vec<Json>)>, String> {
+    fn entries_of(&mut self, subject: &str, older: Option<(u16, f64)>) -> Result<Vec<Entries>, String> {
         self.take_entries(subject, older, false)
     }
 
-    fn take_entries(&mut self, subject: &str, older: Option<(u16, f64)>, remove: bool) -> Result<Vec<(Rc<crate::vm::value::ObjRef>, Rc<str>, Vec<Json>)>, String> {
+    fn take_entries(&mut self, subject: &str, older: Option<(u16, f64)>, remove: bool) -> Result<Vec<Entries>, String> {
         let mut found = Vec::new();
         for (class, field, by, at) in self.shared_lists() {
             if older.is_some_and(|(c, _)| c != class) {

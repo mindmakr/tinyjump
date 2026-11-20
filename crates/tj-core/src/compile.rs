@@ -458,7 +458,7 @@ impl Compiler {
             }
             for (i, d) in f.decorators.iter().enumerate() {
                 let by_after_pii = d.name == "by" && i == 1 && f.decorators[0].name == "pii";
-                if !(d.name == "pii" && i == 0) && !by_after_pii {
+                if !(by_after_pii || d.name == "pii" && i == 0) {
                     self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take @pii(category, purpose), and @by(field) after it for a list of several people's entries; other decorators go on methods"));
                 } else if by_after_pii {
                     if let Some(by) = self.by(d, f, o) {

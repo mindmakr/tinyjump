@@ -24,6 +24,8 @@ typedef struct TjHost {
     int (*save)(void *ctx, const uint8_t *key, size_t key_len, const uint8_t *value, size_t value_len);
     /* Fill `out` with a JSON array of the keys that start with `prefix`. */
     void (*keys)(void *ctx, const uint8_t *prefix, size_t prefix_len, TjBuf *out);
+    /* Delete a record; return 0 when it is gone (or was never there). */
+    int (*remove)(void *ctx, const uint8_t *key, size_t key_len);
     /* Natural size of a leaf widget (points), wrapping text at max_width; max_width < 0 means unbounded. */
     void (*measure)(void *ctx, uint32_t node, float max_width, float *width, float *height);
 } TjHost;

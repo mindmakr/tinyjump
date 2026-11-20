@@ -24,6 +24,10 @@ final class Host {
         return store.keys(prefix);
     }
 
+    boolean remove(String key) {
+        return store.remove(key);
+    }
+
     /** A leaf widget's natural size in dp, packed as two float bit patterns (width, height). */
     long measure(int node, float maxWidth) {
         return renderer == null ? 0 : renderer.measure(node, maxWidth);

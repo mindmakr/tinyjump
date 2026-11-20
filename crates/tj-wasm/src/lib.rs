@@ -19,6 +19,8 @@ extern "C" {
     fn tj_host_save(key: *const u8, key_len: usize, val: *const u8, val_len: usize) -> i32;
     /// Like `tj_host_load`, returning a JSON array of keys.
     fn tj_host_keys(prefix: *const u8, prefix_len: usize, out: *mut *mut u8) -> isize;
+    /// Deletes a record: 0 on success.
+    fn tj_host_remove(key: *const u8, key_len: usize) -> i32;
 }
 
 thread_local! {
@@ -59,6 +61,14 @@ impl Store for HostStore {
         // SAFETY: as in `load`.
         let len = unsafe { tj_host_keys(prefix.as_ptr(), prefix.len(), &mut out) };
         Ok(take_host_string(out, len).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default())
+    }
+
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        // SAFETY: valid key slice for the duration of the call.
+        match unsafe { tj_host_remove(key.as_ptr(), key.len()) } {
+            0 => Ok(()),
+            _ => Err(format!("could not delete {key}")),
+        }
     }
 }
 
