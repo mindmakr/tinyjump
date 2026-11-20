@@ -17,27 +17,31 @@ pub const MARKER: &str = "//# file: ";
 
 /// The modules of the plugins that ship with tinyjump (docs/plugins.md), by import name.
 /// The compiler adds one to an app that imports it, so every host has them.
-pub const BUILT_IN: &[(&str, &str)] = &[("tj:ai", include_str!("../../../plugins/ai/plugin.tj"))];
+pub const BUILT_IN: &[(&str, &str)] = &[
+    ("tj:ai", include_str!("../../../plugins/ai/plugin.tj")),
+    ("tj:agent", include_str!("../../../plugins/agent/plugin.tj")),
+];
 
-/// `src` plus the built-in plugin modules it imports and does not carry itself.
+/// `src` plus the built-in plugin modules it imports and does not carry itself, including
+/// those the added modules import in turn.
 pub fn with_built_ins(src: &str) -> std::borrow::Cow<'_, str> {
-    let present: Vec<String> = files(src).into_iter().map(|f| f.name).collect();
-    let missing: Vec<&(&str, &str)> = BUILT_IN.iter().filter(|(name, _)| src.contains(&format!("\"{name}\"")) && !present.iter().any(|p| p == name)).collect();
-    if missing.is_empty() {
-        return std::borrow::Cow::Borrowed(src);
-    }
-    let mut out = src.to_string();
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    for (name, module) in missing {
-        out.push_str(&format!("{MARKER}{name}\n{module}"));
+    let mut out = std::borrow::Cow::Borrowed(src);
+    loop {
+        let present: Vec<String> = files(&out).into_iter().map(|f| f.name).collect();
+        let Some((name, module)) = BUILT_IN.iter().find(|(name, _)| out.contains(&format!("\"{name}\"")) && !present.iter().any(|p| p == name)) else {
+            return out;
+        };
+        let text = out.to_mut();
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&format!("{MARKER}{name}\n{module}"));
         if !module.ends_with('\n') {
-            out.push('\n');
+            text.push('\n');
         }
     }
-    std::borrow::Cow::Owned(out)
 }
+
 /// The entry's name when a bundle does not name it (a one-file app).
 pub const ENTRY: &str = "app.tj";
 

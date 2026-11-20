@@ -18,7 +18,7 @@ use crate::vm::program::Program;
 use crate::vm::value::{Closure, Exc, ObjRef, Value};
 use indexmap::IndexSet;
 use access::Who;
-use calls::{Outbox, CALL_REPLY_BASE};
+use calls::{Outbox, CALL_REPLY_BASE, INVOKE_REPLY_BASE};
 use objects::Instance;
 use protocol::{Effect, Input, Output};
 use serde_json::Value as Json;
@@ -145,6 +145,10 @@ pub struct Runtime {
     outbox: Outbox,
     /// Calls loaded at boot wait for the first input (see `calls.rs`).
     outbox_held: bool,
+    /// `invoke`s waiting for their calling fiber to suspend: promise, object, method, args, who.
+    invocations: std::collections::VecDeque<(u32, String, String, Vec<Value>, Who)>,
+    /// Who the fiber running now belongs to (see `vm::interp::Runtime::run`).
+    pub(crate) running_caller: Who,
     /// Servers: calls with an id that are still running, and who waits for each.
     running_calls: HashMap<String, (objects::CallRecord, Vec<Option<u64>>)>,
     call_replies: HashMap<u64, (Rc<ObjRef>, String)>,
@@ -196,6 +200,8 @@ impl Runtime {
             waiting: HashMap::new(),
             outbox: Outbox::default(),
             outbox_held: false,
+            invocations: std::collections::VecDeque::new(),
+            running_caller: Who::System,
             running_calls: HashMap::new(),
             call_replies: HashMap::new(),
             next_call_reply: 0,
@@ -308,7 +314,9 @@ impl Runtime {
                 self.reply(reply.or(Some(0)), Ok(snapshot));
             }
         }
+        self.run_invocations();
         self.fire_timers();
+        self.run_invocations();
         if std::mem::take(&mut self.ran_code) && self.render {
             self.render_app();
         }
@@ -464,7 +472,7 @@ impl Runtime {
     /// Refuses a request with an HTTP-like status (see `Output::Reply`).
     fn reply_status(&mut self, reply: Option<u64>, status: u16, why: String) {
         match reply {
-            Some(id) if id >= CALL_REPLY_BASE => self.finish_call(id, Err(why)),
+            Some(id) if id >= INVOKE_REPLY_BASE => self.reply(reply, Err(why)),
             Some(id) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(why), status: Some(status) }),
             None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
         }
@@ -474,6 +482,14 @@ impl Runtime {
     fn reply(&mut self, reply: Option<u64>, r: Result<Json, String>) {
         if let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) {
             self.finish_call(internal, r);
+            return;
+        }
+        if let Some(internal) = reply.filter(|&id| id >= INVOKE_REPLY_BASE) {
+            let (ok, error) = match r {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            };
+            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error);
             return;
         }
         match (reply, r) {

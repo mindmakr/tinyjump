@@ -123,9 +123,18 @@ import { complete } from "tj:ai"
 const reply = await complete("Be brief.", [{ role: "user", text: "Hi" }], [])
 ```
 
-Inside a plugin module, `plugin(name, method, args)` calls the plugin; app code imports the
-plugin's functions instead. The server starts plugins from `plugins.json`. Details:
-[plugins](plugins.md).
+`tj:agent` runs an agent whose tools are your own methods. Each tool call runs as the
+person the agent acts for, under the access rules:
+
+```tsx
+import { act, Skill } from "tj:agent"
+const turn = await act(system, messages, skills, 6) // { text, messages, steps }
+```
+
+Inside a plugin module, `plugin(name, method, args)` calls the plugin, and
+`invoke(object, method, args)` calls an app method as the current caller, under the same
+rules as a request from them. App code imports the plugin's functions instead. The server
+starts plugins from `plugins.json`. Details: [plugins](plugins.md).
 
 Plain objects (no decorator) live wherever the code runs: device-local state on a device,
 and backend state on the server.

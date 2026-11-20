@@ -632,8 +632,8 @@ impl Compiler {
     fn load_var(&mut self, name: &str, span: Span) {
         if let Some(Var::Global { .. }) = self.resolve(name) {
             self.check_imported(name, span);
-            if name == "plugin" && self.source == Source::User && !self.file_names.get(self.file as usize).is_some_and(|f| f.starts_with("tj:")) {
-                self.error(Diagnostic::new("`plugin()` is for plugin modules", span).hint("import the plugin's functions instead, e.g. import { complete } from \"tj:ai\""));
+            if matches!(name, "plugin" | "invoke") && self.source == Source::User && !self.file_names.get(self.file as usize).is_some_and(|f| f.starts_with("tj:")) {
+                self.error(Diagnostic::new(format!("`{name}()` is for plugin modules"), span).hint("import the plugin's functions instead, e.g. import { complete } from \"tj:ai\""));
             }
         }
         match self.resolve(name) {

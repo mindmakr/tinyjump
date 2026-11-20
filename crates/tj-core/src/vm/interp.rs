@@ -68,7 +68,10 @@ impl Runtime {
     /// Runs the fiber until it finishes, suspends or fails.
     pub(crate) fn run(&mut self, f: &mut Fiber) -> Result<Run, Failure> {
         let mut budget = STEP_BUDGET;
+        // Builtins that act for the caller (`invoke`) need to know who that is.
+        let outer = std::mem::replace(&mut self.running_caller, f.caller.clone());
         let r = self.run_steps(f, &mut budget);
+        self.running_caller = outer;
         self.metrics.vm_steps += STEP_BUDGET - budget;
         r
     }

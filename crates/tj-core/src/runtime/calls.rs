@@ -29,6 +29,8 @@ const FIRST_RETRY_MS: f64 = 1000.0;
 const MAX_RETRY_MS: f64 = 30_000.0;
 /// Reply ids from here up are the runtime's own: the results of calls made once.
 pub(crate) const CALL_REPLY_BASE: u64 = 1 << 62;
+/// Reply ids from here up to `CALL_REPLY_BASE` settle the promise of an `invoke`.
+pub(crate) const INVOKE_REPLY_BASE: u64 = 1 << 61;
 const MAX_CALL_ID: usize = 128;
 
 #[derive(Serialize, Deserialize, Default)]
@@ -195,6 +197,32 @@ impl Runtime {
         self.save_outbox();
         self.clear_replicas();
         self.release_outbox();
+    }
+
+    /// `invoke(object, method, args)`: queues a call of an app method as the current caller,
+    /// run once the calling fiber has suspended (so its promise has someone waiting on it).
+    pub(crate) fn invoke_as_caller(&mut self, object: String, method: String, args: Vec<Value>) -> u32 {
+        self.next_effect += 1;
+        let promise = self.next_effect;
+        let who = self.running_caller.clone();
+        self.invocations.push_back((promise, object, method, args, who));
+        promise
+    }
+
+    /// Runs queued `invoke`s, each checked against the rules for its caller, exactly as a
+    /// request from them would be.
+    pub(crate) fn run_invocations(&mut self) {
+        while let Some((promise, object, method, args, who)) = self.invocations.pop_front() {
+            let reply = Some(INVOKE_REPLY_BASE + u64::from(promise));
+            if let Some(why) = self.refusal(&object, Some(&method), &who) {
+                self.reply_status(reply, 403, why);
+                continue;
+            }
+            match self.resolve_object(&object) {
+                Ok(obj) => self.invoke(obj, &method, args, true, reply, who),
+                Err(e) => self.reply(reply, Err(e)),
+            }
+        }
     }
 
     /// Pending server calls, for automation.

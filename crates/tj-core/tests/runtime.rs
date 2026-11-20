@@ -763,6 +763,7 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("@read(\"anyone\") object A { @allow(\"anyone\") private f() {} }").contains("private methods cannot be called remotely"));
     assert!(msg("object A { f() { caller = 1 } }").contains("'caller' cannot be changed"));
     assert!(msg("const caller = 1").contains("'caller' is built in"));
+    assert!(msg("object A { f() { invoke(\"A/a\", \"f\", []) } }").contains("is for plugin modules"), "apps cannot act as someone through invoke");
 }
 
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
@@ -779,7 +780,7 @@ fn example(name: &str) -> String {
 }
 
 #[test]
-fn the_shop_assistant_changes_the_cart_through_the_ai_plugin() {
+fn the_shop_assistant_acts_within_the_askers_rights() {
     let (mut server, _) = boot_as(&example("durable-cart"), Shared::default(), 0.0, true);
     let plugin = |out: &[Output]| {
         out.iter()
@@ -789,25 +790,34 @@ fn the_shop_assistant_changes_the_cart_through_the_ai_plugin() {
             })
             .expect("a plugin call")
     };
-    let ask = Input::Call { object: "Assistant/demo".into(), method: "ask".into(), args: vec![json!("one tea please"), json!("ana")], reply: None, call: None, caller: who("", &[]) };
-    let (id, name, method, args) = plugin(&server.handle(1.0, ask));
-    assert_eq!((name.as_str(), method.as_str()), ("ai", "complete"));
-    assert_eq!(args["messages"], json!([{ "role": "user", "text": "one tea please" }]));
-    assert!(args["system"].as_str().unwrap().contains("Green tea") && args["tools"][0]["name"] == "add");
+    let ask = |text: &str, caller: Option<Caller>| Input::Call { object: "Assistant/demo".into(), method: "ask".into(), args: vec![json!(text), json!("ana")], reply: None, call: None, caller };
+    let reply = |calls: Json, text: &str| json!({ "text": text, "calls": calls, "stop": if calls.as_array().unwrap().is_empty() { "end_turn" } else { "tool_use" }, "raw": [{ "type": "text", "text": text }] });
 
-    // The model asks for a tool; the assistant uses the cart, then asks the model again.
-    let tool_use = json!({ "text": "", "calls": [{ "id": "t1", "name": "add", "input": { "sku": "tea" } }], "stop": "tool_use", "raw": [{ "type": "tool_use", "id": "t1" }] });
-    let (id2, _, _, args2) = plugin(&server.handle(2.0, answered(id, tool_use)));
-    assert_eq!(args2["messages"][2]["results"][0]["id"], json!("t1"));
-    assert!(args2["messages"][2]["results"][0]["output"].as_str().unwrap().starts_with("done"));
-    let done = json!({ "text": "Added a green tea.", "calls": [], "stop": "end_turn", "raw": [{ "type": "text", "text": "Added a green tea." }] });
-    server.handle(3.0, answered(id2, done));
+    // A shopper asks for tea and a restock: the agent may add tea for them, not restock.
+    let (id, name, method, args) = plugin(&server.handle(1.0, ask("a tea, and restock the pots", who("", &[]))));
+    assert_eq!((name.as_str(), method.as_str()), ("ai", "complete"));
+    assert_eq!(args["messages"], json!([{ "role": "user", "text": "a tea, and restock the pots" }]));
+    assert!(args["system"].as_str().unwrap().contains("Green tea") && args["tools"][2]["name"] == "restock");
+    let calls = json!([{ "id": "t1", "name": "add", "input": { "sku": "tea", "name": "mallory" } }, { "id": "t2", "name": "restock", "input": { "sku": "pot", "qty": 5 } }]);
+    let (id2, _, _, args2) = plugin(&server.handle(2.0, answered(id, reply(calls, ""))));
+    let results = &args2["messages"][2]["results"];
+    assert_eq!(results[0], json!({ "id": "t1", "output": "done" }));
+    assert!(results[1]["output"].as_str().unwrap().starts_with("not allowed") && results[1]["error"] == json!(true), "the rules apply to the agent as to the shopper: {results}");
+    server.handle(3.0, answered(id2, reply(json!([]), "Added a tea; only staff may restock.")));
 
     let cart = state(&mut server, 4.0, "Cart/demo");
-    assert_eq!((cart["lines"][0]["sku"].clone(), cart["changedBy"].clone()), (json!("tea"), json!("ana (via the assistant)")));
-    let assistant = state(&mut server, 4.0, "Assistant/demo");
-    assert_eq!(assistant["lines"], json!([{ "who": "ana", "text": "one tea please" }, { "who": "assistant", "text": "Added a green tea." }]));
-    assert_eq!(assistant["busy"], json!(false));
+    assert_eq!((cart["lines"][0]["sku"].clone(), cart["changedBy"].clone()), (json!("tea"), json!("ana (via the assistant)")), "the name is fixed by the app, not the model");
+    assert_eq!(state(&mut server, 4.0, "Shelf/main")["products"][2]["stock"], json!(2));
+    let lines = state(&mut server, 4.0, "Assistant/demo")["lines"].clone();
+    assert_eq!(lines, json!([{ "who": "ana", "text": "a tea, and restock the pots" }, { "who": "assistant", "text": "Added a tea; only staff may restock." }]));
+
+    // The same request from staff restocks.
+    let (id3, _, _, _) = plugin(&server.handle(5.0, ask("restock the pots", who("key:sync", &["staff"]))));
+    let restock = json!([{ "id": "t3", "name": "restock", "input": { "sku": "pot", "qty": 5 } }]);
+    let (id4, _, _, args4) = plugin(&server.handle(6.0, answered(id3, reply(restock, ""))));
+    assert_eq!(args4["messages"].as_array().unwrap().last().unwrap()["results"][0]["output"], json!("done"));
+    server.handle(7.0, answered(id4, reply(json!([]), "Restocked.")));
+    assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
 }
 
 #[test]
