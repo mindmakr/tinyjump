@@ -19,7 +19,7 @@ pub fn report(program: &Program) -> String {
         return "no personal data: mark fields with @pii(category, purpose)\n".into();
     }
     out.push_str("The owner sees these fields; other readers and every tool see •••.\n");
-    out.push_str("Not checked yet: where the values flow (fetch, plugins, emit, errors, logs), and retention.\n");
+    out.push_str("Every compile checks where these values flow (docs/privacy.md); each reveal(value, purpose) lets one path through. Not yet: retention.\n");
     out
 }
 

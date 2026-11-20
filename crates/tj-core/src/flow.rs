@@ -261,8 +261,10 @@ impl Checker {
         }
     }
 
-    /// Runs a function with these argument values; its return taint.
-    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, captured: Option<&HashMap<String, Val>>) -> Taint {
+    /// Runs a function with these argument values; its return taint. A function written
+    /// inside another (`captured`) sees that one's variables, and what it puts into them is
+    /// written back.
+    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, captured: Option<&mut HashMap<String, Val>>) -> Taint {
         let arg_sig: Vec<String> = args.iter().map(|a| self.flatten(a).sig()).collect();
         let key = format!("{:p}|{}|{:?}|{}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
         // A container passed in may be written into: run again for each call, so every
@@ -280,7 +282,7 @@ impl Checker {
             return t;
         }
         let owner_only = endpoint == Endpoint::OwnerOnly;
-        let mut fr = Frame { vars: captured.cloned().unwrap_or_default(), this, owner_only, endpoint, ret: Taint::default() };
+        let mut fr = Frame { vars: captured.as_deref().cloned().unwrap_or_default(), this, owner_only, endpoint, ret: Taint::default() };
         for (i, p) in f.params.iter().enumerate() {
             let mut v = args.get(i).cloned().unwrap_or_else(clean);
             if let Some(d) = &p.default {
@@ -296,6 +298,13 @@ impl Checker {
         self.active.remove(&key);
         if pure {
             self.memo.insert(key, fr.ret.clone());
+        }
+        if let Some(outer) = captured {
+            for (name, v) in outer.iter_mut() {
+                if let Some(inner) = fr.vars.get(name) {
+                    *v = self.merge(Some(v), inner.clone());
+                }
+            }
         }
         fr.ret
     }
@@ -520,8 +529,8 @@ impl Checker {
             ExprKind::Arrow(f) => {
                 // Run it once as written (event handlers, callbacks stored for later).
                 let args = vec![clean(); f.params.len()];
-                let vars = fr.vars.clone();
-                self.call(f, args, fr.this.clone(), Endpoint::Internal, Some(&vars));
+                let this = fr.this.clone();
+                self.call(f, args, this, Endpoint::Internal, Some(&mut fr.vars));
                 Val::Func(f.clone())
             }
             ExprKind::Await(x) => self.expr(x, fr),
@@ -547,16 +556,14 @@ impl Checker {
         }
     }
 
-    /// The base of `a.b[c].d`, and the field of `this` it writes into, if any.
+    /// The base of `a.b[c].d`, and the field of the base it writes into (`b`), if any.
     fn root(target: &Expr) -> (&Expr, Option<&str>) {
         let mut cur = target;
         let mut field = None;
         loop {
             match &cur.kind {
                 ExprKind::Member { obj, name, .. } => {
-                    if matches!(obj.kind, ExprKind::This) {
-                        field = Some(name.as_str());
-                    }
+                    field = Some(name.as_str());
                     cur = obj;
                 }
                 ExprKind::Index { obj, .. } => cur = obj,
@@ -565,26 +572,43 @@ impl Checker {
         }
     }
 
+    /// `v` written into `field` of an object: its own (`this`), or another through a handle.
+    fn write_field(&mut self, class: &Rc<str>, own: bool, field: &str, v: &Val, span: crate::syntax::Span) {
+        let t = self.flatten(v);
+        if t.is_clean() {
+            return;
+        }
+        let place = if own { format!("this.{field}") } else { format!("{class}.{field}") };
+        let personal = self.classes.get(class).is_some_and(|c| c.pii.contains_key(field));
+        if !personal {
+            let d = Diagnostic::new(format!("{} reaches `{place}`, which is not marked as personal data", self.describe(&t)), span)
+                .hint(format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)));
+            self.report(d);
+        } else if t.other {
+            let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
+                .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
+            self.report(d);
+        }
+    }
+
     /// `target = v`, or `v` put into `target` (`push`, `t[i] = v`).
     fn assign(&mut self, target: &Expr, v: Val, span: crate::syntax::Span, fr: &mut Frame) {
         let (base, field) = Self::root(target);
         match &base.kind {
             ExprKind::This => {
-                let Some(field) = field else { return };
-                let t = self.flatten(&v);
-                if t.is_clean() {
-                    return;
+                if let (Some(field), Some((class, _))) = (field, fr.this.clone()) {
+                    self.write_field(&class, true, field, &v, span);
                 }
-                let class = fr.this.as_ref().map(|(c, _)| c.clone());
-                let personal = class.as_ref().and_then(|c| self.classes.get(c)).is_some_and(|c| c.pii.contains_key(field));
-                if !personal {
-                    let d = Diagnostic::new(format!("{} reaches `this.{field}`, which is not marked as personal data", self.describe(&t)), span)
-                        .hint(format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)));
-                    self.report(d);
-                } else if t.other {
-                    let d = Diagnostic::new(format!("{} may be about someone other than this object's owner, and is written into `this.{field}`", self.describe(&t)), span)
-                        .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
-                    self.report(d);
+            }
+            // Another object's field, changed through a handle: `Room.get("lobby").messages.push(x)`.
+            ExprKind::Ident(n) if matches!(fr.vars.get(n), Some(Val::Handle { .. })) && field.is_some() => {
+                if let (Some(Val::Handle { class, other }), Some(field)) = (fr.vars.get(n).cloned(), field) {
+                    self.write_field(&class, !other, field, &v, span);
+                }
+            }
+            ExprKind::Call { .. } => {
+                if let (Val::Handle { class, other }, Some(field)) = (self.expr(base, fr), field) {
+                    self.write_field(&class, !other, field, &v, span);
                 }
             }
             ExprKind::Ident(n) if fr.vars.contains_key(n) => {
@@ -642,7 +666,11 @@ impl Checker {
                 let f = self.expr(callee, fr);
                 let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
                 match f {
-                    Val::Func(f) => Val::Data(self.call(&f, vals, fr.this.clone(), Endpoint::Internal, None)),
+                    // A function written inside this one: it sees, and changes, its variables.
+                    Val::Func(f) => {
+                        let this = fr.this.clone();
+                        Val::Data(self.call(&f, vals, this, Endpoint::Internal, Some(&mut fr.vars)))
+                    }
                     _ => self.unknown_call(&vals, span),
                 }
             }
@@ -741,8 +769,8 @@ impl Checker {
                 } else {
                     vec![elem.clone(), clean(), elem]
                 };
-                let vars = fr.vars.clone();
-                let ret = self.call(&f, cb_args, fr.this.clone(), Endpoint::Internal, Some(&vars));
+                let this = fr.this.clone();
+                let ret = self.call(&f, cb_args, this, Endpoint::Internal, Some(&mut fr.vars));
                 return Val::Data(match name {
                     "map" | "flatMap" | "some" | "every" | "findIndex" => ret,
                     "reduce" => {
@@ -815,9 +843,12 @@ impl Checker {
             },
             _ => None,
         };
-        let class = prefix.and_then(|s| s.split('/').next()).map(str::to_string);
-        let Some(class) = class.map(|c| Rc::<str>::from(c.as_str())) else { return };
-        let Some(decl) = self.classes.get(&class).and_then(|c| c.methods.get(method.as_str())).map(|(d, _)| d.clone()) else { return };
+        let class = prefix.and_then(|s| s.split_once('/')).map(|(c, _)| Rc::<str>::from(c));
+        let decl = class.as_ref().and_then(|c| self.classes.get(c)).and_then(|c| c.methods.get(method.as_str())).map(|(d, _)| d.clone());
+        let (Some(class), Some(decl)) = (class, decl) else {
+            self.report(Diagnostic::new("the privacy check cannot follow this tool's object", object.span).hint("write it as \"Class/id\" or `Class/${...}`, naming a class and one of its methods"));
+            return;
+        };
         let args = vec![clean(); decl.params.len()];
         let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, None);
         if !ret.is_clean() {

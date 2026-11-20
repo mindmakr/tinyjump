@@ -982,7 +982,7 @@ fn personal_data_cannot_leave_without_a_purpose() {
     let e = flow(r#"@allow("owner") peek(victim: string): string { return Account.get(victim).email }"#, "");
     assert!(e.contains("may be about someone other than the caller"), "{e}");
     let e = flow(r#"@allow("owner") steal(victim: string) { this.email = Account.get(victim).email }"#, "");
-    assert!(e.contains("may be about someone other than this object's owner"), "{e}");
+    assert!(e.contains("may be about someone other than the owner of the object it is written into (`this.email`)"), "{e}");
     // L2: through a container filled in another function.
     let e = flow(r#"@allow("owner") run() {
     const box: string[] = []
@@ -1006,6 +1006,33 @@ const tools = [{ name: "email", object: "Account/me", method: "myEmail", descrip
         let e = flow(r#"@allow("owner") myEmail(): string { return this.email }"#, &tools);
         assert!(e.contains("the tool Account.myEmail returns"), "{object}: {e}");
     }
+
+    // critic-008: a nested function and a callback see the outer variables.
+    let e = flow(r#"@allow("anyone") leak(id: string): string {
+    const e = Account.get(id).email
+    function read(): string { return e }
+    return read()
+  }"#, "");
+    assert!(e.contains("is returned here to callers who do not own it"), "{e}");
+    let e = flow(r#"@allow("owner") leak() {
+    let out = ""
+    ;[1].forEach(x => { out = this.email })
+    this.emit("ev", out)
+  }"#, "");
+    assert!(e.contains("reaches `emit`"), "{e}");
+    // Into another object, directly or through a variable.
+    let room = r#"@server @read("anyone") object Room { messages: string[] = [] }"#;
+    let e = flow(r#"@allow("owner") post() { Room.get("lobby").messages.push(this.email) }"#, room);
+    assert!(e.contains("reaches `Room.messages`, which is not marked as personal data"), "{e}");
+    let e = flow(r#"@allow("owner") post() {
+    const r = Room.get("lobby")
+    r.messages.push(this.email)
+  }"#, room);
+    assert!(e.contains("reaches `Room.messages`"), "{e}");
+    // A tool whose object it cannot read is reported, not skipped.
+    let e = flow(r#"@allow("owner") myEmail(): string { return this.email }"#, r#"
+function tools(o: string) { return [{ name: "email", object: o, method: "myEmail", description: "", params: [], input: {}, fixed: {} }] }"#);
+    assert!(e.contains("cannot follow this tool's object"), "{e}");
 
     // Purposes are enforced, and mixing fields for different purposes is refused.
     assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
