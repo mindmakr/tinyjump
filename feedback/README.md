@@ -28,6 +28,12 @@ Every note here is checked against [docs/vision.md](../docs/vision.md).
      `fixed (<sha>)`.
    - If both sides still disagree after one clear exchange, either side marks it
      `escalated` with a short `Case A` vs `Case B` summary for the visionary to decide.
+4. **Ask the visionary directly, never only in a note or a long reply.** The owner does not
+   read every note or response. When a decision is needed (`escalated` items, `vision`
+   proposals, order of work), the agent talking to the owner asks with an interactive
+   question (the ask-user tool): a short question, one or two lines of context, and
+   options with the recommended one first. Record the answer in the note (`decided by
+   visionary: ...`) and, when it changes direction, in `docs/vision.md`.
 
 ## Roles
 
