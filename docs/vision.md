@@ -308,6 +308,13 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 - **Strictly additive** (owner, 2026-11-20): no feature may add setup or ceremony to a
   one-file app. `examples/todo/app.tj` stays zero-config; keys, privacy rules, manifests and
   compliance switch on only when an app uses them.
+- **Runtime or plugin, decided first** (owner, 2026-11-20): before building a feature or a
+  change, place it and say why. In the **runtime** go guarantees that must hold on every
+  path and fail closed (access rules, personal-data checks, saving, `@exclusive`): a plugin
+  an app could forget would fail open. In the **server host** goes what only servers need
+  (audit log, encrypted store, metrics), so devices pay nothing. **Plugins and data packs**
+  carry integrations, vendor choices and regional or industry policy (key managers, audit
+  destinations, compliance packs, consent screens).
 - Every language feature and runtime behaviour gets a test in `tj-core`.
 - Security: hosts bind to localhost by default, cap body sizes and never serve arbitrary paths.
 - CI is local-only for now (`cargo test`, `cargo clippy`).
