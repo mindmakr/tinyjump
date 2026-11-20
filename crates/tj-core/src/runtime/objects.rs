@@ -234,8 +234,14 @@ impl Runtime {
                 *inst.state.borrow_mut() = fresh;
                 // Its alarms were set for the person who left; their timers find nothing.
                 inst.alarms.clear();
-                self.touch(&o);
                 self.ran_code = true;
+                // The record goes, key and all (keys can name the person: `Screen/user:ana`).
+                // It is saved again only when it changes. A store that cannot delete keeps
+                // the blank instead.
+                self.touched.shift_remove(&(class, o.id.clone()));
+                if self.store.remove(&o.key()).is_err() {
+                    self.touch(&o);
+                }
             }
         }
     }
@@ -613,7 +619,7 @@ impl Runtime {
     pub(crate) fn object_states(&self) -> Json {
         let state = |i: &Instance| {
             let mut s = Value::Rec(i.state.clone().into()).to_json().unwrap_or(Json::Null);
-            self.mask(i.handle.class, &mut s);
+            self.mask(i.handle.class, &mut s, false);
             s
         };
         let mut list: Vec<(String, Json)> = self.instances.values().map(|i| (i.handle.key(), state(i))).collect();

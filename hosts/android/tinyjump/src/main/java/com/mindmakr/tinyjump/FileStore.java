@@ -80,6 +80,12 @@ final class FileStore {
         }
     }
 
+    /** Deletes a record; true when it is gone (or was never there). */
+    boolean remove(String key) {
+        file(key).delete();
+        return !file(key).getBaseFile().exists();
+    }
+
     /** JSON array of keys starting with prefix. */
     String keys(String prefix) {
         List<String> keys = new ArrayList<>();

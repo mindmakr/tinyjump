@@ -93,7 +93,8 @@ Containers handle no layout props themselves. They place children at their frame
 
 ## Storage
 
-`Store` is synchronous: `load(key)`, `save(key, json)`, `keys(prefix)`. Keys are
+`Store` is synchronous: `load(key)`, `save(key, json)`, `keys(prefix)`, `remove(key)`
+(sign-out deletes the person's device records). Keys are
 `Class/id` plus `tj:alarms`. The CLI uses one file per key, readable by the server's user
 only, and the web host uses `localStorage`.
 
@@ -141,7 +142,8 @@ Exports: `tj_alloc(len) -> ptr`, `tj_free(ptr, len)`,
 0 means an outputs array; 1 means compile errors or a bad input; 2 means a boot error.
 
 Imports (module `env`): `tj_host_load(key, len, out_ptr) -> len | -1`,
-`tj_host_save(key, klen, val, vlen) -> 0 | 1`, `tj_host_keys(prefix, len, out_ptr) -> len`.
+`tj_host_save(key, klen, val, vlen) -> 0 | 1`, `tj_host_keys(prefix, len, out_ptr) -> len`,
+`tj_host_remove(key, klen) -> 0 | 1`.
 For `load` and `keys`, the host allocates the result with `tj_alloc`, writes its pointer
 to `out_ptr` and returns its length. Rust then owns that memory.
 

@@ -12,7 +12,7 @@ use super::access::Who;
 use super::Runtime;
 use serde_json::Value as Json;
 #[cfg(feature = "server")]
-use {super::objects::Stored, super::TimerKind, crate::runtime::protocol::Output, crate::vm::value::{Exc, Value}, serde_json::Map};
+use {super::objects::Stored, super::TimerKind, crate::runtime::protocol::Output, crate::vm::value::{Exc, Value}, serde_json::Map, std::rc::Rc};
 
 #[cfg(feature = "server")]
 const SWEEP_BATCH: usize = 500;
@@ -27,22 +27,33 @@ const SECRET_KEY: &str = "tj:secret";
 /// What a personal-data field shows to anyone but its owner, and to every tool.
 pub const MASK: &str = "•••";
 
+/// A list of several people's entries (`@by`): class, field, whose field, time field.
+#[cfg(feature = "server")]
+type SharedList = (u16, Rc<str>, Rc<str>, Option<Rc<str>>);
+/// Entries found in one object's list: the object, the field, the entries.
+#[cfg(feature = "server")]
+type Entries = (Rc<crate::vm::value::ObjRef>, Rc<str>, Vec<Json>);
+
 impl Runtime {
     /// Masks the personal-data fields of `state`, an object of class `class`.
-    pub(crate) fn mask(&self, class: u16, state: &mut Json) {
-        for p in &self.program.objects[class as usize].pii {
+    /// Masks the personal fields of `state`. `reader`: a person the object's `@read` rule
+    /// admitted, who sees the lists of several people's entries (`@by`), as reading them is
+    /// what the rule is for; tools see everything masked.
+    pub(crate) fn mask(&self, class: u16, state: &mut Json, reader: bool) {
+        for p in self.program.objects[class as usize].pii.iter().filter(|p| !(reader && p.by.is_some())) {
             if let Some(v) = state.get_mut(&*p.field) {
                 *v = Json::from(MASK);
             }
         }
     }
 
-    /// The state of `object` as someone who does not own it sees it, or `None` when its class
-    /// holds no personal data. For a server's change streams.
-    pub fn masked(&self, object: &str, state: &Json) -> Option<Json> {
+    /// The state of `object` as someone who does not own it sees it (`reader`: a person its
+    /// rule admitted, see [`Runtime::mask`]), or `None` when its class holds no personal
+    /// data. For a server's change streams.
+    pub fn masked(&self, object: &str, state: &Json, reader: bool) -> Option<Json> {
         let class = self.personal_class(object)?;
         let mut masked = state.clone();
-        self.mask(class, &mut masked);
+        self.mask(class, &mut masked, reader);
         Some(masked)
     }
 
@@ -114,14 +125,74 @@ impl Runtime {
     }
 
     /// Everything held about `subject`, unmasked: the state of every object whose id is
-    /// theirs. Servers only (`tj privacy export`).
+    /// theirs, and their entries in lists of several people's (`@by`), as
+    /// `"Class/id#field": [entries]`. Servers only (`tj privacy export`).
     pub fn export_subject(&mut self, subject: &str) -> Result<Json, String> {
         let mut out = Map::new();
         for (class, key) in self.subject_objects(subject)? {
             let o = self.instance(class, subject).map_err(|e| e.message())?;
             out.insert(key, self.object_state(&o)?);
         }
+        for (o, field, entries) in self.entries_of(subject, None)? {
+            out.insert(format!("{}#{field}", o.key()), Json::Array(entries));
+        }
         Ok(Json::Object(out))
+    }
+
+    /// Lists holding several people's entries (`@by`): class, field, whose field, time field.
+    fn shared_lists(&self) -> Vec<SharedList> {
+        let mut out = Vec::new();
+        for (class, def) in self.program.objects.iter().enumerate() {
+            for p in &def.pii {
+                if let Some((by, at)) = &p.by {
+                    out.push((class as u16, p.field.clone(), by.clone(), at.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Entries of `@by` lists that belong to `subject` (or, with `older`, any person's entry
+    /// whose time is before it), with where they are: for export, erasure and retention.
+    /// `remove` takes them out of the lists as well.
+    fn entries_of(&mut self, subject: &str, older: Option<(u16, f64)>) -> Result<Vec<Entries>, String> {
+        self.take_entries(subject, older, false)
+    }
+
+    fn take_entries(&mut self, subject: &str, older: Option<(u16, f64)>, remove: bool) -> Result<Vec<Entries>, String> {
+        let mut found = Vec::new();
+        for (class, field, by, at) in self.shared_lists() {
+            if older.is_some_and(|(c, _)| c != class) {
+                continue;
+            }
+            for id in self.class_ids(class) {
+                let o = self.instance(class, &id).map_err(|e| e.message())?;
+                let list = self.inst(&o).state.borrow().get(&*field).cloned();
+                let Some(Value::Arr(list)) = list else { continue };
+                let matches = |e: &Value| {
+                    let Value::Rec(r) = e else { return false };
+                    let r = r.borrow();
+                    match older {
+                        // A missing or broken time fails closed: the entry is erased.
+                        Some((_, before)) => at.as_ref().is_some_and(|at| match r.get(&**at) {
+                            Some(Value::Num(t)) if t.is_finite() => *t < before,
+                            _ => true,
+                        }),
+                        None => matches!(r.get(&*by), Some(Value::Str(s)) if &**s == subject),
+                    }
+                };
+                let mine: Vec<Json> = list.borrow().iter().filter(|e| matches(e)).filter_map(|e| e.to_json().ok()).collect();
+                if mine.is_empty() {
+                    continue;
+                }
+                if remove {
+                    list.borrow_mut().retain(|e| !matches(e));
+                    self.touch(&o);
+                }
+                found.push((o, field.clone(), mine));
+            }
+        }
+        Ok(found)
     }
 
     /// Erases `subject`: every object whose id is theirs goes back to its defaults, and loses
@@ -162,10 +233,16 @@ impl Runtime {
             self.reset(&o, fresh);
             erased.push(key);
         }
+        // Their entries in lists of several people's go too. These lists live under the
+        // store's own key, not the person's, so backups keep them until those backups expire.
+        for (o, field, _) in self.take_entries(subject, None, true).map_err(|e| (503, e))? {
+            erased.push(format!("{}#{field}", o.key()));
+        }
         self.drop_alarms_of(subject, &held);
         // First the stored copies' keys, so copies in backups cannot be read either; then the
         // blank, under a new key.
-        for key in &erased {
+        // Entries taken out of shared lists (`Class/id#field`) have no key of their own.
+        for key in erased.iter().filter(|k| !k.contains('#')) {
             self.store.forget(key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; nothing was erased; try again")))?;
         }
         if !self.flush() {
@@ -232,8 +309,24 @@ impl Runtime {
 
     /// One step of the sweep: up to `SWEEP_BATCH` objects; a new round every hour.
     pub(crate) fn retain_step(&mut self) {
+        // Entries of lists of several people's whose own time ran out, checked once a round.
         if self.retain_queue.is_empty() {
-            let classes: Vec<String> = self.program.objects.iter().filter(|d| d.retain.is_some()).map(|d| format!("{}/", d.name)).collect();
+            for (class, _, _, at) in self.shared_lists() {
+                let Some(r) = self.program.objects[class as usize].retain.filter(|_| at.is_some()) else { continue };
+                match self.take_entries("", Some((class, self.now - r.ms)), true) {
+                    Ok(gone) => {
+                        for (o, field, entries) in gone {
+                            self.outputs.push(Output::Erased { object: format!("{}#{field}", o.key()), reason: format!("retention: {} entries", entries.len()), forget: false });
+                        }
+                    }
+                    Err(e) => self.outputs.push(Output::Error { message: format!("retention could not check {}: {e}", self.program.objects[class as usize].name), trace: Vec::new() }),
+                }
+            }
+            self.flush();
+        }
+        if self.retain_queue.is_empty() {
+            // Whole objects that are one person's; lists of several people's are swept above.
+            let classes: Vec<String> = self.program.objects.iter().filter(|d| d.retain.is_some() && d.belongs_to_a_person()).map(|d| format!("{}/", d.name)).collect();
             let mut keys: Vec<String> = self.erasures.keys().cloned().collect();
             for prefix in classes {
                 match self.store.keys(&prefix) {

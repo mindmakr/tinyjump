@@ -37,6 +37,11 @@ final class FileStore {
         }
     }
 
+    func remove(_ key: String) -> Bool {
+        try? FileManager.default.removeItem(at: url(key))
+        return !FileManager.default.fileExists(atPath: url(key).path)
+    }
+
     func keys(_ prefix: String) -> [String] {
         let names = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
         return names
@@ -86,6 +91,10 @@ final class NativeRuntime {
             json.withUnsafeBytes { raw in
                 tj_buf_set(out, raw.bindMemory(to: UInt8.self).baseAddress, raw.count)
             }
+        }
+        s.remove = { ctx, key, keyLen in
+            let store = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue().store
+            return store.remove(NativeRuntime.string(key, keyLen)) ? 0 : 1
         }
         s.measure = { ctx, node, maxWidth, width, height in
             let bridge = Unmanaged<HostBridge>.fromOpaque(ctx!).takeUnretainedValue()

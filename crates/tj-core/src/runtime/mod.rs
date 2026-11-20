@@ -360,7 +360,8 @@ impl Runtime {
                     let state = self.resolve_object(&object).and_then(|o| {
                         let mut s = self.object_state(&o)?;
                         if !who.owns(&o.id) {
-                            self.mask(o.class, &mut s);
+                            // A person the rules admitted reads the lists the rule is for.
+                            self.mask(o.class, &mut s, matches!(who, Who::Remote { .. }));
                         }
                         Ok(s)
                     });

@@ -41,6 +41,9 @@ function localStore(prefix) {
     save(key, value) {
       localStorage.setItem(prefix + key, value);
     },
+    remove(key) {
+      localStorage.removeItem(prefix + key);
+    },
     keys(p) {
       const out = [];
       try {
@@ -94,6 +97,11 @@ export async function start(opts) {
       },
       tj_host_keys(pp, pl, out) {
         return giveStr(JSON.stringify(store.keys(readStr(pp, pl))), out);
+      },
+      tj_host_remove(kp, kl) {
+        // A store passed in without `remove` keeps a blank record instead.
+        if (!store.remove) return 1;
+        try { store.remove(readStr(kp, kl)); return 0; } catch (e) { return 1; }
       },
     },
   };

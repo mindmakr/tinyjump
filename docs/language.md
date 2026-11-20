@@ -84,6 +84,8 @@ object Cart {
   functions created inside them, can **change** fields, arrays and records inside them
   included: from outside, `room.messages.push(x)` fails. Other code calls a method, or
   changes a copy (`room.messages.slice()`, `[...room.messages]`).
+- `@pii(category, purpose) @by("customer", "at")` marks a list holding several people's
+  entries, each belonging to the person its `customer` field names (docs/privacy.md).
 - `this.id` is the instance id. `id`, `emit`, `schedule` and `unschedule` are reserved
   names.
 - `this.schedule(ms, "method", ...args)` calls the named method of this object after `ms`

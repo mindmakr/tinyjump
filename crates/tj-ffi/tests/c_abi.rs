@@ -35,13 +35,18 @@ unsafe extern "C" fn keys(ctx: *mut c_void, p: *const u8, pl: usize, out: *mut T
     tj_buf_set(out, json.as_ptr(), json.len());
 }
 
+unsafe extern "C" fn remove(ctx: *mut c_void, k: *const u8, kl: usize) -> c_int {
+    (*(ctx as *mut Map)).remove(text(k, kl));
+    0
+}
+
 unsafe extern "C" fn measure(_ctx: *mut c_void, _node: u32, max_width: f32, w: *mut f32, h: *mut f32) {
     *w = if max_width >= 0.0 { max_width.min(80.0) } else { 80.0 };
     *h = 20.0;
 }
 
 fn host(map: &mut Map) -> TjHost {
-    TjHost { ctx: map as *mut Map as *mut c_void, load, save, keys, measure }
+    TjHost { ctx: map as *mut Map as *mut c_void, load, save, keys, remove, measure }
 }
 
 unsafe fn out(rt: *const TjRuntime) -> String {

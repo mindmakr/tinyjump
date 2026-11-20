@@ -57,6 +57,12 @@ impl Mailbox {
         self
     }
 
+    /// Whether a caller the rules admitted reads it, by a person's token or a role key: they
+    /// see lists of several people's entries. Not admin automation, nor an anonymous caller.
+    pub fn is_person(&self) -> bool {
+        self.reader.as_deref().is_some_and(|r| !r.is_empty())
+    }
+
     /// Whether this reader owns `object` (`Class/id`), and so sees its personal data.
     pub fn owns(&self, object: &str) -> bool {
         let id = object.split_once('/').map_or("", |(_, id)| id);

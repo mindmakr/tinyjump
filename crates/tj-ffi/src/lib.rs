@@ -13,6 +13,7 @@ pub struct TjBuf(Vec<u8>);
 type LoadFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut TjBuf) -> c_int;
 type SaveFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize) -> c_int;
 type KeysFn = unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut TjBuf);
+type RemoveFn = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> c_int;
 type MeasureFn = unsafe extern "C" fn(*mut c_void, u32, f32, *mut f32, *mut f32);
 
 #[repr(C)]
@@ -22,6 +23,7 @@ pub struct TjHost {
     pub load: LoadFn,
     pub save: SaveFn,
     pub keys: KeysFn,
+    pub remove: RemoveFn,
     pub measure: MeasureFn,
 }
 
@@ -55,6 +57,14 @@ impl Store for TjHost {
         // SAFETY: as above.
         unsafe { (self.keys)(self.ctx, prefix.as_ptr(), prefix.len(), &mut buf) };
         Ok(String::from_utf8(buf.0).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default())
+    }
+
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        // SAFETY: as above.
+        match unsafe { (self.remove)(self.ctx, key.as_ptr(), key.len()) } {
+            0 => Ok(()),
+            code => Err(format!("host store failed to delete {key} ({code})")),
+        }
     }
 }
 

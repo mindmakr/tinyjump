@@ -23,11 +23,42 @@ the order of work are in [trust.md](trust.md), section 6.
 - Only `@server` objects hold personal data: the server is where it can be exported and
   erased.
 - **One person per object.** An object with personal data belongs to the person whose id
-  is the object id: `Account.get(caller.id)`. A shared object, such as a chat room, keeps
-  personal data in per-person objects and refers to them.
+  is the object id: `Account.get(caller.id)`.
+- **Or one person per entry**, in a list of several people's entries (see below).
 
 `tj check app.tj --privacy` prints the data map: every personal-data field with its
 category, purposes and readers.
+
+## Lists of several people's entries
+
+A booking sheet, a waiting list or a roster holds many people's data in one object:
+
+```tsx
+type Booker = { customer: string, name: string, at: number }
+
+@server @read("staff") @retain("90d") object Day {
+  @pii("contact", "booking") @by("customer", "at") bookers: Booker[] = []
+  @allow("signedIn") book(name: string) { this.bookers.push({ customer: caller.id, name, at: Date.now() }) }
+}
+```
+
+- `@by("customer", "at")`, after `@pii`, says each entry belongs to the person its
+  `customer` names; `at` is the entry's own time in milliseconds. The list's type must be
+  records with `customer: string` (and `at: number`).
+- **Readers:** those the object's `@read` rule admits see the entries, as reading them is
+  what the rule is for. `@read("anyone")` is refused. Every tool sees `•••`.
+- **Export and erasure** reach the entries: `tj privacy export` lists a person's entries
+  under `Day/<id>#bookers`, and erasure takes them out of the list, leaving the others.
+- **Retention** counts from each entry's own time: with `@retain("90d")`, each entry is
+  taken out 90 days after its `at`. `@retain` requires the time field. `@legalHold` is
+  not supported on these objects yet.
+- **Copies:** personal data revealed from a person's object and kept in a field must go
+  into a `@pii` field, so retention, export and erasure reach the copy. The compiler
+  refuses it otherwise.
+- **Backups:** these objects are sealed under the store's key, not a key per person (they
+  belong to no one person). Erasure removes the entries from the live data; backups keep
+  them until those backups expire. Keep per-person data that must vanish from backups in
+  objects whose id is the person's.
 
 ## Who sees it
 
@@ -105,8 +136,8 @@ import { exportData, erase } from "tj:privacy"
 
 ## Backups: erasure reaches them with `TJ_KEY_FILE`
 
-With an encrypted store, each object that belongs to a person (its class has `@pii` or an
-`"owner"` rule) is sealed under a key of its own. Those keys are kept apart from the data,
+With an encrypted store, each object that belongs to a person (its class has `@pii`
+without `@by`, or an `"owner"` rule) is sealed under a key of its own. Those keys are kept apart from the data,
 in `<TJ_KEY_FILE>.own/`. Erasing the person, or retention, or the end of a hold, destroys
 the object's key, so the copies of it in backups of the data folder can no longer be
 opened (checked by restoring a whole backup taken before an erasure: the record answers

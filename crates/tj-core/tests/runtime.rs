@@ -20,6 +20,9 @@ impl Store for Shared {
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.borrow_mut().keys(prefix)
     }
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        self.0.borrow_mut().remove(key)
+    }
 }
 
 fn boot_with(src: &str, store: Shared, now: f64) -> (Runtime, Vec<Output>) {
@@ -1484,7 +1487,7 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("@server object A { @pii(\"contact\", \"for ads\") email: string = \"\" }").contains("say what 'email' is for"));
     assert!(msg("@server object A { @pii(contact, \"x\") email: string = \"\" }").contains("as strings"));
     assert!(msg("@server object A { @pii(\"contact\", \"a\") @pii(\"contact\", \"b\") email: string = \"\" }").contains("repeated field decorator"));
-    assert!(msg("@server object A { @every(\"1s\") n: number = 0 }").contains("fields take one @pii"));
+    assert!(msg("@server object A { @every(\"1s\") n: number = 0 }").contains("fields take @pii"));
     // Retention and legal holds.
     assert!(msg("@retain(\"30d\") object A { n: number = 0 }").contains("@retain is for @server objects"));
     assert!(msg("@server @retain(\"soon\") object A { n: number = 0 }").contains("@retain takes a duration"));
@@ -2007,9 +2010,9 @@ async function send(to: string) { await fetch("https://API.Mailer.example:443/se
 fn revealed_data_is_followed_through_every_path_to_the_network() {
     use tj_core::Destination::{Cleartext, Host, Plugin, Unknown};
     let src = r#"import { act } from "tj:agent"
-@server object Queue {
-  pending: string[] = []
-  async flush() { for (const to of this.pending) { await fetch("https://queue.example/send", { body: to }) } }
+@server @read("staff") object Queue {
+  @pii("contact", "account") @by("person") pending: { person: string, to: string }[] = []
+  async flush() { for (const p of this.pending) { await fetch("https://queue.example/send", { body: reveal(p.to, "account") }) } }
 }
 let last = ""
 @server @read("owner") object Member {
@@ -2021,7 +2024,7 @@ let last = ""
   @allow("owner") async ported() { await fetch(`https://ported.example:8443/${this.id}`, { body: reveal(this.email, "account") }) }
   @allow("owner") later() { this.schedule(60000, "remind", reveal(this.email, "account")) }
   async remind(to: string) { await fetch("https://alarm.example/x", { body: to }) }
-  @allow("owner") queue() { Queue.get("main").pending.push(reveal(this.email, "account")) }
+  @allow("owner") queue() { Queue.get("main").pending.push({ person: this.id, to: reveal(this.email, "account") }) }
   @allow("owner") keep() { last = reveal(this.email, "account") }
   contact(): string { return reveal(this.email, "account") }
   @allow("owner") async help(q: string): any {
@@ -2177,6 +2180,7 @@ fn signing_out_clears_what_the_device_kept_for_that_person() {
     device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
     call(&mut device, 1.0, "Screen/main", "type", json!(["ana's phone 555"])).unwrap();
     device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert!(store.0.borrow().data.keys().all(|k| !k.starts_with("Screen/")), "the record is deleted, key and all: {:?}", store.0.borrow().data.keys().collect::<Vec<_>>());
     assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!(""), "gone from memory");
     let (mut later, _) = boot_as(src, store.clone(), 4.0, false);
     assert_eq!(state(&mut later, 5.0, "Screen/main")["draft"], json!(""), "and from the device's storage");
@@ -2379,6 +2383,69 @@ fn all_lists_a_class_from_storage_on_a_server_and_by_class_stream_on_a_device() 
     let out = device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
     assert!(format!("{out:?}").contains("Beard"), "a slot the device had never seen is shown: {out:?}");
     assert!(compile("@server object A {}\nobject B { f() { A.get(\"*\") } }").is_ok(), "compiles; `*` is refused when run");
+}
+
+const ROSTER: &str = r#"type Booker = { customer: string, name: string, at: number }
+@server @read("staff") @retain("1d") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+  @allow("signedIn") add(name: string) { this.entries.push({ customer: caller.id, name, at: Date.now() }) }
+}
+"#;
+
+#[test]
+fn several_peoples_entries_are_exported_erased_and_kept_only_as_long_as_each_is_allowed() {
+    let mut rt = server(ROSTER, false);
+    call_as(&mut rt, 1.0, "Roster/main", "add", json!(["Ana"]), who("user:ana", &[])).unwrap();
+    call_as(&mut rt, 2.0, "Roster/main", "add", json!(["Bo"]), who("user:bo", &[])).unwrap();
+    // The roster is not one person's: nobody's erasure blanks it.
+    assert!(!rt.export_subject("user:ana").unwrap().as_object().unwrap().contains_key("Roster/main"));
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Roster/main#entries"], json!([{ "customer": "user:ana", "name": "Ana", "at": 1 }]));
+    // Staff, whom the rule admits, read the list; a tool sees it masked.
+    let staff = rt.handle(3.0, Input::Get { object: "Roster/main".into(), reply: Some(1), caller: who("key:sam", &["staff"]) });
+    assert!(format!("{staff:?}").contains("Ana") && format!("{staff:?}").contains("Bo"), "{staff:?}");
+    let tool = rt.handle(3.0, Input::Get { object: "Roster/main".into(), reply: Some(2), caller: Some(Caller::trusted()) });
+    assert!(!format!("{tool:?}").contains("Ana"), "{tool:?}");
+    // Erasing ana takes her entries out, and only hers.
+    let e = rt.erase_subject("user:ana", None).unwrap();
+    assert!(e.erased.contains(&"Roster/main#entries".to_string()), "{:?}", e.erased);
+    assert_eq!(rt.export_subject("user:bo").unwrap()["Roster/main#entries"][0]["name"], json!("Bo"));
+    assert!(rt.export_subject("user:ana").unwrap().get("Roster/main#entries").is_none());
+    // Each entry is kept for a day from its own time: the sweep takes bo's out after that.
+    call_as(&mut rt, 50_000_000.0, "Roster/main", "add", json!(["Cy"]), who("user:cy", &[])).unwrap();
+    rt.handle(86_400_000.0 + 10.0, Input::Tick);
+    rt.handle(86_400_000.0 + 20.0, Input::Tick);
+    let left = rt.handle(86_400_000.0 + 30.0, Input::Get { object: "Roster/main".into(), reply: Some(3), caller: who("key:sam", &["staff"]) });
+    assert!(!format!("{left:?}").contains("\\\"Bo\\\"") && format!("{left:?}").contains("Cy"), "{left:?}");
+}
+
+#[test]
+fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| format!("{} | {}", d.message, d.hint.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    assert_eq!(msg(ROSTER), "");
+    assert!(msg("@server @read(\"staff\") object R {\n  @pii(\"contact\", \"b\") @by(\"customer\") names: string[] = []\n}\n").contains("needs names's entries to be records with `customer: string`"));
+    assert!(msg("@server @read(\"anyone\") object R {\n  @pii(\"contact\", \"b\") @by(\"customer\") e: { customer: string }[] = []\n}\n").contains("cannot be read by anyone"));
+    assert!(msg("@server @read(\"staff\") @retain(\"1d\") object R {\n  @pii(\"contact\", \"b\") @by(\"customer\") e: { customer: string }[] = []\n}\n").contains("each entry needs its own time"));
+    assert!(msg("@server @read(\"staff\") object R {\n  @by(\"customer\") e: { customer: string }[] = []\n}\n").contains("fields take @pii"));
+    // A copy of personal data is kept only where it is marked as personal data.
+    let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
+    assert!(e.contains("is kept in `Cache.names`, where export and erasure cannot find whose it is") && e.contains("@by"), "{e}");
+    // Marked @pii but not a @by list: export and erasure still could not find it.
+    let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  @pii(\"contact\", \"booking\") names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
+    assert!(e.contains("where export and erasure cannot find whose it is"), "{e}");
+    // A personal field on a shared object's own method is no better: the slot is not the person.
+    let e = msg("@server @read(\"owner\") object Profile {\n  @pii(\"contact\", \"booking\") name: string = \"\"\n}\n@server @read(\"anyone\") object Slot {\n  @pii(\"contact\", \"booking\") bookerName: string = \"\"\n  @allow(\"signedIn\") book() { this.bookerName = reveal(Profile.get(caller.id).name, \"booking\") }\n}\n");
+    assert!(e.contains("is kept in `this.bookerName`, where export and erasure cannot find whose it is"), "{e}");
+    // A device object may hold what the server revealed: it is cleared at sign-out.
+    let e = msg("@server @read(\"owner\") object P {\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") mine(): string { return reveal(this.name, \"booking\") }\n}\nobject Screen {\n  shown: string = \"\"\n  async load() { this.shown = await P.get(caller.id).mine() }\n}\n");
+    assert_eq!(e, "", "a device object may show it");
+    let mixed = |rest: &str| msg(&format!("@server @read(\"staff\") object R {{
+  @pii(\"contact\", \"b\") @by(\"customer\") e: {{ customer: string }}[] = []
+{rest}}}
+"));
+    assert!(mixed("  @pii(\"contact\", \"b\") phone: string = \"\"
+").contains("mixes a list of several people's entries"));
+    assert!(mixed("  @allow(\"owner\") f() {}
+").contains("mixes a list of several people's entries"));
 }
 
 #[test]

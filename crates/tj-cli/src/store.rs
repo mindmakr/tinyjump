@@ -106,7 +106,11 @@ impl Store for FileStore {
     /// Deletes a record, durably.
     fn remove(&mut self, key: &str) -> Result<(), String> {
         let path = self.path(key);
-        fs::remove_file(&path).and_then(|()| sync_dir(&self.dir)).map_err(|e| format!("{}: {e}", path.display()))
+        match fs::remove_file(&path) {
+            // Never saved: already gone, as on the device stores.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r.and_then(|()| sync_dir(&self.dir)).map_err(|e| format!("{}: {e}", path.display())),
+        }
     }
 
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
