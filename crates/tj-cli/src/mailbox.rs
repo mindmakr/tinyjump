@@ -32,6 +32,9 @@ impl Event {
 pub struct Mailbox {
     /// Only events about these objects are kept; empty means all.
     only: Vec<String>,
+    /// Who reads it: their own objects come with personal data, others masked. `None`: the
+    /// admin or an anonymous caller, who own nothing.
+    reader: Option<String>,
     stats: Option<Arc<Stats>>,
     queue: Mutex<Queue>,
     ready: Condvar,
@@ -45,7 +48,18 @@ struct Queue {
 
 impl Mailbox {
     pub fn new(only: Vec<String>, stats: Option<Arc<Stats>>) -> Mailbox {
-        Mailbox { only, stats, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
+        Mailbox { only, reader: None, stats, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
+    }
+
+    pub fn read_by(mut self, reader: Option<String>) -> Mailbox {
+        self.reader = reader;
+        self
+    }
+
+    /// Whether this reader owns `object` (`Class/id`), and so sees its personal data.
+    pub fn owns(&self, object: &str) -> bool {
+        let id = object.split_once('/').map_or("", |(_, id)| id);
+        self.reader.as_deref().is_some_and(|r| tj_core::runtime::access::owns(r, id))
     }
 
     /// Adds an event; false once the client has gone, so the sender can forget it.

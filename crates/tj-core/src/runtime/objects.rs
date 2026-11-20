@@ -168,7 +168,7 @@ impl Runtime {
     }
 
     /// A fresh record of the default state of class `class`.
-    fn defaults(&mut self, class: u16) -> Result<Rc<RefCell<Record>>, Exc> {
+    pub(crate) fn defaults(&mut self, class: u16) -> Result<Rc<RefCell<Record>>, Exc> {
         let init = Rc::new(Closure { proto: self.program.objects[class as usize].init, upvals: Vec::new(), this: None });
         let f = self.fiber_for(&Value::Func(init), Vec::new())?;
         match self.run_sync(f).map_err(|fail| Exc::msg(fail.message))? {
@@ -393,14 +393,36 @@ impl Runtime {
         out.into_iter().map(|(_, o)| o).collect()
     }
 
+    /// Every loaded object, for tools: personal data is always masked here.
     pub(crate) fn object_states(&self) -> Json {
-        let mut list: Vec<(String, Json)> = self.instances.values().map(|i| (i.handle.key(), Value::Rec(i.state.clone()).to_json().unwrap_or(Json::Null))).collect();
+        let state = |i: &Instance| {
+            let mut s = Value::Rec(i.state.clone()).to_json().unwrap_or(Json::Null);
+            self.mask(i.handle.class, &mut s);
+            s
+        };
+        let mut list: Vec<(String, Json)> = self.instances.values().map(|i| (i.handle.key(), state(i))).collect();
         list.sort_by(|a, b| a.0.cmp(&b.0));
         Json::Array(list.into_iter().map(|(object, state)| json!({ "object": object, "state": state })).collect())
     }
 
-    /// Persists every object touched by the last input whose record changed.
-    pub(crate) fn flush(&mut self) {
+    /// Gives an object a new state and drops its alarms and call records (erasure). The
+    /// alarms it had, in case the erasure cannot be saved.
+    pub(crate) fn reset(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) -> Vec<Alarm> {
+        let inst = self.inst_mut(o);
+        inst.state = state;
+        inst.calls.clear();
+        let alarms = std::mem::take(&mut inst.alarms);
+        self.touched.insert((o.class, o.id.clone()));
+        alarms
+    }
+
+    pub(crate) fn put_alarms(&mut self, o: &ObjRef, alarms: Vec<Alarm>) {
+        self.inst_mut(o).alarms = alarms;
+    }
+
+    /// Persists every object touched by the last input whose record changed. Whether every
+    /// save worked.
+    pub(crate) fn flush(&mut self) -> bool {
         let touched = std::mem::take(&mut self.touched);
         let mut index_changed = false;
         let mut seq_changed = false;
@@ -473,6 +495,7 @@ impl Runtime {
                 self.outputs.push(Output::Error { message: format!("could not save the alarm index: {e}"), trace: Vec::new() });
             }
         }
+        !failed
     }
 
     /// Puts an object's state and call records back to its last saved record, after a failed

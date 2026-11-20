@@ -38,6 +38,8 @@ enum Msg {
     MayRead { objects: Vec<String>, caller: Caller, done: Sender<Result<(), Failure>> },
     /// The core's statistics (`Runtime::stats`).
     Stats(Sender<Json>),
+    /// Export (`erase: false`) or erase everything held about a person.
+    Privacy { subject: String, erase: bool, done: Sender<Result<Json, Failure>> },
     Reload(String),
 }
 
@@ -122,7 +124,11 @@ impl Engine {
     /// with the current state of each of `objects` that changed after change number `since`,
     /// so a client that reconnects resumes where it left off instead of refetching.
     pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<Arc<Mailbox>, Failure> {
-        let events = Arc::new(Mailbox::new(objects.clone(), Some(self.stats.clone())));
+        let reader = match &caller {
+            Some(Caller::Remote { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        let events = Arc::new(Mailbox::new(objects.clone(), Some(self.stats.clone())).read_by(reader));
         let (done, r) = channel();
         self.tx.send(Msg::Subscribe { events: events.clone(), objects, since, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
         Self::wait(&r)??;
@@ -133,6 +139,14 @@ impl Engine {
     pub fn may_read(&self, objects: Vec<String>, caller: Caller) -> Result<(), Failure> {
         let (done, r) = channel();
         self.tx.send(Msg::MayRead { objects, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)?
+    }
+
+    /// Everything held about `subject` (`erase: false`), or erases it and forgets their audit
+    /// pseudonym (docs/privacy.md).
+    pub fn privacy(&self, subject: String, erase: bool) -> Result<Json, Failure> {
+        let (done, r) = channel();
+        self.tx.send(Msg::Privacy { subject, erase, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
         Self::wait(&r)?
     }
 
@@ -167,10 +181,12 @@ struct Dispatch {
     audit: Audit,
 }
 
-/// Who waits for a reply, and for calls, the method and when the call was sent.
+/// Who waits for a reply; for calls, the method and when the call was sent; for reads of
+/// personal data, what to write to the audit log once it was read.
 struct Waiter {
     reply: Reply,
     timed: Option<(String, Instant)>,
+    read: Option<(String, Caller)>,
 }
 
 /// Whether `caller` may read every one of `objects`, checked on the runtime thread.
@@ -182,7 +198,7 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Fai
 fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit) {
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone());
     let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit };
-    d.outputs(boot_out);
+    d.outputs(&rt, boot_out);
     loop {
         let msg = match rt.next_wake() {
             Some(at) => rx.recv_timeout(Duration::from_millis((at - now_ms()).max(0.0) as u64)),
@@ -196,8 +212,13 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                         Input::Call { object, method, .. } => rt.method_name(object, method).map(|name| (name, sent)),
                         _ => None,
                     };
+                    // The admin's reads are audited where they arrive; a person's, here.
+                    let read = match &input {
+                        Input::Get { object, caller: Some(c @ Caller::Remote { .. }), .. } if rt.holds_personal_data(object) => Some((object.clone(), c.clone())),
+                        _ => None,
+                    };
                     d.next_reply += 1;
-                    d.replies.insert(d.next_reply, Waiter { reply, timed });
+                    d.replies.insert(d.next_reply, Waiter { reply, timed, read });
                     set_reply(&mut input, d.next_reply);
                 }
                 rt.handle(now_ms(), input)
@@ -205,6 +226,23 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Ok(Msg::Stats(done)) => {
                 let _ = done.send(rt.stats());
                 continue;
+            }
+            Ok(Msg::Privacy { subject, erase, done }) => {
+                if !erase {
+                    let _ = done.send(rt.export_subject(&subject).map_err(|e| (503, e)));
+                    continue;
+                }
+                match rt.erase_subject(&subject) {
+                    Ok((erased, out)) => {
+                        d.audit.forget(&subject);
+                        let _ = done.send(Ok(json!({ "erased": erased })));
+                        out
+                    }
+                    Err(e) => {
+                        let _ = done.send(Err(e));
+                        continue;
+                    }
+                }
             }
             Ok(Msg::EffectDone(id, result)) => {
                 let (ok, error) = match result {
@@ -223,10 +261,16 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     continue;
                 }
                 let _ = done.send(Ok(()));
+                if let Some(c) = caller.filter(|c| matches!(c, Caller::Remote { .. })) {
+                    for object in objects.iter().filter(|o| rt.holds_personal_data(o)) {
+                        d.audit.record(Entry::new("stream").who(Actor::of(&c)).object(object));
+                    }
+                }
                 // Catch-up and live changes come from this one thread, so the client sees every
                 // change once, in order.
                 for o in rt.changed_since(&objects, since) {
                     if let Output::Changed { object, state, seq } = o {
+                        let state = if events.owns(&object) { None } else { rt.masked(&object, &state) }.unwrap_or(state);
                         events.push(changed_event(&object, &state, seq));
                     }
                 }
@@ -250,18 +294,21 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Err(RecvTimeoutError::Timeout) => rt.handle(now_ms(), Input::Tick),
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        d.outputs(out);
+        d.outputs(&rt, out);
     }
 }
 
 impl Dispatch {
-    fn outputs(&mut self, out: Vec<Output>) {
+    fn outputs(&mut self, rt: &Runtime, out: Vec<Output>) {
         for o in out {
             match o {
                 Output::Reply { reply, ok, error, status } => {
                     if let Some(w) = self.replies.remove(&reply) {
                         if let Some((name, sent)) = &w.timed {
                             self.stats.method(name, sent.elapsed(), error.is_none());
+                        }
+                        if let Some((object, caller)) = w.read.filter(|_| error.is_none()) {
+                            self.audit.record(Entry::new("read").who(Actor::of(&caller)).object(&object));
                         }
                         let _ = w.reply.send(match error {
                             Some(e) => Err((status.unwrap_or(400), e)),
@@ -278,7 +325,17 @@ impl Dispatch {
                     let merge = (name == "read").then_some("read");
                     self.broadcast(Event::new(object, merge, text));
                 }
-                Output::Changed { object, state, seq } => self.broadcast(changed_event(&object, &state, seq)),
+                Output::Changed { object, state, seq } => {
+                    let full = changed_event(&object, &state, seq);
+                    match rt.masked(&object, &state) {
+                        // Personal data goes to its owner only.
+                        Some(masked) => {
+                            let masked = changed_event(&object, &masked, seq);
+                            self.subscribers.retain(|s| s.push(if s.owns(&object) { full.clone() } else { masked.clone() }));
+                        }
+                        None => self.broadcast(full),
+                    }
+                }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
                 Output::Ran { object, method, by, caller, ok, ms } => {
                     let kind = match by.as_str() {

@@ -378,9 +378,6 @@ impl<'a> Parser<'a> {
                 methods.push(Method { decorators: member_decorators, private, func });
                 continue;
             }
-            if let Some(d) = member_decorators.first() {
-                return Err(Diagnostic::new("decorators are only allowed on methods", d.span));
-            }
             if private {
                 return Err(Diagnostic::new("fields cannot be private", private_span)
                     .hint("every field is readable; only the object's own methods can change it"));
@@ -390,7 +387,7 @@ impl<'a> Parser<'a> {
             if !(self.eat(&Tok::Semi)? || self.eat(&Tok::Comma)? || self.cur.nl_before || self.at(&Tok::RBrace)) {
                 return Err(self.unexpected("';' or a new line"));
             }
-            fields.push(Field { name: mname, ty, init, span: mspan });
+            fields.push(Field { decorators: member_decorators, name: mname, ty, init, span: mspan });
         }
         self.bump()?;
         Ok(ObjectDecl { decorators, name, fields, methods, span: self.since(start) })

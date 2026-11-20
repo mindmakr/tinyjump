@@ -25,7 +25,7 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 | type | fields | reply |
 |---|---|---|
 | `call` | `object: "Class/id"`, `method`, `args: []`, `caller` (below), optional `call` id: a call with an id runs once for that caller, and repeats get the first result | method result |
-| `get` | `object`, `caller` | state |
+| `get` | `object`, `caller` | state; `@pii` fields are `"•••"` unless the caller owns the object |
 | `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
 | `effectDone` | `id`, and either `ok` or `error`; `unreachable: true` when a server call got no answer | — |
 | `online` | — : the server is reachable again (the change stream connected), so queued server calls are retried now | — |

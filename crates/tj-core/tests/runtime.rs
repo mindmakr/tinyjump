@@ -845,6 +845,81 @@ fn fetch_warns_once_per_plain_http_origin() {
     }
 }
 
+const ACCOUNTS: &str = r#"
+@server @read("owner", "support") object Account {
+  @pii("contact", "account") email: string = ""
+  @pii("health", "care") notes: string = ""
+  plan: string = "free"
+  @allow("owner") set(email: string, notes: string) {
+    this.email = email
+    this.notes = notes
+    this.schedule(60000, "remind")
+  }
+  @allow("owner") async check() { await fetch("https://example.com/verify") }
+  private remind() { this.plan = "reminded" }
+}
+"#;
+
+#[test]
+fn personal_data_reaches_its_owner_only() {
+    let mut rt = server(ACCOUNTS, false);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", "allergic to nuts"]), ana()).unwrap();
+    let get = |rt: &mut Runtime, caller: Option<Caller>| reply(&rt.handle(2.0, Input::Get { object: "Account/user:ana".into(), reply: Some(1), caller })).unwrap();
+    assert_eq!(get(&mut rt, ana()), json!({ "email": "ana@example.com", "notes": "allergic to nuts", "plan": "free" }));
+    let masked = json!({ "email": "•••", "notes": "•••", "plan": "free" });
+    assert_eq!(get(&mut rt, who("key:desk", &["support"])), masked, "a role that may read sees the rest");
+    assert_eq!(get(&mut rt, Some(Caller::trusted())), masked, "tools too");
+    let inspected = rt.inspect()["objects"].to_string();
+    assert!(inspected.contains("•••") && !inspected.contains("ana@example.com"), "{inspected}");
+}
+
+#[test]
+fn a_person_can_be_exported_and_erased() {
+    let store = Shared::default();
+    let boot = || Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let ana = || who("user:ana", &[]);
+    let mut rt = boot();
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", "allergic"]), ana()).unwrap();
+    call_as(&mut rt, 1.0, "Account/user:bo", "set", json!(["bo@example.com", ""]), who("user:bo", &[])).unwrap();
+
+    // Export: everything held about one person, unmasked, from memory or the store.
+    let mut fresh = boot();
+    assert_eq!(fresh.export_subject("user:ana").unwrap(), json!({ "Account/user:ana": { "email": "ana@example.com", "notes": "allergic", "plan": "free" } }));
+    assert_eq!(fresh.export_subject("user:nobody").unwrap(), json!({}));
+
+    // Not while a call is part way through the object.
+    let pending = rt.handle(2.0, Input::Call { object: "Account/user:ana".into(), method: "check".into(), args: vec![], reply: Some(5), call: None, caller: ana() });
+    let effect = pending.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(409));
+    rt.handle(3.0, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
+
+    // Erase: back to the defaults, alarms gone, and the blank state goes out as a change.
+    let (erased, out) = rt.erase_subject("user:ana").unwrap();
+    assert_eq!(erased, ["Account/user:ana"]);
+    let change = out.iter().find_map(|o| if let Output::Changed { object, state, seq } = o { Some((object.clone(), state.clone(), *seq)) } else { None }).expect("replicas hear of it");
+    assert_eq!((change.0.as_str(), &change.1), ("Account/user:ana", &json!({ "email": "", "notes": "", "plan": "free" })));
+    let stored = store.0.borrow().data.get("Account/user:ana").cloned().unwrap();
+    assert!(!stored.contains("ana@example.com") && !stored.contains("\"alarms\":[{"), "{stored}");
+    assert_eq!(boot().export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""), "after a restart too");
+    assert_eq!(boot().export_subject("user:bo").unwrap()["Account/user:bo"]["email"], json!("bo@example.com"), "nobody else");
+    // A device that reconnects later resumes after its change number and gets the blank.
+    assert!(rt.changed_since(&["Account/user:ana".into()], change.2 - 1).len() == 1);
+}
+
+#[test]
+fn a_failed_erasure_erases_nothing() {
+    let store = Flaky::default();
+    let mut rt = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", ""]), who("user:ana", &[])).unwrap();
+    store.1.set(true);
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    store.1.set(false);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!("ana@example.com"), "and says so, rather than claiming it worked");
+    rt.handle(61_000.0, Input::Tick);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["plan"], json!("reminded"), "its alarms still run");
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
@@ -902,6 +977,14 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("object A { f() { invoke(\"A/a\", \"f\", []) } }").contains("is for plugin modules"), "apps cannot act as someone through invoke");
     assert!(msg("object A { @exclusive(\"x\") f() {} }").contains("@exclusive takes no arguments"));
     assert!(msg("object A { @exclusive @exclusive f() {} }").contains("repeated decorator @exclusive"));
+    // Personal data.
+    assert!(msg("object A { @pii(\"contact\", \"account\") email: string = \"\" }").contains("personal data lives in @server objects"));
+    assert!(msg("@server object A { @pii(\"emails\", \"account\") email: string = \"\" }").contains("'emails' is not a personal-data category | use one of: contact"));
+    assert!(msg("@server object A { @pii(\"contact\") email: string = \"\" }").contains("say what 'email' is for"));
+    assert!(msg("@server object A { @pii(\"contact\", \"for ads\") email: string = \"\" }").contains("say what 'email' is for"));
+    assert!(msg("@server object A { @pii(contact, \"x\") email: string = \"\" }").contains("as strings"));
+    assert!(msg("@server object A { @pii(\"contact\", \"a\") @pii(\"contact\", \"b\") email: string = \"\" }").contains("repeated field decorator"));
+    assert!(msg("@server object A { @every(\"1s\") n: number = 0 }").contains("fields take one @pii"));
 }
 
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.

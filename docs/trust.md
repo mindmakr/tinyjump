@@ -195,7 +195,7 @@ As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
   warns once per plain-HTTP origin (this machine and the Android emulator's view of it
   excepted).
 
-## 6. Personal data
+## 6. Personal data (first part built: see [privacy.md](privacy.md))
 
 ```ts
 @server @read("owner") object Account {
@@ -242,6 +242,31 @@ As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
 - **Data map:** `tj check --privacy` lists every personal-data field with its category,
   purpose, readers, retention and every accepted flow. It also writes a record of
   processing (GDPR article 30) from the same facts.
+
+As built, in three parts:
+
+1. **Built:** `@pii` with checked categories and purposes; masking in `get`, change
+   streams (per subscriber: the owner gets the values) and every tool; `tj privacy
+   export|erase` through `/_tj/privacy`, audited first; erase forgets the person's audit
+   pseudonym; reads and streams of personal data are audited; `tj check --privacy`.
+2. **Next:** the flow check and `reveal()`, and purposes checked against it.
+3. **Then:** `@retain` and `@legalHold`, per-person keys (crypto-shredding), app-level
+   export and erase behind the `privacy` role, and the record of processing.
+
+Corrections made while building:
+
+- **Erase blanks, it does not delete.** Object handles can live in globals, other objects'
+  fields and waiting calls, so an object cannot leave memory safely. Erase resets it to its
+  defaults and saves that with a new change number. This is also what makes it reach
+  devices: a deleted record would come back with change number 0, and a device that
+  reconnects with a higher number would keep its stale copy. A real tombstone protocol is
+  not needed for this.
+- **Erase refuses while a call is part way through the object** (409): an awaiting call
+  could otherwise write personal data back after the erasure.
+- **The special categories** are health to sexual (article 9) and criminal (article 10);
+  identifiers, location and financial data are personal data but not special.
+- **Masking is per subscriber on streams,** so one change produces two events at most: the
+  owner's and everyone else's.
 
 ## 7. Compliance packs
 

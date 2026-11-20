@@ -243,7 +243,7 @@ impl Compiler {
                 }
                 Item::Object(o) => {
                     if self.check_top_name(&o.name, o.span) {
-                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None });
+                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None, pii: Vec::new() });
                         self.add_global(&o.name, false, GKind::Object);
                     }
                 }
@@ -341,11 +341,21 @@ impl Compiler {
         }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut fields = Vec::new();
+        let mut pii = Vec::new();
         for f in &o.fields {
             if OBJECT_RESERVED.contains(&f.name.as_str()) {
                 self.error(Diagnostic::new(format!("'{}' is reserved on objects", f.name), f.span).hint("`this.id`, `this.emit()` and `this.schedule()` are built in"));
             } else if !seen.insert(&f.name) {
                 self.error(Diagnostic::new(format!("'{}' is declared twice", f.name), f.span));
+            }
+            for (i, d) in f.decorators.iter().enumerate() {
+                if d.name != "pii" || i > 0 {
+                    self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take one @pii(category, purpose); other decorators go on methods"));
+                } else if !server {
+                    self.error(Diagnostic::new("personal data lives in @server objects", d.span).hint(format!("add @server to {}: the server is where it can be exported and erased", o.name)));
+                } else if let Some(p) = self.pii(d, &f.name) {
+                    pii.push(p);
+                }
             }
             fields.push(Rc::from(f.name.as_str()));
         }
@@ -406,6 +416,27 @@ impl Compiler {
         def.methods = methods;
         def.server = server;
         def.read = read;
+        def.pii = pii;
+    }
+
+    /// `@pii(category, purpose, ...)` on `field`.
+    fn pii(&mut self, d: &Decorator, field: &str) -> Option<Pii> {
+        let words: Option<Vec<&str>> = d.args.iter().map(|a| if let ExprKind::Str(w) = &a.kind { Some(w.as_str()) } else { None }).collect();
+        let hint = "e.g. @pii(\"contact\", \"account\"): a category, then what the data is for";
+        let Some([category, purposes @ ..]) = words.as_deref() else {
+            self.error(Diagnostic::new("@pii takes a category and at least one purpose, as strings", d.span).hint(hint));
+            return None;
+        };
+        if !PII_CATEGORIES.contains(category) {
+            self.error(Diagnostic::new(format!("'{category}' is not a personal-data category"), d.span).hint(format!("use one of: {}", PII_CATEGORIES.join(", "))));
+            return None;
+        }
+        let word = |w: &&str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        if purposes.is_empty() || !purposes.iter().all(word) {
+            self.error(Diagnostic::new(format!("say what '{field}' is for: @pii needs a purpose after the category"), d.span).hint(hint));
+            return None;
+        }
+        Some(Pii { field: Rc::from(field), category: Rc::from(*category), purposes: purposes.iter().map(|p| Rc::from(*p)).collect() })
     }
 
     // ---------- functions and scopes ----------

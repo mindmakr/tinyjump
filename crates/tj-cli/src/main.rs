@@ -12,6 +12,7 @@ mod identity;
 mod mailbox;
 mod plugin_server;
 mod plugins;
+mod privacy;
 mod stats;
 mod mcp;
 mod review;
@@ -34,13 +35,17 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj> [--access]   compile and report errors; --access prints who may read and call what
+  tj check <app.tj> [--access] [--privacy]
+                                 compile and report errors; --access prints who may read and call what,
+                                 --privacy the personal data the app holds and for what
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
   tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
+  tj privacy export|erase <person id> [--target <url>]
+                                 everything a running server holds about a person, or erase it
   tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
   tj plugin ai | fake <file.json>
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
@@ -92,6 +97,7 @@ struct Args {
     budget: Option<PathBuf>,
     json: bool,
     access: bool,
+    privacy: bool,
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
@@ -109,7 +115,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -121,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
             "--budget" => args.budget = Some(PathBuf::from(value()?)),
             "--json" => args.json = true,
             "--access" => args.access = true,
+            "--privacy" => args.privacy = true,
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
@@ -135,6 +142,15 @@ fn parse_args() -> Result<Args, String> {
 fn main() -> ExitCode {
     // `tj plugin <name> [file]` speaks MCP on stdio; it has its own arguments.
     let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("privacy") {
+        return match privacy::run(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw.get(1).map(String::as_str) == Some("plugin") {
         let Some(name) = raw.get(2) else {
             eprintln!("error: tj plugin needs a name (ai, fake)\n\n{USAGE}");
@@ -160,7 +176,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.access)),
+        "check" => args.file().and_then(|f| check(f, args.access, args.privacy)),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -230,14 +246,17 @@ fn read_source(file: &Path) -> Result<String, String> {
     app::read(file).map(|a| a.source)
 }
 
-fn check(file: &Path, access: bool) -> Result<(), String> {
+fn check(file: &Path, access: bool, privacy: bool) -> Result<(), String> {
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
-        Ok(_) => {
+        Ok(program) => {
             println!("ok: {name}");
             if access {
                 print!("{}", access::report(&src));
+            }
+            if privacy {
+                print!("{}", privacy::report(&program));
             }
             Ok(())
         }

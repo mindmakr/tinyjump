@@ -184,7 +184,7 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Personal-data handling with GDPR and PDPL subject rights.</li>
+          <li>Checking where personal data flows, retention, and per-person keys so an erasure reaches backups too.</li>
           <li>Compliance packs for the EU, Saudi Arabia, the wider MENA region and the US, which others can extend.</li>
           <li>Servers that talk to each other, and webhooks.</li>
           <li>More native components (navigation, long lists, forms), translations, and one-command app builds.</li>
@@ -197,6 +197,7 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>Personal data, marked and masked.</b> <code>@pii("contact", "account")</code> marks a field with its category and purpose. Its owner reads it; other readers and every tool, agents included, see <code>•••</code>. <code>tj privacy export</code> and <code>erase</code> act on everything held about one person, erasures reach their devices like any other change, and the audit log forgets them. <code>tj check --privacy</code> prints the data map. Still to come, and said so in the docs: checking where personal data flows in code, retention, and backups.</li>
           <li><b>Encrypted at rest, and secrets for apps.</b> Set <code>TJ_KEY_FILE</code> and every stored object is sealed with AES-256-GCM under its own key; file names reveal nothing, and keys change without re-encrypting. Apps get <code>crypto.randomId()</code>, <code>crypto.hmac()</code> and <code>crypto.timingSafeEqual()</code>, backed by secure random bytes from every host. A server reachable from other machines refuses credentials over plain HTTP. On the way we fixed an older flaw: a record that could not be read made its object start empty, and its next save overwrote it. Now the call fails instead.</li>
           <li><b>An audit log that shows tampering.</b> Every API call, refusal, admin request, timer, alarm, agent tool and plugin call is written down: who, what, the outcome and the time taken, never values. Each line is chained to the one before with a keyed hash, and signed checkpoints can be copied off the machine. <code>tj audit verify</code> finds a changed, removed or reordered line, and with that copy, a history rewritten by someone holding the key. People appear as random tokens, so forgetting someone does not mean editing the log.</li>
           <li><b>One call at a time, where it matters.</b> Mark a method <code>@exclusive</code> and an object runs one such call at a time, like an actor, even across <code>await</code>. Three payments of 60 from a balance of 100, sent at once: one goes through instead of all three. Calls that would wait for each other fail at once instead of hanging, and an agent's tools never wait for the agent.</li>

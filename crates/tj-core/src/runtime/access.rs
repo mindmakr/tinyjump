@@ -23,6 +23,10 @@ pub enum Who {
 }
 
 impl Who {
+    pub fn owns(&self, object_id: &str) -> bool {
+        matches!(self, Who::Remote { id, .. } if owns(id, object_id))
+    }
+
     /// A protocol caller, as a server (`trusted` is the server itself) or a device sees it.
     pub fn from_caller(c: &Caller, server: bool) -> Who {
         match c {
@@ -54,13 +58,19 @@ impl Who {
 /// The words of an `@read` / `@allow` rule.
 pub type Rule = Rc<[Rc<str>]>;
 
+/// Whether the caller with id `caller_id` owns the object with id `object_id`: the object
+/// is theirs. Anonymous callers own nothing, even an object with an empty id.
+pub fn owns(caller_id: &str, object_id: &str) -> bool {
+    !caller_id.is_empty() && caller_id == object_id
+}
+
 /// Whether `rule` lets `who` act on the object with id `object_id`.
 fn allows(rule: &[Rc<str>], who: &Who, object_id: &str) -> bool {
     let Who::Remote { id, roles } = who else { return true };
     rule.iter().any(|word| match &**word {
         "anyone" => true,
         "signedIn" => !id.is_empty(),
-        "owner" => !id.is_empty() && **id == *object_id,
+        "owner" => owns(id, object_id),
         role => roles.iter().any(|r| **r == *role),
     })
 }

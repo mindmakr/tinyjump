@@ -113,6 +113,22 @@ Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take i
 `caller.id`, never from arguments. `tj check app.tj --access` prints every rule. Details:
 [access control](access-control.md).
 
+## Personal data: `@pii`
+
+Mark fields that hold personal data with a category and what they are for. Keep them in an
+`@server` object whose id is the person's id:
+
+```tsx
+@server @read("owner", "support") object Account {
+  @pii("contact", "account") email: string = ""
+  plan: string = "free"
+}
+```
+
+The owner reads the email; other readers and every tool see `•••`. `tj privacy export` and
+`tj privacy erase` act on everything held about one person. `tj check app.tj --privacy`
+prints the data map. Details, and what is not checked yet: [personal data](privacy.md).
+
 ## Plugins
 
 Capabilities such as AI models come as plugins: typed modules named `tj:<name>`, run on the

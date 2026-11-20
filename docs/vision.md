@@ -56,7 +56,8 @@ Next, agreed with the owner on 2026-11-20:
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
-   - personal data with subject rights;
+   - personal data with subject rights (`@pii`, masking, export and erase done; the flow
+     check, retention and per-person keys next);
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
      follows.
