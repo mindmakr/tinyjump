@@ -90,10 +90,13 @@
           me = { id: '', roles: [] };
           return show(me);
         }
+        const k = key.value.trim();
+        if (!k) return;
         try {
-          const m = await whoami(key.value.trim());
-          try { sessionStorage.setItem(KEY, key.value.trim()); } catch (err) { /* private mode */ }
-          app.setToken(key.value.trim(), m.id, m.roles);
+          const m = await whoami(k);
+          if (!m.id) throw new Error('that key is not signed in to anyone');
+          try { sessionStorage.setItem(KEY, k); } catch (err) { /* private mode */ }
+          app.setToken(k, m.id, m.roles);
           key.value = '';
           me = m;
           show(me);

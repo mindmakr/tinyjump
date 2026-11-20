@@ -244,14 +244,12 @@ export async function start(opts) {
     token = newToken || null;
     const sameRoles = (newRoles || []).join(',') === roles.join(',');
     if ((newUser || null) !== user || !sameRoles) {
-      const changed = (newUser || null) !== user;
       user = newUser || null;
       roles = newRoles || [];
-      if (changed) {
-        replicas.clear();
-        if (events) events.close();
-        events = null;
-      }
+      // Another user or other roles: replicas start over, as the runtime's do.
+      replicas.clear();
+      if (events) events.close();
+      events = null;
       send({ type: 'identity', user, roles });
     } else {
       clearTimeout(reconnect);

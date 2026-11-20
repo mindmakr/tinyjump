@@ -1427,6 +1427,16 @@ fn remote_requests_cannot_load_unlimited_objects() {
 }
 
 #[test]
+fn losing_a_role_drops_what_only_that_role_could_read() {
+    let (mut device, _) = boot_as(BOARD, Shared::default(), 0.0, false);
+    device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: vec!["staff".into()] });
+    device.handle(1.0, Input::Sync { object: "Board/b".into(), state: json!({ "notes": ["staff only"] }), seq: Some(5) });
+    let out = device.handle(2.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Board/b")), "read again under the new roles: {out:?}");
+    assert_eq!(state(&mut device, 3.0, "Board/b")["notes"], json!([]));
+}
+
+#[test]
 fn signing_in_as_someone_else_drops_their_queued_calls_and_replicas() {
     let store = Shared::default();
     let (mut device, _) = boot_as(BOARD, store.clone(), 0.0, false);

@@ -75,8 +75,9 @@ pub struct Dev {
     next_ask: AtomicU64,
 }
 
-/// How long a browser tab has to answer an agent.
-const TAB_ANSWER: Duration = Duration::from_secs(10);
+/// How long a browser tab has to answer an agent. An open tab answers in milliseconds; one
+/// that closed is only noticed when this runs out.
+const TAB_ANSWER: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(3) };
 
 impl Dev {
     pub fn notify_reload(&self) {
@@ -86,31 +87,43 @@ impl Dev {
     }
 
     /// Asks the newest open tab to `inspect` or take an `input`; `None` when no tab is open,
-    /// and the server answers itself.
+    /// and the server answers itself. A tab that does not answer is dropped, and the question
+    /// goes to the next open tab, or to the server.
     fn ask(&self, kind: &str, input: &Json) -> Option<Result<Json, Failure>> {
         let id = self.next_ask.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = channel();
         self.asks.lock().ok()?.insert(id, tx);
         let text = format!("event: ask\ndata: {}\n\n", json!({ "id": id, "kind": kind, "input": input }));
-        let sent = {
+        let tab = {
             let mut tabs = self.tabs.lock().ok()?;
             loop {
                 match tabs.last() {
-                    Some(tab) if tab.push(Event::new(String::new(), None, text.clone())) => break true,
+                    Some(tab) if tab.push(Event::new(String::new(), None, text.clone())) => break Some(tab.clone()),
                     Some(_) => drop(tabs.pop()),
-                    None => break false,
+                    None => break None,
                 }
             }
         };
-        let answer = sent.then(|| rx.recv_timeout(TAB_ANSWER));
+        let answer = tab.as_ref().map(|_| rx.recv_timeout(TAB_ANSWER));
         if let Ok(mut asks) = self.asks.lock() {
             asks.remove(&id);
         }
         Some(match answer? {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => Err((400, e)),
-            Err(_) => Err((504, "the browser tab did not answer; is the app open and running?".into())),
+            Err(_) => {
+                self.forget_tab(tab.as_ref().expect("asked a tab"));
+                return self.ask(kind, input);
+            }
         })
+    }
+
+    /// A tab that closed (its stream ended) or stopped answering.
+    fn forget_tab(&self, tab: &Arc<Mailbox>) {
+        tab.close();
+        if let Ok(mut tabs) = self.tabs.lock() {
+            tabs.retain(|t| !Arc::ptr_eq(t, tab));
+        }
     }
 
     fn answer(&self, id: u64, r: Result<Json, String>) {
@@ -307,17 +320,27 @@ fn handle(mut req: Request, front: &Front) {
             }))
         }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
-        // Under `tj dev` the screen is in the browser tab, which answers when it is open.
+        // Under `tj dev` the screen is in the browser tab, which answers when it is open; the
+        // server's objects, which it holds for real, come from the server either way.
         (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| {
-            let screen = front.dev.as_ref().and_then(|d| d.ask("inspect", &Json::Null));
-            screen.unwrap_or_else(|| engine.request(Input::Inspect { reply: None }))
+            let server = engine.request(Input::Inspect { reply: None })?;
+            match front.dev.as_ref().and_then(|d| d.ask("inspect", &Json::Null)) {
+                Some(screen) => screen.map(|mut s| {
+                    s["serverObjects"] = server["objects"].clone();
+                    s
+                }),
+                None => Ok(server),
+            }
         }).map(|mut s| {
             s["server"] = engine.stats().json();
             s
         })),
         // Who the credentials (or their absence) say the caller is: the web host signs in
         // with it. Outside `/_tj/`, so a person's own key is enough.
-        (Method::Get, ["api", "whoami"]) => result_response(front.identity.verify(authorization.as_deref()).map(|v| match v.caller {
+        (Method::Get, ["api", "whoami"]) => result_response({
+            asked = Some(("whoami", None, None));
+            front.identity.verify(authorization.as_deref())
+        }.map(|v| match v.caller {
             Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some() }),
             Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some() }),
         })),
@@ -337,9 +360,12 @@ fn handle(mut req: Request, front: &Front) {
         (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
             let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
             front.audit.security(admin_input(&input))?;
-            // Under `tj dev`, the open tab takes it, as if a person did it on the screen.
-            if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
-                return r;
+            // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
+            // reads stay here, where the server's objects live.
+            if matches!(input, Input::Ui { .. } | Input::Layout { .. }) {
+                if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
+                    return r;
+                }
             }
             // Automation is trusted (it already passed the admin key), so it says so explicitly.
             if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
@@ -359,11 +385,14 @@ fn handle(mut req: Request, front: &Front) {
             Ok(json!(null))
         })),
         (Method::Get, ["_tj", "reload"]) if front.dev.is_some() => {
+            let dev = front.dev.as_ref().expect("checked");
             let events = Arc::new(Mailbox::new(Vec::new(), None));
-            if let Ok(mut tabs) = front.dev.as_ref().expect("checked").tabs.lock() {
+            if let Ok(mut tabs) = dev.tabs.lock() {
                 tabs.push(events.clone());
             }
-            return sse(req, &events, || true);
+            sse(req, &events, || true);
+            dev.forget_tab(&events);
+            return;
         }
         (Method::Get, rest) if front.web.is_some() => {
             let web = front.web.as_deref().expect("checked");
@@ -610,6 +639,10 @@ mod tests {
         let r = dev.ask("input", &json!({ "type": "ui", "target": { "id": "add" }, "event": "onPress" }));
         answering.join().unwrap();
         assert_eq!(r, Some(Ok(json!({ "pressed": "add" }))));
+
+        // A tab that stops answering (closed, reloading) is dropped, and the server answers.
+        assert!(dev.ask("inspect", &Json::Null).is_none());
+        assert!(dev.tabs.lock().unwrap().is_empty());
     }
 
     #[test]
