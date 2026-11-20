@@ -37,18 +37,45 @@ and the same agents can drive and inspect the running app.
 
 ## Order of work (agreed)
 
-The vision has gained many planned items, so this order keeps the work focused:
+Done so far, in order: resumable change streams, the benchmark and size budget, reliable
+calls and backpressure, modules, the language reference, server metrics, access control,
+and plugins with `tj:ai`.
 
-1. Reliable messaging, step 1: ordered, resumable change streams (done).
-2. **A benchmark and size budget that fail when things get worse (done: `tj bench`,
-   `scripts/budget.sh`):** boot time, render time, and WASM, APK and binary sizes. Without it, "fast and small" drifts as
-   messaging, locales and modules land. Timings also give agents numbers to optimise.
-3. Reliable messaging, steps 2 to 4 (step 2 and backpressure done).
-4. Modules (multi-file apps), since agents need them for real apps (done). Then `tj build`.
-5. **One compact language reference** an agent can load in one go (done: `docs/language.md`,
-   served by `tj docs` and the MCP `language` tool; a test keeps it complete).
-6. The rest of automation (golden images, retro reports; server metrics done), then
-   translations and locale formats, the agent loop, and GPU/3D.
+Next, agreed with the owner on 2026-11-20:
+
+1. **Sign-in tokens (done)** from OpenID Connect providers, proven against a built-in test
+   issuer (no real accounts needed in tests).
+2. **The agent library (`tj:agent`):** an agent's tools are the app's own methods, called
+   under the same access rules as the person it acts for.
+3. **Servers talking to each other:** replicas of another server's objects, then webhooks.
+4. Alongside: **rewrite the marketing site** as one plain page for three readers (founders,
+   developers, agent-driven coders), with real code, measured numbers, the decisions and
+   why, and an honest status and roadmap.
+
+After that: the UI catalog (navigation, long lists, forms, icons, themes), `tj build`, the
+rest of automation (golden images, run reports), translations and locale formats, and
+GPU/3D.
+
+## The ecosystem: filling the gap of missing libraries (agreed)
+
+A new runtime has no libraries yet. That is also its advantage: no legacy, and every
+library can be small, typed, tested and checked against its rules.
+
+- **Short term:**
+  - **MCP plugins** give apps the existing MCP servers (databases, payments, search,
+    GitHub) from day one.
+  - **`fetch`** reaches any web API.
+  - **Device plugins** wrap native code (maps, charts, camera) on each platform.
+  - **Agents write small modules** on demand.
+- **Long term: a tinyjump registry of libraries ported by agents.** Each port is checked
+  against the original library's tests and kept within the size budget. An optional
+  JavaScript-engine plugin, to run existing JavaScript libraries unchanged, comes only if
+  real demand appears: it doubles the runtimes and weakens the guarantees.
+- **For existing systems:** tinyjump runs next to them (it calls them; they call its API and
+  webhooks), so teams move piece by piece. A migration tool (`tj migrate`) that ports
+  TypeScript and React code, comparing old and new behaviour, is a later option.
+- **Data:** objects are the app's database. Queries across objects come next; outside
+  databases come through plugins.
 
 ## One layout engine for every host (done)
 
@@ -110,7 +137,7 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
    call carries an id, and the server drops duplicates, so a retry never runs twice.
 3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
    objects, and durable object-to-object messages on the server.
-4. **Backpressure and access control (done; OIDC sign-in tokens next).** Slow subscribers
+4. **Backpressure and access control (done, with sign-in tokens).** Slow subscribers
    are coalesced to the latest state, and each object declares who may read and call it
    (`docs/access-control.md`).
 
