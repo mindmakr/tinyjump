@@ -226,7 +226,10 @@ impl Runtime {
             for id in ids {
                 let (Ok(o), Ok(fresh)) = (self.instance(class, &id), self.defaults(class)) else { continue };
                 let fresh = fresh.borrow().clone();
-                *self.inst_mut(&o).state.borrow_mut() = fresh;
+                let inst = self.inst_mut(&o);
+                *inst.state.borrow_mut() = fresh;
+                // Its alarms were set for the person who left; their timers find nothing.
+                inst.alarms.clear();
                 self.touch(&o);
                 self.ran_code = true;
             }

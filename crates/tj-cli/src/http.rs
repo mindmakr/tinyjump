@@ -468,6 +468,15 @@ fn query_values(url: &str, name: &str) -> Result<Vec<String>, Failure> {
         .collect()
 }
 
+/// The classes of refused objects, for the audit log. Object ids are never written: they can
+/// be anything a caller makes up, and a person's object id is their id.
+fn classes(objects: &[String]) -> String {
+    let mut classes: Vec<&str> = objects.iter().map(|o| o.split_once('/').map_or("?", |(c, _)| c)).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    classes.join(" ")
+}
+
 /// `POST /api/events/ticket`: a one-time ticket for a stream of the listed objects, bound to
 /// the caller and those objects, stored only by its hash.
 fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Result<Json, Failure> {
@@ -484,8 +493,8 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
             Caller::Remote { id, .. } => Actor::id(Some(id)),
             Caller::Trusted(_) => Actor::Admin,
         };
-        let refused: Vec<&str> = objects.iter().filter(|o| !readable.contains(o)).map(String::as_str).collect();
-        front.audit.record(Entry::new("refused").who(who).text("request", "ticket").text("objects", &refused.join(" ")).num("status", 403));
+        let refused: Vec<String> = objects.iter().filter(|o| !readable.contains(o)).cloned().collect();
+        let _ = front.audit.security(Entry::new("refused").who(who).text("request", "ticket").text("classes", &classes(&refused)).num("status", 403));
     }
     let value = hex(&random::<32>().map_err(|e| (500, e))?);
     let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
@@ -550,7 +559,8 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
             Ok((events, refused)) => {
                 // Partly refused is still a refusal, written to the audit log.
                 if !refused.is_empty() {
-                    front.audit.record(Entry::new("refused").who(caller_id.as_deref().map_or(Actor::Anonymous, |id| Actor::id(Some(id)))).text("request", "stream").text("objects", &refused.join(" ")).num("status", 403));
+                    let who = caller_id.as_deref().map_or(Actor::Anonymous, |id| Actor::id(Some(id)));
+                    let _ = front.audit.security(Entry::new("refused").who(who).text("request", "stream").text("classes", &classes(&refused)).num("status", 403));
                 }
                 Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) })
             }
