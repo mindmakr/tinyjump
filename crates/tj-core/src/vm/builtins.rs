@@ -28,6 +28,7 @@ pub const GLOBALS: &[Global] = &[
     ("Number", || native("Number", |_, a| Ok(Value::Num(to_number(arg(a, 0)))))),
     ("parseInt", || native("parseInt", parse_int)),
     ("parseFloat", || native("parseFloat", |_, a| Ok(Value::Num(parse_float_prefix(&arg(a, 0).display()))))),
+    ("encodeURIComponent", || native("encodeURIComponent", |_, a| Ok(Value::Str(encode_uri_component(&arg(a, 0).display()).into())))),
     ("Error", || native("Error", |_, a| Ok(error_record(&arg(a, 0).display())))),
     // `check(ok, field, message)`: a rule on input, the same in UI code and on the server.
     ("check", || native("check", check)),
@@ -156,7 +157,22 @@ fn object_entries(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 }
 
 fn date_now(rt: &mut Runtime, _: &[Value]) -> Result<Value, Exc> {
+    rt.read_clock = true;
     Ok(Value::Num(rt.now()))
+}
+
+/// As JavaScript's: every byte of the UTF-8 text is `%XX` except letters, digits and
+/// `-_.!~*'()`.
+fn encode_uri_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 pub fn to_number(v: &Value) -> f64 {

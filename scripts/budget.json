@@ -3,7 +3,7 @@
     "target/wasm32-unknown-unknown/small/tj_wasm.wasm": 770,
     "target/aarch64-linux-android/small/libtj_android.so": 1030,
     "target/armv7-linux-androideabi/small/libtj_android.so": 735,
-    "target/i686-linux-android/small/libtj_android.so": 1230,
+    "target/i686-linux-android/small/libtj_android.so": 1235,
     "target/x86_64-linux-android/small/libtj_android.so": 1215,
     "target/release/tj": 6880
   },

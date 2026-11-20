@@ -377,7 +377,7 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 `console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/min/max/random/PI`,
 `JSON.stringify(v, null, 2)/parse`, `Object.keys/values/entries`, `Array.isArray`,
 `Date.now()`, `crypto.randomId/hmac/timingSafeEqual`, `String(x)`, `Number(x)`, `parseInt`,
-`parseFloat`, `fetch`, `Error`.
+`parseFloat`, `encodeURIComponent`, `fetch`, `Error`.
 
 - Strings: `length`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`,
   `includes`, `startsWith`, `endsWith`, `indexOf`, `slice`, `substring`, `split`,
@@ -388,8 +388,9 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   `findIndex`, `some`, `every`, `forEach`, `reduce`, `flatMap`.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
-`Date.now()` may be used anywhere, the UI included; a screen that shows the time is drawn
-again when something changes, so add an `@every` timer to redraw it on a clock.
+`Date.now()` may be used anywhere, the UI included. A screen that reads it is drawn again
+at the start of each minute, and whenever something changes, so a slot turns "past" on
+time with no timer in the app.
 
 Times are plain numbers: milliseconds since 1970 in UTC, in fields, JSON and the HTTP API
 alike. Compare them with `<` and subtract them. For the calendar, use `Time`:
