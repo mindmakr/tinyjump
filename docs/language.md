@@ -299,9 +299,10 @@ Built-in components, drawn as real native widgets:
 | `Spacer` | | | none |
 | `Text` | `lines` | | text |
 | `Button` | `disabled` | `onPress()` | text |
-| `Input` | `value`, `placeholder`, `secure`, `multiline` | `onChange(text)`, `onSubmit(text)` | none |
+| `Input` | `value`, `placeholder`, `secure`, `multiline`, `type`, `zone` | `onChange(text)`, `onSubmit(text)` | none |
 | `Toggle` | `value` | `onChange(checked)` | text (label) |
 | `Image` | `src`, `fit` | | none |
+| `Time` | `value`, `show`, `style`, `zone` | | none |
 
 Every built-in component also accepts `id` (the automation handle), `key` (list identity),
 `label` (accessibility), and the layout and style props `padding`, `margin`, `gap`,
@@ -310,6 +311,18 @@ Every built-in component also accepts `id` (the automation handle), `key` (list 
 (`"bold"` or `"normal"`) and `border` (a width, or `"2px #ccc"`). Numbers are pixels.
 Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 
+- `<Time value={ms} />` shows a time the way the viewer's phone or browser writes it, in
+  their language and time zone. Options:
+  - `show="date" | "time" | "datetime"` (the default is `datetime`);
+  - `zone="UTC"` instead of the viewer's zone;
+  - `style="iso"` for `2026-12-01 14:30`.
+- `<Input type="number" | "date" | "time" | "datetime">` opens the platform's own keypad or
+  picker. Its `value` and what `onChange` receives are numbers, not text:
+  - milliseconds for `date` and `datetime`;
+  - milliseconds since midnight for `time`;
+  - `null` while the entry is empty or not a real date (February 30).
+  - Dates are in the viewer's zone, or in UTC with `zone="UTC"`.
+  - Agents may type `2026-12-01 14:30` into one, and it is read as a person's entry is.
 - Give lists a `key`: `{items.map(i => <Row key={i.id}>…</Row>)}`.
 - `{cond && <X/>}` renders nothing when `cond` is false or null. Bare strings and numbers
   inside `Column`, `Row` and `Scroll` become `Text`.
@@ -332,8 +345,22 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
 `Date.now()` may be used anywhere, the UI included; a screen that shows the time is drawn
-again when something changes, so add an `@every` timer to redraw it on a clock. There is
-no date parsing or formatting yet: work in UTC milliseconds. `Number(x)` is `NaN` when `x`
+again when something changes, so add an `@every` timer to redraw it on a clock.
+
+Times are plain numbers: milliseconds since 1970 in UTC, in fields, JSON and the HTTP API
+alike. Compare them with `<` and subtract them. For the calendar, use `Time`:
+
+- `Time.add(t, { years, months, weeks, days, hours, minutes, seconds })`: any of them.
+  A month later than January 31 is the last day of February.
+- `Time.startOf(t, "minute" | "hour" | "day" | "week" | "month" | "year")`: in UTC; weeks
+  start on Monday.
+- `Time.parts(t)`: `{ year, month, day, hour, minute, second, weekday }` in UTC. Months
+  count from 1; weekdays run from 1 (Monday) to 7 (Sunday).
+- `Time.from({ year, month, day, hour, minute, second })`: the time in UTC, or `null` when
+  the parts are not a real date (February 30, hour 24).
+
+Do not format or parse dates in code: show a time with `<Time>`, and let people pick one
+with `<Input type="date">` (see UI). `Number(x)` is `NaN` when `x`
 is not a number (`Number.isNaN` is not available; `n !== n` is true only for `NaN`).
 
 For secrets, use `crypto`, never `Math.random()`:

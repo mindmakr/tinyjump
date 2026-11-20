@@ -21,8 +21,10 @@ pub struct Layout {
     cache: HashMap<(u32, u64, i32), (f32, f32)>,
 }
 
+/// A widget the host measures: every catalog component that holds no child nodes, apart
+/// from `Spacer`, which only fills space. From the catalog, so a new component is measured.
 fn is_leaf(kind: &str) -> bool {
-    matches!(kind, "Text" | "Button" | "Input" | "Toggle" | "Image")
+    crate::ui::catalog::kind(kind).is_some_and(|k| k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer")
 }
 
 fn num(props: &Map<String, Json>, key: &str) -> Option<f32> {
@@ -228,6 +230,20 @@ mod tests {
         assert_eq!(rect(&f[0]), [0.0, 0.0, 300.0, 65.0], "full width, as tall as its content (like the web)");
         assert_eq!(rect(&f[1]), [10.0, 10.0, 280.0, 20.0]);
         assert_eq!(rect(&f[2]), [10.0, 35.0, 280.0, 20.0]);
+    }
+
+    #[test]
+    fn every_catalog_widget_without_children_is_measured() {
+        // The host knows what a <Time> shows; the layout must ask it (found in Milestone 1:
+        // a time in a row came out zero wide on Android).
+        let mut time = v("Time", json!({ "value": 0 }), Vec::new());
+        time.props.insert("text".into(), json!("Dec 1, 2026"));
+        let f = lay(vec![v("Row", json!({}), vec![time, text("Dentist", json!({}))])]);
+        assert_eq!(f[1].w, 88.0, "measured like text");
+        assert_eq!(f[2].x, 88.0);
+        for k in crate::ui::catalog::KINDS {
+            assert_eq!(is_leaf(k.name), k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer", "{}", k.name);
+        }
     }
 
     #[test]

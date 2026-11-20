@@ -3,6 +3,7 @@
 pub mod builtins;
 pub mod interp;
 pub mod program;
+pub mod time;
 pub mod value;
 
 /// Library code compiled into every program.

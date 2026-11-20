@@ -100,9 +100,10 @@ final class Automation {
                 reply(500, ["error": "no window to capture"])
             }
         case ("POST", "/_tj/input"):
-            guard let input = (try? JSONSerialization.jsonObject(with: req.body)) as? [String: Any] else {
+            guard let raw = (try? JSONSerialization.jsonObject(with: req.body)) as? [String: Any] else {
                 return reply(400, ["error": "body must be one protocol input"])
             }
+            let input = tj.renderer.forAgent(raw)
             if ["call", "get", "ui", "inspect"].contains(input["type"] as? String ?? "") {
                 tj.request(input, reply: finish)
             } else {

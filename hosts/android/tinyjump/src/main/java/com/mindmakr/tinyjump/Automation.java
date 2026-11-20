@@ -120,6 +120,11 @@ final class Automation {
         tj.main.post(new Runnable() {
             @Override
             public void run() {
+                try {
+                    tj.renderer.forAgent(input);
+                } catch (JSONException e) {
+                    throw new IllegalStateException(e);
+                }
                 if (!replies) {
                     tj.send(input);
                     out.set(ok(JSONObject.NULL));

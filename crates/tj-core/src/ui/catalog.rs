@@ -31,9 +31,11 @@ pub const KINDS: &[Kind] = &[
     Kind { name: "Spacer", props: &[], events: &[], content: Content::None },
     Kind { name: "Text", props: &["lines"], events: &[], content: Content::Text },
     Kind { name: "Button", props: &["disabled"], events: &["onPress"], content: Content::Text },
-    Kind { name: "Input", props: &["value", "placeholder", "secure", "multiline"], events: &["onChange", "onSubmit"], content: Content::None },
+    Kind { name: "Input", props: &["value", "placeholder", "secure", "multiline", "type", "zone"], events: &["onChange", "onSubmit"], content: Content::None },
     Kind { name: "Toggle", props: &["value"], events: &["onChange"], content: Content::Text },
     Kind { name: "Image", props: &["src", "fit"], events: &[], content: Content::None },
+    // A time, shown by the platform's own formatter in the viewer's language and zone.
+    Kind { name: "Time", props: &["value", "show", "style", "zone"], events: &[], content: Content::None },
 ];
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
