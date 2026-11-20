@@ -17,12 +17,23 @@
 use super::access::Who;
 use super::objects::CallRecord;
 use super::protocol::{Effect, Output};
-use super::{Runtime, TimerKind};
+use super::{Entry, Runtime, TimerKind};
 use crate::vm::value::{ObjRef, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashSet;
 use std::rc::Rc;
+
+/// An `invoke` waiting for its calling fiber to suspend: the promise it settles, the call,
+/// and who it acts for, in which chain.
+pub(crate) struct Invocation {
+    promise: u32,
+    object: String,
+    method: String,
+    args: Vec<Value>,
+    who: Who,
+    chain: u64,
+}
 
 const OUTBOX_KEY: &str = "tj:outbox";
 const FIRST_RETRY_MS: f64 = 1000.0;
@@ -204,25 +215,40 @@ impl Runtime {
     pub(crate) fn invoke_as_caller(&mut self, object: String, method: String, args: Vec<Value>) -> u32 {
         self.next_effect += 1;
         let promise = self.next_effect;
-        let who = self.running_caller.clone();
-        self.invocations.push_back((promise, object, method, args, who));
+        let (who, chain) = (self.running_caller.clone(), self.running_chain);
+        self.invocations.push_back(Invocation { promise, object, method, args, who, chain });
         promise
     }
 
     /// Runs queued `invoke`s, each checked against the rules for its caller, exactly as a
-    /// request from them would be.
-    pub(crate) fn run_invocations(&mut self) {
-        while let Some((promise, object, method, args, who)) = self.invocations.pop_front() {
-            let reply = Some(INVOKE_REPLY_BASE + u64::from(promise));
-            if let Some(why) = self.refusal(&object, Some(&method), &who) {
-                self.count_refused(&object, &method);
+    /// request from them would be. Each joins its caller's chain, so it may enter objects the
+    /// caller holds. Whether any ran.
+    pub(crate) fn run_invocations(&mut self) -> bool {
+        let mut ran = false;
+        while let Some(i) = self.invocations.pop_front() {
+            ran = true;
+            let reply = Some(INVOKE_REPLY_BASE + u64::from(i.promise));
+            if let Some(why) = self.refusal(&i.object, Some(&i.method), &i.who) {
+                self.count_refused(&i.object, &i.method);
                 self.reply_status(reply, 403, why);
                 continue;
             }
-            match self.resolve_object(&object) {
-                Ok(obj) => self.invoke(obj, &method, args, true, reply, who),
+            match self.resolve_object(&i.object) {
+                Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, beat: false }),
                 Err(e) => self.reply(reply, Err(e)),
             }
+        }
+        ran
+    }
+
+    /// Refuses a call before it started. A call made once is forgotten, not recorded, so a
+    /// retry with the same id runs.
+    pub(crate) fn refuse_start(&mut self, reply: Option<u64>, status: u16, why: String) {
+        let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) else { return self.reply_status(reply, status, why) };
+        let Some((_, call)) = self.call_replies.remove(&internal) else { return };
+        let Some((_, waiting)) = self.running_calls.remove(&call) else { return };
+        for reply in waiting {
+            self.reply_status(reply, status, why.clone());
         }
     }
 
@@ -258,7 +284,7 @@ impl Runtime {
         self.call_replies.insert(internal, (obj.clone(), call.clone()));
         self.running_calls.insert(call, (mine, vec![reply]));
         let args = args.iter().map(Value::from_json).collect();
-        self.invoke(obj, method, args, true, Some(internal), who);
+        self.invoke(obj, method, args, true, Some(internal), Entry::new(who));
     }
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.

@@ -219,7 +219,8 @@ Every snapshot also carries `stats`, the runtime statistics:
   - Calls from requests, timers, alarms and `invoke` all count.
   - Methods that never ran are left out.
   - Unknown method names are never counted, so requests cannot grow the table.
-- `stats.objects["Cart"]` holds the number of objects loaded.
+- `stats.objects["Cart"]` holds the number of objects loaded, and `stats.waiting["Cart"]`
+  the calls waiting for `@exclusive` objects of that class.
 
 Two tools build on this:
 

@@ -96,7 +96,7 @@ function App() {
     {assistant.lines.slice(-6).map((l, i) => <Text key={i} color={l.who === "assistant" ? "#14532d" : "#333"}>{l.who}: {l.text}</Text>)}
     <Row gap={8}>
       <Input id="question" grow={1} value={me.question} placeholder="Ask, e.g. two teas please" onChange={(t) => me.setQuestion(t)} onSubmit={() => me.ask()} />
-      <Button id="ask" disabled={assistant.busy || me.question.trim() === ""} onPress={() => me.ask()}>Ask</Button>
+      <Button id="ask" disabled={me.question.trim() === ""} onPress={() => me.ask()}>Ask</Button>
     </Row>
     {me.error !== "" && <Text id="error" color="#b00020">{me.error}</Text>}
   </Column>

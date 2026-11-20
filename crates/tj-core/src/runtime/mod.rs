@@ -3,6 +3,7 @@
 
 pub mod access;
 mod calls;
+pub(crate) mod exclusive;
 mod objects;
 pub mod protocol;
 mod render;
@@ -97,6 +98,22 @@ enum TimerKind {
     Alarm { obj: Rc<ObjRef>, alarm: u64 },
     /// Retry server calls waiting in the outbox.
     Outbox,
+    /// Give up on calls that waited too long for an exclusive object.
+    Expire,
+}
+
+/// How a method call starts: who it is for, its chain (0: a new one, see `exclusive.rs`),
+/// and whether it is an `@every` beat, which merges with a waiting one.
+pub(crate) struct Entry {
+    pub who: Who,
+    pub chain: u64,
+    pub beat: bool,
+}
+
+impl Entry {
+    pub(crate) fn new(who: Who) -> Entry {
+        Entry { who, chain: 0, beat: false }
+    }
 }
 
 /// Why a request was refused, with its HTTP status.
@@ -146,10 +163,16 @@ pub struct Runtime {
     outbox: Outbox,
     /// Calls loaded at boot wait for the first input (see `calls.rs`).
     outbox_held: bool,
-    /// `invoke`s waiting for their calling fiber to suspend: promise, object, method, args, who.
-    invocations: std::collections::VecDeque<(u32, String, String, Vec<Value>, Who)>,
-    /// Who the fiber running now belongs to (see `vm::interp::Runtime::run`).
+    /// `invoke`s waiting for their calling fiber to suspend.
+    invocations: std::collections::VecDeque<calls::Invocation>,
+    /// Who the fiber running now belongs to, and its chain (see `vm::interp::Runtime::run`).
     pub(crate) running_caller: Who,
+    pub(crate) running_chain: u64,
+    next_chain: u64,
+    /// `@exclusive` (see `exclusive.rs`): held objects and calls whose turn has come.
+    locks: Vec<exclusive::Lock>,
+    ready: Vec<exclusive::Ready>,
+    any_exclusive: bool,
     /// Servers: calls with an id that are still running, and who waits for each.
     running_calls: HashMap<String, (objects::CallRecord, Vec<Option<u64>>)>,
     call_replies: HashMap<u64, (Rc<ObjRef>, String)>,
@@ -204,6 +227,11 @@ impl Runtime {
             outbox_held: false,
             invocations: std::collections::VecDeque::new(),
             running_caller: Who::System,
+            running_chain: 0,
+            next_chain: 0,
+            locks: Vec::new(),
+            ready: Vec::new(),
+            any_exclusive: program.objects.iter().any(|o| o.methods.values().any(|m| m.exclusive)),
             running_calls: HashMap::new(),
             call_replies: HashMap::new(),
             next_call_reply: 0,
@@ -260,7 +288,7 @@ impl Runtime {
                     (Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
                     (Ok(obj), None) => {
                         let args = args.iter().map(Value::from_json).collect();
-                        self.invoke(obj, &method, args, true, reply, who)
+                        self.invoke(obj, &method, args, true, reply, Entry::new(who))
                     }
                     (Err(e), _) => self.reply(reply, Err(e)),
                 },
@@ -322,9 +350,9 @@ impl Runtime {
                 self.reply(reply.or(Some(0)), Ok(snapshot));
             }
         }
-        self.run_invocations();
+        self.run_queued();
         self.fire_timers();
-        self.run_invocations();
+        self.run_queued();
         if std::mem::take(&mut self.ran_code) && self.render {
             self.render_app();
         }
@@ -397,10 +425,24 @@ impl Runtime {
 
     /// Runs a fiber that must not suspend (top-level code, object init, render).
     fn run_sync(&mut self, mut f: Fiber) -> Result<Value, Failure> {
-        match self.run(&mut f)? {
-            Run::Done(v) => Ok(v),
-            Run::Await(_) => Err(self.failure(&f, "`await` is not allowed here (top-level code, object field defaults and rendering must not wait)".into())),
-        }
+        let r = match self.run(&mut f) {
+            Ok(Run::Done(v)) => return Ok(v),
+            Ok(Run::Await(_)) => Err(self.failure(&f, "`await` is not allowed here (top-level code, object field defaults and rendering must not wait)".into())),
+            Ok(Run::Blocked(key)) => Err(self.blocked_failure(&f, &key)),
+            Err(e) => Err(e),
+        };
+        self.release_frames(&mut f, 0);
+        r
+    }
+
+    pub(crate) fn new_chain(&mut self) -> u64 {
+        self.next_chain += 1;
+        self.next_chain
+    }
+
+    /// Runs `invoke`s and calls whose turn has come, until neither is left.
+    fn run_queued(&mut self) {
+        while self.run_invocations() | self.run_ready() {}
     }
 
     /// Who a `call` or `get` comes from, after the access rules and the object cap; or the
@@ -429,12 +471,9 @@ impl Runtime {
         }
     }
 
-    fn invoke(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, external: bool, reply: Option<u64>, who: Who) {
+    fn invoke(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, external: bool, reply: Option<u64>, entry: Entry) {
         match self.method_fiber(obj, method, args, external) {
-            Ok(mut f) => {
-                f.caller = who;
-                self.drive(f, reply)
-            }
+            Ok(f) => self.start(f, reply, entry),
             Err(e) => self.reply(reply, Err(e.message())),
         }
     }
@@ -445,17 +484,19 @@ impl Runtime {
         self.settle(f, reply, r);
     }
 
-    fn settle(&mut self, f: Fiber, reply: Option<u64>, r: Result<Run, Failure>) {
+    fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>) {
         match r {
             Ok(Run::Await(p)) => {
                 self.waiting.insert(p, (f, reply));
             }
+            Ok(Run::Blocked(key)) => self.park(key, f, reply),
             Ok(Run::Done(v)) => {
                 if reply.is_some() {
                     self.reply(reply, v.to_json());
                 }
             }
             Err(fail) => {
+                self.release_frames(&mut f, 0);
                 self.count_error(f.stat);
                 match reply {
                     Some(_) => self.reply(reply, Err(fail.message)),
@@ -529,17 +570,18 @@ impl Runtime {
                         next = self.now + interval;
                     }
                     self.push_timer(next, TimerKind::Every { obj: obj.clone(), method: method.clone(), interval });
-                    self.invoke(obj, &method, Vec::new(), false, None, Who::System);
+                    self.invoke(obj, &method, Vec::new(), false, None, Entry { who: Who::System, chain: 0, beat: true });
                 }
                 TimerKind::Alarm { obj, alarm } => {
                     if let Some(a) = self.take_alarm(&obj, alarm) {
                         let args = a.args.iter().map(Value::from_json).collect();
                         // An alarm runs as whoever scheduled it, so rules on data still hold.
                         let who = a.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
-                        self.invoke(obj, &a.method, args, false, None, who);
+                        self.invoke(obj, &a.method, args, false, None, Entry::new(who));
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),
+                TimerKind::Expire => self.expire_waiters(),
             }
         }
     }

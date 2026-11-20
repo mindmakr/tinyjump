@@ -214,6 +214,10 @@ impl Stats {
         for (class, n) in core["objects"].as_object().unwrap_or(&empty) {
             let _ = writeln!(out, "tj_objects_loaded{{class=\"{}\"}} {}", escape(class), n.as_u64().unwrap_or(0));
         }
+        let _ = writeln!(out, "# TYPE tj_calls_waiting gauge\n# HELP tj_calls_waiting Calls waiting for an @exclusive object, by class.");
+        for (class, n) in core["waiting"].as_object().unwrap_or(&empty) {
+            let _ = writeln!(out, "tj_calls_waiting{{class=\"{}\"}} {}", escape(class), n.as_u64().unwrap_or(0));
+        }
         histogram(&mut out, "tj_method_duration_seconds", "Time from a call reaching the runtime to its answer", &self.methods.snapshot(), method_labels);
         histogram(&mut out, "tj_effect_duration_seconds", "Time to perform an effect", &self.effects.snapshot(), |kind| format!("kind=\"{}\"", escape(kind)));
         let counters = [
@@ -261,6 +265,10 @@ pub fn report(snapshot: &Json) -> String {
     }
     let loaded: Vec<String> = snapshot["stats"]["objects"].as_object().unwrap_or(&empty).iter().map(|(class, n)| format!("{class} {n}")).collect();
     let _ = writeln!(out, "\nobjects loaded: {}", if loaded.is_empty() { "none".to_string() } else { loaded.join(", ") });
+    let waiting: Vec<String> = snapshot["stats"]["waiting"].as_object().unwrap_or(&empty).iter().map(|(class, n)| format!("{class} {n}")).collect();
+    if !waiting.is_empty() {
+        let _ = writeln!(out, "calls waiting for @exclusive objects: {}", waiting.join(", "));
+    }
     for (kind, e) in snapshot["server"]["effects"].as_object().unwrap_or(&empty) {
         let _ = writeln!(out, "effect {kind}: {} done, {} failed, p50 {} ms, p95 {} ms, max {} ms", e["count"], e["failed"], e["p50Ms"], e["p95Ms"], e["maxMs"]);
     }
@@ -341,12 +349,13 @@ mod tests {
         s.method("Cart.add", Duration::from_millis(3), true);
         s.method("Cart.add", Duration::from_millis(30), false);
         s.effect("plugin.ai", Duration::from_secs(2), true);
-        let core = json!({ "methods": { "Cart.add": { "calls": 2, "errors": 1, "refused": 4, "steps": 900 } }, "objects": { "Cart": 3 } });
+        let core = json!({ "methods": { "Cart.add": { "calls": 2, "errors": 1, "refused": 4, "steps": 900 } }, "objects": { "Cart": 3 }, "waiting": { "Cart": 1 } });
         let text = s.openmetrics(&core);
         for line in [
             "tj_method_calls_total{class=\"Cart\",method=\"add\"} 2",
             "tj_method_refused_total{class=\"Cart\",method=\"add\"} 4",
             "tj_objects_loaded{class=\"Cart\"} 3",
+            "tj_calls_waiting{class=\"Cart\"} 1",
             "tj_method_duration_seconds_bucket{class=\"Cart\",method=\"add\",le=\"0.005\"} 1",
             "tj_method_duration_seconds_bucket{class=\"Cart\",method=\"add\",le=\"+Inf\"} 2",
             "tj_method_duration_seconds_count{class=\"Cart\",method=\"add\"} 2",

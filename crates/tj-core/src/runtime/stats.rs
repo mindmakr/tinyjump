@@ -65,8 +65,9 @@ impl Runtime {
         }
     }
 
-    /// `{ methods: { "Cart.add": { calls, errors, refused, steps } }, objects: { "Cart": 2 } }`,
-    /// leaving out methods that never ran and classes with nothing loaded.
+    /// `{ methods: { "Cart.add": { calls, errors, refused, steps } }, objects: { "Cart": 2 },
+    /// waiting: { "Cart": 1 } }`: objects loaded and calls waiting for `@exclusive` objects,
+    /// per class. Methods that never ran and empty classes are left out.
     pub fn stats(&self) -> Json {
         let mut methods = Map::new();
         for (c, row) in self.stats.iter().enumerate() {
@@ -81,6 +82,6 @@ impl Runtime {
             loaded[*class as usize] += 1;
         }
         let objects: Map<String, Json> = self.program.objects.iter().zip(loaded).filter(|(_, n)| *n > 0).map(|(o, n)| (o.name.to_string(), json!(n))).collect();
-        json!({ "methods": methods, "objects": objects })
+        json!({ "methods": methods, "objects": objects, "waiting": self.waiting_json() })
     }
 }

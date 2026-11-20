@@ -216,6 +216,37 @@ async load(city: string) {
 `fetch(url, { method, headers, body })` returns `{ status, ok, headers, text(), json() }`.
 A network failure throws.
 
+### One call at a time: `@exclusive`
+
+A method without `await` always runs to the end before anything else happens. When a
+method must read, wait and then write, mark it `@exclusive`. The object then runs one
+exclusive call at a time, in order, like an actor:
+
+```tsx
+@server object Account {
+  balance: number = 0
+  @exclusive async pay(to: string, amount: number) {
+    if (this.balance < amount) { throw new Error("not enough money") }
+    await fetch(`https://bank.example.com/pay?to=${to}&amount=${amount}`, { method: "POST" })
+    this.balance -= amount      // no other exclusive call ran since the check
+  }
+  @exclusive deposit(amount: number) { this.balance += amount }
+}
+```
+
+- Only exclusive calls wait for each other. Methods that are not exclusive, reading
+  fields and rendering never wait.
+- An exclusive call holds its object until it returns or throws, including while it
+  awaits. Mark every method that changes the same fields `@exclusive`.
+- Everything a call runs belongs to it, including the methods an agent calls as tools
+  (`tj:agent`). It enters objects it already holds at once and never waits for itself.
+- If two calls would wait for each other forever (each holds an object the other wants),
+  the second one fails at once with an error that says so.
+- At most 100 calls wait per object. A call someone is waiting on gives up after
+  30 seconds: a request answers 503, and a call already running gets an error it can
+  catch. Timers and alarms wait as long as needed, and `@every` beats that pile up run
+  once.
+
 ## UI
 
 Components are functions that return JSX. Props arrive as one record, with nested
