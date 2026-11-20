@@ -1215,9 +1215,10 @@ fn waits_are_bounded_and_timers_merge() {
     assert_eq!(rt.stats()["waiting"], json!({ "Slot": 100 }));
 }
 
-/// A store whose saves, or reads, can be made to fail, like a full or broken disk.
+/// A store whose saves, or reads, or saves of one key, can be made to fail, like a full or
+/// broken disk.
 #[derive(Clone, Default)]
-struct Flaky(Shared, Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>);
+struct Flaky(Shared, Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>, Rc<std::cell::RefCell<String>>);
 
 impl Store for Flaky {
     fn load(&mut self, key: &str) -> Result<Option<String>, String> {
@@ -1227,7 +1228,7 @@ impl Store for Flaky {
         self.0.load(key)
     }
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
-        if self.1.get() {
+        if self.1.get() || *self.3.borrow() == key {
             return Err("disk full".into());
         }
         self.0.save(key, value)
@@ -1254,6 +1255,38 @@ fn a_failed_save_fails_the_call_and_changes_nothing() {
     store.1.set(false);
     assert_eq!(answer(rt.handle(3.0, add("one", 3))), (Some(json!(1)), None));
     assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["one"]));
+}
+
+#[test]
+fn an_alarm_from_a_call_that_could_not_be_saved_never_fires() {
+    let store = Flaky::default();
+    let mut rt = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let ana = || who("user:ana", &[]);
+    store.1.set(true);
+    assert_eq!(call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["a@example.com", ""]), ana()).unwrap_err().0, Some(503));
+    store.1.set(false);
+    rt.handle(61_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 62_000.0, "Account/user:ana")["plan"], json!("free"), "the call failed, so its alarm is gone too");
+
+    // The alarm index is saved before the object, so a restart always finds the object's
+    // alarms; when the index cannot be saved, the call fails rather than claim it worked.
+    *store.3.borrow_mut() = "tj:alarms".into();
+    let refused = call_as(&mut rt, 70_000.0, "Account/user:bo", "set", json!(["b@example.com", ""]), who("user:bo", &[]));
+    assert_eq!(refused.unwrap_err().0, Some(503));
+    assert!(!store.0.0.borrow().data.contains_key("Account/user:bo"), "and nothing was saved");
+    store.3.borrow_mut().clear();
+    call_as(&mut rt, 71_000.0, "Account/user:bo", "set", json!(["b@example.com", ""]), who("user:bo", &[])).unwrap();
+    let mut restarted = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(72_000.0, 7) }).unwrap().0;
+    restarted.handle(132_000.0, Input::Tick);
+    assert_eq!(restarted.export_subject("user:bo").unwrap()["Account/user:bo"]["plan"], json!("reminded"), "found and run after a restart");
+}
+
+#[test]
+fn a_damaged_alarm_index_stops_the_boot() {
+    let store = Shared::default();
+    store.0.borrow_mut().data.insert("tj:alarms".into(), "{not json".into());
+    let err = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store), Options { server: true, render: false, ..Options::new(0.0, 7) }).err().unwrap();
+    assert!(err.message.contains("tj:alarms is damaged"), "{}", err.message);
 }
 
 #[test]

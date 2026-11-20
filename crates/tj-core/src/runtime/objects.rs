@@ -405,28 +405,40 @@ impl Runtime {
         Json::Array(list.into_iter().map(|(object, state)| json!({ "object": object, "state": state })).collect())
     }
 
-    /// Gives an object a new state and drops its alarms and call records (erasure). The
-    /// alarms it had, in case the erasure cannot be saved.
-    pub(crate) fn reset(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) -> Vec<Alarm> {
+    /// Gives an object a new state and drops its alarms and call records (erasure). A failed
+    /// save puts all of it back (see `revert`).
+    pub(crate) fn reset(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) {
         let inst = self.inst_mut(o);
         inst.state = state;
         inst.calls.clear();
-        let alarms = std::mem::take(&mut inst.alarms);
+        inst.alarms.clear();
         self.touched.insert((o.class, o.id.clone()));
-        alarms
-    }
-
-    pub(crate) fn put_alarms(&mut self, o: &ObjRef, alarms: Vec<Alarm>) {
-        self.inst_mut(o).alarms = alarms;
     }
 
     /// Persists every object touched by the last input whose record changed. Whether every
     /// save worked.
     pub(crate) fn flush(&mut self) -> bool {
-        let touched = std::mem::take(&mut self.touched);
+        let mut touched = std::mem::take(&mut self.touched);
         let mut index_changed = false;
         let mut seq_changed = false;
         let mut failed = false;
+        // An object that now has alarms goes into the alarm index before it is saved, so a
+        // restart always finds it. If the index cannot be saved, nothing is.
+        let joining: Vec<String> = touched.iter().filter_map(|k| self.instances.get(k)).filter(|i| !i.alarms.is_empty()).map(|i| i.handle.key()).filter(|o| !self.alarm_index.contains(o)).collect();
+        if !joining.is_empty() {
+            self.alarm_index.extend(joining.iter().cloned());
+            let text = serde_json::to_string(&self.alarm_index).expect("strings serialize");
+            if let Err(e) = self.store.save(ALARM_INDEX_KEY, &text) {
+                for o in &joining {
+                    self.alarm_index.remove(o);
+                }
+                self.outputs.push(Output::Error { message: format!("could not save the alarm index: {e}"), trace: Vec::new() });
+                for key in std::mem::take(&mut touched) {
+                    self.revert(&key);
+                }
+                failed = true;
+            }
+        }
         for key in touched {
             let Some(inst) = self.instances.get(&key) else { continue };
             let object = inst.handle.key();
@@ -468,7 +480,9 @@ impl Runtime {
                 inst.seq = record.seq;
                 inst.state_text = state_text;
             }
-            index_changed |= if has_alarms { self.alarm_index.insert(object.clone()) } else { self.alarm_index.remove(&object) };
+            // Objects joined the index above; leaving it can wait, as a stale entry only loads
+            // an object without alarms at boot.
+            index_changed |= !has_alarms && self.alarm_index.remove(&object);
             if state_changed {
                 self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
             }
@@ -498,8 +512,10 @@ impl Runtime {
         !failed
     }
 
-    /// Puts an object's state and call records back to its last saved record, after a failed
-    /// save. Alarms stay as they are: they are saved with the next successful write.
+    /// Puts an object's state, call records and alarms back to its last saved record, after a
+    /// failed save. An alarm scheduled by the failed call does not fire; one that fired in it
+    /// runs again, as its work was undone too. Timers left from the failed call find no alarm
+    /// with their id and do nothing.
     fn revert(&mut self, key: &(u16, Rc<str>)) {
         let Some(inst) = self.instances.get(key) else { return };
         let (class, saved) = (inst.handle.class, inst.saved.clone());
@@ -516,11 +532,21 @@ impl Runtime {
                 }
             }
         }
+        let (calls, mut alarms) = stored.map(|s| (s.calls, s.alarms)).unwrap_or_default();
         let Some(inst) = self.instances.get_mut(key) else { return };
         let restored = fresh.borrow().clone();
         *inst.state.borrow_mut() = restored;
-        inst.calls = stored.map(|s| s.calls).unwrap_or_default();
+        inst.calls = calls;
         inst.state_text = Value::Rec(inst.state.clone()).to_json().map(|j| j.to_string()).unwrap_or_default();
+        let handle = inst.handle.clone();
+        for a in &mut alarms {
+            self.next_alarm += 1;
+            a.id = self.next_alarm;
+            self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
+        }
+        if let Some(inst) = self.instances.get_mut(key) {
+            inst.alarms = alarms;
+        }
         self.ran_code = true;
     }
 
@@ -534,7 +560,8 @@ impl Runtime {
         let stored_seq = self.store.load(CHANGE_SEQ_KEY).map_err(read)?.and_then(|s| s.parse().ok()).unwrap_or(0);
         self.change_seq = stored_seq.max((self.now.max(0.0) as u64).saturating_mul(1000));
         if let Some(text) = self.store.load(ALARM_INDEX_KEY).map_err(read)? {
-            self.alarm_index = serde_json::from_str(&text).unwrap_or_default();
+            // Without it, sleeping objects' alarms would silently never fire.
+            self.alarm_index = serde_json::from_str(&text).map_err(|e| read(format!("{ALARM_INDEX_KEY} is damaged ({e}); restore it from a backup")))?;
         }
         let mut keys: Vec<String> = self.alarm_index.iter().cloned().collect();
         let program = self.program.clone();

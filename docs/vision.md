@@ -163,18 +163,47 @@ idempotent calls give the same result for apps.
 
 The way it is built is part of what it offers, and we say so publicly:
 
-- **One owner sets the direction** in this document. Every change is checked against it,
-  and work that serves no goal here is not done.
-- **AI agents build it,** step by step. Each step comes with its tests, is measured
-  against the size and speed budget, and is run live before it merges. What is not built
-  is listed as not built.
-- **Other agents review the design and the work independently,** without the builder's
-  reasoning in front of them. The trust design was corrected by such a review before it
-  was built. A standing review channel between the reviewing agents and the builder is
-  being set up in the repository.
+- **Five roles work together, played by people or AI agents** ([feedback/README.md](../feedback/README.md)):
+  - **Visionary (owner):** sets goals, guardrails and the order of work here, and approves
+    scope changes.
+  - **Builder (engineer):** builds agreed steps in small branches, keeps tests and
+    `scripts/budget.sh` green, runs live checks before merging, and answers review findings
+    before closing work. What is not built is listed as not built.
+  - **Critic (empty-mind reviewer):** reads the vision, docs and code without the
+    builder's conversation or assumptions, checking security, privacy, durable state, edge
+    cases and drift from this document.
+  - **Tester (verifier):** drives running apps on every host (`tj mcp`, `tj review`,
+    `tj bench`), testing restarts, offline queues, locales and hostile inputs.
+  - **Maintainer (protector):** guards size and step budgets, stored-state compatibility
+    across upgrades, key and audit hygiene, and removal of unused code.
+- **One conflict-free channel (`feedback/`).** Concurrent roles communicate through
+  numbered notes (`feedback/YYYY-MM-DD-<role>-NNN-<topic>.md`), one note per file, so
+  critics, testers and maintainers never edit files a builder is changing.
 - **Corrections are written down with their reasons,** next to the design they change
-  (for example the "as built" notes in `docs/trust.md`), so a reader can see what was
-  planned, what was found and what was done instead.
+  (for example the "as built" notes in `docs/trust.md`), so any human or agent arriving
+  later sees what was planned, what was found and what was done instead.
+
+## Living, agentic-first apps (direction)
+
+tinyjump apps are meant to be living systems that agents and people build, test, review,
+protect and improve continuously, while staying plain enough for any developer to read and
+take over in minutes (`feedback/2026-11-20-critic-001-agentic-living-apps.md`; not built
+yet, queued for review after the trust work):
+
+1. **Self-aware:** every app can state its own contract (`manifest`: object schemas,
+   access rules, personal-data map, plugins and code hash) and its live pulse (errors,
+   refusals, slow methods, queue depth and audit health).
+2. **Scoped operational roles:** observers/critics, testers, maintainers and human
+   operators use distinct, named credentials instead of one shared admin key. Critics
+   observe read-only with personal data masked; testers drive forked shadow state, never
+   live user records; leases show who is currently working on an app.
+3. **Self-protecting:** object invariants, per-turn VM step limits, per-object size caps,
+   outbound network rules and access/privacy checks fail closed before bad state reaches
+   the store.
+4. **Safe to evolve and keep fresh:** compile-time schema compatibility checks against the
+   deployed version, deterministic input-trace tests (`tj test`), shadow boot against
+   stored data with automatic rollback, and `tj retro` reports that flag dead code,
+   locale/layout regressions and budget drift.
 
 ## For the next review and retro
 

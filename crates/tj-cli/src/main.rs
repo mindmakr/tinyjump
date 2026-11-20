@@ -75,6 +75,9 @@ ENVIRONMENT (tj serve):
   TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
+  TJ_ALLOW_PRIVATE_FETCH
+                  1 lets fetch reach loopback, private and link-local addresses (blocked on
+                  tj serve, so app URLs and agent prompts cannot read internal services)
   TJ_TLS_TERMINATED
                   1 when a proxy in front terminates TLS. Without it, a server on an address
                   other machines can reach refuses requests that carry credentials

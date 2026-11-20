@@ -38,7 +38,10 @@ function skills(name: string): Skill[] {
   forget() { this.messages = [] }
 }
 
-/// What everyone sees: questions and answers.
+/// What everyone sees: questions and answers. One shared conversation, like a public shop
+/// counter for anonymous shoppers. In an app where people sign in, give each person their
+/// own (`Assistant.get(caller.id)`, `@read("owner")`), so one person's answers and tool
+/// results never reach another's (docs/plugins.md).
 export @server @read("anyone") object Assistant {
   lines: ChatLine[] = []
 

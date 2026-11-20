@@ -73,17 +73,12 @@ impl Runtime {
         if let Some((_, key)) = held.iter().find(|(class, _)| self.in_use(*class, subject)) {
             return Err((409, format!("{key} is part way through a call; try again in a moment")));
         }
-        let mut alarms = Vec::new();
         for (class, _) in &held {
             let o = self.instance(*class, subject).map_err(|e| (503, e.message()))?;
             let fresh = self.defaults(*class).map_err(|e| (503, e.message()))?;
-            alarms.push((o.clone(), self.reset(&o, fresh)));
+            self.reset(&o, fresh);
         }
         if !self.flush() {
-            // The failed save put state and call records back; the alarms go back too.
-            for (o, a) in alarms {
-                self.put_alarms(&o, a);
-            }
             return Err((503, "the erasure could not be saved; nothing was erased; try again".into()));
         }
         Ok((held.into_iter().map(|(_, key)| key).collect(), std::mem::take(&mut self.outputs)))
