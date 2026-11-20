@@ -54,16 +54,19 @@ methods that `await`.
 - **Timers and alarms never expire in a queue.** `@every` ticks that pile up are merged
   into one.
 
-## 3. Runtime statistics
+## 3. Runtime statistics (built)
 
-Per method: calls, errors, refusals, wall time (p50, p95, max) and VM steps. Per class:
-objects loaded and queue depth. Effects: HTTP, plugin and outbox calls, with failures and
-latency.
+Per method: calls, errors, refusals and VM steps (every host), and wall time as p50, p95 and
+max (servers). Per class: objects loaded. Effects (servers): HTTP and each plugin, with
+failures and latency. Queue depth comes with `@exclusive`.
 
-- Statistics appear in `inspect` under `stats`.
+- Statistics appear in `inspect` under `stats`, and under `server` for latency.
 - `/_tj/metrics` serves them as OpenMetrics text (admin key) for Prometheus or Grafana.
 - `tj stats` shows the slowest and busiest methods.
 - Labels are method and class names only, never object ids, which can identify people.
+- The first live run showed that saving dominates a small call (about 20 ms on Windows),
+  because each record is synced to disk. Syncing several records together (group commit)
+  is the follow-up.
 
 ## 4. Audit log
 
@@ -210,8 +213,8 @@ controls; it cannot weaken another pack's.
 
 ## Build order (agreed)
 
-1. **Saving:** sync to disk, and failed saves fail the call.
-2. **Statistics.**
+1. **Saving:** sync to disk, and failed saves fail the call (built).
+2. **Statistics** (built).
 3. **`@exclusive`,** with chains through `invoke`, cycle detection, capped queues and
    merged ticks.
 4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`.

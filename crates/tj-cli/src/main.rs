@@ -37,6 +37,7 @@ USAGE:
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
+  tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
   tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
   tj plugin ai | fake <file.json>
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
@@ -146,6 +147,7 @@ fn main() -> ExitCode {
         "serve" => serve(&args, false),
         "dev" => serve(&args, true),
         "review" => review(&args.target),
+        "stats" => inspect(&args.target).map(|s| print!("{}", stats::report(&s))),
         "mcp" => mcp::run(&args.target),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     };
@@ -160,6 +162,17 @@ fn main() -> ExitCode {
 
 /// Prints the review of a running app; fails if it found errors, so CI can gate on it.
 fn review(target: &str) -> Result<(), String> {
+    let snapshot = inspect(target)?;
+    let findings = review::review(&snapshot);
+    print!("{}", review::report(&snapshot, &findings));
+    if findings.iter().any(|f| f.severity == review::Severity::Error) {
+        return Err("review found errors".into());
+    }
+    Ok(())
+}
+
+/// A running app's snapshot, from its automation endpoint.
+fn inspect(target: &str) -> Result<serde_json::Value, String> {
     let url = format!("{}/_tj/inspect", target.trim_end_matches('/'));
     let mut req = ureq::get(&url);
     if let Some(h) = auth::client_header() {
@@ -173,13 +186,7 @@ fn review(target: &str) -> Result<(), String> {
     if let Some(e) = reply["error"].as_str() {
         return Err(e.to_string());
     }
-    let snapshot = &reply["ok"];
-    let findings = review::review(snapshot);
-    print!("{}", review::report(snapshot, &findings));
-    if findings.iter().any(|f| f.severity == review::Severity::Error) {
-        return Err("review found errors".into());
-    }
-    Ok(())
+    Ok(reply["ok"].clone())
 }
 
 fn run_bench(args: &Args) -> Result<(), String> {

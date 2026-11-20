@@ -19,6 +19,8 @@ pub struct Fiber {
     handlers: Vec<Handler>,
     /// Who the call belongs to: `caller` in code, and alarms it schedules.
     pub caller: crate::runtime::access::Who,
+    /// The method this fiber runs, by class and method index, for statistics.
+    pub stat: Option<(u16, u16)>,
 }
 
 pub struct Frame {
@@ -73,6 +75,7 @@ impl Runtime {
         let r = self.run_steps(f, &mut budget);
         self.running_caller = outer;
         self.metrics.vm_steps += STEP_BUDGET - budget;
+        self.count_steps(f.stat, STEP_BUDGET - budget);
         r
     }
 

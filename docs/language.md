@@ -200,6 +200,11 @@ Not yet: `switch`, `finally`, rest parameters, spread arguments, getters,
 that call; the app keeps running. Top-level code, field defaults and rendering
 (`App` and components) must not `await`.
 
+Changes are saved and shared each time a method pauses, so other callers can see an
+object between a method's `await`s. Check and write in the same step, after the last
+`await` that the check depends on. If a save fails, the call fails and its changes are
+undone, so a retry is always safe.
+
 ```tsx
 async load(city: string) {
   const res = await fetch(`https://api.example.com/w?city=${city}`, { headers: { accept: "application/json" } })

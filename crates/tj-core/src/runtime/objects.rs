@@ -287,6 +287,10 @@ impl Runtime {
         }
         self.touch(&obj);
         let mut f = Fiber::default();
+        f.stat = self.program.objects[obj.class as usize].methods.get_index_of(name).map(|m| (obj.class, m as u16));
+        if let Some(slot) = f.stat {
+            self.count_call(slot);
+        }
         f.stack.push(Value::Obj(obj.clone()));
         f.stack.extend(args);
         self.push_frame(&mut f, closure, 0, 0, Some(obj))?;
@@ -400,6 +404,7 @@ impl Runtime {
         let touched = std::mem::take(&mut self.touched);
         let mut index_changed = false;
         let mut seq_changed = false;
+        let mut failed = false;
         for key in touched {
             let Some(inst) = self.instances.get(&key) else { continue };
             let object = inst.handle.key();
@@ -429,7 +434,11 @@ impl Runtime {
                 text = serde_json::to_string(&record).expect("JSON values serialize");
             }
             if let Err(e) = self.store.save(&object, &text) {
+                // The change did not happen: back to the last saved record, and the input's
+                // answers become errors below, so nobody is told it worked.
                 self.outputs.push(Output::Error { message: format!("{object}: could not save: {e}"), trace: Vec::new() });
+                self.revert(&key);
+                failed = true;
                 continue;
             }
             if let Some(inst) = self.instances.get_mut(&key) {
@@ -440,6 +449,17 @@ impl Runtime {
             index_changed |= if has_alarms { self.alarm_index.insert(object.clone()) } else { self.alarm_index.remove(&object) };
             if state_changed {
                 self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
+            }
+        }
+        if failed {
+            for o in &mut self.outputs {
+                if let Output::Reply { ok, error, status, .. } = o {
+                    if error.is_none() {
+                        *ok = None;
+                        *error = Some("the change could not be saved; try again".into());
+                        *status = Some(503);
+                    }
+                }
             }
         }
         if seq_changed {
@@ -453,6 +473,32 @@ impl Runtime {
                 self.outputs.push(Output::Error { message: format!("could not save the alarm index: {e}"), trace: Vec::new() });
             }
         }
+    }
+
+    /// Puts an object's state and call records back to its last saved record, after a failed
+    /// save. Alarms stay as they are: they are saved with the next successful write.
+    fn revert(&mut self, key: &(u16, Rc<str>)) {
+        let Some(inst) = self.instances.get(key) else { return };
+        let (class, saved) = (inst.handle.class, inst.saved.clone());
+        let fresh = match self.defaults(class) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let stored: Option<Stored> = serde_json::from_str(&saved).ok();
+        {
+            let mut s = fresh.borrow_mut();
+            for (k, v) in stored.iter().flat_map(|st| st.state.iter()) {
+                if let Some(slot) = s.get_mut(k.as_str()) {
+                    *slot = Value::from_json(v);
+                }
+            }
+        }
+        let Some(inst) = self.instances.get_mut(key) else { return };
+        let restored = fresh.borrow().clone();
+        *inst.state.borrow_mut() = restored;
+        inst.calls = stored.map(|s| s.calls).unwrap_or_default();
+        inst.state_text = Value::Rec(inst.state.clone()).to_json().map(|j| j.to_string()).unwrap_or_default();
+        self.ran_code = true;
     }
 
     /// Loads instances that have timers: every stored instance of a type with `@every`

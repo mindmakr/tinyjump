@@ -145,8 +145,8 @@ in URLs, streams and logs.
 - `tj dev` adds the reason to help development (`Cart.checkout needs owner or role
   staff`). `tj serve` never does, so it does not reveal what exists.
 - Each refusal writes a structured audit line to stderr: time, caller id, object, method,
-  rule and outcome. Tokens and arguments are never logged. The server's metrics count
-  `denied`.
+  rule and outcome. Tokens and arguments are never logged. Runtime statistics count the
+  refusals of each method (`refused`; see `docs/host-protocol.md`).
 
 ## Calls made once, per caller
 

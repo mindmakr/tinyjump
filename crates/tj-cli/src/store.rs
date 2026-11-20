@@ -1,7 +1,9 @@
-//! One JSON file per key, written atomically (temp file + rename).
+//! One JSON file per key, written atomically and durably: a temporary file is synced to disk,
+//! renamed over the old one, and the folder is synced, so a crash leaves the old record or
+//! the new one, never a torn or lost write.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tj_core::Store;
 
@@ -60,7 +62,18 @@ impl Store for FileStore {
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
         let path = self.path(key);
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, value).and_then(|()| fs::rename(&tmp, &path)).map_err(|e| format!("{}: {e}", path.display()))
+        let write = || -> io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(value.as_bytes())?;
+            f.sync_all()?;
+            fs::rename(&tmp, &path)?;
+            // The rename itself must reach the disk. Windows cannot sync a folder; its rename
+            // replaces the file in one step.
+            #[cfg(unix)]
+            fs::File::open(&self.dir)?.sync_all()?;
+            Ok(())
+        };
+        write().map_err(|e| format!("{}: {e}", path.display()))
     }
 
     fn keys(&mut self, prefix: &str) -> Vec<String> {

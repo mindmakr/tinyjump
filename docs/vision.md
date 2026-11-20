@@ -47,15 +47,21 @@ Next, agreed with the owner on 2026-11-20:
    issuer (no real accounts needed in tests).
 2. **The agent library (`tj:agent`, done):** an agent's tools are the app's own methods,
    called under the same access rules as the person it acts for.
-3. **Trust (added by the owner on 2026-11-20; `docs/trust.md`):**
-   - objects as actors (one call at a time);
+3. **Trust (added by the owner on 2026-11-20; `docs/trust.md`).** The design was corrected
+   after an independent review, which also fixed its build order:
+   - saving that reaches the disk, where a failed save fails the call (done);
+   - runtime statistics: per method on every host, latency, `/_tj/metrics` and `tj stats`
+     (done);
+   - `@exclusive` methods: actor-style turns where an `await` needs them, without
+     deadlocks;
    - a built-in, tamper-evident audit log;
-   - runtime statistics;
+   - encryption at rest;
    - personal data with subject rights;
-   - encryption at rest and in transit, and compression;
-   - region compliance packs (GDPR, KSA PDPL, MENA, US) that third parties can extend.
+   - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
+   - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
+     follows.
 4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
-5. Alongside: **rewrite the marketing site** as one plain page for three readers (founders,
+5. Alongside: **rewrite the marketing site (done)** as one plain page for three readers (founders,
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 

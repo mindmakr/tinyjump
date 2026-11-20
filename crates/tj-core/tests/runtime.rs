@@ -691,6 +691,44 @@ fn remote_callers_get_only_what_the_rules_allow() {
 }
 
 #[test]
+fn statistics_count_calls_errors_refusals_and_steps() {
+    let src = r#"
+@server @read("anyone") object Till {
+  total: number = 0
+  @allow("anyone") pay(n: number) {
+    if (n <= 0) { throw new Error("pay something") }
+    this.total += n
+  }
+  @allow("staff") refund() { this.total = 0 }
+  @every("1s") check() { }
+}
+"#;
+    let mut rt = server(src, false);
+    let anon = || who("", &[]);
+    assert!(call_as(&mut rt, 1.0, "Till/a", "pay", json!([5]), anon()).is_ok());
+    assert!(call_as(&mut rt, 2.0, "Till/a", "pay", json!([0]), anon()).is_err());
+    assert_eq!(call_as(&mut rt, 3.0, "Till/a", "refund", json!([]), anon()).unwrap_err().0, Some(403));
+    // Unknown names are refused like any other, but never counted, so requests cannot grow
+    // the table.
+    assert!(call_as(&mut rt, 4.0, "Till/a", "nope", json!([]), anon()).is_err());
+    assert!(call_as(&mut rt, 4.0, "Nope/a", "pay", json!([1]), anon()).is_err());
+    rt.handle(1500.0, Input::Tick);
+
+    let s = rt.stats();
+    let pay = &s["methods"]["Till.pay"];
+    assert_eq!((pay["calls"].clone(), pay["errors"].clone(), pay["refused"].clone()), (json!(2), json!(1), json!(0)));
+    assert!(pay["steps"].as_u64().unwrap() > 0, "{s}");
+    assert_eq!(s["methods"]["Till.refund"], json!({ "calls": 0, "errors": 0, "refused": 1, "steps": 0 }));
+    assert_eq!(s["methods"]["Till.check"]["calls"], json!(1), "timers count too");
+    assert_eq!(s["methods"].as_object().unwrap().len(), 3, "{s}");
+    assert_eq!(s["objects"], json!({ "Till": 1 }));
+    assert_eq!(rt.inspect()["stats"], s, "inspect carries them on every host");
+
+    assert_eq!(rt.method_name("Till/x", "pay").as_deref(), Some("Till.pay"));
+    assert_eq!((rt.method_name("Till/x", "nope"), rt.method_name("Nope/x", "pay")), (None, None));
+}
+
+#[test]
 fn caller_belongs_to_each_call_alarms_and_timers() {
     let mut rt = server(GUARDED, false);
     // Two interleaved async calls from different callers keep their own caller.
@@ -818,6 +856,44 @@ fn the_shop_assistant_acts_within_the_askers_rights() {
     assert_eq!(args4["messages"].as_array().unwrap().last().unwrap()["results"][0]["output"], json!("done"));
     server.handle(7.0, answered(id4, reply(json!([]), "Restocked.")));
     assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
+}
+
+/// A store whose saves can be made to fail, like a full or broken disk.
+#[derive(Clone, Default)]
+struct Flaky(Shared, Rc<std::cell::Cell<bool>>);
+
+impl Store for Flaky {
+    fn load(&mut self, key: &str) -> Option<String> {
+        self.0.load(key)
+    }
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if self.1.get() {
+            return Err("disk full".into());
+        }
+        self.0.save(key, value)
+    }
+    fn keys(&mut self, prefix: &str) -> Vec<String> {
+        self.0.keys(prefix)
+    }
+}
+
+#[test]
+fn a_failed_save_fails_the_call_and_changes_nothing() {
+    let store = Flaky::default();
+    let program = compile(BOARD).unwrap();
+    let mut rt = Runtime::boot(program, Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let add = |text: &str, reply: u64| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!(text)], reply: Some(reply), call: Some("c-1".into()), caller: Some(Caller::trusted()) };
+    let answer = |out: Vec<Output>| out.into_iter().find_map(|o| if let Output::Reply { ok, status, .. } = o { Some((ok, status)) } else { None }).unwrap();
+
+    store.1.set(true);
+    assert_eq!(answer(rt.handle(1.0, add("one", 1))), (None, Some(503)), "nobody is told it worked");
+    assert_eq!(state(&mut rt, 2.0, "Board/b")["notes"], json!([]), "the change is undone in memory too");
+
+    // The disk recovers: the retry with the same call id runs, rather than returning a result
+    // that was never saved.
+    store.1.set(false);
+    assert_eq!(answer(rt.handle(3.0, add("one", 3))), (Some(json!(1)), None));
+    assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["one"]));
 }
 
 #[test]
