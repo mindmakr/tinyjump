@@ -1430,12 +1430,12 @@ fn remote_requests_cannot_load_unlimited_objects() {
 fn signing_in_as_someone_else_drops_their_queued_calls_and_replicas() {
     let store = Shared::default();
     let (mut device, _) = boot_as(BOARD, store.clone(), 0.0, false);
-    device.handle(0.0, Input::Identity { user: Some("user:ana".into()) });
+    device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
     device.handle(1.0, Input::Sync { object: "Board/b".into(), state: json!({ "notes": ["ana's"] }), seq: Some(5) });
     let sent = server_calls(&device.handle(2.0, note("from ana")));
     device.handle(3.0, Input::EffectDone { id: sent[0].0, ok: None, error: Some("offline".into()), unreachable: true });
 
-    let out = device.handle(4.0, Input::Identity { user: Some("user:bo".into()) });
+    let out = device.handle(4.0, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
     assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Board/b")), "replicas start over: {out:?}");
     assert_eq!(state(&mut device, 5.0, "Board/b")["notes"], json!([]), "ana's data is gone");
     assert!(server_calls(&device.handle(9000.0, Input::Tick)).is_empty(), "ana's queued call is never sent as bo");
@@ -1938,14 +1938,16 @@ fn on_a_device_caller_id_is_the_signed_in_user_and_the_ui_follows_it() {
 }
 function App() {
   if (caller.id === "") { return <Text id="who">signed out</Text> }
-  return <Text id="who">{caller.id}</Text>
+  return <Text id="who">{caller.id + (caller.roles.includes("staff") ? " (staff)" : "")}</Text>
 }
 "#;
     let (mut device, out) = boot_as(src, Shared::default(), 0.0, false);
     assert!(format!("{out:?}").contains("signed out"));
-    let out = device.handle(1.0, Input::Identity { user: Some("user:ana".into()) });
+    let out = device.handle(1.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
     assert!(format!("{out:?}").contains("user:ana"), "drawn again for ana: {out:?}");
-    let out = device.handle(2.0, Input::Identity { user: None });
+    let out = device.handle(2.0, Input::Identity { user: Some("user:ana".into()), roles: vec!["staff".into()] });
+    assert!(format!("{out:?}").contains("user:ana (staff)"), "roles too, for showing staff controls: {out:?}");
+    let out = device.handle(3.0, Input::Identity { user: None, roles: Vec::new() });
     assert!(format!("{out:?}").contains("signed out"), "and again when signed out");
 }
 

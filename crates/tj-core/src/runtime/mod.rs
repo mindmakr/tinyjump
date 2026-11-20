@@ -189,6 +189,9 @@ pub struct Runtime {
     invocations: std::collections::VecDeque<calls::Invocation>,
     /// Who the fiber running now belongs to, and its chain (see `vm::interp::Runtime::run`).
     pub(crate) running_caller: Who,
+    /// On a device, the signed-in user's roles (`Input::Identity`), for `caller.roles` in UI
+    /// code.
+    pub(crate) device_roles: Rc<[Rc<str>]>,
     pub(crate) running_chain: u64,
     next_chain: u64,
     /// `@exclusive` (see `exclusive.rs`): held objects and calls whose turn has come.
@@ -265,6 +268,7 @@ impl Runtime {
             outbox_held: false,
             invocations: std::collections::VecDeque::new(),
             running_caller: Who::System,
+            device_roles: Rc::from([]),
             running_chain: 0,
             next_chain: 0,
             locks: Vec::new(),
@@ -366,7 +370,7 @@ impl Runtime {
                     }
                 }
             },
-            Input::Identity { user } => self.set_identity(user),
+            Input::Identity { user, roles } => self.set_identity(user, roles),
             Input::Entropy { bytes } => match crate::crypto::unhex(&bytes).filter(|b| b.len() >= 32) {
                 Some(b) => {
                     self.drbg.reseed(&b);
@@ -380,7 +384,13 @@ impl Runtime {
                     Some(h) => match self.fiber_for(&h, vec![Value::from_json(&value)]) {
                         Ok(mut f) => {
                             f.caller = self.local();
-                            self.drive(f, reply)
+                            self.ran_code = true;
+                            // A handler that starts a call without awaiting it (`onPress={() =>
+                            // cart.add(x)}`) has done its part: the press is answered then.
+                            match self.run(&mut f) {
+                                Ok(Run::Done(Value::Promise(_))) => self.settle(f, reply, Ok(Run::Done(Value::Null))),
+                                r => self.settle(f, reply, r),
+                            }
                         }
                         Err(e) => self.reply(reply, Err(e.message())),
                     },
@@ -539,7 +549,7 @@ impl Runtime {
     /// refusal. Checked before anything is loaded.
     fn admit(&self, object: &str, method: Option<&str>, caller: Option<protocol::Caller>) -> Result<Who, (u16, String)> {
         let who = match caller.map(|c| Who::from_caller(&c, self.server)) {
-            Some(Who::Local(_)) | None if !self.server => self.local(),
+            Some(Who::Local { .. }) | None if !self.server => self.local(),
             Some(who) => who,
             None => return refused(400, "a request to a server must say who is calling (caller)").map(|_| Who::System),
         };
@@ -558,7 +568,7 @@ impl Runtime {
         if self.server {
             Who::System
         } else {
-            Who::Local(Rc::from(self.outbox.user.as_deref().unwrap_or_default()))
+            Who::Local { id: Rc::from(self.outbox.user.as_deref().unwrap_or_default()), roles: self.device_roles.clone() }
         }
     }
 
@@ -625,7 +635,7 @@ impl Runtime {
         let method = self.program.objects[class as usize].methods.get_index(m as usize).map_or("", |(name, _)| name).to_string();
         let caller = match &f.caller {
             Who::Remote { id, .. } => Some(id.to_string()),
-            Who::System | Who::Local(_) => None,
+            Who::System | Who::Local { .. } => None,
         };
         self.outputs.push(Output::Ran { object: o.obj.key(), method, by: o.by.into(), caller, ok, ms: (self.now - o.at).max(0.0) as u64 });
     }

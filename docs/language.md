@@ -95,8 +95,9 @@ replica of it:
 - **Reads** (`room.messages`) come from the replica. It is cached on the device, so it also
   shows while offline.
 - **Method calls** run on the server and return a promise. While offline they wait in a
-  queue and run exactly once when the server is back. A method that throws rejects the
-  promise.
+  queue and run exactly once when the server is back. A method that throws, or a call the
+  server refuses, rejects the promise, even when it was queued offline. Catch it
+  (`try { await slot.book() } catch (e) { this.error = e.message }`) to tell the person.
 - **Changes** from any device stream back over realtime, and every replica re-renders.
 
 The server is the single authority, so there are no conflicts to resolve. Timers on
@@ -112,7 +113,10 @@ Without a rule, nothing can be read or called from outside the server:
 - `"owner"` is the caller whose id is the object's id, as in `Cart.get(caller.id)`.
 
 Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take identity from
-`caller.id`, never from arguments. `tj check app.tj --access` prints every rule. Details:
+`caller.id`, never from arguments. In UI code on a device, `caller` is the signed-in user
+(`{ id: "", roles: [] }` before sign-in), and the screen is drawn again when that changes. Use
+it to show the right screen (`if (caller.roles.includes("staff"))`); the server still checks
+every call. `tj check app.tj --access` prints every rule. Details:
 [access control](access-control.md).
 
 ## Personal data: `@pii`
@@ -132,7 +136,7 @@ reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's cal
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
 `@retain("90d")` erases objects of a class that long after their last change, and
 `@legalHold("6y")` keeps them that long even when erased. `tj privacy export` and
-`tj privacy erase` act on everything held about one person; from app code,
+`tj privacy erase` act on everything held about one person: every object whose id is theirs (copies the app put on other objects are the app's to clear); from app code,
 `import { exportData, erase } from "tj:privacy"` does the same for the person themselves or
 the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `--record`
 the record of processing. Optionally, `const lawfulBasis = { account: "contract" }` gives each
@@ -365,3 +369,6 @@ Keep keys in a server object nobody outside the server can read or call:
 - `tj dev app.tj` runs the app with live reload.
 - In the browser, `window.tinyjump.inspect()` returns every node with its bounds and
   visibility, plus all object state. `tinyjump.act({ id: "inc" }, "onPress")` presses a button.
+- `tj mcp` and `tj review` drive the real screen: under `tj dev`, the open browser tab
+  answers them (with no tab open, the server does). `tj dev --as ana:staff` signs the
+  browser in as `dev:ana` with the role `staff`.

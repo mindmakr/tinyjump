@@ -77,6 +77,10 @@ only requests whose `Host` is `localhost` or an IP address: this blocks DNS rebi
 needs a host name, while devices and emulators still connect by address (`10.0.2.2`).
 `tj serve` has no `--as`.
 
+**`tj serve --web`** also serves the web app, with a sign-in bar that takes an API key and
+keeps it for the tab only. An app with its own sign-in (an OIDC provider's SDK, say)
+serves its own page and calls `setToken` instead.
+
 ## What callers may do: rules
 
 ```ts
@@ -119,11 +123,13 @@ through calls into other objects. Two interleaved calls never see each other's c
 - An alarm set with `this.schedule` runs as the caller who scheduled it, so data rules
   such as a ban list still hold.
 - `@every` timers and boot run as `{ id: "system", roles: ["system"] }`.
-- On a device, local code (the UI and its handlers) runs as `{ id, roles: [] }`:
-  - `id` is the user the host signed in (the `identity` input, `setToken` on the web), or
-    `""` before anyone signs in;
-  - the UI is drawn again when that changes, so `Member.get(caller.id)` follows the user;
-  - the device does not verify identity; the server does, on every call.
+- On a device, local code (the UI and its handlers) runs as `{ id, roles }` of the user the
+  host signed in (the `identity` input, `setToken` on the web), or `{ id: "", roles: [] }`
+  before anyone signs in:
+  - the UI is drawn again when either changes, so `Member.get(caller.id)` follows the user,
+    and `caller.roles.includes("staff")` shows or hides staff controls;
+  - the device does not verify identity; the server does, on every call, so hiding a
+    button is for people, never for security.
 
 ```ts
 @allow("signedIn") post(text: string) {
@@ -208,8 +214,9 @@ The app that embeds tinyjump signs the user in, for example with the platform's 
 SDK, and hands the token to the host. Signing in inside tinyjump (an OIDC flow with PKCE)
 can come later, as a plugin.
 
-- **`setToken(token, userId)`:** the host passes the user's id to the runtime too
-  (`identity` input).
+- **`setToken(token, userId, roles)`:** the host passes the user's id and roles to the
+  runtime too (`identity` input). It learns them from `GET /api/whoami`, which answers
+  `{ id, roles }` for the credentials it is sent.
   - Each queued server call records the identity it was made under.
   - When the identity changes, calls queued by the previous user are dropped and reported
     as errors, never sent as the new user.
