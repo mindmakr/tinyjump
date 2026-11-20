@@ -125,6 +125,12 @@ struct Checker {
     /// Revealed data written into fields that are not personal (a queue, a cache): read
     /// back from them, it is still followed.
     field_revealed: HashMap<Field, BTreeSet<Field>>,
+    /// Purposes whose lawful basis is consent (`const lawfulBasis`).
+    consent_purposes: HashSet<String>,
+    /// The consents each method checks first (`@needs`), by the method's declaration.
+    needs_of: HashMap<*const FnDecl, Vec<String>>,
+    /// The consents checked in the code being followed: the method's, and its closures'.
+    needs: Vec<Vec<String>>,
 }
 
 /// Where personal data goes when it leaves the server.
@@ -233,7 +239,8 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
         return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new() };
+    c.consent_purposes = crate::lawful_basis::declared(files).unwrap_or_default().into_iter().filter(|(_, b)| b == "consent").map(|(p, _)| p).collect();
     let user: Vec<&Program> = files.iter().filter(|(name, _)| !name.starts_with("tj:")).map(|(_, p)| *p).collect();
     for (name, p) in files.iter().filter(|(name, _)| name.starts_with("tj:")) {
         for item in &p.items {
@@ -262,6 +269,10 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
                                 pii.insert(Rc::from(f.name.as_str()), (cat.clone(), purposes.to_vec()));
                             }
                         }
+                    }
+                    for m in &o.methods {
+                        let needs: Vec<String> = m.decorators.iter().filter(|d| d.name == "needs").flat_map(words).filter_map(|w| w.strip_prefix("consent:").map(str::to_string)).collect();
+                        c.needs_of.insert(Rc::as_ptr(&m.func), needs);
                     }
                     let methods = o.methods.iter().map(|m| (m.func.name.clone(), (m.func.clone(), m.decorators.iter().find(|d| d.name == "allow").map(words)))).collect();
                     c.classes.insert(Rc::from(o.name.as_str()), Class { pii, methods });
@@ -401,6 +412,12 @@ impl Checker {
             args.iter().for_each(|a| t.join(&self.flatten(a)));
             return t;
         }
+        // A closure checks what the code around it checked; a method, its own @needs.
+        let needs = match &captured {
+            Some(_) => self.needs.last().cloned().unwrap_or_default(),
+            None => self.needs_of.get(&Rc::as_ptr(f)).cloned().unwrap_or_default(),
+        };
+        self.needs.push(needs);
         let owner_only = endpoint == Endpoint::OwnerOnly;
         let mut fr = Frame { vars: captured.as_deref().cloned().unwrap_or_default(), this, owner_only, endpoint, ret: Taint::default() };
         for (i, p) in f.params.iter().enumerate() {
@@ -415,6 +432,7 @@ impl Checker {
         for _ in 0..2 {
             self.block(&f.body, &mut fr);
         }
+        self.needs.pop();
         self.active.remove(&key);
         if pure {
             self.memo.insert(key, fr.ret.clone());
@@ -645,6 +663,7 @@ impl Checker {
             }
             ExprKind::Assign { target, value, .. } => {
                 let v = self.expr(value, fr);
+                self.consent_to_store(target, value, e.span, fr);
                 self.assign(target, v.clone(), e.span, fr);
                 v
             }
@@ -713,6 +732,22 @@ impl Checker {
             let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
                 .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
             self.report(d);
+        }
+    }
+
+    /// Writing into this object's field held only for purposes that rest on consent (collecting
+    /// it) needs one of those consents checked. Clearing it to a literal does not, so data can
+    /// be dropped once consent is withdrawn.
+    fn consent_to_store(&mut self, target: &Expr, value: &Expr, span: crate::syntax::Span, fr: &Frame) {
+        let (ExprKind::This, Some(field)) = (&Self::root(target).0.kind, Self::root(target).1) else { return };
+        let Some((class, _)) = &fr.this else { return };
+        let Some((_, purposes)) = self.classes.get(class).and_then(|c| c.pii.get(field)) else { return };
+        let literal = matches!(&value.kind, ExprKind::Str(_) | ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Null) || matches!(&value.kind, ExprKind::Array(a) if a.is_empty());
+        if literal || purposes.is_empty() || !purposes.iter().all(|p| self.consent_purposes.contains(p)) {
+            return;
+        }
+        if !self.needs.last().is_some_and(|n| purposes.iter().any(|p| n.contains(p))) {
+            self.report(Diagnostic::new(format!("{class}.{field} is held only for {}, which rests on consent, and this method stores it without checking", purposes.join(", ")), span).hint(format!("add @needs(\"consent:{}\") to this method", purposes[0])));
         }
     }
 
@@ -973,6 +1008,10 @@ impl Checker {
             self.report(Diagnostic::new("reveal needs the purpose as a string", span).hint("write reveal(value, \"account\"), naming one of the field's purposes"));
             return;
         };
+        // Data used for a purpose that rests on consent: only where the consent is checked.
+        if self.consent_purposes.contains(p) && !t.is_clean() && !self.needs.last().is_some_and(|n| n.contains(p)) {
+            self.report(Diagnostic::new(format!("\"{p}\" rests on consent (lawfulBasis), and this method does not check it"), span).hint(format!("add @needs(\"consent:{p}\") to the method that reveals it; it refuses to run unless the person has consented")));
+        }
         let wrong: Vec<String> = t
             .fields
             .iter()

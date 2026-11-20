@@ -60,7 +60,11 @@ impl Runtime {
     }
 
     pub(crate) fn count_refused(&mut self, object: &str, method: &str) {
-        if let Some((c, m)) = self.method_slot(object, method) {
+        self.count_refused_slot(self.method_slot(object, method));
+    }
+
+    pub(crate) fn count_refused_slot(&mut self, slot: Option<(u16, u16)>) {
+        if let Some((c, m)) = slot {
             self.stats[c as usize][m as usize].refused += 1;
         }
     }

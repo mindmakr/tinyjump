@@ -61,6 +61,8 @@ pub enum Run {
 pub struct Failure {
     pub message: String,
     pub trace: Vec<String>,
+    /// How a request fails, when not the default (`Exc::refused`).
+    pub status: Option<u16>,
 }
 
 impl Runtime {
@@ -442,6 +444,23 @@ impl Runtime {
                         f.stack.push(Value::Elem(Rc::new(elem)));
                     }
                     Op::Caller => f.stack.push(f.caller.record()),
+                    Op::NeedsConsent(k) => {
+                        let o = pop!();
+                        let Value::Str(purpose) = &self.program.consts[k as usize] else { unreachable!("the purpose is a string constant") };
+                        #[cfg(feature = "server")]
+                        let refused = match &o {
+                            Value::Obj(o) => self.needs_consent(o, &purpose.clone()).err(),
+                            _ => Some(Exc::msg("@needs runs on objects")),
+                        };
+                        #[cfg(not(feature = "server"))]
+                        let refused = {
+                            drop(o);
+                            Some(Exc::msg(format!("@needs(\"consent:{purpose}\") is checked on servers only")))
+                        };
+                        if let Some(e) = refused {
+                            throw!(e);
+                        }
+                    }
                     Op::Await => {
                         let v = pop!();
                         if let Value::Promise(id) = v {
@@ -452,7 +471,7 @@ impl Runtime {
                     }
                     Op::Throw => {
                         let v = pop!();
-                        throw!(Exc(v));
+                        throw!(Exc(v, crate::vm::value::Refusal(false)));
                     }
                     Op::TryBegin(t) => f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize }),
                     Op::TryEnd => {
@@ -476,7 +495,7 @@ impl Runtime {
                 f.stack.push(exc.0);
                 Ok(())
             }
-            None => Err(self.failure(f, exc.message())),
+            None => Err(Failure { status: exc.status(), ..self.failure(f, exc.message()) }),
         }
     }
 
@@ -500,7 +519,7 @@ impl Runtime {
                 format!("at {} ({at})", proto.name)
             })
             .collect();
-        Failure { message, trace }
+        Failure { message, trace, status: None }
     }
 
     fn call_value(&mut self, f: &mut Fiber, pos: usize) -> Result<(), Exc> {

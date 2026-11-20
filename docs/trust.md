@@ -338,6 +338,15 @@ controls; it cannot weaken another pack's.
   - a pack's `transfers` list allows destinations, each with its basis;
   - the `transfers` control;
   - the record of processing lists recipients.
+- **As built, part 7C:**
+  - `tj:consent`, with `Consent/<person>` keeping the text, version, when given and when
+    withdrawn;
+  - `@needs("consent:x")`, compiled into a check at the start of the method, so requests,
+    timers, alarms and other methods all pass through it; a refusal is catchable and
+    answers 403;
+  - the flow check allows a consent-based purpose to be revealed only in a `@needs`
+    method;
+  - the `consent` control.
 - **Packs:** none ship with tinyjump (owner decision above). A sample GDPR pack shows the
   format. Regional packs (Saudi PDPL, UAE, Qatar, Bahrain, UK, California, HIPAA) come from
   counsel or contributors. They are mostly "person" controls, because those regimes are

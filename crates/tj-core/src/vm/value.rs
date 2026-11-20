@@ -107,11 +107,26 @@ pub struct Elem {
 }
 
 /// A thrown value. Runtime errors are records `{ name: "Error", message }`, like `new Error(msg)`.
-pub struct Exc(pub Value);
+pub struct Exc(pub Value, pub Refusal);
+
+/// Whether an error refuses the request (`Exc::refused`): set only by the runtime, so app
+/// code cannot make a request fail with a status of its choosing.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Refusal(pub bool);
 
 impl Exc {
     pub fn msg(message: impl Into<String>) -> Exc {
-        Exc(error_record(&message.into()))
+        Exc(error_record(&message.into()), Refusal(false))
+    }
+
+    /// An error that refuses the request, answered with 403 when nothing catches it.
+    pub fn refused(message: impl Into<String>) -> Exc {
+        Exc(error_record(&message.into()), Refusal(true))
+    }
+
+    /// The status a request fails with when nothing catches this error (see [`Exc::refused`]).
+    pub fn status(&self) -> Option<u16> {
+        self.1 .0.then_some(403)
     }
 
     pub fn message(&self) -> String {

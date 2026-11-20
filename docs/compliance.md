@@ -95,6 +95,7 @@ Not covered by this pack:
 | `encryption-at-rest` | the server runs with `TJ_KEY_FILE`, kept outside the data folder so backups do not carry it (checked by `tj serve`) |
 | `encryption-in-transit` | the server is reached over TLS (`TJ_TLS_TERMINATED=1`), or listens on this machine only (checked by `tj serve`) |
 | `transfers` | personal data leaves the server only for destinations in the pack's `transfers` (below) |
+| `consent` | purposes whose basis is `consent` are recorded with `tj:consent`, and their data is revealed only in methods marked `@needs` (below) |
 
 An app with no personal data meets every check.
 
@@ -124,3 +125,42 @@ leaves the server:
 - **A plugin** such as `tj:ai`: the plugin's name.
 
 `tj check --privacy --record` lists these destinations as the recipients.
+
+## Consent
+
+When a purpose rests on consent (`lawfulBasis = { news: "consent" }`), people give and
+withdraw it through `tj:consent`. Methods that use the data check it first:
+
+```ts
+import { Consent, consented } from "tj:consent"
+
+const lawfulBasis = { account: "contract", news: "consent" }
+
+@server @read("owner") object Member {
+  @pii("contact", "account", "news") email: string = ""
+
+  @needs("consent:news") async newsletter(issue: string) {
+    await fetch("https://api.mailer.example/send", { method: "POST", body: reveal(this.email, "news") })
+  }
+}
+
+// In the UI:
+Consent.get(caller.id).give("news", "Send me the monthly newsletter.", "v1")
+Consent.get(caller.id).withdraw("news")
+```
+
+- **`Consent/<person>`** keeps, for each purpose, the exact text the person was shown, its
+  version, when they gave it, and when they withdrew it. It belongs to the person: only
+  they can give or withdraw it, every change is an audited call, and `tj privacy export` and
+  `erase` include it.
+- **`@needs("consent:<purpose>")`** goes on a method of a `@server` object that belongs to a
+  person. The method runs only if that person has consented and not withdrawn, whoever
+  starts it: a request, a timer, an alarm or another method.
+  - When it refuses, it throws an error that code can catch, so a loop over members skips
+    one without stopping.
+  - A request it refuses gets 403, written to the audit log as a refusal.
+- **`consented(person, purpose)`** answers the same question, for the UI or for code that
+  chooses what to do.
+- **The check:** data held for a consent-based purpose may be revealed for that purpose
+  only inside a method marked `@needs` for it, or the arrow functions in that method. A
+  helper function called from it does not count, so move the `reveal` into the method.

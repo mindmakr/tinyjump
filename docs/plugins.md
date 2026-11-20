@@ -125,3 +125,5 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
 6. **Done: `tj:privacy`** (`plugins/privacy/plugin.tj`): a person's export and erasure
    from app code (docs/privacy.md). The server carries it out itself rather than through an
    MCP server, because it acts on the runtime's own objects.
+7. **Done: `tj:consent`** (`plugins/consent/plugin.tj`): consent records, owned by the
+   person. `@needs("consent:x")` checks them in the runtime (docs/compliance.md).

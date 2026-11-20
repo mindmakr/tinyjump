@@ -8,6 +8,9 @@ use std::rc::Rc;
 /// and element tables, a frame's local slots, or the closure's captured cells.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Op {
+    /// `@needs("consent:<purpose>")` at the start of a method: pops `this` and throws a
+    /// refusal unless the person it belongs to has consented (tj:consent).
+    NeedsConsent(u32),
     Const(u32),
     Null,
     True,

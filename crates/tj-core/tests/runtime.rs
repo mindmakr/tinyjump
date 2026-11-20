@@ -2012,3 +2012,90 @@ async function report() { await fetch("https://global.example/x", { body: last }
     has(23, Host("global.example".into()));
     assert!(!found.iter().any(|(_, d)| *d == Host("api.mailer.example".into())), "a user part does not make the allowed host the destination: {found:?}");
 }
+
+const CONSENTING: &str = r#"import { consented } from "tj:consent"
+const lawfulBasis = { account: "contract", marketing: "consent" }
+@server @read("owner") object Member {
+  @pii("contact", "account", "marketing") email: string = ""
+  sent: number = 0
+  @allow("owner") setEmail(e: string) { this.email = e }
+  @needs("consent:marketing") @allow("owner") news() { this.sent += 1 }
+  @allow("owner") tryNews(): string {
+    try { this.news(); return "sent" } catch (e) { return e.message }
+  }
+  @allow("owner") asks(): boolean { return consented(this.id, "marketing") }
+}
+"#;
+
+#[test]
+fn needs_consent_refuses_until_given_and_again_once_withdrawn() {
+    let mut rt = server(CONSENTING, false);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1.0, "Member/user:ana", "setEmail", json!(["a@example.com"]), ana()).unwrap();
+    let refused = call_as(&mut rt, 2.0, "Member/user:ana", "news", json!([]), ana()).unwrap_err();
+    assert_eq!(refused.0, Some(403), "{refused:?}");
+    assert!(refused.1.contains("has not consented to marketing"), "{refused:?}");
+    assert!(call_as(&mut rt, 3.0, "Member/user:ana", "tryNews", json!([]), ana()).unwrap().as_str().unwrap().contains("has not consented"), "app code can catch it, so one refusal need not stop a loop");
+
+    call_as(&mut rt, 4.0, "Consent/user:ana", "give", json!(["marketing", "Send me the club's news", "v1"]), ana()).unwrap();
+    assert_eq!(call_as(&mut rt, 5.0, "Member/user:ana", "tryNews", json!([]), ana()), Ok(json!("sent")));
+    assert_eq!(call_as(&mut rt, 5.0, "Member/user:ana", "asks", json!([]), ana()), Ok(json!(true)));
+    assert!(call_as(&mut rt, 6.0, "Consent/user:bo", "give", json!(["marketing", "x", "v1"]), ana()).is_err(), "nobody gives consent for someone else");
+
+    call_as(&mut rt, 7.0, "Consent/user:ana", "withdraw", json!(["marketing"]), ana()).unwrap();
+    assert_eq!(call_as(&mut rt, 8.0, "Member/user:ana", "news", json!([]), ana()).unwrap_err().0, Some(403));
+    // The record of it is the person's: exported with their data, erased with it.
+    let data = rt.export_subject("user:ana").unwrap();
+    assert_eq!(data["Consent/user:ana"]["given"]["marketing"]["text"], json!("Send me the club's news"));
+    assert_eq!(data["Consent/user:ana"]["given"]["marketing"]["withdrawn"], json!(7));
+    let e = rt.erase_subject("user:ana", None).unwrap();
+    assert!(e.erased.contains(&"Consent/user:ana".to_string()), "{:?}", e.erased);
+}
+
+#[test]
+fn a_consent_refusal_keeps_its_403_and_app_code_cannot_forge_one() {
+    let src = CONSENTING.replace("  @allow(\"owner\") asks()", "  @allow(\"owner\") forge() { throw { message: \"x\", status: 401 } }
+  @allow(\"owner\") asks()");
+    let mut rt = server(&src, false);
+    let ana = || who("user:ana", &[]);
+    // A device's call, run once under its id: still 403, and nothing kept for it.
+    let out = rt.handle(1.0, Input::Call { object: "Member/user:ana".into(), method: "news".into(), args: vec![], reply: Some(1), call: Some("k1".into()), caller: ana() });
+    let status = out.iter().find_map(|o| if let Output::Reply { status, error: Some(_), .. } = o { Some(*status) } else { None });
+    assert_eq!(status, Some(Some(403)), "{out:?}");
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Member/user:ana"]["sent"], json!(0));
+    // A record thrown by app code is an ordinary error, whatever it says.
+    assert_eq!(call_as(&mut rt, 2.0, "Member/user:ana", "forge", json!([]), ana()).unwrap_err().0, None);
+}
+
+#[test]
+fn needs_consent_is_checked_where_it_must_be() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| format!("{} | {}", d.message, d.hint.clone().unwrap_or_default())).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    let import = "import { consented } from \"tj:consent\"\n";
+    assert!(msg(&format!("{import}object Board {{\n  @needs(\"consent:marketing\") f() {{}}\n}}\n")).contains("@needs is for methods of a @server object that belongs to a person"));
+    assert!(msg("@server @read(\"owner\") object M {\n  @needs(\"consent:marketing\") f() {}\n}\n").contains("add import { consented } from \"tj:consent\""));
+    assert!(msg(&format!("{import}@server @read(\"owner\") object M {{\n  @needs(\"marketing\") f() {{}}\n}}\n")).contains("@needs takes \"consent:<purpose>\""));
+    // Data for a purpose resting on consent is revealed only where consent is checked.
+    let app = |method: &str| format!("{import}const lawfulBasis = {{ marketing: \"consent\" }}\n@server @read(\"owner\") object M {{\n  @pii(\"contact\", \"marketing\") email: string = \"\"\n  {method}\n}}\n");
+    let e = msg(&app("async send() { await fetch(\"https://mail.example/x\", { body: reveal(this.email, \"marketing\") }) }"));
+    assert!(e.contains("\"marketing\" rests on consent") && e.contains("add @needs(\"consent:marketing\")"), "{e}");
+    assert_eq!(msg(&app("@needs(\"consent:marketing\") async send() { await fetch(\"https://mail.example/x\", { body: reveal(this.email, \"marketing\") }) }")), "");
+    // Collecting data held only on consent needs the consent; clearing it does not.
+    let e = msg(&app("@allow(\"owner\") setEmail(e: string) { this.email = e }"));
+    assert!(e.contains("M.email is held only for marketing, which rests on consent") && e.contains("add @needs(\"consent:marketing\")"), "{e}");
+    assert_eq!(msg(&app("@needs(\"consent:marketing\") @allow(\"owner\") setEmail(e: string) { this.email = e }")), "");
+    assert_eq!(msg(&app("@allow(\"owner\") forget() { this.email = \"\" }")), "");
+    // @needs may be written once per purpose too.
+    assert_eq!(msg(&format!("{import}@server @read(\"owner\") object M {{
+  @needs(\"consent:a\") @needs(\"consent:b\") f() {{}}
+}}
+")), "");
+    // Only tj:consent keeps consents: an app's own Consent object does not count.
+    let own = "@server object Consent {
+  given: any = {}
+}
+@server @read(\"owner\") object M {
+  @needs(\"consent:marketing\") f() {}
+}
+";
+    assert!(msg(own).contains("add import { consented } from \"tj:consent\""), "{}", msg(own));
+}
