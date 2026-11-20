@@ -176,7 +176,8 @@ reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's cal
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
 `@retain("90d")` erases objects of a class that long after their last change, and
 `@legalHold("6y")` keeps them that long even when erased. `tj privacy export` and
-`tj privacy erase` act on everything held about one person: every object whose id is theirs (copies the app put on other objects are the app's to clear); from app code,
+`tj privacy erase` act on everything held about one person: every object whose id is
+theirs, and their entries in shared lists (below); from app code,
 `import { exportData, erase } from "tj:privacy"` does the same for the person themselves or
 the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `--record`
 the record of processing. Optionally, `const lawfulBasis = { account: "contract" }` gives each
@@ -186,6 +187,21 @@ app against a region's rules. For a purpose that rests on consent, `tj:consent` 
 people's consents (`Consent.get(caller.id).give(purpose, text, version)`, `withdraw`), and
 `@needs("consent:news")` on a method makes it refuse to run without consent. Details: [personal data](privacy.md),
 [compliance packs](compliance.md).
+
+A list holding several people's entries, such as a staff roster of who booked, says whose
+each entry is with `@by`. Readers the object's `@read` rule admits see the entries, tools
+see `•••`, and export, erasure and `@retain` (counted from each entry's own time) reach
+each entry:
+
+```tsx
+type Booker = { customer: string, name: string, at: number }
+@server @read("staff") @retain("90d") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+}
+```
+
+Personal data copied into a field must go into a `@pii` field like this one; the compiler
+refuses other copies.
 
 ## Plugins
 
