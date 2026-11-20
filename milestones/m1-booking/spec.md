@@ -48,9 +48,10 @@ title, start, length and state ("open", "booked" or "past").
 - **B5. Book.** Given an open slot, when a customer presses `book-<slot id>`, then the slot
   shows as booked to everyone, and in that customer's `my-bookings` list.
   - Booking checks with the business first. Staff may set a check address
-    (`check-url`, saved with `save-check`): before a booking is recorded, the app fetches
-    it with the slot id, and refuses the booking unless the answer is `200`. With no
-    address set, bookings are accepted.
+    (`check-url`, saved with `save-check`). Before a booking is recorded, the app sends
+    `GET <check-url>?slot=<slot id>` (`&slot=` when the address already has a `?`). It
+    refuses the booking, with the reason in `book-error`, unless the answer is `200`. With
+    no address set, bookings are accepted.
 - **B6. No double booking.** Given an open slot, when two customers book it at the same
   moment, then exactly one gets it, even while the check above is slow. The other sees
   `book-error` saying it was just taken, and the slot is not in their `my-bookings`.
