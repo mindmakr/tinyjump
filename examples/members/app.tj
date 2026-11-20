@@ -20,6 +20,9 @@ const lawfulBasis = { account: "contract" }
 }
 
 function App() {
+  if (caller.id === "") {
+    return <Column padding={24}><Text>Sign in to see your membership.</Text></Column>
+  }
   const me = Member.get(caller.id)
   return <Column padding={24} gap={12}>
     <Text size={24} weight="bold">Members</Text>

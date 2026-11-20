@@ -9,7 +9,7 @@
 use serde_json::Value as Json;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use tj_core::vm::program::Program;
+use tj_core::vm::program::{Program, PII_CATEGORIES};
 
 /// The controls tinyjump can check, and what each means.
 const CHECKS: &[(&str, &str)] = &[
@@ -18,8 +18,9 @@ const CHECKS: &[(&str, &str)] = &[
     ("retention", "every object holding personal data is erased after a set time (`@retain`)"),
     ("subject-rights", "people can get a copy of their data and have it erased (`tj privacy`, `tj:privacy`)"),
     ("records", "the record of processing can be written (`tj check --privacy --record`)"),
-    ("audit-log", "who read or changed personal data is logged, tamper-evident (on every server)"),
-    ("encryption-at-rest", "stored data is encrypted (`TJ_KEY_FILE`); checked when the server starts"),
+    ("audit-log", "who read or changed personal data is logged, under a key kept apart from the data; checked when the server starts"),
+    ("encryption-at-rest", "stored data is encrypted, under a key kept apart from the data; checked when the server starts"),
+    ("encryption-in-transit", "the server is reached over TLS, or only from this machine; checked when the server starts"),
 ];
 
 /// A pack, with the packs it extends merged in.
@@ -30,6 +31,10 @@ pub struct Pack {
     /// Each pack it is made of: name, date in force, and who reviewed it (`None`: a draft).
     pub reviews: Vec<(String, String, Option<String>)>,
     pub special: BTreeSet<String>,
+    /// The lawful bases on which special-category data may be held without a person
+    /// confirming another condition: `["consent"]` unless packs say otherwise, and only
+    /// narrowed when packs are combined.
+    pub special_bases: Option<BTreeSet<String>>,
     pub controls: Vec<Control>,
     pub not_covered: Vec<String>,
 }
@@ -48,6 +53,17 @@ pub enum Kind {
     Person(String),
 }
 
+/// What only a starting server knows.
+pub struct Server {
+    /// `TJ_KEY_FILE` is set, and lives outside the data folder.
+    pub encrypted: bool,
+    pub encryption_key_apart: bool,
+    /// The audit key lives outside the data folder.
+    pub audit_key_apart: bool,
+    /// Loopback, or TLS terminated in front (`TJ_TLS_TERMINATED=1`).
+    pub tls: bool,
+}
+
 /// Where a control stands.
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
@@ -62,29 +78,53 @@ impl Pack {
     /// Loads `path` and every pack it extends (paths relative to the file).
     pub fn load(path: &Path) -> Result<Pack, String> {
         let mut pack = Pack::default();
-        pack.add(path, &mut Vec::new())?;
+        pack.add(path, &mut Vec::new(), &mut Vec::new())?;
         Ok(pack)
     }
 
-    fn add(&mut self, path: &Path, seen: &mut Vec<PathBuf>) -> Result<(), String> {
+    /// Adds the pack at `path` after the packs it extends. `visiting` is the chain being
+    /// loaded (a pack in it again is a cycle); `loaded` are packs already merged, which a
+    /// second path to them (two packs extending the same base) skips.
+    fn add(&mut self, path: &Path, visiting: &mut Vec<PathBuf>, loaded: &mut Vec<PathBuf>) -> Result<(), String> {
         let at = path.canonicalize().map_err(|e| format!("cannot read the pack {}: {e}", path.display()))?;
-        if seen.contains(&at) {
+        if visiting.contains(&at) {
             return Err(format!("the pack {} extends itself", path.display()));
         }
-        seen.push(at.clone());
+        if loaded.contains(&at) {
+            return Ok(());
+        }
+        visiting.push(at.clone());
         let text = std::fs::read_to_string(&at).map_err(|e| format!("cannot read the pack {}: {e}", path.display()))?;
         let json: Json = serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
         let bad = |what: &str| format!("{}: {what}", path.display());
         let name = json["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("needs a \"name\""))?;
         for parent in strings(&json["extends"]).map_err(|e| bad(&format!("\"extends\" {e}")))? {
-            self.add(&at.parent().unwrap_or(Path::new(".")).join(parent), seen)?;
+            self.add(&at.parent().unwrap_or(Path::new(".")).join(parent), visiting, loaded)?;
         }
+        visiting.pop();
+        loaded.push(at.clone());
         // Parents are added first, so the pack given last names the whole.
         self.title = json["title"].as_str().unwrap_or(name).to_string();
         self.names.push(name.to_string());
         let effective = json["effective"].as_str().filter(|d| !d.is_empty()).ok_or_else(|| bad("needs \"effective\", the date the rules apply from"))?;
         self.reviews.push((name.to_string(), effective.to_string(), json["reviewedBy"].as_str().map(str::to_string)));
-        self.special.extend(strings(&json["special"]).map_err(|e| bad(&format!("\"special\" {e}")))?);
+        for category in strings(&json["special"]).map_err(|e| bad(&format!("\"special\" {e}")))? {
+            if !PII_CATEGORIES.contains(&category.as_str()) {
+                return Err(bad(&format!("\"special\" lists \"{category}\", which is not a @pii category; the categories are {}", PII_CATEGORIES.join(", "))));
+            }
+            self.special.insert(category);
+        }
+        if !json["specialBases"].is_null() {
+            let bases: BTreeSet<String> = strings(&json["specialBases"]).map_err(|e| bad(&format!("\"specialBases\" {e}")))?.into_iter().collect();
+            if let Some(b) = bases.iter().find(|b| !tj_core::lawful_basis::BASES.contains(&b.as_str())) {
+                return Err(bad(&format!("\"specialBases\" lists \"{b}\", which is not a lawful basis; the bases are {}", tj_core::lawful_basis::BASES.join(", "))));
+            }
+            // Combined packs only narrow: a basis must be allowed by every pack that names any.
+            self.special_bases = Some(match self.special_bases.take() {
+                Some(before) => before.intersection(&bases).cloned().collect(),
+                None => bases,
+            });
+        }
         self.not_covered.extend(strings(&json["notCovered"]).map_err(|e| bad(&format!("\"notCovered\" {e}")))?);
         let controls = json["controls"].as_array().ok_or_else(|| bad("needs \"controls\", a list"))?;
         for (i, c) in controls.iter().enumerate() {
@@ -104,8 +144,9 @@ impl Pack {
         Ok(())
     }
 
-    /// Each control with its verdict, for an app (`encrypted`: known only to a server).
-    pub fn evaluate(&self, src: &str, program: &Program, encrypted: Option<bool>) -> Vec<(&Control, Verdict)> {
+    /// Each control with its verdict, for an app; `server` when a server is starting.
+    pub fn evaluate(&self, src: &str, program: &Program, server: Option<&Server>) -> Vec<(&Control, Verdict)> {
+        let special_bases = self.special_bases.clone().unwrap_or_else(|| BTreeSet::from(["consent".to_string()]));
         let bases = tj_core::lawful_bases(src);
         let held: Vec<_> = program.objects.iter().filter(|o| !o.pii.is_empty()).collect();
         let basis_of = |purpose: &str| bases.as_ref().and_then(|b| b.iter().find(|(p, _)| p == purpose).map(|(_, b)| b.clone()));
@@ -129,7 +170,7 @@ impl Pack {
                         for o in &held {
                             for p in o.pii.iter().filter(|p| self.special.contains(&*p.category)) {
                                 any = true;
-                                let not_consent: Vec<String> = p.purposes.iter().filter(|purpose| basis_of(purpose).as_deref() != Some("consent")).map(|p| p.to_string()).collect();
+                                let not_consent: Vec<String> = p.purposes.iter().filter(|purpose| !basis_of(purpose).is_some_and(|b| special_bases.contains(&b))).map(|p| p.to_string()).collect();
                                 if !not_consent.is_empty() {
                                     doubtful.push(format!("{}.{} ({}) for {}", o.name, p.field, p.category, not_consent.join(", ")));
                                 }
@@ -138,9 +179,9 @@ impl Pack {
                         if !any {
                             Verdict::Met("the app holds no special-category data".into())
                         } else if doubtful.is_empty() {
-                            Verdict::Met("special categories are held only on consent".into())
+                            Verdict::Met(format!("special categories are held only on {}", special_bases.iter().cloned().collect::<Vec<_>>().join(" or ")))
                         } else {
-                            Verdict::NotMet(format!("special-category data held without consent: {}. Make those purposes consent-based, or have a person confirm another condition and record it", doubtful.join("; ")))
+                            Verdict::NotMet(format!("special-category data held on another basis than {}: {}. Change those purposes' basis, or have a person confirm another condition the law allows and record it", special_bases.iter().cloned().collect::<Vec<_>>().join(" or "), doubtful.join("; ")))
                         }
                     }
                     "retention" => {
@@ -153,11 +194,21 @@ impl Pack {
                     }
                     "subject-rights" => Verdict::Met("built in: tj privacy export|erase, and tj:privacy in app code".into()),
                     "records" => Verdict::Met("built in: tj check --privacy --record".into()),
-                    "audit-log" => Verdict::Met("built in on every server".into()),
-                    "encryption-at-rest" => match encrypted {
-                        Some(true) => Verdict::Met("TJ_KEY_FILE is set".into()),
-                        Some(false) => Verdict::NotMet("set TJ_KEY_FILE to encrypt stored data (docs/privacy.md)".into()),
+                    "audit-log" => match server {
                         None => Verdict::AtServe,
+                        Some(s) if s.audit_key_apart => Verdict::Met("on, with its key kept apart from the data".into()),
+                        Some(_) => Verdict::NotMet("the audit key is in the data folder, so a copy of the data could rewrite the log: set TJ_AUDIT_KEY_FILE to a file elsewhere".into()),
+                    },
+                    "encryption-at-rest" => match server {
+                        None => Verdict::AtServe,
+                        Some(s) if !s.encrypted => Verdict::NotMet("set TJ_KEY_FILE to encrypt stored data (docs/privacy.md)".into()),
+                        Some(s) if !s.encryption_key_apart => Verdict::NotMet("TJ_KEY_FILE is in the data folder, so every backup carries its key: keep it elsewhere".into()),
+                        Some(_) => Verdict::Met("on, with its key kept apart from the data".into()),
+                    },
+                    "encryption-in-transit" => match server {
+                        None => Verdict::AtServe,
+                        Some(s) if s.tls => Verdict::Met("TLS in front, or reachable from this machine only".into()),
+                        Some(_) => Verdict::NotMet("the server listens on the network over plain HTTP: put TLS in front and set TJ_TLS_TERMINATED=1, or bind to 127.0.0.1".into()),
                     },
                     other => unreachable!("loading accepts only known checks, not {other}"),
                 };
@@ -237,6 +288,16 @@ mod tests {
         assert!(Pack::load(&d.join("unknown.json")).unwrap_err().contains("cannot check \"be-nice\""));
         write("loop.json", r#"{ "name": "x", "effective": "2020-01-01", "extends": ["loop.json"], "controls": [] }"#);
         assert!(Pack::load(&d.join("loop.json")).unwrap_err().contains("extends itself"));
+        // Two packs extending the same base: the base is merged once.
+        write("finance.json", r#"{ "name": "finance", "effective": "2024-01-01", "extends": ["base.json"], "specialBases": ["consent", "contract"], "controls": [] }"#);
+        write("both.json", r#"{ "name": "both", "effective": "2025-01-01", "extends": ["health.json", "finance.json"], "specialBases": ["consent"], "controls": [] }"#);
+        let both = Pack::load(&d.join("both.json")).unwrap();
+        assert_eq!(both.names, ["base", "health", "finance", "both"]);
+        assert_eq!(both.special_bases, Some(BTreeSet::from(["consent".to_string()])), "combined packs only narrow");
+        write("bad-special.json", r#"{ "name": "x", "effective": "2020-01-01", "special": ["sexuality"], "controls": [] }"#);
+        assert!(Pack::load(&d.join("bad-special.json")).unwrap_err().contains("\"sexuality\", which is not a @pii category"));
+        write("bad-basis.json", r#"{ "name": "x", "effective": "2020-01-01", "specialBases": ["because"], "controls": [] }"#);
+        assert!(Pack::load(&d.join("bad-basis.json")).unwrap_err().contains("not a lawful basis"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -252,16 +313,19 @@ mod tests {
         assert!(!ok);
         assert!(r.starts_with("p (p from 2018-05-25)\nThis report is not legal advice. Not reviewed by counsel: p."), "{r}");
         assert!(r.contains("NOT MET   lawful-basis: declare the lawful basis of each purpose: const lawfulBasis = { care: \"contract\" }"), "{r}");
-        assert!(r.contains("NOT MET   special-basis: special-category data held without consent: Patient.notes (health) for care"), "{r}");
+        assert!(r.contains("NOT MET   special-basis: special-category data held on another basis than consent: Patient.notes (health) for care"), "{r}");
         assert!(r.contains("NOT MET   retention: kept forever: Patient."), "{r}");
         assert!(r.contains("at serve  encryption-at-rest") && r.contains("person    Appoint a DPO  [art. 37]"), "{r}");
 
         let src = "const lawfulBasis = { care: \"consent\" }\n@server @read(\"owner\") @retain(\"2y\") object Patient {\n  @pii(\"health\", \"care\") notes: string = \"\"\n}\n";
         let program = tj_core::compile(src).unwrap();
-        let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(true)));
+        let good = Server { encrypted: true, encryption_key_apart: true, audit_key_apart: true, tls: true };
+        let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(&good)));
         assert!(ok && !r.contains("NOT MET"), "{r}");
-        let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(false)));
+        let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(&Server { encrypted: false, ..good })));
         assert!(!ok && r.contains("NOT MET   encryption-at-rest: set TJ_KEY_FILE"), "{r}");
+        let (r, _) = pack.report(&pack.evaluate(src, &program, Some(&Server { encryption_key_apart: false, audit_key_apart: false, tls: false, ..good })));
+        assert!(r.contains("every backup carries its key") && r.contains("TJ_AUDIT_KEY_FILE") && r.contains("plain HTTP"), "{r}");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

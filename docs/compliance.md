@@ -56,8 +56,13 @@ Not covered by this pack:
 - **`reviewedBy`** names the counsel who reviewed the pack. Until it is set, every report
   says the pack is not reviewed.
 - **`extends`** lists other packs, by path relative to this file. A pack can only add to
-  the packs it extends: their controls, special categories and `notCovered` all remain.
-- **`special`** lists the `@pii` categories this law treats as special or sensitive.
+  the packs it extends: their controls, special categories and `notCovered` all
+  remain. Two packs may extend the same base; it is merged once.
+- **`special`** lists the `@pii` categories this law treats as special or sensitive. An
+  unknown category does not load.
+- **`specialBases`** (optional) lists the lawful bases on which special-category data may be
+  held without a person confirming another condition. The default is `["consent"]`. When
+  packs are combined, only the bases every one of them allows remain.
 - **Every control cites its `source`**, the law and article. A pack with a control without
   a source does not load.
 - A control is either:
@@ -70,12 +75,13 @@ Not covered by this pack:
 | `check` | Met when |
 |---|---|
 | `lawful-basis` | every purpose personal data is held for names its lawful basis (`const lawfulBasis`, below) |
-| `special-basis` | data in the pack's special categories is held only for purposes based on consent (otherwise, a person must confirm another condition) |
+| `special-basis` | data in the pack's special categories is held only for purposes on the pack's `specialBases` (`consent` unless the pack says otherwise); otherwise a person must confirm another condition |
 | `retention` | every object holding personal data has `@retain` |
 | `subject-rights` | always: people can get a copy of their data and have it erased (`tj privacy`, `tj:privacy`) |
 | `records` | always: `tj check --privacy --record` writes the record of processing |
-| `audit-log` | always on servers: reads and changes of personal data are logged, tamper-evident |
-| `encryption-at-rest` | the server runs with `TJ_KEY_FILE` (checked by `tj serve`) |
+| `audit-log` | reads and changes of personal data are logged, tamper-evident, under a key outside the data folder (`TJ_AUDIT_KEY_FILE`; checked by `tj serve`) |
+| `encryption-at-rest` | the server runs with `TJ_KEY_FILE`, kept outside the data folder so backups do not carry it (checked by `tj serve`) |
+| `encryption-in-transit` | the server is reached over TLS (`TJ_TLS_TERMINATED=1`), or listens on this machine only (checked by `tj serve`) |
 
 An app with no personal data meets every check.
 

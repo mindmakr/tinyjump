@@ -1922,4 +1922,29 @@ fn purposes_name_their_lawful_basis_when_declared() {
     assert!(e.contains("no @pii field is held for \"billing\""), "{e}");
     assert!(with(r#"let lawfulBasis = { account: "contract", marketing: "consent" }"#).contains("must be declared with const"));
     assert!(with(r#"const lawfulBasis = ["account"]"#).contains("must be a record of purposes"));
+    let twice = files(&[("app.tj", &format!("import {{ x }} from \"./more\"
+const lawfulBasis = {{ account: \"contract\", marketing: \"consent\" }}
+{obj}")), ("more.tj", "const lawfulBasis = { account: \"consent\" }
+export const x = 1
+")]);
+    assert!(errors(&twice).contains("`lawfulBasis` is declared more than once"), "{}", errors(&twice));
+}
+
+#[test]
+fn on_a_device_caller_id_is_the_signed_in_user_and_the_ui_follows_it() {
+    let src = r#"@server @read("owner") object Member {
+  name: string = ""
+  @allow("owner") setName(n: string) { this.name = n }
+}
+function App() {
+  if (caller.id === "") { return <Text id="who">signed out</Text> }
+  return <Text id="who">{caller.id}</Text>
+}
+"#;
+    let (mut device, out) = boot_as(src, Shared::default(), 0.0, false);
+    assert!(format!("{out:?}").contains("signed out"));
+    let out = device.handle(1.0, Input::Identity { user: Some("user:ana".into()) });
+    assert!(format!("{out:?}").contains("user:ana"), "drawn again for ana: {out:?}");
+    let out = device.handle(2.0, Input::Identity { user: None });
+    assert!(format!("{out:?}").contains("signed out"), "and again when signed out");
 }

@@ -339,8 +339,14 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("
 
 "))?;
-        let encrypted = std::env::var_os(sealed::KEY_FILE_ENV).is_some_and(|v| !v.is_empty());
-        let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(encrypted)));
+        let key_file = std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let server = compliance::Server {
+            encrypted: key_file.is_some(),
+            encryption_key_apart: key_file.as_deref().is_some_and(|k| audit::kept_apart(k, &data)),
+            audit_key_apart: audit::kept_apart(&audit::key_path(&data), &data),
+            tls: !http::credentials_need_tls(dev_mode, &args.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref()),
+        };
+        let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(&server)));
         if !ok {
             return Err(format!("{report}
 not starting: some controls of the compliance pack are not met (above)"));

@@ -16,8 +16,9 @@ pub enum Who {
     /// Timers, boot and trusted hosts on a server: `{ id: "system", roles: ["system"] }`.
     #[default]
     System,
-    /// A device's own user, whom the device cannot verify: `{ id: "", roles: [] }`.
-    Local,
+    /// A device's own user, whom the device cannot verify: `{ id, roles: [] }`, with the id
+    /// the host signed in (`Input::Identity`), or `""` before anyone signs in.
+    Local(Rc<str>),
     /// A verified (or anonymous, with an empty id) remote caller; the rules apply.
     Remote { id: Rc<str>, roles: Rc<[Rc<str>]> },
 }
@@ -31,7 +32,7 @@ impl Who {
     pub fn from_caller(c: &Caller, server: bool) -> Who {
         match c {
             Caller::Trusted(_) if server => Who::System,
-            Caller::Trusted(_) => Who::Local,
+            Caller::Trusted(_) => Who::Local(Rc::from("")),
             Caller::Remote { id, roles } => Who::Remote { id: Rc::from(id.as_str()), roles: roles.iter().map(|r| Rc::from(r.as_str())).collect() },
         }
     }
@@ -40,7 +41,7 @@ impl Who {
     pub fn record(&self) -> Value {
         let (id, roles): (&str, Vec<Value>) = match self {
             Who::System => ("system", vec![Value::str("system")]),
-            Who::Local => ("", Vec::new()),
+            Who::Local(id) => (id, Vec::new()),
             Who::Remote { id, roles } => (id, roles.iter().map(|r| Value::Str(r.clone())).collect()),
         };
         Value::rec([(Rc::from("id"), Value::str(id)), (Rc::from("roles"), Value::arr(roles))].into_iter().collect())
@@ -50,7 +51,7 @@ impl Who {
     pub fn to_caller(&self) -> Option<Caller> {
         match self {
             Who::Remote { id, roles } => Some(Caller::Remote { id: id.to_string(), roles: roles.iter().map(|r| r.to_string()).collect() }),
-            Who::System | Who::Local => None,
+            Who::System | Who::Local(_) => None,
         }
     }
 }
@@ -141,6 +142,6 @@ mod tests {
         assert!(allows(&rule(&["owner"]), &ana, "user:ana") && !allows(&rule(&["owner"]), &ana, "user:bo"));
         assert!(!allows(&rule(&["owner"]), &anon, ""), "anonymous callers own nothing, even an empty id");
         assert!(allows(&rule(&["owner", "staff"]), &staff, "user:ana") && !allows(&rule(&["staff"]), &ana, "x"));
-        assert!(allows(&rule(&[]), &Who::Local, "x") && allows(&rule(&[]), &Who::System, "x"), "local and system code is not checked");
+        assert!(allows(&rule(&[]), &Who::Local(Rc::from("")), "x") && allows(&rule(&[]), &Who::System, "x"), "local and system code is not checked");
     }
 }

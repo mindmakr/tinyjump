@@ -22,7 +22,11 @@ pub fn declared(files: &[(&str, &Program)]) -> Option<Vec<(String, String)>> {
 
 /// Checks the declaration against the `@pii` fields.
 pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
-    let Some(Found { entries, span, mutable }) = find(files) else { return Vec::new() };
+    let mut found = all(files);
+    let Some(Found { entries, span, mutable }) = (!found.is_empty()).then(|| found.remove(0)) else { return Vec::new() };
+    if let Some(again) = found.first() {
+        return vec![Diagnostic::new("`lawfulBasis` is declared more than once", again.span).hint("declare it once, in one file, with every purpose")];
+    }
     let fix = "write `const lawfulBasis = { account: \"contract\" }`, one entry per purpose";
     let Some(entries) = entries else {
         return vec![Diagnostic::new("`lawfulBasis` must be a record of purposes and their lawful bases", span).hint(fix)];
@@ -62,10 +66,15 @@ struct Found {
     mutable: bool,
 }
 
-/// The app's top-level `lawfulBasis` declaration.
+/// The app's top-level `lawfulBasis` declaration (the first, if there are more).
 fn find(files: &[(&str, &Program)]) -> Option<Found> {
+    all(files).into_iter().next()
+}
+
+/// Every top-level `lawfulBasis` declaration, in every file of the app.
+fn all(files: &[(&str, &Program)]) -> Vec<Found> {
     let items = files.iter().filter(|(name, _)| !name.starts_with("tj:")).flat_map(|(_, p)| &p.items);
-    items.filter_map(|i| if let Item::Let(d) = i { Some(d) } else { None }).find(|d| matches!(&d.pattern, Pattern::Ident(n, _) if n == "lawfulBasis")).map(|d| {
+    items.filter_map(|i| if let Item::Let(d) = i { Some(d) } else { None }).filter(|d| matches!(&d.pattern, Pattern::Ident(n, _) if n == "lawfulBasis")).map(|d| {
         let entries = match d.init.as_ref().map(|e| &e.kind) {
             Some(ExprKind::Record(fields)) => fields
                 .iter()
@@ -78,6 +87,7 @@ fn find(files: &[(&str, &Program)]) -> Option<Found> {
         };
         Found { entries, span: d.span, mutable: d.mutable }
     })
+    .collect()
 }
 
 /// Every purpose a `@pii` field names.

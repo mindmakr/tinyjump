@@ -170,10 +170,7 @@ impl Audit {
         let writer = Writer::open(data, keys, days, dropped.clone()).map_err(|e| format!("cannot open the audit log in {}: {e}", data.join("audit").display()))?;
         let (tx, rx) = sync_channel(QUEUE);
         thread::Builder::new().name("tj-audit".into()).spawn(move || run(writer, &rx)).map_err(|e| format!("cannot start the audit log: {e}"))?;
-        let apart = match (fs::canonicalize(&key), fs::canonicalize(data)) {
-            (Ok(k), Ok(d)) => !k.starts_with(d),
-            _ => false,
-        };
+        let apart = kept_apart(&key, data);
         let mut about = key.display().to_string();
         if created {
             about += " (new: back it up; without it the log cannot be verified)";
@@ -210,8 +207,20 @@ impl Audit {
     }
 }
 
+/// Whether a key file lives outside the data folder, so a copy of the data (a backup, a
+/// stolen disk image) does not carry the key with it.
+/// The key need not exist yet: its folder is what counts. Anything that cannot be resolved
+/// counts as not apart.
+pub fn kept_apart(key: &Path, data: &Path) -> bool {
+    let folder = key.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    match (fs::canonicalize(folder), fs::canonicalize(data)) {
+        (Ok(k), Ok(d)) => !k.starts_with(d),
+        _ => false,
+    }
+}
+
 /// The key file: `TJ_AUDIT_KEY_FILE`, else `audit.key` in the data folder.
-fn key_path(data: &Path) -> PathBuf {
+pub fn key_path(data: &Path) -> PathBuf {
     std::env::var_os(KEY_ENV).filter(|v| !v.is_empty()).map_or_else(|| data.join("audit.key"), PathBuf::from)
 }
 
@@ -658,6 +667,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tj-audit-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn keys_count_as_apart_only_outside_the_data_folder_even_before_they_exist() {
+        let root = folder("apart");
+        let data = root.join("data");
+        fs::create_dir_all(&data).unwrap();
+        assert!(kept_apart(&root.join("audit.key"), &data), "not created yet, but elsewhere");
+        assert!(!kept_apart(&data.join("audit.key"), &data));
+        assert!(!kept_apart(&data.join("keys").join("audit.key"), &data), "a folder inside the data that does not exist yet");
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn keys() -> Keys {
