@@ -60,6 +60,29 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
   then forgets the person's pseudonym in the audit log, so the entries about them become
   anonymous without the log being edited.
 
+### From app code: `tj:privacy`
+
+```ts
+import { exportData, erase } from "tj:privacy"
+
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") async myData(): any { return await exportData(caller.id) }
+  @allow("owner") async deleteMe() { await erase(caller.id) }
+}
+```
+
+- The same export and erase as above, carried out by the server, on servers only.
+- Allowed for the person themselves (`caller.id` is the id given), callers with the
+  `privacy` role, and the server's own code (timers, alarms). The runtime supplies the
+  caller; code cannot choose it.
+- A method of the person's own object may erase them: its own call is not counted as one
+  part way through, and after the `await` it sees the blank state.
+- Audited as a `privacy` entry. The audit log forgets the person after the call's own
+  entry is written, so that entry is anonymous too.
+- The flow check treats what `exportData` returns as all of the person's personal data:
+  it may go back to them, and nowhere else without `reveal`.
+
 ## Keeping data no longer than needed
 
 ```tsx
@@ -140,9 +163,17 @@ in a variable) is refused only when personal data goes into it.
 
 Devices do not run the check: they run apps the command line has checked.
 
-## Not yet
+## The record of processing
 
-These are designed (trust.md, section 6) and not built. Until they are, the app's code is
-responsible for them:
-- **App code** cannot export or erase yet (planned behind a `privacy` role).
-- The record of processing (GDPR article 30).
+```sh
+tj check app.tj --privacy --record > record-of-processing.md
+```
+
+Writes the record of processing activities (GDPR article 30) as far as the code states it:
+- the personal data held, by object and field, with its category and purposes;
+- every `reveal`, by file and line, with the fields it lets out and for what;
+- how long each person's object is kept, legal holds included;
+- the security measures the runtime provides.
+
+What only people know (the controller, the data protection officer, transfers abroad) is
+left blank to fill in. Generate it again whenever the app changes.

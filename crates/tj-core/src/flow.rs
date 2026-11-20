@@ -109,6 +109,17 @@ struct Checker {
     seen: HashSet<(u32, u32, String)>,
     memo: HashMap<String, Taint>,
     active: HashSet<String>,
+    /// Every place personal data is let out on purpose, for the record of processing.
+    reveals: Vec<Reveal>,
+}
+
+/// A `reveal(value, purpose)`: where (a byte offset in the app's source), for what, and
+/// which personal fields it lets out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reveal {
+    pub at: u32,
+    pub purpose: String,
+    pub fields: Vec<String>,
 }
 
 const CALLBACK_METHODS: &[&str] = &["map", "filter", "find", "findIndex", "some", "every", "forEach", "reduce", "flatMap", "sort"];
@@ -124,10 +135,22 @@ fn has_pii(p: &Program) -> bool {
 
 /// Checks the files of an app (name and parsed file, plugin modules included).
 pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
+    analyze(files).map(|c| c.errors).unwrap_or_default()
+}
+
+/// Every `reveal` in the app, in source order.
+pub fn reveals(files: &[(&str, &Program)]) -> Vec<Reveal> {
+    let mut r = analyze(files).map(|c| c.reveals).unwrap_or_default();
+    r.sort_by_key(|x| x.at);
+    r.dedup();
+    r
+}
+
+fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
-        return Vec::new();
+        return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new() };
     let user: Vec<&Program> = files.iter().filter(|(name, _)| !name.starts_with("tj:")).map(|(_, p)| *p).collect();
     for (name, p) in files.iter().filter(|(name, _)| name.starts_with("tj:")) {
         for item in &p.items {
@@ -198,7 +221,7 @@ pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
         c.call(&decl, args, this, endpoint, None);
     }
     c.errors.sort_by_key(|d| d.span.start);
-    c.errors
+    Some(c)
 }
 
 impl Checker {
@@ -650,6 +673,12 @@ impl Checker {
                         let v = self.expr(a, fr);
                         self.sink(&v, a.span, &format!("the plugin {module}"));
                     }
+                    if module == "tj:privacy" && name == "exportData" {
+                        // Everything held about a person: their own when asked for by them.
+                        let own = fr.owner_only && args.first().is_some_and(|a| is_member(a, "caller", "id") || is_member(a, "this", "id"));
+                        let fields: BTreeSet<Field> = self.classes.iter().flat_map(|(c, info)| info.pii.keys().map(move |f| (c.clone(), f.clone()))).collect();
+                        return Val::Data(Taint { fields, other: !own, from: Some(Rc::from("exportData(...)")) });
+                    }
                     clean()
                 }
                 _ if self.functions.contains_key(name) => {
@@ -818,6 +847,9 @@ impl Checker {
         if !wrong.is_empty() {
             let hint = if t.fields.len() > 1 && self.purposes(&t).is_empty() { "these fields are for different purposes: reveal each for its own purpose before combining them".to_string() } else { "use one of the purposes the field was declared for, or add this purpose to its @pii".to_string() };
             self.report(Diagnostic::new(format!("\"{p}\" is not a purpose of this personal data: {}", wrong.join("; ")), span).hint(hint));
+        } else {
+            let fields = t.fields.iter().map(|(c, f)| format!("{c}.{f}")).collect();
+            self.reveals.push(Reveal { at: span.start, purpose: p.clone(), fields });
         }
     }
 

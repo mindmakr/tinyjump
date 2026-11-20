@@ -7,7 +7,7 @@
 pub mod compile;
 pub mod crypto;
 #[cfg(feature = "check")]
-mod flow;
+pub mod flow;
 pub mod host;
 pub mod modules;
 pub mod runtime;
@@ -17,6 +17,8 @@ pub mod ui;
 pub mod vm;
 
 pub use compile::compile;
+#[cfg(feature = "check")]
+pub use {compile::reveals, flow::Reveal};
 pub use runtime::protocol::{Input, Output, PatchOp, Target};
 pub use runtime::store::{MemStore, Store};
 pub use runtime::{BootError, Options, Runtime};

@@ -266,9 +266,11 @@ As built, in three parts:
    erased. Corrected while testing it live: the keys were first stored with the data, so a
    restored backup of the whole data folder brought them back; they now live in
    `<TJ_KEY_FILE>.own/`, and the docs say how to back that folder up.
-   **Next, 3B2:** `tj:privacy` as a host effect for app code (self-erase allowed,
-   flow-tainted export), forgetting audit pseudonyms after the request's own entry, and the
-   record of processing.
+   **Part 3B2 built:** `tj:privacy` (`exportData`, `erase`) for app code, allowed for the
+   person themselves, the `privacy` role and the server's own code, with the caller taken
+   from the runtime; the flow check treats an export as all of a person's data; the engine
+   writes a call's audit entry as it answers it, so a person erased by their own call is
+   forgotten after it; `tj check --privacy --record` writes the record of processing.
 
 Corrections made while building:
 

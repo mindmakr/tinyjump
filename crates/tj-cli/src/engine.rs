@@ -183,14 +183,20 @@ struct Dispatch {
     effects: Sender<(u32, Effect)>,
     stats: Arc<Stats>,
     audit: Audit,
+    /// `tj:privacy` calls to carry out on the runtime thread.
+    privacy: Vec<(u32, String, Json)>,
+    /// People erased in this turn, forgotten by the audit log after its entries are written.
+    forget_after: Vec<String>,
 }
 
 /// Who waits for a reply; for calls, the method and when the call was sent; for reads of
-/// personal data, what to write to the audit log once it was read.
+/// personal data, what to write to the audit log once it was read; for a person's calls,
+/// the audit entry written when it is answered.
 struct Waiter {
     reply: Reply,
     timed: Option<(String, Instant)>,
     read: Option<(String, Caller)>,
+    call: Option<(String, String, Caller, Instant)>,
 }
 
 /// Whether `caller` may read every one of `objects`, checked on the runtime thread.
@@ -203,7 +209,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit };
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new() };
     d.outputs(&rt, boot_out);
     loop {
         let msg = match rt.next_wake() {
@@ -223,8 +229,12 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                         Input::Get { object, caller: Some(c @ Caller::Remote { .. }), .. } if rt.holds_personal_data(object) => Some((object.clone(), c.clone())),
                         _ => None,
                     };
+                    let call = match &input {
+                        Input::Call { object, method, caller: Some(c @ Caller::Remote { .. }), .. } => Some((object.clone(), method.clone(), c.clone(), sent)),
+                        _ => None,
+                    };
                     d.next_reply += 1;
-                    d.replies.insert(d.next_reply, Waiter { reply, timed, read });
+                    d.replies.insert(d.next_reply, Waiter { reply, timed, read, call });
                     set_reply(&mut input, d.next_reply);
                 }
                 rt.handle(now_ms(), input)
@@ -238,7 +248,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     let _ = done.send(rt.export_subject(&subject).map_err(|e| (503, e)));
                     continue;
                 }
-                match rt.erase_subject(&subject) {
+                match rt.erase_subject(&subject, None) {
                     Ok(e) => {
                         d.audit.forget(&subject);
                         let held: Vec<Json> = e.held.iter().map(|(object, until)| json!({ "object": object, "until": until })).collect();
@@ -302,6 +312,58 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Err(RecvTimeoutError::Disconnected) => return,
         };
         d.outputs(&rt, out);
+        privacy_effects(&mut rt, &mut d);
+    }
+}
+
+/// Carries out `tj:privacy` calls, as `tj privacy export|erase` does, and answers them. Then
+/// the audit log forgets the people erased, after the entries of this turn.
+fn privacy_effects(rt: &mut Runtime, d: &mut Dispatch) {
+    while !d.privacy.is_empty() {
+        for (id, method, args) in std::mem::take(&mut d.privacy) {
+            let (ok, error) = match privacy_effect(rt, d, id, &method, &args) {
+                Ok(v) => (Some(v), None),
+                Err(e) => (None, Some(e)),
+            };
+            let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false });
+            d.outputs(rt, out);
+        }
+    }
+    // Not while a call of theirs is still running: what it does next is written under
+    // their name, so they are forgotten after it ends.
+    let running = |d: &Dispatch, rt: &Runtime, person: &str| rt.runs_for(person) || d.replies.values().any(|w| matches!(&w.call, Some((_, _, Caller::Remote { id, .. }, _)) if id == person));
+    for person in std::mem::take(&mut d.forget_after) {
+        if running(d, rt, &person) {
+            d.forget_after.push(person);
+        } else {
+            d.audit.forget(&person);
+        }
+    }
+}
+
+/// One `tj:privacy` call: allowed for the person themselves, the `privacy` role and the
+/// server's own code; audited.
+fn privacy_effect(rt: &mut Runtime, d: &mut Dispatch, effect: u32, method: &str, args: &Json) -> Result<Json, String> {
+    let person = args["id"].as_str().filter(|id| !id.is_empty()).ok_or("give the id of the person")?;
+    let by = args["caller"]["id"].as_str().unwrap_or_default();
+    let roles: Vec<&str> = args["caller"]["roles"].as_array().map(|r| r.iter().filter_map(Json::as_str).collect()).unwrap_or_default();
+    let who = if roles.contains(&"system") { Actor::System } else { Actor::id(Some(by)) };
+    if !((by == person) || roles.contains(&"privacy") || roles.contains(&"system")) {
+        // A security event; without the person, since any id can be given.
+        d.audit.record(Entry::new("refused").who(who).text("request", &format!("privacy {method}")).num("status", 403));
+        return Err("only the person themselves, the privacy role or the server's own code may export or erase someone's data".into());
+    }
+    d.audit.record(Entry::new("privacy").who(who).text("request", method).person("subject", person));
+    match method {
+        "export" => rt.export_subject(person),
+        "erase" => {
+            let e = rt.erase_subject(person, Some(effect)).map_err(|(_, why)| why)?;
+            d.outputs(rt, e.outputs);
+            d.forget_after.push(person.to_string());
+            let held: Vec<Json> = e.held.iter().map(|(object, until)| json!({ "object": object, "until": until })).collect();
+            Ok(json!({ "erased": e.erased, "held": held }))
+        }
+        other => Err(format!("tj:privacy has no {other}")),
     }
 }
 
@@ -317,12 +379,22 @@ impl Dispatch {
                         if let Some((object, caller)) = w.read.filter(|_| error.is_none()) {
                             self.audit.record(Entry::new("read").who(Actor::of(&caller)).object(&object));
                         }
+                        // Written here, as it is answered, so a person erased by their own call
+                        // is forgotten only after (refusals are written by the HTTP layer).
+                        if let Some((object, method, caller, sent)) = w.call {
+                            let status = if error.is_some() { status.unwrap_or(400) } else { 200 };
+                            if !matches!(status, 401 | 403) {
+                                self.audit.record(Entry::new("call").who(Actor::of(&caller)).object(&object).text("method", &method).num("status", status.into()).num("ms", sent.elapsed().as_millis() as u64));
+                            }
+                        }
                         let _ = w.reply.send(match error {
                             Some(e) => Err((status.unwrap_or(400), e)),
                             None => Ok(ok.unwrap_or(Json::Null)),
                         });
                     }
                 }
+                // tj:privacy acts on the runtime, so it runs on this thread (see `privacy_effects`).
+                Output::Effect { id, effect: Effect::Plugin { plugin, method, args } } if plugin == "privacy" => self.privacy.push((id, method, args)),
                 Output::Effect { id, effect } => {
                     let _ = self.effects.send((id, effect));
                 }
@@ -533,6 +605,62 @@ mod tests {
         }
         assert_eq!(public_only("8.8.8.8:53").unwrap().len(), 1);
         assert!(public_only("[2606:4700::1111]:443").is_ok());
+    }
+
+    #[test]
+    fn a_person_can_delete_their_own_account_and_the_audit_log_forgets_them_after() {
+        let data = std::env::temp_dir().join(format!("tj-engine-privacy-{}", std::process::id()));
+        let source = r#"
+import { erase, exportData } from "tj:privacy"
+
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  note: string = ""
+  @allow("owner") set(e: string) { this.email = e }
+  @allow("owner") async mine(): any { return await exportData(caller.id) }
+  @allow("owner") async deleteMe(): string {
+    await erase(caller.id)
+    return this.email
+  }
+  @allow("signedIn") async eraseOther(id: string) { await erase(id) }
+  @allow("owner") async deleteThenWait(): string {
+    await erase(caller.id)
+    try { await fetch("http://127.0.0.1:9/") } catch (e) { }
+    return "done"
+  }
+}
+"#
+        .to_string();
+        let (audit, _) = Audit::start(&data).expect("audit log");
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
+        let as_user = |id: &str| Some(Caller::Remote { id: id.into(), roles: Vec::new() });
+        let call = |object: &str, method: &str, args: Vec<Json>, who: &str| engine.request(Input::Call { object: object.into(), method: method.into(), args, reply: None, call: None, caller: as_user(who) });
+        call("Account/user:ana", "set", vec![json!("ana@example.com")], "user:ana").expect("set");
+        let mine = call("Account/user:ana", "mine", vec![], "user:ana").expect("export");
+        assert_eq!(mine["Account/user:ana"]["email"], json!("ana@example.com"));
+
+        // Someone else cannot; the person can, and their method sees the blank state.
+        let refused = call("Account/user:bo", "eraseOther", vec![json!("user:ana")], "user:bo").unwrap_err();
+        assert!(refused.1.contains("only the person themselves"), "{refused:?}");
+        assert_eq!(call("Account/user:ana", "deleteMe", vec![], "user:ana"), Ok(json!("")));
+        // A call that goes on after erasing its caller: they are forgotten once it ends.
+        call("Account/user:cy", "set", vec![json!("cy@example.com")], "user:cy").expect("set");
+        assert_eq!(call("Account/user:cy", "deleteThenWait", vec![], "user:cy"), Ok(json!("done")));
+
+        // The audit log has the call, written before the person was forgotten: no pseudonym
+        // of theirs is left behind (bo's remains).
+        let log = || std::fs::read_dir(data.join("audit")).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl")).map(|e| std::fs::read_to_string(e.path()).unwrap()).collect::<String>();
+        let mut tries = 0;
+        while !log().contains("\"method\":\"deleteThenWait\"") && tries < 50 {
+            std::thread::sleep(Duration::from_millis(50));
+            tries += 1;
+        }
+        let entries = log();
+        assert!(entries.contains("\"kind\":\"privacy\"") && entries.contains("\"method\":\"deleteMe\""), "{entries}");
+        assert!(entries.contains("\"kind\":\"refused\"") && entries.contains("\"request\":\"privacy erase\""), "the refusal is a security event: {entries}");
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(std::fs::read_dir(data.join("subjects")).unwrap().count(), 1, "only bo's pseudonym is left");
+        let _ = std::fs::remove_dir_all(&data);
     }
 
     #[test]

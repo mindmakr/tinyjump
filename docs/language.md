@@ -132,8 +132,10 @@ reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's cal
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
 `@retain("90d")` erases objects of a class that long after their last change, and
 `@legalHold("6y")` keeps them that long even when erased. `tj privacy export` and
-`tj privacy erase` act on everything held about one person.
-`tj check app.tj --privacy` prints the data map. Details: [personal data](privacy.md).
+`tj privacy erase` act on everything held about one person; from app code,
+`import { exportData, erase } from "tj:privacy"` does the same for the person themselves or
+the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `--record`
+the record of processing. Details: [personal data](privacy.md).
 
 ## Plugins
 

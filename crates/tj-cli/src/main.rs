@@ -37,7 +37,8 @@ USAGE:
   tj docs                        print the language reference: load it before writing app code
   tj check <app.tj> [--access] [--privacy]
                                  compile and report errors; --access prints who may read and call what,
-                                 --privacy the personal data the app holds and for what
+                                 --privacy the personal data the app holds and for what, and with
+                                 --record the record of processing (GDPR article 30) as Markdown
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
@@ -101,6 +102,7 @@ struct Args {
     json: bool,
     access: bool,
     privacy: bool,
+    record: bool,
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
@@ -118,7 +120,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -131,6 +133,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => args.json = true,
             "--access" => args.access = true,
             "--privacy" => args.privacy = true,
+            "--record" => args.record = true,
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
@@ -179,7 +182,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.access, args.privacy)),
+        "check" => args.file().and_then(|f| check(f, args.access, args.privacy, args.record)),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -249,7 +252,7 @@ fn read_source(file: &Path) -> Result<String, String> {
     app::read(file).map(|a| a.source)
 }
 
-fn check(file: &Path, access: bool, privacy: bool) -> Result<(), String> {
+fn check(file: &Path, access: bool, privacy: bool, record: bool) -> Result<(), String> {
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
@@ -258,7 +261,9 @@ fn check(file: &Path, access: bool, privacy: bool) -> Result<(), String> {
             if access {
                 print!("{}", access::report(&src));
             }
-            if privacy {
+            if privacy && record {
+                print!("{}", privacy::record(&src, &program));
+            } else if privacy {
                 print!("{}", privacy::report(&program));
             }
             Ok(())

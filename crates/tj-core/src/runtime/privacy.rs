@@ -132,9 +132,11 @@ impl Runtime {
     /// Returns what was erased, what is held and until when (epoch ms), or why not (409
     /// while a call is part way through one of the objects; 503 when the store fails).
     /// Servers only (`tj privacy erase`).
-    pub fn erase_subject(&mut self, subject: &str) -> Result<Erasure, (u16, String)> {
+    /// `awaiting`: the promise of the call doing the erasure (`tj:privacy` from a method of
+    /// the person's own object), which is not counted as a call part way through.
+    pub fn erase_subject(&mut self, subject: &str, awaiting: Option<u32>) -> Result<Erasure, (u16, String)> {
         let objects = self.subject_objects(subject).map_err(|e| (503, e))?;
-        if let Some((_, key)) = objects.iter().find(|(class, _)| self.in_use(*class, subject)) {
+        if let Some((_, key)) = objects.iter().find(|(class, _)| self.in_use(*class, subject, awaiting)) {
             return Err((409, format!("{key} is part way through a call; try again in a moment")));
         }
         let (mut erased, mut held, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
@@ -148,6 +150,13 @@ impl Runtime {
             if let Some(until) = self.held_until(class, &o) {
                 held.push((key, until));
                 continue;
+            }
+            // A call still running on it (the one erasing, from the person's own method)
+            // keeps no record there: its result would come back after the erasure.
+            for (on, _, record) in self.call_replies.values_mut() {
+                if on.class == o.class && on.id == o.id {
+                    *record = false;
+                }
             }
             let fresh = self.defaults(class).map_err(|e| (503, e.message()))?;
             self.reset(&o, fresh);
@@ -259,7 +268,7 @@ impl Runtime {
         let loaded = self.is_loaded(key);
         let (created, changed, blank) = if loaded {
             let o = self.instance(class, id).map_err(|e| e.message())?;
-            if self.in_use(class, id) {
+            if self.in_use(class, id, None) {
                 // A call is part way through it: the next round looks again.
                 return Ok(());
             }
@@ -329,9 +338,17 @@ impl Runtime {
 
     /// Whether a call is part way through the object: waiting on an effect, or holding or
     /// waiting for it as `@exclusive`.
-    fn in_use(&self, class: u16, id: &str) -> bool {
+    fn in_use(&self, class: u16, id: &str, awaiting: Option<u32>) -> bool {
         let here = |o: &Option<std::rc::Rc<crate::vm::value::ObjRef>>| o.as_ref().is_some_and(|o| o.class == class && &*o.id == id);
-        self.waiting.values().any(|(f, _)| f.frames.iter().any(|fr| here(&fr.this))) || self.exclusive_busy(class, id)
+        let waiting = self.waiting.iter().filter(|(p, _)| Some(**p) != awaiting).any(|(_, (f, _))| f.frames.iter().any(|fr| here(&fr.this)));
+        let own_chain = awaiting.and_then(|p| self.waiting.get(&p)).map(|(f, _)| f.chain);
+        waiting || self.exclusive_busy(class, id, own_chain)
+    }
+
+    /// Whether a call made by the person `id` is still running (waiting on something), so
+    /// what it does next would be written to the audit log under their name.
+    pub fn runs_for(&self, id: &str) -> bool {
+        self.waiting.values().any(|(f, _)| matches!(&f.caller, super::access::Who::Remote { id: i, .. } if &**i == id))
     }
 }
 

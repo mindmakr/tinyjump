@@ -243,7 +243,7 @@ impl Runtime {
     /// retry with the same id runs.
     pub(crate) fn refuse_start(&mut self, reply: Option<u64>, status: u16, why: String) {
         let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) else { return self.reply_status(reply, status, why) };
-        let Some((_, call)) = self.call_replies.remove(&internal) else { return };
+        let Some((_, call, _)) = self.call_replies.remove(&internal) else { return };
         let Some((_, waiting)) = self.running_calls.remove(&call) else { return };
         for reply in waiting {
             self.reply_status(reply, status, why.clone());
@@ -283,7 +283,7 @@ impl Runtime {
         }
         self.next_call_reply += 1;
         let internal = CALL_REPLY_BASE + self.next_call_reply;
-        self.call_replies.insert(internal, (obj.clone(), call.clone()));
+        self.call_replies.insert(internal, (obj.clone(), call.clone(), true));
         self.running_calls.insert(call, (mine, vec![reply]));
         let args = args.iter().map(Value::from_json).collect();
         self.invoke(obj, method, args, true, Some(internal), Entry::new(who));
@@ -291,9 +291,11 @@ impl Runtime {
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.
     pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, String>) {
-        let Some((obj, call)) = self.call_replies.remove(&internal) else { return };
+        let Some((obj, call, keep)) = self.call_replies.remove(&internal) else { return };
         let Some((record, waiting)) = self.running_calls.remove(&call) else { return };
-        self.record_call(&obj, record.with_result(&r));
+        if keep {
+            self.record_call(&obj, record.with_result(&r));
+        }
         for reply in waiting {
             self.reply(reply, r.clone());
         }

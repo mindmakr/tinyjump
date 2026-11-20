@@ -20,6 +20,7 @@ pub const MARKER: &str = "//# file: ";
 pub const BUILT_IN: &[(&str, &str)] = &[
     ("tj:ai", include_str!("../../../plugins/ai/plugin.tj")),
     ("tj:agent", include_str!("../../../plugins/agent/plugin.tj")),
+    ("tj:privacy", include_str!("../../../plugins/privacy/plugin.tj")),
 ];
 
 /// `src` plus the built-in plugin modules it imports and does not carry itself, including

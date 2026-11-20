@@ -197,7 +197,9 @@ pub struct Runtime {
     any_exclusive: bool,
     /// Servers: calls with an id that are still running, and who waits for each.
     running_calls: HashMap<String, (objects::CallRecord, Vec<Option<u64>>)>,
-    call_replies: HashMap<u64, (Rc<ObjRef>, String)>,
+    /// Calls run once (`call_once`), by their internal reply: the object, the call id, and
+    /// whether to keep the result on the object (not when the call erased it).
+    pub(crate) call_replies: HashMap<u64, (Rc<ObjRef>, String, bool)>,
     next_call_reply: u64,
     tree: Tree,
     #[cfg(feature = "layout")]
