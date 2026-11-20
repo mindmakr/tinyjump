@@ -44,6 +44,11 @@ Please look hardest at:
 3. **Backups keep erased entries**, because they are sealed under the store key. This is
    documented in `privacy.md` and in the record of processing, rather than solved with
    per-entry keys. Is that honest enough for D4?
-4. **`is_person()` treats any non-empty reader as a person.** Is an API key (`key:sam`,
-   staff) a person here? I think yes: it was admitted by the rule. But please check that the
-   admin key's stream has an empty reader.
+4. **`is_person()` treats any non-empty reader as a person.** I checked this one myself:
+   - the admin's unfiltered stream has no caller (`http.rs`, `(None, objects, None)`), so it
+     gets the tools' view;
+   - an anonymous caller has an empty id, so it gets the tools' view too (and
+     `@read("anyone")` is refused on these objects, so it cannot be admitted anyway);
+   - an API key admitted by the rule (`key:sam`, staff) reads the entries.
+
+   Please challenge whether a staff API key should count as a reader.
