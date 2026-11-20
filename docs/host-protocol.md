@@ -44,7 +44,7 @@ id and it fails, the runtime reports the failure as an `error` output.
 |---|---|
 | `patch` | `ops` to apply to the native view tree (below) |
 | `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }`. For `{ kind: "call", object, method, args, call }`, `POST /api/{object}/{method}` with `args` and the header `Idempotency-Key: {call}`, and answer with its `ok`. Failures are `error: "message"`. If no answer came (offline, a 5xx, an unreadable reply), add `unreachable: true` (see Reliable server calls) |
-| `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams) |
+| `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams). `Class/*` asks for the whole class (`Class.all()`): keep every object of that class the stream sends, including ones the device has not seen, and do not reconnect for objects the class stream already covers |
 | `emit` | `{ object, name, data }`: realtime event |
 | `changed` | `{ object, state, seq }`: state after a persisted change, with its change number |
 | `reply` | `{ reply, ok }` or `{ reply, error, status? }`. `status` marks a refused request: 400, 403, 422 or 503 |

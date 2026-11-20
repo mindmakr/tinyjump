@@ -1044,6 +1044,13 @@ function tools(o: string) { return [{ name: "email", object: o, method: "myEmail
     let e = flow(r#"@allow("support") async look(id: string): any { return await exportData(id) }"#, export);
     assert!(e.contains("exportData(...)") && e.contains("is returned here to callers who do not own it"), "{e}");
 
+    // A list from Class.all() may be anyone's: personal fields from it are other people's,
+    // the rest are not personal at all.
+    let e = flow(r#"@allow("signedIn") everyone(): string[] { return Account.all().map(a => a.email) }"#, "");
+    assert!(e.contains("is returned here to callers who do not own it"), "{e}");
+    let e = flow(r#"@allow("signedIn") plans(): string[] { return Account.all().filter(a => a.plan !== "").map(a => a.plan) }"#, "");
+    assert_eq!(e, "", "plain fields of anyone's objects are not personal data");
+
     // Purposes are enforced, and mixing fields for different purposes is refused.
     assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
     let e = flow(r#"@allow("owner") async ad() { await fetch("https://ads.example/?e=" + reveal(this.email, "ads")) }"#, "");
@@ -2335,4 +2342,36 @@ fn an_alarm_can_be_cancelled_by_its_handle_even_after_a_restart() {
     call(&mut rt, 6000.0, "Booking/b", "book", json!([100])).unwrap();
     rt.handle(6200.0, Input::Tick);
     assert_eq!(state(&mut rt, 6201.0, "Booking/b")["sent"], json!(["first"]));
+}
+
+const SLOTS: &str = r#"@server @read("anyone") object Slot {
+  title: string = ""
+  @allow("anyone") name(t: string) { this.title = t }
+}
+@server object Desk {
+  titles: string[] = []
+  look() { this.titles = Slot.all().filter(s => s.title !== "").map(s => s.title) }
+}
+"#;
+
+#[test]
+fn all_lists_a_class_from_storage_on_a_server_and_by_class_stream_on_a_device() {
+    let store = Shared::default();
+    let opts = || Options { server: true, render: false, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(SLOTS).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    for (id, t) in [("s2", "Shave"), ("s1", "Cut")] {
+        call_as(&mut rt, 1.0, &format!("Slot/{id}"), "name", json!([t]), who("", &[])).unwrap();
+    }
+    // A fresh server finds them in storage, in id order.
+    let mut rt = Runtime::boot(compile(SLOTS).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    call(&mut rt, 2.0, "Desk/main", "look", json!([])).unwrap();
+    assert_eq!(state(&mut rt, 3.0, "Desk/main")["titles"], json!(["Cut", "Shave"]));
+
+    // A device asks for the whole class, and the list fills as the server sends it.
+    let src = format!("{SLOTS}\nfunction App() {{\n  return <Column>{{Slot.all().map(s => <Text key={{s.id}}>{{s.title}}</Text>)}}</Column>\n}}\n");
+    let (mut device, out) = boot_as(&src, Shared::default(), 0.0, false);
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, .. } if object == "Slot/*")), "{out:?}");
+    let out = device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
+    assert!(format!("{out:?}").contains("Beard"), "a slot the device had never seen is shown: {out:?}");
+    assert!(compile("@server object A {}\nobject B { f() { A.get(\"*\") } }").is_ok(), "compiles; `*` is refused when run");
 }

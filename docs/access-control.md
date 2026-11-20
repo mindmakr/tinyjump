@@ -182,7 +182,7 @@ method and a hash of the arguments.
 |---|---|
 | `POST /api/{Class}/{id}/{method}` | method `@allow`; private methods refused; body must be `application/json` (blocks cross-site form posts) |
 | `GET /api/{Class}/{id}` | object `@read` |
-| `GET /api/events?object=…` | `@read` for the listed objects: those refused are named in a `refused` event, left out, and written to the audit log as a refusal. A malformed `object=` is `400`. Without any `object=`, a stream of every object needs the admin key |
+| `GET /api/events?object=…` | `@read` for the listed objects: those refused are named in a `refused` event, left out, and written to the audit log as a refusal. `Class/*` streams the whole class, starting with up to 1000 of its objects; an `"owner"` rule grants it to nobody, as no one owns every object. A malformed `object=` is `400`. Without any `object=`, a stream of every object needs the admin key |
 | Device server calls (outbox) | the same as the first row; devices send their token |
 | `/_tj/*` | the admin key; trusted, rules bypassed |
 

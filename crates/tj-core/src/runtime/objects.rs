@@ -531,8 +531,8 @@ impl Runtime {
         // A class stream (`Slot/*`) starts with the class's objects.
         let mut keys: Vec<String> = Vec::new();
         for key in objects {
-            match key.strip_suffix("/*").and_then(|c| self.program.object(c)) {
-                Some(class) => keys.extend(self.class_ids(class).into_iter().take(CLASS_STREAM_CAP).map(|id| format!("{key}").replace('*', &id))),
+            match key.strip_suffix("/*").and_then(|c| self.program.object(c).map(|class| (c, class))) {
+                Some((name, class)) => keys.extend(self.class_ids(class).into_iter().take(CLASS_STREAM_CAP).map(|id| format!("{name}/{id}"))),
                 None => keys.push(key.clone()),
             }
         }
