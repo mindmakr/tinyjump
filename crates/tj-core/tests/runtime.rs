@@ -1532,6 +1532,15 @@ fn the_shop_assistant_acts_within_the_askers_rights() {
     assert_eq!(args4["messages"].as_array().unwrap().last().unwrap()["results"][0]["output"], json!("done"));
     server.handle(7.0, answered(id4, reply(json!([]), "Restocked.")));
     assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
+
+    // A model's arguments are checked like any from outside: text where a number belongs is
+    // refused before the method runs.
+    let (id5, _, _, _) = plugin(&server.handle(9.0, ask("restock lots of pots", who("key:sync", &["staff"]))));
+    let wrong = json!([{ "id": "t5", "name": "restock", "input": { "sku": "pot", "qty": "lots" } }]);
+    let (_, _, _, args6) = plugin(&server.handle(10.0, answered(id5, reply(wrong, ""))));
+    let result = &args6["messages"].as_array().unwrap().last().unwrap()["results"][0];
+    assert!(result["output"].as_str().unwrap().contains("`qty` must be a number") && result["error"] == json!(true), "{result}");
+    assert_eq!(state(&mut server, 11.0, "Shelf/main")["products"][2]["stock"], json!(7));
 }
 
 const TURNS: &str = r#"
@@ -2200,4 +2209,101 @@ fn time_does_calendar_arithmetic_on_plain_milliseconds() {
     assert_eq!(out["bad"], json!(null), "February 30 is not a date");
     assert_eq!(out["partial"], json!(null), "a missing day is not a date either");
     assert_eq!(out["plain"], json!(60000), "times are plain numbers");
+}
+
+#[test]
+fn calls_from_outside_must_fit_the_declared_parameter_types() {
+    let src = r#"type Slot = { title: string, minutes: number, note?: string }
+@server @read("anyone") object Board {
+  last: string = ""
+  @allow("anyone") publish(title: string, minutes: number, kind: "cut" | "shave", tags?: string[]) { this.last = title }
+  @allow("anyone") put(slot: Slot) { this.last = slot.title }
+  @allow("anyone") loose(x: any) { this.last = "any" }
+  @allow("anyone") confirm(really: true) { this.last = "confirmed" }
+}
+"#;
+    let mut rt = server(src, false);
+    let anyone = || who("", &[]);
+    let call = |rt: &mut Runtime, m: &str, args: Json| call_as(rt, 1.0, "Board/b", m, args, anyone());
+    assert!(call(&mut rt, "publish", json!(["Cut", 30, "cut"])).is_ok());
+    assert!(call(&mut rt, "publish", json!(["Cut", 30, "shave", ["a"]])).is_ok(), "optional given");
+    assert!(call(&mut rt, "publish", json!(["Cut", 30, "cut", null])).is_ok(), "optional as null");
+    let e = call(&mut rt, "publish", json!(["Cut", "30", "cut"])).unwrap_err();
+    assert_eq!(e.0, Some(400));
+    assert!(e.1.contains("Board.publish: `minutes` must be a number, got text: \"30\""), "{}", e.1);
+    assert!(call(&mut rt, "publish", json!(["Cut", 30, "trim"])).unwrap_err().1.contains("`kind` must be \"cut\" or \"shave\""));
+    assert!(call(&mut rt, "publish", json!(["Cut", 30])).unwrap_err().1.contains("`kind` is missing"));
+    assert!(call(&mut rt, "publish", json!(["Cut", 30, "cut", [], "extra"])).unwrap_err().1.contains("takes 4 argument(s) (title, minutes, kind, tags), got 5"));
+    // Type aliases are followed; unknown fields are refused, optional ones may be left out.
+    assert!(call(&mut rt, "put", json!([{ "title": "Cut", "minutes": 30 }])).is_ok());
+    assert!(call(&mut rt, "put", json!([{ "title": "Cut", "minutes": 30, "admin": true }])).unwrap_err().1.contains("`slot` must be a record with title, minutes, note?"));
+    assert!(call(&mut rt, "loose", json!([{ "anything": [1, "x"] }])).is_ok(), "any takes anything");
+    // A large wrong value is not echoed back whole.
+    let big = "x".repeat(10_000);
+    let e = call(&mut rt, "publish", json!([big, 30, "cut"])).is_ok();
+    assert!(e, "a long title is still a string");
+    let e = call(&mut rt, "publish", json!(["Cut", [big], "cut"])).unwrap_err().1;
+    assert!(e.len() < 200 && e.ends_with("..."), "{}", e.len());
+    assert!(call(&mut rt, "confirm", json!([false])).unwrap_err().1.contains("`really` must be true"));
+    assert!(call(&mut rt, "confirm", json!([true])).is_ok());
+}
+
+#[test]
+fn check_states_a_rule_once_for_the_ui_and_the_server() {
+    let src = r#"function validSlot(title: string, minutes: number) {
+  check(title.trim() !== "", "title", "Give the slot a title")
+  check(minutes >= 5 && minutes <= 480, "minutes", "A slot lasts 5 to 480 minutes")
+}
+@server @read("anyone") object Board {
+  last: string = ""
+  @allow("anyone") publish(title: string, minutes: number) {
+    validSlot(title, minutes)
+    this.last = title
+  }
+}
+object Form {
+  error: string = ""
+  field: string = ""
+  try(title: string, minutes: number) {
+    try { validSlot(title, minutes); this.error = "" } catch (e) { this.error = e.message; this.field = e.field }
+  }
+}
+"#;
+    let mut rt = server(src, false);
+    let e = call_as(&mut rt, 1.0, "Board/b", "publish", json!(["Cut", 3]), who("", &[])).unwrap_err();
+    assert!(e.1.contains("A slot lasts 5 to 480 minutes"), "{e:?}");
+    assert!(call_as(&mut rt, 1.0, "Board/b", "publish", json!(["Cut", 30]), who("", &[])).is_ok());
+    let mut ui = boot(src);
+    call(&mut ui, 1.0, "Form/f", "try", json!(["", 30])).unwrap();
+    assert_eq!((state(&mut ui, 2.0, "Form/f")["error"].clone(), state(&mut ui, 2.0, "Form/f")["field"].clone()), (json!("Give the slot a title"), json!("title")));
+}
+
+#[test]
+fn tj_ui_fields_keep_their_label_and_show_errors_by_them() {
+    let src = r#"import { Field, Notice } from "tj:ui"
+object Form {
+  error: string = "A slot lasts 5 to 480 minutes"
+}
+function App() {
+  const f = Form.get("main")
+  return <Column>
+    <Field label="Length (minutes)" error={f.error} id="minutes">
+      <Input id="new-minutes" type="number" value={30} />
+    </Field>
+    <Field label="Title" id="title"><Input id="new-title" value="Cut" /></Field>
+    <Notice id="saved" text="Saved." kind="ok" />
+    <Notice id="quiet" text={null} />
+  </Column>
+}
+"#;
+    let (_, out) = boot_as(src, Shared::default(), 0.0, false);
+    let shown = format!("{out:?}");
+    assert!(shown.contains("Length (minutes)") && shown.contains("Title"), "labels stay visible: {shown}");
+    assert!(shown.contains("minutes-error") && shown.contains("A slot lasts 5 to 480 minutes") && shown.contains("#b00020"));
+    assert!(!shown.contains("title-error"), "no error, no error text");
+    assert!(shown.contains("#1b5e20") && !shown.contains("quiet"), "good news in green; an empty notice shows nothing");
+    // The field's label names its control, for screen readers and agents.
+    let create = patches(&out).into_iter().find(|op| matches!(op, PatchOp::Create { props, .. } if props.get("id") == Some(&json!("new-title")))).expect("the title input");
+    let PatchOp::Create { props, .. } = create else { unreachable!() };
+    assert_eq!(props.get("label"), Some(&json!("Title")));
 }

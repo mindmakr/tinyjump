@@ -554,7 +554,7 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, effect: Effect) -> Result<Jso
         Effect::Call { .. } => return Err("server objects live here; there is no server to call".into()),
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!("only http(s) URLs can be fetched: {url}"));
+        return Err("only http and https addresses can be fetched".into());
     }
     let mut req = agent.request(&method, &url);
     if let Json::Object(h) = &headers {
@@ -570,7 +570,9 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, effect: Effect) -> Result<Jso
     };
     let resp = match resp {
         Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-        Err(e) => return Err(e.to_string()),
+        // What went wrong, but not the address: app code often shows the error to people, and
+        // an address can be private (a webhook with a token in it).
+        Err(ureq::Error::Transport(t)) => return Err(format!("the request failed: {}", t.kind())),
     };
     let status = resp.status();
     let headers: serde_json::Map<String, Json> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.clone(), Json::String(v.to_string())))).collect();
@@ -666,6 +668,15 @@ mod tests {
         }
         assert_eq!(public_only("8.8.8.8:53").unwrap().len(), 1);
         assert!(public_only("[2606:4700::1111]:443").is_ok());
+    }
+
+    #[test]
+    fn a_failed_fetch_says_what_went_wrong_but_not_the_address() {
+        // The address may be private (a webhook with a token in it), and apps show errors.
+        let agent = ureq::AgentBuilder::new().resolver(public_only).timeout(Duration::from_secs(2)).build();
+        let url = "http://127.0.0.1:9/hook?token=secret123";
+        let e = perform(&agent, &Plugins::default(), Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        assert!(e.starts_with("the request failed") && !e.contains("secret123") && !e.contains("127.0.0.1"), "{e}");
     }
 
     #[test]

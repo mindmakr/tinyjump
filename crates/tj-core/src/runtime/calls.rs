@@ -250,6 +250,14 @@ impl Runtime {
                 self.reply_status(reply, 403, why);
                 continue;
             }
+            // Arguments from a model are checked like any from outside.
+            if matches!(i.who, Who::Remote { .. }) {
+                let args: Vec<Json> = i.args.iter().map(|a| a.to_json().unwrap_or(Json::Null)).collect();
+                if let Some(why) = self.bad_args(&i.object, &i.method, &args) {
+                    self.reply_status(reply, 400, why);
+                    continue;
+                }
+            }
             match self.resolve_object(&i.object) {
                 Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, by: By::Invoke }),
                 Err(e) => self.reply(reply, Err(e)),

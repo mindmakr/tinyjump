@@ -29,6 +29,8 @@ pub const GLOBALS: &[Global] = &[
     ("parseInt", || native("parseInt", parse_int)),
     ("parseFloat", || native("parseFloat", |_, a| Ok(Value::Num(parse_float_prefix(&arg(a, 0).display()))))),
     ("Error", || native("Error", |_, a| Ok(error_record(&arg(a, 0).display())))),
+    // `check(ok, field, message)`: a rule on input, the same in UI code and on the server.
+    ("check", || native("check", check)),
     ("__fetch", || native("fetch", fetch)),
     // Only plugin modules (`tj:<name>`) may call these; apps import their typed functions.
     ("plugin", || native("plugin", plugin)),
@@ -234,6 +236,25 @@ fn fetch(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
         Some(other) => Some(other.to_string()),
     };
     Ok(Value::Promise(rt.fetch(url.to_string(), method, headers, body)))
+}
+
+/// `check(ok, field, message)`: unless `ok`, throws `{ name: "Error", message, field }`, so a
+/// form shows `message` by the field that is wrong. Rules written once, in a function the UI
+/// and the server both call.
+fn check(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let ok = match arg(a, 0) {
+        Value::Bool(b) => *b,
+        v => return Err(Exc::msg(format!("check expects true or false first, got {}", v.type_name()))),
+    };
+    if ok {
+        return Ok(Value::Null);
+    }
+    let (field, message) = (text(a, 1, "check field")?, text(a, 2, "check message")?);
+    let e = error_record(&message);
+    if let Value::Rec(r) = &e {
+        r.borrow_mut().insert("field".into(), Value::Str(field));
+    }
+    Err(Exc(e, super::value::Refusal(false)))
 }
 
 /// `plugin(name, method, args)`: a call to a plugin, answered by the host (docs/plugins.md).
