@@ -78,8 +78,8 @@ the goal; being in the market early, to gain momentum and contributors, is.
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
-   - personal data with subject rights (`@pii`, masking, export and erase done; the flow
-     check, retention and per-person keys next);
+   - personal data with subject rights (`@pii`, masking, export and erase, and the flow
+     check with `reveal` done; retention and per-person keys next);
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
    - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
      scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,

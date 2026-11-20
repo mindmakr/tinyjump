@@ -19,3 +19,10 @@ taffy = { version = "0.15", default-features = false, features = ["std", "flexbo
 default = ["layout"]
 # The flexbox layout engine, for native hosts. The web build leaves it out.
 layout = ["dep:taffy"]
+# Checks that only the command line runs (`tj check`, `dev`, `serve`): the personal-data
+# flow check (flow.rs), about 60 KB that devices, which run apps the CLI checked, leave out.
+check = []
+
+[dev-dependencies]
+# The core's own tests cover the checks too.
+tj-core = { path = ".", features = ["check"] }

@@ -60,15 +60,40 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
 Reads of objects with personal data are written to the audit log (`read`, and `stream`
 when a change stream opens), as pseudonyms (see trust.md, section 4).
 
+## Where it may go: the flow check
+
+Every compile on the command line (`tj check`, `tj dev`, `tj serve`) follows `@pii` values
+through the code and refuses each path where they would leave their owner:
+
+- `fetch`, plugins (and the tools a `tj:agent` agent calls, whose results go to the AI
+  model), `emit`, `throw` and error messages, logs, alarm arguments;
+- fields that are not marked `@pii`, and module-level variables, which every caller shares;
+- the return value of a method someone other than the owner may call; and, for a method
+  only the owner may call, data that may be about someone else (read through
+  `Account.get(otherId)` rather than `this` or `Account.get(caller.id)`).
+
+When a path is intended, say why: `reveal(value, "purpose")` returns the value, and the
+purpose must be one the field declares. A value made from fields with different purposes
+is revealed field by field.
+
+```tsx
+@allow("owner") async bill() {
+  await fetch("https://pay.example.com/?email=" + reveal(this.email, "billing"))
+}
+```
+
+It follows values, not types: through variables, `+` and templates, arrays and records
+(including ones filled in another function), `JSON.stringify`, array callbacks and the
+app's own functions and methods. Reading a field that is not personal through a handle is
+fine, and so is testing whether a field is empty. A call it cannot follow (a function kept
+in a variable) is refused only when personal data goes into it.
+
+Devices do not run the check: they run apps the command line has checked.
+
 ## Not yet
 
 These are designed (trust.md, section 6) and not built. Until they are, the app's code is
 responsible for them:
-
-- **Where the values flow.** Nothing yet checks that personal data is not sent to `fetch`,
-  plugins (including `tj:agent` prompts), `emit`, `throw` messages, logs, or the return
-  values of methods others may call. Masking covers object state, not code paths.
-- **Purposes** are recorded and printed, not enforced.
 - **Retention** (`@retain`) and legal holds (`@legalHold`).
 - **Backups:** erase blanks the live data; copies in backups keep it until per-person keys
   make them unreadable (crypto-shredding). With a plain store, file names hold object ids;

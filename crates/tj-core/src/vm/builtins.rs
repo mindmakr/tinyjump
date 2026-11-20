@@ -18,6 +18,9 @@ pub const GLOBALS: &[Global] = &[
     ("JSON", || namespace(&[("stringify", json_stringify), ("parse", json_parse)])),
     ("Object", || namespace(&[("keys", object_keys), ("values", object_values), ("entries", object_entries)])),
     ("Date", || namespace(&[("now", date_now)])),
+    // `reveal(value, purpose)`: personal data leaving on purpose. The compiler checks the
+    // purpose (flow.rs); at run time it is the value.
+    ("reveal", || native("reveal", |_, a| Ok(arg(a, 0).clone()))),
     ("crypto", || namespace(&[("hmac", crypto_hmac), ("timingSafeEqual", timing_safe_equal), ("randomId", random_id)])),
     ("Array", || namespace(&[("isArray", |_, a| Ok(Value::Bool(matches!(arg(a, 0), Value::Arr(_)))))])),
     ("String", || native("String", |_, a| Ok(Value::str(&arg(a, 0).display())))),

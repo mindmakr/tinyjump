@@ -6,6 +6,8 @@
 
 pub mod compile;
 pub mod crypto;
+#[cfg(feature = "check")]
+mod flow;
 pub mod host;
 pub mod modules;
 pub mod runtime;

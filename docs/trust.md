@@ -249,7 +249,11 @@ As built, in three parts:
    streams (per subscriber: the owner gets the values) and every tool; `tj privacy
    export|erase` through `/_tj/privacy`, audited first; erase forgets the person's audit
    pseudonym; reads and streams of personal data are audited; `tj check --privacy`.
-2. **Next:** the flow check and `reveal()`, and purposes checked against it.
+2. **Built:** the flow check and `reveal(value, purpose)`, with purposes enforced
+   (`crates/tj-core/src/flow.rs`). Its design was reviewed before any code
+   (`feedback/2026-11-20-builder-006`, `critic-reply-006`): the critic's four leaks and
+   four wrongly rejected programs are its tests. It runs in the command line only (the
+   `check` feature): about 60 KB that devices, which run checked apps, leave out.
 3. **Then:** `@retain` and `@legalHold`, per-person keys (crypto-shredding), app-level
    export and erase behind the `privacy` role, and the record of processing.
 
