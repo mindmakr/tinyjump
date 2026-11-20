@@ -2,6 +2,7 @@
 
 mod access;
 mod app;
+mod audit;
 mod auth;
 mod bench;
 mod engine;
@@ -43,6 +44,9 @@ USAGE:
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
   tj key <name> --keys <file> [--role <r>]...
                                  make an API key (printed once; only its hash is stored in the file)
+  tj audit verify --data <dir> [--checkpoints <copy>]
+                                 check a server's audit log; with a copy of its checkpoints kept
+                                 elsewhere, also catch a history rewritten by someone with the key
 
 OPTIONS:
   --port <n>      port to listen on (default 4700)
@@ -62,6 +66,10 @@ ENVIRONMENT (tj serve):
   TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
+  TJ_AUDIT_KEY_FILE
+                  the audit log's key (made on first start; default: audit.key in the data
+                  folder). Keep it apart from the data, and back it up
+  TJ_AUDIT_DAYS   days of audit log kept (default 365)
 ";
 
 struct Args {
@@ -79,6 +87,7 @@ struct Args {
     keys: Option<PathBuf>,
     roles: Vec<String>,
     plugins: Vec<String>,
+    checkpoints: Option<PathBuf>,
 }
 
 impl Args {
@@ -91,7 +100,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new() };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -107,6 +116,7 @@ fn parse_args() -> Result<Args, String> {
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
             "--plugin" => args.plugins.push(value()?),
+            "--checkpoints" => args.checkpoints = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -148,6 +158,7 @@ fn main() -> ExitCode {
         "dev" => serve(&args, true),
         "review" => review(&args.target),
         "stats" => inspect(&args.target).map(|s| print!("{}", stats::report(&s))),
+        "audit" => audit_verify(&args),
         "mcp" => mcp::run(&args.target),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     };
@@ -224,6 +235,16 @@ fn check(file: &Path, access: bool) -> Result<(), String> {
     }
 }
 
+fn audit_verify(args: &Args) -> Result<(), String> {
+    let usage = "usage: tj audit verify --data <dir> [--checkpoints <copy of checkpoints.jsonl>]";
+    if args.file.as_deref() != Some(Path::new("verify")) {
+        return Err(usage.into());
+    }
+    let data = args.data.as_deref().ok_or(usage)?;
+    print!("{}", audit::verify(data, args.checkpoints.as_deref())?);
+    Ok(())
+}
+
 fn new_key(args: &Args) -> Result<(), String> {
     let name = args.file.as_ref().map(|p| p.display().to_string()).ok_or("`tj key` needs a name: tj key <name> --keys keys.json --role staff")?;
     let file = args.keys.as_deref().ok_or("`tj key` needs --keys <file>, the file TJ_KEYS will name")?;
@@ -250,7 +271,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // explains refusals, which a real server must not.
     let plugins = Arc::new(plugins::load(file, &args.plugins)?);
     plugins.start_all()?;
-    let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone())?;
+    let (audit, audit_key) = audit::Audit::start(&data)?;
+    let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     let dev = if dev_mode {
@@ -267,7 +289,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let names = plugins.names();
     let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
     eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
-    http::serve(&addr, http::Front::new(engine, dev, automation, identity))
+    eprintln!("audit log: {} (key: {audit_key})", data.join("audit").display());
+    http::serve(&addr, http::Front::new(engine, dev, automation, identity, audit))
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.

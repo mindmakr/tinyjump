@@ -72,7 +72,7 @@ Effects (servers): HTTP and each plugin, with failures and latency.
   because each record is synced to disk. Syncing several records together (group commit)
   is the follow-up.
 
-## 4. Audit log
+## 4. Audit log (built)
 
 Every remote `call` and `get` on objects that hold personal data, every refusal, admin
 action, erasure and key use, and every timer, alarm and plugin call appends an entry. It
@@ -97,6 +97,30 @@ records who, what, the outcome, the time taken and which fields changed; never v
   instead: they fail closed.
 - **Retention:** `TJ_AUDIT_DAYS` (default 365). Older days are pruned behind a signed
   carry-over checkpoint. The files are readable by the server's user only.
+
+As built (`crates/tj-cli/src/audit.rs`):
+
+- **Files.** `<data>/audit/YYYY-MM-DD.jsonl`, one line per entry, plus `checkpoints.jsonl`
+  (the copy to ship off the machine) and `signing.pub`. Each day file starts with a signed
+  checkpoint, so the carry-over checkpoint is simply the first line of the oldest file kept.
+  The key file holds one 32-byte secret; the chain key, the pseudonym key and the Ed25519
+  signing key are derived from it. Without `TJ_AUDIT_KEY_FILE` the key is made in the data
+  folder, and the startup line says to move it.
+- **What is written.** `call` (API calls: who, object, method, status, ms), `refused`
+  (who, what was asked, class and method, status; never the object id, which anyone can
+  make up), `admin` (`inspect` and `input`, before they run; metrics scrapes are not
+  written), `timer`, `alarm` and `invoke` (agent tools; reported by the core as
+  `Output::Ran`), `plugin`, `start` (the app's SHA-256, on every boot and reload),
+  `dropped` and `checkpoint`.
+- **Pseudonyms.** A random token per id, in `<data>/subjects/`, one file per id named by a
+  keyed hash. A new id costs one small synced file on the writer thread.
+- **`tj audit verify --data <dir> [--checkpoints <copy>]`** checks every HMAC, the order,
+  every signature, and that each checkpoint in the copy is still in the log, which catches
+  a history rewritten or cut short by someone holding the key.
+- **Comes with personal data (step 6):** reads (`get` and streams) of objects that hold
+  personal data, the names of the fields a call changed, and erasing a person's
+  pseudonym. Entries still queued in memory when the process is killed are lost; batches
+  are written as soon as they arrive.
 
 ## 5. Encryption
 
@@ -221,7 +245,8 @@ controls; it cannot weaken another pack's.
 2. **Statistics** (built).
 3. **`@exclusive`,** with chains through `invoke`, cycle detection, capped queues and
    merged ticks (built).
-4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`.
+4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`
+   (built).
 5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
    hashed file names, and `crypto.*`.
 6. **Personal data:**

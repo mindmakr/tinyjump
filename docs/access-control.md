@@ -144,8 +144,9 @@ in URLs, streams and logs.
   `403 not allowed`.
 - `tj dev` adds the reason to help development (`Cart.checkout needs owner or role
   staff`). `tj serve` never does, so it does not reveal what exists.
-- Each refusal writes a structured audit line to stderr: time, caller id, object, method,
-  rule and outcome. Tokens and arguments are never logged. Runtime statistics count the
+- Each refusal is written to the audit log before the answer goes out: who (as a
+  pseudonym), what was asked, the class and method, and the status. Tokens, arguments and
+  object ids are never written (`docs/trust.md`, section 4). Runtime statistics count the
   refusals of each method (`refused`; see `docs/host-protocol.md`).
 
 ## Calls made once, per caller

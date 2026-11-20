@@ -17,12 +17,17 @@
 //!   POST /_tj/input                   body: one protocol Input
 //!   (`/_tj/*` needs the admin key on `tj serve`; see auth.rs)
 //!
+//! The audit log (audit.rs) gets every API call, every refusal, and every admin request that
+//! can read objects or change them (`inspect`, `input`). Refusals and admin requests wait
+//! until they are on disk, and an admin request that cannot be written is refused.
+//!
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
 //! plus `/_tj/reload` (SSE) for live reload, and answers only loopback `Host`s.
 
+use crate::audit::{Actor, Audit, Entry};
 use crate::auth::Automation;
 use crate::engine::{Engine, Failure};
-use crate::identity::{sha256_hex, Identity};
+use crate::identity::{hex, random, sha256_hex, Identity};
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -35,6 +40,10 @@ use std::time::{Duration, Instant, SystemTime};
 use tiny_http::{Header, Method, Request, Response, Server};
 use tj_core::runtime::protocol::Caller;
 use tj_core::Input;
+
+/// An API request, for the audit log if it is refused: what was asked, of which class and
+/// method. Object ids are left out, as anyone can make them up.
+type Asked<'a> = (&'static str, Option<&'a str>, Option<&'a str>);
 
 const MAX_BODY: u64 = 1 << 20;
 const MAX_CONNECTIONS: usize = 512;
@@ -78,6 +87,7 @@ pub struct Front {
     pub dev: Option<Arc<Dev>>,
     pub automation: Automation,
     pub identity: Identity,
+    pub audit: Audit,
     /// Behind a proxy: take the client address from `X-Forwarded-For` (`TJ_TRUST_PROXY=1`).
     pub trust_proxy: bool,
     streams: Mutex<HashMap<String, usize>>,
@@ -85,9 +95,9 @@ pub struct Front {
 }
 
 impl Front {
-    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity) -> Front {
+    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, dev, automation, identity, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        Front { engine, dev, automation, identity, audit, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
     }
 }
 
@@ -183,28 +193,36 @@ fn handle(mut req: Request, front: &Front) {
     };
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let authorization = header_value(&req, "Authorization");
+    let admin = segs.first() == Some(&"_tj");
     let early = if front.dev.is_some() && !trusted_host(&req) {
-        Some((403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
-    } else if segs.first() == Some(&"_tj") {
-        front.automation.check(authorization.as_deref()).err()
+        Some(("host", 403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
+    } else if admin {
+        front.automation.check(authorization.as_deref()).err().map(|(status, e)| ("admin", status, e))
     } else {
         None
     };
-    if let Some((status, e)) = early {
+    if let Some((asked, status, e)) = early {
+        refused(front, authorization.as_deref(), (asked, None, None), status);
         let _ = req.respond(json_response(status, &json!({ "error": e })));
         front.engine.stats().request(started.elapsed(), false);
         return;
     }
     let method = req.method().clone();
     let engine = &front.engine;
+    let mut asked: Option<Asked> = None;
     let response = match (&method, segs.as_slice()) {
         (Method::Get, ["api", "events"]) => return stream(req, front, authorization),
-        (Method::Post, ["api", "events", "ticket"]) => result_response(ticket(&mut req, front, authorization.as_deref())),
+        (Method::Post, ["api", "events", "ticket"]) => {
+            asked = Some(("ticket", None, None));
+            result_response(ticket(&mut req, front, authorization.as_deref()))
+        }
         (Method::Get, ["api", class, id]) => {
+            asked = Some(("get", Some(class), None));
             let object = format!("{class}/{id}");
             result_response(front.identity.verify(authorization.as_deref()).and_then(|v| engine.request(Input::Get { object, reply: None, caller: Some(v.caller) })))
         }
         (Method::Post, ["api", class, id, name]) => {
+            asked = Some(("call", Some(class), Some(name)));
             let object = format!("{class}/{id}");
             // With an Idempotency-Key, a repeated request returns the first result without running again.
             let call = header_value(&req, "Idempotency-Key");
@@ -213,13 +231,21 @@ fn handle(mut req: Request, front: &Front) {
                 Json::Array(args) => Ok(args),
                 _ => Err((400, "body must be a JSON array of arguments".into())),
             });
-            result_response(r.and_then(|args| {
+            let mut who = None;
+            let r = r.and_then(|args| {
                 let caller = front.identity.verify(authorization.as_deref())?.caller;
-                engine.request(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
-            }))
+                who = Some(Actor::of(&caller));
+                engine.request(Input::Call { object: object.clone(), method: name.to_string(), args, reply: None, call, caller: Some(caller) })
+            });
+            let status = r.as_ref().map_or_else(|(status, _)| *status, |_| 200);
+            // Refusals are written below, as security events.
+            if let Some(who) = who.filter(|_| !matches!(status, 401 | 403)) {
+                front.audit.record(Entry::new("call").who(who).object(&object).text("method", name).num("status", status.into()).num("ms", started.elapsed().as_millis() as u64));
+            }
+            result_response(r)
         }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
-        (Method::Get, ["_tj", "inspect"]) => result_response(engine.request(Input::Inspect { reply: None }).map(|mut s| {
+        (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| engine.request(Input::Inspect { reply: None })).map(|mut s| {
             s["server"] = engine.stats().json();
             s
         })),
@@ -234,6 +260,7 @@ fn handle(mut req: Request, front: &Front) {
             if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
                 *c = Some(Caller::trusted());
             }
+            front.audit.security(admin_input(&input))?;
             engine.request(input)
         })),
         (Method::Get, rest) if front.dev.is_some() => {
@@ -260,24 +287,38 @@ fn handle(mut req: Request, front: &Front) {
         _ => json_response(404, &json!({ "error": "not found" })),
     };
     let status = response.status_code().0;
-    if segs.first() == Some(&"api") && matches!(status, 401 | 403 | 422) {
-        audit(front, &authorization, &method, &path, status);
+    if let Some(asked) = asked.filter(|_| matches!(status, 401 | 403)) {
+        refused(front, authorization.as_deref(), asked, status);
     }
     let _ = req.respond(response);
     engine.stats().request(started.elapsed(), status < 400);
 }
 
-/// One line per refused API request, for operators: never credentials, bodies or arguments.
-fn audit(front: &Front, authorization: &Option<String>, method: &Method, path: &str, status: u16) {
-    let who = match front.identity.verify(authorization.as_deref()) {
-        Ok(v) => match v.caller {
-            Caller::Remote { id, .. } if !id.is_empty() => id,
-            _ => "anonymous".into(),
-        },
-        Err(_) => "invalid credential".into(),
-    };
-    let at = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    eprintln!("{}", json!({ "audit": "refused", "at": at, "caller": who, "request": format!("{method} {path}"), "status": status }));
+/// A refusal, written to the audit log before the answer goes out: who (re-checked here, so
+/// only refusals pay for it), what was asked, and the status. Never credentials, bodies or
+/// arguments. The request is refused either way, so a log that cannot be written changes
+/// nothing; the writer reports that itself.
+fn refused(front: &Front, authorization: Option<&str>, (asked, class, method): Asked, status: u16) {
+    let who = front.identity.verify(authorization).map_or(Actor::Invalid, |v| Actor::of(&v.caller));
+    let mut e = Entry::new("refused").who(who).text("request", asked).num("status", status.into());
+    if let Some(class) = class {
+        e = e.text("class", class);
+    }
+    if let Some(method) = method {
+        e = e.text("method", method);
+    }
+    let _ = front.audit.security(e);
+}
+
+/// An admin input, for the audit log: what it does and to which object, never its values.
+fn admin_input(input: &Input) -> Entry {
+    let e = Entry::new("admin").who(Actor::Admin);
+    match input {
+        Input::Call { object, method, .. } => e.text("request", "call").object(object).text("method", method),
+        Input::Get { object, .. } => e.text("request", "get").object(object),
+        Input::Ui { event, .. } => e.text("request", "ui").text("event", event),
+        _ => e.text("request", "input"),
+    }
 }
 
 fn header_value(req: &Request, name: &'static str) -> Option<String> {
@@ -313,9 +354,7 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
     }
     let verified = front.identity.verify(authorization)?;
     front.engine.may_read(objects.clone(), verified.caller.clone())?;
-    let mut bytes = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| (500, "no secure random source".to_string()))?;
-    let value: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let value = hex(&random::<32>().map_err(|e| (500, e))?);
     let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
     tickets.retain(|_, t| t.expires > Instant::now());
     if tickets.len() >= MAX_TICKETS {
@@ -399,7 +438,7 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
         }
         Err((status, e)) => {
             if matches!(status, 401 | 403) {
-                audit(front, &authorization, &Method::Get, "/api/events", status);
+                refused(front, authorization.as_deref(), ("stream", None, None), status);
             }
             let _ = req.respond(json_response(status, &json!({ "error": e })));
         }

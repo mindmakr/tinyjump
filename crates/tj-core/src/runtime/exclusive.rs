@@ -19,7 +19,7 @@
 //! Few objects are held at once and waits are rare, so plain vectors searched in order keep
 //! this small (device builds pay for every collection type).
 
-use super::{Entry, Runtime, TimerKind};
+use super::{By, Entry, Runtime, TimerKind};
 use crate::vm::interp::Fiber;
 use crate::vm::value::{Exc, ObjRef, Value};
 use serde_json::{json, Map, Value as Json};
@@ -163,6 +163,7 @@ impl Runtime {
     pub(crate) fn start(&mut self, mut f: Fiber, reply: Option<u64>, entry: Entry) {
         f.caller = entry.who;
         f.chain = if entry.chain == 0 { self.new_chain() } else { entry.chain };
+        self.origin(&mut f, entry.by);
         let key = f.stat.filter(|_| self.any_exclusive).and_then(|(c, m)| {
             let (_, def) = self.program.objects[c as usize].methods.get_index(m as usize)?;
             def.exclusive.then(|| f.frames[0].this.as_ref().map(|o| (o.class, o.id.clone()))).flatten()
@@ -175,10 +176,11 @@ impl Runtime {
                 self.drive(f, reply);
             }
             Ok(false) => {
-                let merged = entry.beat && self.lock(&key).is_some_and(|l| l.queue.iter().any(|w| w.beat && w.fiber.stat == f.stat));
+                let beat = entry.by == By::Timer;
+                let merged = beat && self.lock(&key).is_some_and(|l| l.queue.iter().any(|w| w.beat && w.fiber.stat == f.stat));
                 if !merged {
                     let deadline = reply.map(|_| self.now + WAIT_MS);
-                    self.enqueue(&key, Waiter { chain: f.chain, fiber: f, reply, started: false, deadline, beat: entry.beat });
+                    self.enqueue(&key, Waiter { chain: f.chain, fiber: f, reply, started: false, deadline, beat });
                 }
             }
             Err((status, why)) => self.refuse_start(reply, status, why),

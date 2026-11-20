@@ -103,17 +103,35 @@ enum TimerKind {
 }
 
 /// How a method call starts: who it is for, its chain (0: a new one, see `exclusive.rs`),
-/// and whether it is an `@every` beat, which merges with a waiting one.
+/// and what started it.
 pub(crate) struct Entry {
     pub who: Who,
     pub chain: u64,
-    pub beat: bool,
+    pub by: By,
 }
 
 impl Entry {
     pub(crate) fn new(who: Who) -> Entry {
-        Entry { who, chain: 0, beat: false }
+        Entry { who, chain: 0, by: By::Request }
     }
+}
+
+/// What started a method call. A server reports calls nobody requested ([`Output::Ran`]),
+/// for its audit log; requests are logged where they arrive.
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum By {
+    Request,
+    /// An `@every` beat; a beat that finds one waiting merges into it.
+    Timer,
+    Alarm,
+    Invoke,
+}
+
+/// A server's record of a call nobody requested, kept on its fiber until the call ends.
+pub struct Origin {
+    by: &'static str,
+    obj: Rc<ObjRef>,
+    at: f64,
 }
 
 /// Why a request was refused, with its HTTP status.
@@ -491,11 +509,13 @@ impl Runtime {
             }
             Ok(Run::Blocked(key)) => self.park(key, f, reply),
             Ok(Run::Done(v)) => {
+                self.ran(&mut f, true);
                 if reply.is_some() {
                     self.reply(reply, v.to_json());
                 }
             }
             Err(fail) => {
+                self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
                 self.count_error(f.stat);
                 match reply {
@@ -504,6 +524,31 @@ impl Runtime {
                 }
             }
         }
+    }
+
+    /// Remembers on a server what started a call nobody requested, to report when it ends.
+    fn origin(&self, f: &mut Fiber, by: By) {
+        let by = match by {
+            _ if !self.server => return,
+            By::Request => return,
+            By::Timer => "timer",
+            By::Alarm => "alarm",
+            By::Invoke => "invoke",
+        };
+        if let Some(obj) = f.frames[0].this.clone() {
+            f.origin = Some(Origin { by, obj, at: self.now });
+        }
+    }
+
+    /// Reports a call nobody requested as it ends (see [`Runtime::origin`]).
+    fn ran(&mut self, f: &mut Fiber, ok: bool) {
+        let (Some(o), Some((class, m))) = (f.origin.take(), f.stat) else { return };
+        let method = self.program.objects[class as usize].methods.get_index(m as usize).map_or("", |(name, _)| name).to_string();
+        let caller = match &f.caller {
+            Who::Remote { id, .. } => Some(id.to_string()),
+            Who::System | Who::Local => None,
+        };
+        self.outputs.push(Output::Ran { object: o.obj.key(), method, by: o.by.into(), caller, ok, ms: (self.now - o.at).max(0.0) as u64 });
     }
 
     /// Continues the fiber waiting on promise `id` with an effect's result.
@@ -570,14 +615,14 @@ impl Runtime {
                         next = self.now + interval;
                     }
                     self.push_timer(next, TimerKind::Every { obj: obj.clone(), method: method.clone(), interval });
-                    self.invoke(obj, &method, Vec::new(), false, None, Entry { who: Who::System, chain: 0, beat: true });
+                    self.invoke(obj, &method, Vec::new(), false, None, Entry { who: Who::System, chain: 0, by: By::Timer });
                 }
                 TimerKind::Alarm { obj, alarm } => {
                     if let Some(a) = self.take_alarm(&obj, alarm) {
                         let args = a.args.iter().map(Value::from_json).collect();
                         // An alarm runs as whoever scheduled it, so rules on data still hold.
                         let who = a.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
-                        self.invoke(obj, &a.method, args, false, None, Entry::new(who));
+                        self.invoke(obj, &a.method, args, false, None, Entry { who, chain: 0, by: By::Alarm });
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),

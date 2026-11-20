@@ -178,7 +178,7 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Audit log, runtime statistics, encryption, and personal-data handling with GDPR and PDPL subject rights.</li>
+          <li>Encryption at rest, and personal-data handling with GDPR and PDPL subject rights.</li>
           <li>Compliance packs for the EU, Saudi Arabia, the wider MENA region and the US, which others can extend.</li>
           <li>Servers that talk to each other, and webhooks.</li>
           <li>More native components (navigation, long lists, forms), translations, and one-command app builds.</li>
@@ -191,6 +191,7 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>An audit log that shows tampering.</b> Every API call, refusal, admin request, timer, alarm, agent tool and plugin call is written down: who, what, the outcome and the time taken, never values. Each line is chained to the one before with a keyed hash, and signed checkpoints can be copied off the machine. <code>tj audit verify</code> finds a changed, removed or reordered line, and with that copy, a history rewritten by someone holding the key. People appear as random tokens, so forgetting someone does not mean editing the log.</li>
           <li><b>One call at a time, where it matters.</b> Mark a method <code>@exclusive</code> and an object runs one such call at a time, like an actor, even across <code>await</code>. Three payments of 60 from a balance of 100, sent at once: one goes through instead of all three. Calls that would wait for each other fail at once instead of hanging, and an agent's tools never wait for the agent.</li>
           <li><b>Runtime statistics.</b> Calls, errors, refusals and work for every method on every platform, latency on servers, <code>tj stats</code>, and <code>/_tj/metrics</code> for Prometheus and Grafana.</li>
           <li><b>Saves that reach the disk.</b> A crash leaves the old record or the new one, and a save that fails fails the call, so nobody is told a change happened when it did not.</li>

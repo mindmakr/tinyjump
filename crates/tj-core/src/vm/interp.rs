@@ -24,6 +24,8 @@ pub struct Fiber {
     /// The chain the call belongs to: its request, timer, alarm or event, and everything it
     /// runs, `invoke` included (see `runtime/exclusive.rs`). 0 until it first runs.
     pub chain: u64,
+    /// On a server, what started a call nobody requested (a timer, alarm or `invoke`).
+    pub origin: Option<crate::runtime::Origin>,
 }
 
 pub struct Frame {
