@@ -2147,3 +2147,23 @@ fn a_press_is_answered_once_its_handler_starts_waiting() {
     assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 9, error: None, .. })), "answered now: {out:?}");
     assert_eq!(server_calls(&out).len(), 1, "and the call went out");
 }
+
+#[test]
+fn signing_out_clears_what_the_device_kept_for_that_person() {
+    let src = "object Screen {\n  draft: string = \"\"\n  type(t: string) { this.draft = t }\n}\nfunction App() {\n  return <Text id=\"d\">{Screen.get(\"main\").draft}</Text>\n}\n";
+    let store = Shared::default();
+    let (mut device, _) = boot_as(src, store.clone(), 0.0, false);
+    device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    call(&mut device, 1.0, "Screen/main", "type", json!(["ana's phone 555"])).unwrap();
+    device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!(""), "gone from memory");
+    let (mut later, _) = boot_as(src, store.clone(), 4.0, false);
+    assert_eq!(state(&mut later, 5.0, "Screen/main")["draft"], json!(""), "and from the device's storage");
+
+    // An app nobody signs in to keeps its state.
+    let kept = Shared::default();
+    let (mut device, _) = boot_as(src, kept.clone(), 0.0, false);
+    call(&mut device, 1.0, "Screen/main", "type", json!(["my list"])).unwrap();
+    device.handle(2.0, Input::Identity { user: None, roles: Vec::new() });
+    assert_eq!(state(&mut device, 3.0, "Screen/main")["draft"], json!("my list"));
+}

@@ -206,7 +206,13 @@ impl Runtime {
         }
         let (keep, dropped): (Vec<Pending>, Vec<Pending>) = std::mem::take(&mut self.outbox.pending).into_iter().partition(|p| p.user == user);
         self.outbox.pending = keep;
+        // Someone was signed in and is no longer: the device's own objects go too. An app
+        // nobody signs in to keeps them.
+        let someone_left = self.outbox.user.is_some();
         self.outbox.user = user;
+        if someone_left {
+            self.clear_device_objects();
+        }
         // `caller.id` changed: the UI is drawn again for the new user.
         self.ran_code = true;
         for p in dropped {

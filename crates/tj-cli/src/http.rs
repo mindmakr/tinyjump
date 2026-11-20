@@ -386,7 +386,7 @@ fn handle(mut req: Request, front: &Front) {
         })),
         (Method::Get, ["_tj", "reload"]) if front.dev.is_some() => {
             let dev = front.dev.as_ref().expect("checked");
-            let events = Arc::new(Mailbox::new(Vec::new(), None));
+            let events = Arc::new(Mailbox::new(Some(Vec::new()), None));
             if let Ok(mut tabs) = dev.tabs.lock() {
                 tabs.push(events.clone());
             }
@@ -478,7 +478,15 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
     }
     let verified = front.identity.verify(authorization)?;
     // The stream checks again when it opens, and names any it refuses.
-    front.engine.may_read(objects.clone(), verified.caller.clone())?;
+    let readable = front.engine.may_read(objects.clone(), verified.caller.clone())?;
+    if readable.len() < objects.len() {
+        let who = match &verified.caller {
+            Caller::Remote { id, .. } => Actor::id(Some(id)),
+            Caller::Trusted(_) => Actor::Admin,
+        };
+        let refused: Vec<&str> = objects.iter().filter(|o| !readable.contains(o)).map(String::as_str).collect();
+        front.audit.record(Entry::new("refused").who(who).text("request", "ticket").text("objects", &refused.join(" ")).num("status", 403));
+    }
     let value = hex(&random::<32>().map_err(|e| (500, e))?);
     let mut tickets = front.tickets.lock().map_err(|_| (500, "tickets unavailable".to_string()))?;
     tickets.retain(|_, t| t.expires > Instant::now());
@@ -539,7 +547,13 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
             _ => None,
         };
         match front.engine.subscribe(objects, since, caller) {
-            Ok(events) => Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) }),
+            Ok((events, refused)) => {
+                // Partly refused is still a refusal, written to the audit log.
+                if !refused.is_empty() {
+                    front.audit.record(Entry::new("refused").who(caller_id.as_deref().map_or(Actor::Anonymous, |id| Actor::id(Some(id)))).text("request", "stream").text("objects", &refused.join(" ")).num("status", 403));
+                }
+                Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) })
+            }
             Err(e) => {
                 release(front, slot.as_deref());
                 Err(e)
@@ -624,7 +638,7 @@ mod tests {
     fn agents_reach_the_open_tab_and_the_server_answers_when_none_is_open() {
         let dev = Arc::new(Dev::default());
         assert!(dev.ask("inspect", &Json::Null).is_none(), "no tab: the server answers");
-        let tab = Arc::new(Mailbox::new(Vec::new(), None));
+        let tab = Arc::new(Mailbox::new(Some(Vec::new()), None));
         dev.tabs.lock().unwrap().push(tab.clone());
         // The tab reads the question and posts its answer.
         let answering = {

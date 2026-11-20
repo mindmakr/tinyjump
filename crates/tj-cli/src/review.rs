@@ -28,8 +28,15 @@ struct Walk {
 /// All findings, most severe first.
 pub fn review(snapshot: &Json) -> Vec<Finding> {
     let mut w = Walk { viewport_w: snapshot["viewport"]["w"].as_f64(), findings: Vec::new() };
-    if let Some(tree) = snapshot["tree"].as_array() {
-        w.nodes(tree, "#ffffff", false);
+    match snapshot["tree"].as_array() {
+        Some(tree) if !tree.is_empty() => w.nodes(tree, "#ffffff", false),
+        // Nothing drawn means nothing checked: say so, rather than "No findings".
+        _ => w.findings.push(Finding {
+            severity: Severity::Error,
+            check: "screen",
+            node: "the target".into(),
+            message: "there is no screen to review. tj serve draws none; under tj dev, open the app in a browser tab, which answers".into(),
+        }),
     }
     w.findings.sort_by_key(|f| f.severity);
     w.findings
@@ -234,6 +241,9 @@ mod tests {
             node(3, "Button", json!({ "text": "Add" }), [16.0, 60.0, 80.0, 44.0], vec![]),
         ])]);
         assert!(review(&json!({ "tree": tree, "viewport": { "w": 390, "h": 800 } })).is_empty());
+        // A target that drew nothing is not a clean screen.
+        let none = review(&json!({ "tree": [] }));
+        assert!(none.len() == 1 && none[0].severity == Severity::Error && none[0].check == "screen");
     }
 
     #[test]

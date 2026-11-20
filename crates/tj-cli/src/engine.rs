@@ -127,7 +127,8 @@ impl Engine {
     /// allowed to read (`None`: the admin, and every object if `objects` is empty). It starts
     /// with the current state of each of `objects` that changed after change number `since`,
     /// so a client that reconnects resumes where it left off instead of refetching.
-    pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<Arc<Mailbox>, Failure> {
+    /// Also returns the listed objects the caller may not read, for the audit log.
+    pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<(Arc<Mailbox>, Vec<String>), Failure> {
         let reader = match &caller {
             Some(Caller::Remote { id, .. }) => Some(id.clone()),
             _ => None,
@@ -138,15 +139,17 @@ impl Engine {
             Some(c) => self.may_read(objects.clone(), c.clone())?,
             None => objects.clone(),
         };
-        let events = Arc::new(Mailbox::new(readable.clone(), Some(self.stats.clone())).read_by(reader));
-        let refused: Vec<&String> = objects.iter().filter(|o| !readable.contains(o)).collect();
+        // The admin's stream with no list is every object; any other is exactly what it may read.
+        let only = (caller.is_some() || !objects.is_empty()).then(|| readable.clone());
+        let events = Arc::new(Mailbox::new(only, Some(self.stats.clone())).read_by(reader));
+        let refused: Vec<String> = objects.iter().filter(|o| !readable.contains(o)).cloned().collect();
         if !refused.is_empty() {
             events.push(Event::new(String::new(), None, format!("event: refused\ndata: {}\n\n", json!({ "objects": refused }))));
         }
         let (done, r) = channel();
         self.tx.send(Msg::Subscribe { events: events.clone(), objects: readable, since, caller, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
         Self::wait(&r)??;
-        Ok(events)
+        Ok((events, refused))
     }
 
     /// The `objects` that `caller` may read (see [`may_read`]).
@@ -210,21 +213,11 @@ struct Waiter {
 }
 
 /// Whether `caller` may read every one of `objects`, checked on the runtime thread.
-/// The `objects` that `caller` may read. Some refused is not a failure: a device still listing
-/// an object from before its user changed gets the rest. All refused is a 403.
+/// The `objects` that `caller` may read. Refusals are not a failure: a device still listing
+/// objects from before its user changed gets a stream of what it may read (perhaps nothing)
+/// that names the rest, so it stops asking instead of retrying a 403 for ever.
 fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<Vec<String>, Failure> {
-    let mut readable = Vec::new();
-    let mut refused = None;
-    for o in objects {
-        match rt.may_read(o, caller) {
-            Ok(()) => readable.push(o.clone()),
-            Err(why) => refused = refused.or(Some(why)),
-        }
-    }
-    match refused {
-        Some(why) if readable.is_empty() => Err((403, why)),
-        _ => Ok(readable),
-    }
+    Ok(objects.iter().filter(|o| rt.may_read(o, caller).is_ok()).cloned().collect())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -612,11 +605,11 @@ mod tests {
         post("one").expect("posted");
 
         // A new client catches up on the current state first.
-        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0, None).expect("admin may stream"));
+        let (seq, msg) = next_change(&engine.subscribe(vec!["Room/lobby".into()], 0, None).expect("admin may stream").0);
         assert!(msg.contains("\"one\""), "{msg}");
 
         // A client that already has that change gets nothing old, only what happens next.
-        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq, None).expect("admin may stream");
+        let resumed = engine.subscribe(vec!["Room/lobby".into()], seq, None).expect("admin may stream").0;
         post("two").expect("posted");
         let (next, msg) = next_change(&resumed);
         assert!(next > seq && msg.contains("\"two\""), "{msg}");
@@ -639,7 +632,8 @@ mod tests {
         set("user:bo", "Bo");
         // A device still listing ana's profile from before bo signed in: bo gets his own, and
         // ana's is named as refused instead of the whole stream failing.
-        let events = engine.subscribe(vec!["Profile/user:ana".into(), "Profile/user:bo".into()], 0, who("user:bo")).expect("bo may stream his own");
+        let (events, refused) = engine.subscribe(vec!["Profile/user:ana".into(), "Profile/user:bo".into()], 0, who("user:bo")).expect("bo may stream his own");
+        assert_eq!(refused, ["Profile/user:ana"], "named for the audit log");
         // Everything that arrives until `until` shows up (or two seconds pass).
         let read = |until: &str| {
             let (mut text, start) = (String::new(), std::time::Instant::now());
@@ -656,8 +650,12 @@ mod tests {
         set("user:bo", "Bo again");
         let later = read("Bo again");
         assert!(later.contains("Bo again") && !later.contains("Ana again"), "{later}");
-        // Nothing readable at all is still a refusal.
-        assert_eq!(engine.subscribe(vec!["Profile/user:ana".into()], 0, who("user:bo")).err().map(|e| e.0), Some(403));
+        // Nothing readable: a stream that only names the refusals, and carries nothing else.
+        let (events, refused) = engine.subscribe(vec!["Profile/user:ana".into()], 0, who("user:bo")).expect("opens");
+        assert_eq!(refused, ["Profile/user:ana"]);
+        set("user:ana", "Ana once more");
+        let text: String = events.take(Duration::from_secs(1)).into_iter().map(|e| e.text).collect();
+        assert!(text.contains("event: refused") && !text.contains("Ana once more"), "{text}");
         let _ = std::fs::remove_dir_all(&data);
     }
 
