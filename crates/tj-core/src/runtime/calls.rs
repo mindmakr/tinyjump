@@ -77,13 +77,6 @@ struct Pending {
 }
 
 /// splitmix64, to turn the random state into a device id without consuming it.
-fn mix(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
-
 impl Runtime {
     /// Loads the outbox at boot. What is still pending is sent on the first input, not at
     /// boot: if that input says a different user signed in (`identity`), their calls are
@@ -116,9 +109,10 @@ impl Runtime {
     /// Queues a call to an `@server` object and returns the promise its caller awaits.
     pub(crate) fn queue_call(&mut self, object: String, method: String, args: Vec<Json>) -> u32 {
         if self.outbox.device.is_empty() {
-            // 128 bits from the host's seed, which hosts take from a secure random source.
-            let a = mix(self.rng ^ self.now.to_bits());
-            self.outbox.device = format!("{a:016x}{:016x}", mix(a));
+            // 128 bits from the generator, unguessable once the host sent `entropy`.
+            let mut id = [0u8; 16];
+            self.drbg.fill(&mut id);
+            self.outbox.device = crate::crypto::hex(&id);
         }
         self.outbox.next += 1;
         let call = format!("{}-{}", self.outbox.device, self.outbox.next);

@@ -59,7 +59,10 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runti
     let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
-    Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))
+    let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
+    // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
+    out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
+    Ok((rt, out))
 }
 
 impl Engine {
@@ -151,7 +154,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Entropy { .. } | Input::Tick => {}
     }
 }
 

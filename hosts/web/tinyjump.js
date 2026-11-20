@@ -438,7 +438,8 @@ export async function start(opts) {
   // ---------- boot ----------
 
   const [p, n] = writeStr(opts.source);
-  // A secure seed: device and call ids derive from it, so they must not be guessable.
+  // The seed drives Math.random (set it to replay a run); ids and crypto.randomId() use the
+  // secure bytes sent as `entropy` below.
   const words = crypto.getRandomValues(new Uint32Array(2));
   const seed = opts.seed || (words[0] & 0x1fffff) * 4294967296 + words[1];
   const code = ex.tj_boot(p, n, Date.now(), seed, 1);
@@ -453,6 +454,8 @@ export async function start(opts) {
     throw new Error(out.message);
   }
   apply(out);
+  const entropy = crypto.getRandomValues(new Uint8Array(32));
+  send({ type: 'entropy', bytes: Array.from(entropy, (b) => ('0' + b.toString(16)).slice(-2)).join('') });
   // Before any other input, so calls held from the last session are checked against it.
   if (opts.user !== undefined) send({ type: 'identity', user: opts.user || null });
   window.tinyjump = api;

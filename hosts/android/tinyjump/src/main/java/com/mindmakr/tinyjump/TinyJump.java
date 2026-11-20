@@ -76,11 +76,21 @@ public final class TinyJump {
         TinyJump tj = new TinyJump(context, root, server);
         Host host = new Host(new FileStore(new File(context.getFilesDir(), "tinyjump")));
         host.renderer = tj.renderer;
-        // A secure seed: device and call ids derive from it, so they must not be guessable.
-        int code = Native.boot(host, source, now(), new java.security.SecureRandom().nextLong(), true);
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        // The seed drives Math.random; ids and crypto.randomId() use the `entropy` bytes below.
+        int code = Native.boot(host, source, now(), random.nextLong(), true);
         String out = Native.out();
         if (code != 0) throw new IllegalStateException(describeFailure(code, out));
         tj.apply(out);
+        byte[] bytes = new byte[32];
+        random.nextBytes(bytes);
+        StringBuilder hex = new StringBuilder();
+        for (byte b : bytes) hex.append(String.format("%02x", b & 0xff));
+        try {
+            tj.send(input("entropy").put("bytes", hex.toString()));
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
         return tj;
     }
 

@@ -1,10 +1,10 @@
 {
   "files": {
-    "target/wasm32-unknown-unknown/small/tj_wasm.wasm": 750,
-    "target/aarch64-linux-android/small/libtj_android.so": 1000,
+    "target/wasm32-unknown-unknown/small/tj_wasm.wasm": 760,
+    "target/aarch64-linux-android/small/libtj_android.so": 1010,
     "target/armv7-linux-androideabi/small/libtj_android.so": 720,
-    "target/i686-linux-android/small/libtj_android.so": 1200,
-    "target/x86_64-linux-android/small/libtj_android.so": 1180,
+    "target/i686-linux-android/small/libtj_android.so": 1210,
+    "target/x86_64-linux-android/small/libtj_android.so": 1190,
     "target/release/tj": 6100
   },
   "apps": {

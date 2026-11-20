@@ -152,13 +152,19 @@
       </div>
     </section>
 
+    <section class="narrow">
+      <h2>How it is built</h2>
+      <p>One owner sets the direction in a written vision that every change is checked against. AI agents build tinyjump step by step: each step comes with its tests, is measured against a size and speed budget, and is run live before it merges.</p>
+      <p>Other agents review the design and the work independently, without the builder's reasoning in front of them. That review corrected the trust design before any of it was built, and it keeps going: every correction is written down in the docs with its reason, so you can see what was planned, what was found and what was done instead.</p>
+    </section>
+
     <section>
       <h2>Measured, not claimed</h2>
       <div class="numbers">
-        <div class="num"><b>725 KB</b><span>web runtime, compiler included (268 KB compressed)</span></div>
+        <div class="num"><b>752 KB</b><span>web runtime, compiler included (278 KB compressed)</span></div>
         <div class="num"><b>~1 MB</b><span>native library per Android CPU type (700 KB on 32-bit ARM)</span></div>
         <div class="num"><b>&lt;0.2 ms</b><span>to boot each example app on a laptop (<code>tj bench</code>)</span></div>
-        <div class="num"><b>91</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
+        <div class="num"><b>120</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
         <div class="num"><b>Android 5</b><span>and up, iOS 13 and up, and 2019-era browsers</span></div>
         <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM</span></div>
       </div>
@@ -178,7 +184,7 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Encryption at rest, and personal-data handling with GDPR and PDPL subject rights.</li>
+          <li>Personal-data handling with GDPR and PDPL subject rights.</li>
           <li>Compliance packs for the EU, Saudi Arabia, the wider MENA region and the US, which others can extend.</li>
           <li>Servers that talk to each other, and webhooks.</li>
           <li>More native components (navigation, long lists, forms), translations, and one-command app builds.</li>
@@ -191,6 +197,7 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>Encrypted at rest, and secrets for apps.</b> Set <code>TJ_KEY_FILE</code> and every stored object is sealed with AES-256-GCM under its own key; file names reveal nothing, and keys change without re-encrypting. Apps get <code>crypto.randomId()</code>, <code>crypto.hmac()</code> and <code>crypto.timingSafeEqual()</code>, backed by secure random bytes from every host. A server reachable from other machines refuses credentials over plain HTTP. On the way we fixed an older flaw: a record that could not be read made its object start empty, and its next save overwrote it. Now the call fails instead.</li>
           <li><b>An audit log that shows tampering.</b> Every API call, refusal, admin request, timer, alarm, agent tool and plugin call is written down: who, what, the outcome and the time taken, never values. Each line is chained to the one before with a keyed hash, and signed checkpoints can be copied off the machine. <code>tj audit verify</code> finds a changed, removed or reordered line, and with that copy, a history rewritten by someone holding the key. People appear as random tokens, so forgetting someone does not mean editing the log.</li>
           <li><b>One call at a time, where it matters.</b> Mark a method <code>@exclusive</code> and an object runs one such call at a time, like an actor, even across <code>await</code>. Three payments of 60 from a balance of 100, sent at once: one goes through instead of all three. Calls that would wait for each other fail at once instead of hanging, and an agent's tools never wait for the agent.</li>
           <li><b>Runtime statistics.</b> Calls, errors, refusals and work for every method on every platform, latency on servers, <code>tj stats</code>, and <code>/_tj/metrics</code> for Prometheus and Grafana.</li>

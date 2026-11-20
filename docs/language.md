@@ -280,7 +280,8 @@ and `border`. Numbers are pixels.
 
 `console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/min/max/random/PI`,
 `JSON.stringify(v, null, 2)/parse`, `Object.keys/values/entries`, `Array.isArray`,
-`Date.now()`, `String(x)`, `Number(x)`, `parseInt`, `parseFloat`, `fetch`, `Error`.
+`Date.now()`, `crypto.randomId/hmac/timingSafeEqual`, `String(x)`, `Number(x)`, `parseInt`,
+`parseFloat`, `fetch`, `Error`.
 
 - Strings: `length`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`,
   `includes`, `startsWith`, `endsWith`, `indexOf`, `slice`, `substring`, `split`,
@@ -291,6 +292,42 @@ and `border`. Numbers are pixels.
   `findIndex`, `some`, `every`, `forEach`, `reduce`, `flatMap`.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
+
+For secrets, use `crypto`, never `Math.random()`:
+
+- `crypto.randomId()`: 32 hex characters (128 bits) from the host's secure random source,
+  for tokens, invite codes and ids nobody may guess.
+- `crypto.hmac(key, text)`: HMAC-SHA256 as hex, to sign data or to store a lookup value for
+  an email or a phone number. There is no plain hash, because a hash of an email is easy to
+  reverse by trying them all.
+- `crypto.timingSafeEqual(a, b)`: compares a given secret with the stored one without the
+  time taken revealing how much matched.
+
+Keep keys in a server object nobody outside the server can read or call:
+
+```tsx
+/// No @read and no @allow: only server code reaches it, and TJ_KEY_FILE encrypts it at rest.
+@server object Keys {
+  invites: string = ""
+  invite(): string {
+    if (this.invites === "") { this.invites = crypto.randomId() }
+    return this.invites
+  }
+}
+
+@server @read("staff") object Invites {
+  codes: string[] = []
+  @allow("staff") create(): string {
+    const code = crypto.randomId()
+    this.codes.push(crypto.hmac(Keys.get("main").invite(), code))   // only the HMAC is stored
+    return code
+  }
+  @allow("anyone") check(code: string): boolean {
+    const mac = crypto.hmac(Keys.get("main").invite(), code)
+    return this.codes.some(c => crypto.timingSafeEqual(c, mac))
+  }
+}
+```
 
 ## Checking your work
 

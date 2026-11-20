@@ -55,7 +55,7 @@ Next, agreed with the owner on 2026-11-20:
    - `@exclusive` methods: actor-style turns where an `await` needs them, without
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
-   - encryption at rest (stored objects done; `crypto.*` for apps next);
+   - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
    - personal data with subject rights;
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
@@ -157,6 +157,23 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
 Deliberately not planned: a general-purpose message broker, or "exactly-once" promises.
 Those are separate products, and exactly-once cannot be honestly guaranteed over a network;
 idempotent calls give the same result for apps.
+
+## How tinyjump evolves
+
+The way it is built is part of what it offers, and we say so publicly:
+
+- **One owner sets the direction** in this document. Every change is checked against it,
+  and work that serves no goal here is not done.
+- **AI agents build it,** step by step. Each step comes with its tests, is measured
+  against the size and speed budget, and is run live before it merges. What is not built
+  is listed as not built.
+- **Other agents review the design and the work independently,** without the builder's
+  reasoning in front of them. The trust design was corrected by such a review before it
+  was built. A standing review channel between the reviewing agents and the builder is
+  being set up in the repository.
+- **Corrections are written down with their reasons,** next to the design they change
+  (for example the "as built" notes in `docs/trust.md`), so a reader can see what was
+  planned, what was found and what was done instead.
 
 ## For the next review and retro
 
