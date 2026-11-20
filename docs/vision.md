@@ -41,7 +41,25 @@ Done so far, in order: resumable change streams, the benchmark and size budget, 
 calls and backpressure, modules, the language reference, server metrics, access control,
 and plugins with `tj:ai`.
 
-Next, agreed with the owner on 2026-11-20:
+### Milestone 1 (active, set by the owner on 2026-11-20): one small app, end to end
+
+One milestone at a time. The first is a small app that agents build from the docs alone
+and that runs end to end on the happy path, so every piece of plumbing is proven together
+before anything is enhanced. Release is not the goal; being in the market early, to gain
+momentum and contributors, is.
+
+- **Done when** one small app (chosen with the owner) is written by agents from
+  `docs/language.md`, runs in `tj dev` on the web, on Android and on the iOS Simulator,
+  is served by a `tj serve` binary on Linux with sign-in, keeps working offline and syncs
+  when back, updates live on every screen, is driven and checked by an agent through
+  `tj mcp` and `tj review`, and is deployed as documented.
+- **How:** other agents build it and post every gap they hit to `feedback/`; the builder
+  fixes what blocks the happy path and lists the rest. Nothing beyond the happy path is
+  built in this milestone.
+- **Paused until it is done:** the rest of the trust work below (personal data parts 2 and
+  3, compliance packs).
+
+### The rest of the agreed order
 
 1. **Sign-in tokens (done)** from OpenID Connect providers, proven against a built-in test
    issuer (no real accounts needed in tests).
@@ -57,8 +75,13 @@ Next, agreed with the owner on 2026-11-20:
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
    - personal data with subject rights (`@pii`, masking, export and erase done; the flow
-     check, retention and per-person keys next);
+     check, retention and per-person keys after Milestone 1);
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
+   - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
+     scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,
+     shadow boot and rollback, size and AI-cost caps and `tj retro`.
+   - Then a design note on effects that already happened outside when a call is retried
+     after a crash (durable effect records, or idempotency keys passed to `fetch`).
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
      follows.
 4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
@@ -66,9 +89,13 @@ Next, agreed with the owner on 2026-11-20:
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 
-After that: the UI catalog (navigation, long lists, forms, icons, themes), `tj build`, the
-rest of automation (golden images, run reports), translations and locale formats, and
-GPU/3D.
+After that: the UI catalog (navigation, long lists, forms, icons, themes), **native
+components** (owner, 2026-11-20: a Kotlin or Java view, a Swift view or a web element
+registered under a name and used from `.tj` like any catalog component, with props and
+events through the protocol), `tj build`, the rest of automation (golden images, run
+reports), translations and locale formats, and GPU/3D. Size: profile the device builds and
+cut what is really large (a server-only split was measured at 1.2 KB and dropped,
+`feedback/2026-11-20-builder-004-size-split-measured.md`).
 
 ## The ecosystem: filling the gap of missing libraries (agreed)
 
@@ -176,19 +203,28 @@ The way it is built is part of what it offers, and we say so publicly:
     `tj bench`), testing restarts, offline queues, locales and hostile inputs.
   - **Maintainer (protector):** guards size and step budgets, stored-state compatibility
     across upgrades, key and audit hygiene, and removal of unused code.
-- **One conflict-free channel (`feedback/`).** Concurrent roles communicate through
-  numbered notes (`feedback/YYYY-MM-DD-<role>-NNN-<topic>.md`), one note per file, so
-  critics, testers and maintainers never edit files a builder is changing.
-- **Corrections are written down with their reasons,** next to the design they change
-  (for example the "as built" notes in `docs/trust.md`), so any human or agent arriving
-  later sees what was planned, what was found and what was done instead.
+- **One conflict-free channel (`feedback/`), with two-way debate.** Concurrent roles
+  communicate through numbered notes (`feedback/YYYY-MM-DD-<role>-NNN-<topic>.md`) and
+  reply files, never editing files a builder is changing. No feedback is rubber-stamped and
+  none is ignored: every critique and every pushback states both what a change solves and
+  what it costs (size, latency, VM steps or language surface). Roles push back with
+  evidence when a proposal hurts the runtime, concede when shown wrong, and escalate
+  unresolved trade-offs to the owner.
+- **Corrections and trade-offs are written down with their reasons,** next to the design
+  they change (for example the "as built" notes in `docs/trust.md`), so any human or agent
+  arriving later sees what was planned, what was debated and what was done instead.
 
 ## Living, agentic-first apps (direction)
 
-tinyjump apps are meant to be living systems that agents and people build, test, review,
-protect and improve continuously, while staying plain enough for any developer to read and
-take over in minutes (`feedback/2026-11-20-critic-001-agentic-living-apps.md`; not built
-yet, queued for review after the trust work):
+All roles share one goal: a small, solid runtime that agentic coders and people can build
+and refactor on with clear, immediate feedback, producing apps that are **live** (reloads
+and upgrades keep state and connections running), **responsive** (sub-millisecond ticks,
+native frames, bounded turns), **reactive** (every state change streams in order to every
+replica, screen and subscriber) and **progressive** (one plain `.tj` file offline on day
+one, growing into modules, `@server` authority, access/privacy rules, plugins and
+compliance without a rewrite). Proposed steps (`feedback/2026-11-20-critic-001-agentic-living-apps.md`
+and `feedback/2026-11-20-critic-003-two-way-case-and-refactoring.md`; not built yet, open
+for builder pushback and owner decision after the trust work):
 
 1. **Self-aware:** every app can state its own contract (`manifest`: object schemas,
    access rules, personal-data map, plugins and code hash) and its live pulse (errors,
@@ -265,6 +301,9 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 - **DRY.** Each fact has one home: the catalog in `ui/catalog.rs`, builtins in
   `vm/builtins.rs`, and the protocol in `runtime/protocol.rs` plus `docs/host-protocol.md`.
 - **No dead code, no speculative abstractions, no placeholder files.**
+- **Strictly additive** (owner, 2026-11-20): no feature may add setup or ceremony to a
+  one-file app. `examples/todo/app.tj` stays zero-config; keys, privacy rules, manifests and
+  compliance switch on only when an app uses them.
 - Every language feature and runtime behaviour gets a test in `tj-core`.
 - Security: hosts bind to localhost by default, cap body sizes and never serve arbitrary paths.
 - CI is local-only for now (`cargo test`, `cargo clippy`).

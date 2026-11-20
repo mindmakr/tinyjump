@@ -202,7 +202,7 @@ pub struct Runtime {
     /// Native hosts measure their widgets for layout; the web and servers do not need it.
     measure: Option<Box<dyn Measure>>,
     render: bool,
-    server: bool,
+    pub(crate) server: bool,
     explain: bool,
     max_objects: usize,
     ran_code: bool,

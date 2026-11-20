@@ -920,6 +920,28 @@ fn a_failed_erasure_erases_nothing() {
     assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["plan"], json!("reminded"), "its alarms still run");
 }
 
+/// A server runs every object on one thread, so a runaway call is stopped sooner there
+/// (about 0.3 s), and the server answers the next call as usual.
+#[test]
+fn a_runaway_call_on_a_server_fails_and_the_server_carries_on() {
+    let src = r#"
+@server @read("anyone") object Spin {
+  n: number = 0
+  @allow("anyone") forever() { while (true) { this.n += 1 } }
+  @allow("anyone") ok(): string { return "alive" }
+}
+"#;
+    let mut rt = server(src, false);
+    let err = call_as(&mut rt, 1.0, "Spin/s", "forever", json!([]), who("", &[])).unwrap_err().1;
+    assert!(err.contains("ran too long"), "{err}");
+    let steps = rt.stats()["methods"]["Spin.forever"]["steps"].as_u64().unwrap();
+    assert!((20_000_000..20_000_100).contains(&steps), "{steps}");
+    assert_eq!(call_as(&mut rt, 2.0, "Spin/s", "ok", json!([]), who("", &[])), Ok(json!("alive")));
+    // Like any thrown error, it keeps the changes made before it failed (see
+    // feedback/2026-11-20-builder-005-failed-calls-keep-changes.md).
+    assert!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap() > 0);
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
