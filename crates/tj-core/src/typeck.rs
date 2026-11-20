@@ -122,6 +122,11 @@ fn builtin(name: &str) -> Option<Ty> {
             ("entries", func(&[("record", Ty::Any, false)], None, Ty::Arr(Box::new(Ty::Any)))),
         ]),
         "Date" => rec(&[("now", func(&[], None, Ty::Num))]),
+        "crypto" => rec(&[
+            ("hmac", func(&[("key", Ty::Str, false), ("text", Ty::Str, false)], None, Ty::Str)),
+            ("timingSafeEqual", func(&[("a", Ty::Str, false), ("b", Ty::Str, false)], None, Ty::Bool)),
+            ("randomId", func(&[], None, Ty::Str)),
+        ]),
         "Array" => rec(&[("isArray", func(&[("value", Ty::Any, false)], None, Ty::Bool))]),
         "String" => func(&[("value", Ty::Any, false)], None, Ty::Str),
         "Number" => func(&[("value", Ty::Any, false)], None, Ty::Num),

@@ -32,10 +32,13 @@ public final class TinyJump {
         tj.sync = Sync(tj: tj, server: server)
         tj.renderer.tj = tj
         tj.renderer.root.onResize = { [weak tj] in tj?.layout() }
-        // A secure seed: device and call ids derive from it, so they must not be guessable.
+        // The seed drives Math.random; ids and crypto.randomId() use the `entropy` bytes below.
+        // Swift's default random source is the system's secure one.
         let (code, out) = tj.native.boot(source: source, now: now(), seed: UInt64.random(in: 1...UInt64.max))
         guard code == 0 else { throw BootError(description: describeFailure(code, out)) }
         tj.apply(out)
+        let bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
+        tj.send(["type": "entropy", "bytes": bytes.map { String(format: "%02x", $0) }.joined()])
         return tj
     }
 

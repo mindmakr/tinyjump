@@ -102,6 +102,9 @@ pub enum Input {
         #[serde(default)]
         user: Option<String>,
     },
+    /// Secure random bytes from the host (hex, at least 32 bytes), sent once right after
+    /// boot. They are mixed into the generator behind `crypto.randomId()` and device ids.
+    Entropy { bytes: String },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.

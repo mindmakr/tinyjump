@@ -781,6 +781,71 @@ fn servers_report_timers_and_alarms_as_they_end() {
 }
 
 #[test]
+fn crypto_needs_the_hosts_random_bytes_and_matches_the_standards() {
+    // The example from docs/language.md.
+    let src = r#"
+/// No @read and no @allow: only server code reaches it, and TJ_KEY_FILE encrypts it at rest.
+@server object Keys {
+  invites: string = ""
+  invite(): string {
+    if (this.invites === "") { this.invites = crypto.randomId() }
+    return this.invites
+  }
+}
+
+@server @read("staff") object Invites {
+  codes: string[] = []
+  @allow("staff") create(): string {
+    const code = crypto.randomId()
+    this.codes.push(crypto.hmac(Keys.get("main").invite(), code))   // only the HMAC is stored
+    return code
+  }
+  @allow("anyone") check(code: string): boolean {
+    const mac = crypto.hmac(Keys.get("main").invite(), code)
+    return this.codes.some(c => crypto.timingSafeEqual(c, mac))
+  }
+  @allow("anyone") vector(): string { return crypto.hmac("Jefe", "what do ya want for nothing?") }
+}
+"#;
+    let mut rt = server(src, false);
+    let staff = || who("key:ops", &["staff"]);
+    let refused = call_as(&mut rt, 1.0, "Invites/i", "create", json!([]), staff()).unwrap_err().1;
+    assert!(refused.contains("`entropy` input"), "without the host's bytes, no ids: {refused}");
+    assert!(rt.handle(1.0, Input::Entropy { bytes: "ab".into() }).iter().any(|o| matches!(o, Output::Error { .. })), "too few bytes");
+
+    rt.handle(1.0, Input::Entropy { bytes: "07".repeat(32) });
+    let code = call_as(&mut rt, 2.0, "Invites/i", "create", json!([]), staff()).unwrap();
+    let code = code.as_str().unwrap().to_string();
+    assert!(code.len() == 32 && code.bytes().all(|b| b.is_ascii_hexdigit()), "{code}");
+    assert_ne!(json!(code), call_as(&mut rt, 2.0, "Invites/i", "create", json!([]), staff()).unwrap());
+    assert_eq!(call_as(&mut rt, 3.0, "Invites/i", "check", json!([code]), who("", &[])), Ok(json!(true)));
+    assert_eq!(call_as(&mut rt, 3.0, "Invites/i", "check", json!(["0".repeat(32)]), who("", &[])), Ok(json!(false)));
+    assert!(!state(&mut rt, 4.0, "Invites/i").to_string().contains(&code), "only HMACs are stored");
+    assert_eq!(call_as(&mut rt, 4.0, "Keys/main", "invite", json!([]), staff()).unwrap_err().0, Some(403), "keys stay on the server");
+    // RFC 4231, case 2.
+    assert_eq!(call_as(&mut rt, 5.0, "Invites/i", "vector", json!([]), who("", &[])), Ok(json!("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")));
+}
+
+#[test]
+fn fetch_warns_once_per_plain_http_origin() {
+    let src = r#"
+@server @read("anyone") object Feed {
+  @allow("anyone") async pull(url: string) { await fetch(url) }
+}
+"#;
+    let mut rt = server(src, false);
+    let mut warned = |url: &str| -> Vec<String> {
+        let out = rt.handle(1.0, Input::Call { object: "Feed/f".into(), method: "pull".into(), args: vec![json!(url)], reply: None, call: None, caller: who("", &[]) });
+        out.into_iter().filter_map(|o| if let Output::Log { level, message } = o { (level == "warn").then_some(message) } else { None }).collect()
+    };
+    assert_eq!(warned("http://feeds.example.com:8080/a?x=1"), ["fetch uses plain HTTP to feeds.example.com:8080: anyone on the way can read and change it; use https://"]);
+    assert!(warned("http://feeds.example.com:8080/b").is_empty(), "once per origin");
+    for quiet in ["https://feeds.example.com/a", "http://localhost:4700/x", "http://127.0.0.1/x", "http://[::1]:80/x", "http://10.0.2.2:4700/x"] {
+        assert!(warned(quiet).is_empty(), "{quiet}");
+    }
+}
+
+#[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
     let add = |caller: Option<Caller>, text: &str, reply: u64| Input::Call { object: "Board/main".into(), method: "add".into(), args: vec![json!(text)], reply: Some(reply), call: Some("c-1".into()), caller };

@@ -207,6 +207,12 @@ pub struct Runtime {
     ran_code: bool,
     now: f64,
     rng: u64,
+    /// Behind `crypto.randomId()` and device ids; unguessable once `strong`.
+    drbg: crate::crypto::Drbg,
+    /// Whether the host has sent secure random bytes (`entropy`).
+    strong: bool,
+    /// Plain-HTTP origins `fetch` has already warned about.
+    plain_http: BTreeSet<String>,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
     stats: stats::Table,
@@ -264,6 +270,9 @@ impl Runtime {
             ran_code: false,
             now: opts.now,
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
+            drbg: crate::crypto::Drbg::new(&[opts.seed.to_le_bytes(), opts.now.to_bits().to_le_bytes()].concat()),
+            strong: false,
+            plain_http: BTreeSet::new(),
             outputs: Vec::new(),
             metrics: Metrics::default(),
             stats: stats::table(&program),
@@ -291,7 +300,8 @@ impl Runtime {
             self.now = now;
         }
         self.metrics.inputs += 1;
-        if !matches!(input, Input::Identity { .. }) {
+        // Held calls wait for the identity; entropy comes before it on every host.
+        if !matches!(input, Input::Identity { .. } | Input::Entropy { .. }) {
             self.release_outbox();
         }
         match input {
@@ -325,6 +335,13 @@ impl Runtime {
                 }
             },
             Input::Identity { user } => self.set_identity(user),
+            Input::Entropy { bytes } => match crate::crypto::unhex(&bytes).filter(|b| b.len() >= 32) {
+                Some(b) => {
+                    self.drbg.reseed(&b);
+                    self.strong = true;
+                }
+                None => self.reply(None, Err("entropy needs at least 32 bytes, as hex".into())),
+            },
             Input::Ui { target, event, value, reply } => {
                 let handler = self.tree.find(&target).and_then(|node| self.tree.handler(node, &event).cloned());
                 match handler {
@@ -401,6 +418,15 @@ impl Runtime {
         self.now
     }
 
+    /// Bytes no one can guess, once the host has sent `entropy`.
+    pub(crate) fn secure_bytes(&mut self, out: &mut [u8]) -> Result<(), Exc> {
+        if !self.strong {
+            return Err(Exc::msg("this host has not given the runtime secure random bytes: hosts send an `entropy` input right after boot (docs/host-protocol.md)"));
+        }
+        self.drbg.fill(out);
+        Ok(())
+    }
+
     /// xorshift64*: deterministic for a given seed.
     pub(crate) fn random(&mut self) -> f64 {
         self.rng ^= self.rng >> 12;
@@ -422,6 +448,19 @@ impl Runtime {
     }
 
     pub(crate) fn fetch(&mut self, url: String, method: String, headers: Json, body: Option<String>) -> u32 {
+        // Anyone on the way can read or change plain HTTP. Warn once per origin; this machine
+        // and the Android emulator's view of it are fine.
+        if let Some(rest) = url.strip_prefix("http://") {
+            let origin = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let host = match origin.find(']') {
+                Some(end) if origin.starts_with('[') => &origin[..=end],
+                _ => origin.split(':').next().unwrap_or(""),
+            };
+            let local = matches!(host, "localhost" | "[::1]" | "10.0.2.2") || host.starts_with("127.");
+            if !local && self.plain_http.insert(origin.to_string()) {
+                self.log("warn", format!("fetch uses plain HTTP to {origin}: anyone on the way can read and change it; use https://"));
+            }
+        }
         self.next_effect += 1;
         let id = self.next_effect;
         self.outputs.push(Output::Effect { id, effect: Effect::Http { url, method, headers, body } });

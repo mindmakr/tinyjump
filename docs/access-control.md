@@ -26,8 +26,11 @@ at the end.
 - Tokens leak (logs, screenshots), so they are short-lived and checked on every request,
   and long-lived connections are re-checked.
 - Server-side app code and the server's configuration are trusted.
-- Out of scope here: TLS (put `tj serve` behind a TLS-terminating proxy, or a platform
-  that provides it), and outbound request filtering for `fetch` (later; see the end).
+- TLS is the proxy's job: put `tj serve` behind a TLS-terminating proxy, or a platform
+  that provides it, and set `TJ_TLS_TERMINATED=1`. On an address other machines can
+  reach, a server without that setting refuses every request that carries credentials,
+  so a token never crosses the network readable. `fetch` warns on plain-HTTP URLs.
+  Outbound request filtering for `fetch` comes later (see the end).
 
 ## Who is calling: identity
 

@@ -70,6 +70,9 @@ ENVIRONMENT (tj serve):
   TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
+  TJ_TLS_TERMINATED
+                  1 when a proxy in front terminates TLS. Without it, a server on an address
+                  other machines can reach refuses requests that carry credentials
   TJ_KEY_FILE     encrypts stored objects: a file only the server can read, made on first use.
                   Back it up; add a line `k2 <64 hex>` and run `tj store rekey` to change keys
   TJ_AUDIT_KEY_FILE
@@ -278,7 +281,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let file = args.file()?;
     let source = read_source(file)?;
     let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
-    let loopback = matches!(args.host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let loopback = http::is_loopback(&args.host);
     if args.as_user.is_some() && !(dev_mode && loopback) {
         return Err("--as is for `tj dev` on this machine only (with --host 127.0.0.1)".into());
     }
@@ -308,8 +311,12 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let names = plugins.names();
     let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
     eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
+    let tls = http::credentials_need_tls(dev_mode, &args.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
     eprintln!("storage: {storage}\naudit log: {} (key: {audit_key})", data.join("audit").display());
-    http::serve(&addr, http::Front::new(engine, dev, automation, identity, audit))
+    if tls {
+        eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", args.host, http::TLS_TERMINATED_ENV);
+    }
+    http::serve(&addr, http::Front::new(engine, dev, automation, identity, audit, tls))
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.

@@ -89,6 +89,9 @@ pub struct Front {
     pub automation: Automation,
     pub identity: Identity,
     pub audit: Audit,
+    /// Refuse requests that carry credentials, as this server only speaks plain HTTP and
+    /// nobody said a proxy in front of it terminates TLS (see [`credentials_need_tls`]).
+    pub credentials_need_tls: bool,
     /// Behind a proxy: take the client address from `X-Forwarded-For` (`TJ_TRUST_PROXY=1`).
     pub trust_proxy: bool,
     streams: Mutex<HashMap<String, usize>>,
@@ -96,10 +99,25 @@ pub struct Front {
 }
 
 impl Front {
-    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit) -> Front {
+    pub fn new(engine: Engine, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, credentials_need_tls: bool) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, dev, automation, identity, audit, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        Front { engine, dev, automation, identity, audit, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
     }
+}
+
+pub const TLS_TERMINATED_ENV: &str = "TJ_TLS_TERMINATED";
+
+/// Whether `tj serve` must refuse credentials: it speaks plain HTTP, so on an address other
+/// machines can reach, a token or key would cross the network readable, unless a proxy in
+/// front terminates TLS (`TJ_TLS_TERMINATED=1`, which is declared, not verified). `tj dev`
+/// is for development and is exempt.
+pub fn credentials_need_tls(dev: bool, host: &str, tls_terminated: Option<&str>) -> bool {
+    !dev && !is_loopback(host) && tls_terminated != Some("1")
+}
+
+/// Whether a bind address is reachable from this machine only.
+pub fn is_loopback(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
 }
 
 pub fn serve(addr: &str, front: Front) -> Result<(), String> {
@@ -197,6 +215,8 @@ fn handle(mut req: Request, front: &Front) {
     let admin = segs.first() == Some(&"_tj");
     let early = if front.dev.is_some() && !trusted_host(&req) {
         Some(("host", 403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
+    } else if front.credentials_need_tls && authorization.is_some() {
+        Some(("plain http", 403, format!("credentials are refused over plain HTTP, where anyone on the way can read them; put this server behind a proxy that terminates TLS and set {TLS_TERMINATED_ENV}=1")))
     } else if admin {
         front.automation.check(authorization.as_deref()).err().map(|(status, e)| ("admin", status, e))
     } else {
@@ -495,6 +515,15 @@ fn sse(req: Request, events: &Mailbox, still_valid: impl Fn() -> bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credentials_need_tls_on_reachable_servers_only() {
+        assert!(credentials_need_tls(false, "0.0.0.0", None));
+        assert!(credentials_need_tls(false, "10.1.2.3", Some("yes")), "only 1 says so");
+        assert!(!credentials_need_tls(false, "0.0.0.0", Some("1")));
+        assert!(!credentials_need_tls(false, "127.0.0.1", None));
+        assert!(!credentials_need_tls(true, "0.0.0.0", None), "tj dev is for development");
+    }
 
     #[test]
     fn bad_object_values_are_errors_not_dropped() {

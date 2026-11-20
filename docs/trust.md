@@ -122,7 +122,7 @@ As built (`crates/tj-cli/src/audit.rs`):
   pseudonym. Entries still queued in memory when the process is killed are lost; batches
   are written as soon as they arrive.
 
-## 5. Encryption (stored data built; `crypto.*` and transport next)
+## 5. Encryption (built)
 
 - **Stored data (servers):** the encryption lives in a store wrapper on the host, so the
   core stays free of cryptography.
@@ -173,8 +173,27 @@ As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
   mixes plain and sealed records, so a forgotten `TJ_KEY_FILE` cannot write plain records
   next to encrypted ones. Data files are readable by the server's user only.
 - **Not yet:** the audit log and the pseudonym mapping are not encrypted (they hold no
-  values, and the log is keyed); `crypto.*` needs a 256-bit secure seed from every host
-  and a cryptographic generator in the core, and comes next with the transport checks.
+  values, and the log is keyed).
+
+`crypto.*` and transport, as built:
+
+- **Random bytes from every host.** The boot seed (53 to 64 bits, behind `Math.random`,
+  which stays replayable) was also behind device ids, through a generator whose output
+  reveals its state. Now every host sends 32 bytes from its platform's secure source as an
+  `entropy` input right after boot (web `crypto.getRandomValues`, Android `SecureRandom`,
+  Swift's system generator, the server `ring`). They feed an HMAC-DRBG (SHA-256) in the
+  core behind device ids and `crypto.randomId()`. Each delivery is mixed in, never
+  replacing the state, so a client sending known bytes cannot make ids guessable.
+  `crypto.randomId()` throws until the bytes arrive; it never falls back to a weak source.
+- **SHA-256 and HMAC are written out in the core** (`crates/tj-core/src/crypto.rs`,
+  checked against the FIPS and RFC 4231 vectors), so devices need no crate for them.
+  Everything this step added costs device builds about 10 KB.
+- **Keys for apps** live in a server object with no `@read` and no `@allow`
+  (`docs/language.md`), which `TJ_KEY_FILE` encrypts at rest.
+- **Plain HTTP:** `tj serve` on an address other machines can reach refuses every request
+  that carries credentials, unless `TJ_TLS_TERMINATED=1`; the refusal is audited. `fetch`
+  warns once per plain-HTTP origin (this machine and the Android emulator's view of it
+  excepted).
 
 ## 6. Personal data
 
@@ -271,7 +290,7 @@ controls; it cannot weaken another pack's.
 4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`
    (built).
 5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
-   hashed file names (built), and `crypto.*` with the transport checks (next).
+   hashed file names, `crypto.*` and the transport checks (built).
 6. **Personal data:**
    - `@pii` for single-subject objects;
    - masking;

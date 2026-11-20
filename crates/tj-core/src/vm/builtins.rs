@@ -18,6 +18,7 @@ pub const GLOBALS: &[Global] = &[
     ("JSON", || namespace(&[("stringify", json_stringify), ("parse", json_parse)])),
     ("Object", || namespace(&[("keys", object_keys), ("values", object_values), ("entries", object_entries)])),
     ("Date", || namespace(&[("now", date_now)])),
+    ("crypto", || namespace(&[("hmac", crypto_hmac), ("timingSafeEqual", timing_safe_equal), ("randomId", random_id)])),
     ("Array", || namespace(&[("isArray", |_, a| Ok(Value::Bool(matches!(arg(a, 0), Value::Arr(_)))))])),
     ("String", || native("String", |_, a| Ok(Value::str(&arg(a, 0).display())))),
     ("Number", || native("Number", |_, a| Ok(Value::Num(to_number(arg(a, 0)))))),
@@ -466,6 +467,27 @@ fn number_method(name: &str) -> Option<NativeMethod> {
         },
         _ => return None,
     })
+}
+
+/// `crypto.hmac(key, text)`: HMAC-SHA256 as hex. There is no plain hash: a hash of an email
+/// or a phone number is easy to reverse by trying them all.
+fn crypto_hmac(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let (key, msg) = (text(a, 0, "crypto.hmac key")?, text(a, 1, "crypto.hmac text")?);
+    Ok(Value::str(&crate::crypto::hex(&crate::crypto::hmac(key.as_bytes(), &[msg.as_bytes()]))))
+}
+
+/// `crypto.timingSafeEqual(a, b)`: compares secrets without revealing, by the time taken,
+/// how much of them matched.
+fn timing_safe_equal(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let (x, y) = (text(a, 0, "crypto.timingSafeEqual")?, text(a, 1, "crypto.timingSafeEqual")?);
+    Ok(Value::Bool(crate::crypto::same(x.as_bytes(), y.as_bytes())))
+}
+
+/// `crypto.randomId()`: 128 bits from the host's secure random source, as 32 hex characters.
+fn random_id(rt: &mut Runtime, _: &[Value]) -> Result<Value, Exc> {
+    let mut id = [0u8; 16];
+    rt.secure_bytes(&mut id)?;
+    Ok(Value::str(&crate::crypto::hex(&id)))
 }
 
 #[cfg(test)]
