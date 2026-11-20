@@ -721,7 +721,7 @@ fn statistics_count_calls_errors_refusals_and_steps() {
     assert_eq!(s["methods"]["Till.refund"], json!({ "calls": 0, "errors": 0, "refused": 1, "steps": 0 }));
     assert_eq!(s["methods"]["Till.check"]["calls"], json!(1), "timers count too");
     assert_eq!(s["methods"].as_object().unwrap().len(), 3, "{s}");
-    assert_eq!(s["objects"], json!({ "Till": 1 }));
+    assert_eq!((s["objects"].clone(), s["waiting"].clone()), (json!({ "Till": 1 }), json!({})));
     assert_eq!(rt.inspect()["stats"], s, "inspect carries them on every host");
 
     assert_eq!(rt.method_name("Till/x", "pay").as_deref(), Some("Till.pay"));
@@ -802,6 +802,8 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("object A { f() { caller = 1 } }").contains("'caller' cannot be changed"));
     assert!(msg("const caller = 1").contains("'caller' is built in"));
     assert!(msg("object A { f() { invoke(\"A/a\", \"f\", []) } }").contains("is for plugin modules"), "apps cannot act as someone through invoke");
+    assert!(msg("object A { @exclusive(\"x\") f() {} }").contains("@exclusive takes no arguments"));
+    assert!(msg("object A { @exclusive @exclusive f() {} }").contains("repeated decorator @exclusive"));
 }
 
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
@@ -856,6 +858,177 @@ fn the_shop_assistant_acts_within_the_askers_rights() {
     assert_eq!(args4["messages"].as_array().unwrap().last().unwrap()["results"][0]["output"], json!("done"));
     server.handle(7.0, answered(id4, reply(json!([]), "Restocked.")));
     assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
+}
+
+const TURNS: &str = r#"
+@server object Counter {
+  n: number = 0
+  log: string[] = []
+  @exclusive async bump(tag: string) {
+    const v = this.n
+    await fetch("https://example.com/" + tag)
+    this.n = v + 1
+    this.log.push(tag)
+  }
+  async loose(tag: string) {
+    const v = this.n
+    await fetch("https://example.com/" + tag)
+    this.n = v + 1
+  }
+  peek() { this.log.push("peek") }
+}
+"#;
+
+fn fetches(out: &[Output]) -> Vec<u32> {
+    out.iter().filter_map(|o| if let Output::Effect { id, effect: Effect::Http { .. } } = o { Some(*id) } else { None }).collect()
+}
+
+/// A reply: its id, result, error and status.
+type Answer = (u64, Option<Json>, Option<String>, Option<u16>);
+
+fn replies(out: &[Output]) -> Vec<Answer> {
+    out.iter().filter_map(|o| if let Output::Reply { reply, ok, error, status } = o { Some((*reply, ok.clone(), error.clone(), *status)) } else { None }).collect()
+}
+
+fn trusted_call(object: &str, method: &str, args: Json, reply: u64, call: Option<&str>) -> Input {
+    Input::Call { object: object.into(), method: method.into(), args: args.as_array().cloned().unwrap_or_default(), reply: Some(reply), call: call.map(String::from), caller: Some(Caller::trusted()) }
+}
+
+const FETCHED: fn() -> Json = || json!({ "status": 200, "headers": {}, "body": "" });
+
+#[test]
+fn exclusive_calls_take_turns_and_lose_no_updates() {
+    let mut rt = server(TURNS, false);
+    let a = fetches(&rt.handle(1.0, trusted_call("Counter/c", "bump", json!(["a"]), 1, None)));
+    assert_eq!(a.len(), 1);
+    assert!(fetches(&rt.handle(2.0, trusted_call("Counter/c", "bump", json!(["b"]), 2, None))).is_empty(), "b waits for a's turn");
+    assert_eq!(rt.stats()["waiting"], json!({ "Counter": 1 }));
+    // Methods that are not exclusive never wait.
+    assert_eq!(replies(&rt.handle(3.0, trusted_call("Counter/c", "peek", json!([]), 3, None)))[0].0, 3);
+
+    let out = rt.handle(4.0, answered(a[0], FETCHED()));
+    assert_eq!(replies(&out).iter().map(|r| r.0).collect::<Vec<_>>(), vec![1], "a answers");
+    let b = fetches(&out);
+    assert_eq!(b.len(), 1, "then b starts");
+    assert_eq!(replies(&rt.handle(5.0, answered(b[0], FETCHED())))[0].0, 2);
+    let c = state(&mut rt, 6.0, "Counter/c");
+    assert_eq!((c["n"].clone(), c["log"].clone()), (json!(2), json!(["peek", "a", "b"])));
+    assert_eq!(rt.stats()["waiting"], json!({}));
+
+    // The same interleaving without @exclusive loses an update.
+    let x = fetches(&rt.handle(7.0, trusted_call("Counter/c", "loose", json!(["x"]), 7, None)));
+    let y = fetches(&rt.handle(8.0, trusted_call("Counter/c", "loose", json!(["y"]), 8, None)));
+    rt.handle(9.0, answered(x[0], FETCHED()));
+    rt.handle(10.0, answered(y[0], FETCHED()));
+    assert_eq!(state(&mut rt, 11.0, "Counter/c")["n"], json!(3), "4 calls, 3 counted: the race @exclusive prevents");
+}
+
+#[test]
+fn an_agent_calling_back_into_its_own_object_does_not_wait_for_itself() {
+    let src = r#"
+import { act, Skill } from "tj:agent"
+
+@server object Desk {
+  notes: string[] = []
+  @exclusive async ask(q: string) {
+    const skills: Skill[] = [{ name: "note", object: "Desk/d", method: "note", description: "Write a note.", params: ["text"], input: { type: "object", properties: { text: { type: "string" } }, required: ["text"] }, fixed: {} }]
+    const turn = await act("You keep notes.", [{ role: "user", text: q }], skills, 3)
+    this.notes.push("answer: " + turn.text)
+  }
+  @exclusive note(text: string) { this.notes.push(text) }
+}
+"#;
+    let (mut rt, _) = boot_as(src, Shared::default(), 0.0, true);
+    let plugin = |out: &[Output]| out.iter().find_map(|o| if let Output::Effect { id, effect: Effect::Plugin { .. } } = o { Some(*id) } else { None });
+    let model = |calls: Json, text: &str| json!({ "text": text, "calls": calls, "stop": if calls.as_array().unwrap().is_empty() { "end_turn" } else { "tool_use" }, "raw": [{ "type": "text", "text": text }] });
+
+    let first = plugin(&rt.handle(1.0, trusted_call("Desk/d", "ask", json!(["one"]), 1, None))).expect("the model is asked");
+    assert_eq!(plugin(&rt.handle(1.5, trusted_call("Desk/d", "ask", json!(["two"]), 2, None))), None, "a second question waits its turn");
+    // The model asks for a tool that is a method of the same object: it belongs to the
+    // asking call's chain, so it enters at once.
+    let tool = json!([{ "id": "t1", "name": "note", "input": { "text": "from the agent" } }]);
+    let second = plugin(&rt.handle(2.0, answered(first, model(tool, "")))).expect("the tool ran and the model is asked again");
+    let out = rt.handle(3.0, answered(second, model(json!([]), "ok")));
+    assert_eq!(replies(&out)[0].0, 1);
+    assert!(plugin(&out).is_some(), "then the second question starts");
+    assert_eq!(state(&mut rt, 4.0, "Desk/d")["notes"], json!(["from the agent", "answer: ok"]));
+}
+
+#[test]
+fn calls_that_would_wait_for_each_other_fail_at_once() {
+    let src = r#"
+@server object X {
+  @exclusive async m() {
+    await fetch("https://example.com/x")
+    Y.get("y").n()
+    return "m done"
+  }
+  @exclusive p() { }
+}
+@server object Y {
+  @exclusive async k() {
+    await fetch("https://example.com/y")
+    X.get("x").p()
+  }
+  @exclusive n() { }
+}
+"#;
+    let mut rt = server(src, false);
+    let ex = fetches(&rt.handle(1.0, trusted_call("X/x", "m", json!([]), 1, None)));
+    let ey = fetches(&rt.handle(2.0, trusted_call("Y/y", "k", json!([]), 2, None)));
+    // m holds X and now waits for Y, which k holds.
+    assert!(replies(&rt.handle(3.0, answered(ex[0], FETCHED()))).is_empty());
+    // k, holding Y, now wants X: a cycle. k fails at once, which frees Y, so m finishes.
+    let out = replies(&rt.handle(4.0, answered(ey[0], FETCHED())));
+    let k = out.iter().find(|r| r.0 == 2).expect("k answered");
+    assert!(k.2.as_deref().unwrap_or("").contains("both would wait forever"), "{k:?}");
+    let m = out.iter().find(|r| r.0 == 1).expect("m answered");
+    assert_eq!(m.1, Some(json!("m done")));
+}
+
+#[test]
+fn waits_are_bounded_and_timers_merge() {
+    let src = r#"
+@server object Slot {
+  ticks: number = 0
+  done: string[] = []
+  @exclusive async hold() { await fetch("https://example.com/hold") }
+  @exclusive take(tag: string) { this.done.push(tag) }
+  @exclusive @every("1s") beat() { this.ticks += 1 }
+}
+"#;
+    let mut rt = server(src, false);
+    let held = fetches(&rt.handle(500.0, trusted_call("Slot/s", "hold", json!([]), 1, None)));
+    assert!(replies(&rt.handle(600.0, trusted_call("Slot/s", "take", json!(["late"]), 2, Some("c1")))).is_empty());
+    // Beats pile up behind the hold and merge into one.
+    for now in [1500.0, 2500.0, 3500.0] {
+        rt.handle(now, Input::Tick);
+    }
+    assert_eq!(rt.stats()["waiting"], json!({ "Slot": 2 }));
+
+    // After 30 s the request gives up with 503; the beat keeps waiting.
+    let out = replies(&rt.handle(30_700.0, Input::Tick));
+    assert_eq!((out[0].0, out[0].3), (2, Some(503)), "{out:?}");
+    assert!(out[0].2.as_deref().unwrap_or("").contains("Slot/s was busy for 30 s"), "{out:?}");
+    assert_eq!(rt.stats()["waiting"], json!({ "Slot": 1 }));
+
+    rt.handle(31_000.0, answered(held[0], FETCHED()));
+    assert_eq!(state(&mut rt, 31_100.0, "Slot/s")["ticks"], json!(1), "the merged beat ran once");
+    // The timed-out call was not recorded, so its retry runs.
+    assert_eq!(replies(&rt.handle(31_200.0, trusted_call("Slot/s", "take", json!(["late"]), 3, Some("c1"))))[0].3, None);
+    assert_eq!(state(&mut rt, 31_300.0, "Slot/s")["done"], json!(["late"]));
+
+    // At most 100 calls wait per object (a waiting beat takes one place).
+    fetches(&rt.handle(32_000.0, trusted_call("Slot/s", "hold", json!([]), 4, None)));
+    for i in 0.. {
+        let r = replies(&rt.handle(32_001.0, trusted_call("Slot/s", "take", json!([i.to_string()]), 10 + i, None)));
+        if let Some(full) = r.first() {
+            assert_eq!(full.3, Some(503), "{full:?}");
+            break;
+        }
+        assert!(i < 100, "the queue never filled");
+    }
+    assert_eq!(rt.stats()["waiting"], json!({ "Slot": 100 }));
 }
 
 /// A store whose saves can be made to fail, like a full or broken disk.

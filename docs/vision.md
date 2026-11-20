@@ -53,7 +53,7 @@ Next, agreed with the owner on 2026-11-20:
    - runtime statistics: per method on every host, latency, `/_tj/metrics` and `tj stats`
      (done);
    - `@exclusive` methods: actor-style turns where an `await` needs them, without
-     deadlocks;
+     deadlocks (done);
    - a built-in, tamper-evident audit log;
    - encryption at rest;
    - personal data with subject rights;

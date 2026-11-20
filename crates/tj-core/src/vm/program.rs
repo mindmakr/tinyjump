@@ -136,6 +136,8 @@ pub struct MethodDef {
     pub every: Option<f64>,
     /// `@allow(...)`: who may call it remotely; `None` means nobody (see `runtime/access.rs`).
     pub allow: Option<Rc<[Rc<str>]>>,
+    /// `@exclusive`: one exclusive call at a time per object (see `runtime/exclusive.rs`).
+    pub exclusive: bool,
 }
 
 #[derive(Debug)]

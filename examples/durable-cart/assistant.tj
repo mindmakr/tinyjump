@@ -18,7 +18,6 @@ const RESTOCK = {
   required: ["sku", "qty"],
 }
 const MAX_STEPS = 6
-const STUCK_MS = 2 * 60 * 1000
 
 /// What the assistant may do, for a shopper called `name`: the cart's own methods. The
 /// shopper's name is fixed here, so the model cannot choose it.
@@ -42,16 +41,13 @@ function skills(name: string): Skill[] {
 /// What everyone sees: questions and answers.
 export @server @read("anyone") object Assistant {
   lines: ChatLine[] = []
-  busy: boolean = false
-  startedAt: number = 0
 
-  /// `name` is the shopper's display name.
-  @allow("anyone") async ask(question: string, name: string) {
+  /// `name` is the shopper's display name. @exclusive: one conversation turn at a time, so
+  /// two shoppers asking at once take turns instead of mixing up the model's memory. The
+  /// tools the agent calls run in this call's chain, so they never wait for it.
+  @allow("anyone") @exclusive async ask(question: string, name: string) {
     const q = question.trim()
     if (q === "") { throw new Error("ask something first") }
-    if (this.busy && Date.now() - this.startedAt < STUCK_MS) { throw new Error("the assistant is answering someone; try again in a moment") }
-    this.busy = true
-    this.startedAt = Date.now()
     this.say(name, q)
     const memory = AssistantMemory.get(this.id)
     try {
@@ -63,7 +59,6 @@ export @server @read("anyone") object Assistant {
       memory.forget()
       this.say("assistant", `Sorry, I could not answer: ${e.message}`)
     }
-    this.busy = false
   }
 
   private instructions(): string {

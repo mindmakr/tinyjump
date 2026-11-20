@@ -21,6 +21,9 @@ pub struct Fiber {
     pub caller: crate::runtime::access::Who,
     /// The method this fiber runs, by class and method index, for statistics.
     pub stat: Option<(u16, u16)>,
+    /// The chain the call belongs to: its request, timer, alarm or event, and everything it
+    /// runs, `invoke` included (see `runtime/exclusive.rs`). 0 until it first runs.
+    pub chain: u64,
 }
 
 pub struct Frame {
@@ -30,6 +33,8 @@ pub struct Frame {
     /// Stack height to restore on return.
     pub ret: usize,
     pub this: Option<Rc<ObjRef>>,
+    /// The frame runs an `@exclusive` method and holds its object until it ends.
+    pub exclusive: bool,
 }
 
 struct Handler {
@@ -42,6 +47,8 @@ pub enum Run {
     Done(Value),
     /// Suspended on the promise with this id.
     Await(u32),
+    /// Waiting for an object an exclusive method of which another call holds.
+    Blocked(crate::runtime::exclusive::Key),
 }
 
 /// An uncaught exception, with a trace from innermost to outermost frame.
@@ -63,17 +70,22 @@ impl Runtime {
             f.stack.truncate(base + params);
         }
         f.stack.resize(base + proto.locals as usize, Value::Null);
-        f.frames.push(Frame { closure, ip: 0, base, ret, this });
+        f.frames.push(Frame { closure, ip: 0, base, ret, this, exclusive: false });
         Ok(())
     }
 
     /// Runs the fiber until it finishes, suspends or fails.
     pub(crate) fn run(&mut self, f: &mut Fiber) -> Result<Run, Failure> {
         let mut budget = STEP_BUDGET;
-        // Builtins that act for the caller (`invoke`) need to know who that is.
+        if f.chain == 0 {
+            f.chain = self.new_chain();
+        }
+        // Builtins that act for the caller (`invoke`) need to know who that is, and its chain.
         let outer = std::mem::replace(&mut self.running_caller, f.caller.clone());
+        let outer_chain = std::mem::replace(&mut self.running_chain, f.chain);
         let r = self.run_steps(f, &mut budget);
         self.running_caller = outer;
+        self.running_chain = outer_chain;
         self.metrics.vm_steps += STEP_BUDGET - budget;
         self.count_steps(f.stat, STEP_BUDGET - budget);
         r
@@ -369,12 +381,21 @@ impl Runtime {
                     }
                     Op::CallMethod(k, argc) => {
                         f.frames[fi].ip = ip;
-                        tri!(self.call_method(f, &name!(k), argc as usize));
+                        let name = name!(k);
+                        if let Some(key) = tri!(self.must_wait(f, &name, argc as usize)) {
+                            // Wait for the object, then run this call instruction again.
+                            f.frames[fi].ip = ip - 1;
+                            return Ok(Run::Blocked(key));
+                        }
+                        tri!(self.call_method(f, &name, argc as usize));
                         continue 'frames;
                     }
                     Op::Return => {
                         let v = pop!();
                         let fr = f.frames.pop().expect("frame");
+                        if let (true, Some(o)) = (fr.exclusive, &fr.this) {
+                            self.release_object(o);
+                        }
                         f.stack.truncate(fr.ret);
                         let depth = f.frames.len();
                         f.handlers.retain(|h| h.frames <= depth);
@@ -433,6 +454,7 @@ impl Runtime {
     pub(crate) fn unwind(&mut self, f: &mut Fiber, exc: Exc) -> Result<(), Failure> {
         match f.handlers.pop() {
             Some(h) => {
+                self.release_frames(f, h.frames);
                 f.frames.truncate(h.frames);
                 f.stack.truncate(h.stack);
                 if let Some(fr) = f.frames.last_mut() {
@@ -525,7 +547,9 @@ impl Runtime {
                             return Err(Exc::msg(format!("'{name}' is private to {}", o.class_name)));
                         }
                         self.touch(o);
-                        self.push_frame(f, closure, pos, pos, Some(o.clone()))
+                        self.push_frame(f, closure, pos, pos, Some(o.clone()))?;
+                        self.entered(f, o.class, &o.id, name);
+                        Ok(())
                     }
                 }
             }

@@ -34,7 +34,7 @@ draft, and this version corrects them. The agreed build order is at the end.
   Changes to several objects in one input are saved one file after another. They are not a
   single atomic step, and the guide says so too.
 
-## 2. Objects as actors, where it matters
+## 2. Objects as actors, where it matters (built)
 
 A method without `await` already runs to the end before anything else happens. Nested
 calls are part of the same run, so no other call can interleave. Locking only matters for
@@ -52,13 +52,17 @@ methods that `await`.
 - **Queues are capped:** 100 waiting calls per object, and 30 seconds per call. A call that
   times out answers `503`, and its call id is not recorded, so a retry runs normally.
 - **Timers and alarms never expire in a queue.** `@every` ticks that pile up are merged
-  into one.
+  into one. An alarm waiting in a queue lives in memory: if the server stops before its
+  turn, it is lost. Saving waiting alarms is a follow-up.
+- **Where it lives:** `crates/tj-core/src/runtime/exclusive.rs`. A call into an exclusive
+  method that must wait suspends like an `await` and re-runs its call instruction when its
+  turn comes; each frame of an exclusive method holds its object until the frame ends.
 
 ## 3. Runtime statistics (built)
 
 Per method: calls, errors, refusals and VM steps (every host), and wall time as p50, p95 and
-max (servers). Per class: objects loaded. Effects (servers): HTTP and each plugin, with
-failures and latency. Queue depth comes with `@exclusive`.
+max (servers). Per class: objects loaded, and calls waiting for `@exclusive` objects.
+Effects (servers): HTTP and each plugin, with failures and latency.
 
 - Statistics appear in `inspect` under `stats`, and under `server` for latency.
 - `/_tj/metrics` serves them as OpenMetrics text (admin key) for Prometheus or Grafana.
@@ -216,7 +220,7 @@ controls; it cannot weaken another pack's.
 1. **Saving:** sync to disk, and failed saves fail the call (built).
 2. **Statistics** (built).
 3. **`@exclusive`,** with chains through `invoke`, cycle detection, capped queues and
-   merged ticks.
+   merged ticks (built).
 4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`.
 5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
    hashed file names, and `crypto.*`.

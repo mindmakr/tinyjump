@@ -378,6 +378,7 @@ impl Compiler {
             }
             let mut every = None;
             let mut allow = None;
+            let mut exclusive = false;
             for d in &m.decorators {
                 match d.name.as_str() {
                     "every" => match d.args.first().and_then(duration_ms) {
@@ -391,11 +392,13 @@ impl Compiler {
                             self.error(Diagnostic::new(format!("{} can be called remotely but not read", o.name), d.span).hint(format!("add @read(...) to {}, e.g. @read(\"owner\") to keep it private to its user", o.name)));
                         }
                     }
-                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\") and @allow(...) (who may call it remotely)")),
+                    "exclusive" if !exclusive && d.args.is_empty() => exclusive = true,
+                    "exclusive" if !exclusive => self.error(Diagnostic::new("@exclusive takes no arguments", d.span).hint("write @exclusive on its own")),
+                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely) and @exclusive (one exclusive call at a time per object)")),
                 }
             }
             let proto = self.function(&m.func, FnKind::Method);
-            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow });
+            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive });
         }
         let def = &mut self.objects[class];
         def.fields = fields;
