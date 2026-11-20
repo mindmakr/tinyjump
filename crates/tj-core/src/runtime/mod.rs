@@ -7,6 +7,7 @@ pub(crate) mod exclusive;
 mod objects;
 pub mod protocol;
 mod render;
+mod privacy;
 mod stats;
 pub mod store;
 
@@ -201,7 +202,7 @@ pub struct Runtime {
     /// Native hosts measure their widgets for layout; the web and servers do not need it.
     measure: Option<Box<dyn Measure>>,
     render: bool,
-    server: bool,
+    pub(crate) server: bool,
     explain: bool,
     max_objects: usize,
     ran_code: bool,
@@ -324,8 +325,15 @@ impl Runtime {
             },
             Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
                 Err((status, why)) => self.reply_status(reply, status, why),
-                Ok(_) => {
-                    let state = self.resolve_object(&object).and_then(|o| self.object_state(&o));
+                Ok(who) => {
+                    // Personal data reaches its owner only; everyone else, tools included, sees it masked.
+                    let state = self.resolve_object(&object).and_then(|o| {
+                        let mut s = self.object_state(&o)?;
+                        if !who.owns(&o.id) {
+                            self.mask(o.class, &mut s);
+                        }
+                        Ok(s)
+                    });
                     if state.is_ok() {
                         // Reading is an event too: subscribers learn who is looking. It never
                         // changes state, so a replica fetching state cannot start a loop.

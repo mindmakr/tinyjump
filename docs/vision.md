@@ -41,7 +41,29 @@ Done so far, in order: resumable change streams, the benchmark and size budget, 
 calls and backpressure, modules, the language reference, server metrics, access control,
 and plugins with `tj:ai`.
 
-Next, agreed with the owner on 2026-11-20:
+### Milestone 1 (set by the owner on 2026-11-20): one small app, end to end
+
+One milestone at a time. The first is a small app that runs end to end on the happy path,
+so every piece of plumbing is proven together before anything is enhanced. Release is not
+the goal; being in the market early, to gain momentum and contributors, is.
+
+- **The app:** appointment booking. A business publishes slots, customers book and
+  cancel, and reminders go out by alarm (`@exclusive` keeps a slot from being booked
+  twice).
+- **When:** after the work in flight is finished. The trust work keeps going alongside.
+- **How, kept simple:**
+  1. A short spec: what the app does, written as behaviours that can be tested (given,
+     when, then), reviewed before anyone builds.
+  2. Other AI developers build it from the spec and `docs/language.md` alone.
+  3. Blind reviewers, who never saw the builders' conversation, check it against the spec
+     and score it; gaps go to `feedback/`. Build and review repeat until the score is
+     acceptable.
+- **Done when** it runs in `tj dev` on the web, on Android and on the iOS Simulator, is
+  served by `tj serve` on Linux with sign-in, keeps working offline and syncs when back,
+  updates live on every screen, and passes the spec's behaviours, driven by an agent
+  through `tj mcp` and `tj review`.
+
+### The rest of the agreed order
 
 1. **Sign-in tokens (done)** from OpenID Connect providers, proven against a built-in test
    issuer (no real accounts needed in tests).
@@ -56,8 +78,14 @@ Next, agreed with the owner on 2026-11-20:
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
-   - personal data with subject rights;
+   - personal data with subject rights (`@pii`, masking, export and erase done; the flow
+     check, retention and per-person keys next);
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
+   - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
+     scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,
+     shadow boot and rollback, size and AI-cost caps and `tj retro`.
+   - Then a design note on effects that already happened outside when a call is retried
+     after a crash (durable effect records, or idempotency keys passed to `fetch`).
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
      follows.
 4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
@@ -65,9 +93,13 @@ Next, agreed with the owner on 2026-11-20:
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 
-After that: the UI catalog (navigation, long lists, forms, icons, themes), `tj build`, the
-rest of automation (golden images, run reports), translations and locale formats, and
-GPU/3D.
+After that: the UI catalog (navigation, long lists, forms, icons, themes), **native
+components** (owner, 2026-11-20: a Kotlin or Java view, a Swift view or a web element
+registered under a name and used from `.tj` like any catalog component, with props and
+events through the protocol), `tj build`, the rest of automation (golden images, run
+reports), translations and locale formats, and GPU/3D. Size: profile the device builds and
+cut what is really large (a server-only split was measured at 1.2 KB and dropped,
+`feedback/2026-11-20-builder-004-size-split-measured.md`).
 
 ## The ecosystem: filling the gap of missing libraries (agreed)
 
@@ -162,18 +194,56 @@ idempotent calls give the same result for apps.
 
 The way it is built is part of what it offers, and we say so publicly:
 
-- **One owner sets the direction** in this document. Every change is checked against it,
-  and work that serves no goal here is not done.
-- **AI agents build it,** step by step. Each step comes with its tests, is measured
-  against the size and speed budget, and is run live before it merges. What is not built
-  is listed as not built.
-- **Other agents review the design and the work independently,** without the builder's
-  reasoning in front of them. The trust design was corrected by such a review before it
-  was built. A standing review channel between the reviewing agents and the builder is
-  being set up in the repository.
-- **Corrections are written down with their reasons,** next to the design they change
-  (for example the "as built" notes in `docs/trust.md`), so a reader can see what was
-  planned, what was found and what was done instead.
+- **Five roles work together, played by people or AI agents** ([feedback/README.md](../feedback/README.md)):
+  - **Visionary (owner):** sets goals, guardrails and the order of work here, and approves
+    scope changes.
+  - **Builder (engineer):** builds agreed steps in small branches, keeps tests and
+    `scripts/budget.sh` green, runs live checks before merging, and answers review findings
+    before closing work. What is not built is listed as not built.
+  - **Critic (empty-mind reviewer):** reads the vision, docs and code without the
+    builder's conversation or assumptions, checking security, privacy, durable state, edge
+    cases and drift from this document.
+  - **Tester (verifier):** drives running apps on every host (`tj mcp`, `tj review`,
+    `tj bench`), testing restarts, offline queues, locales and hostile inputs.
+  - **Maintainer (protector):** guards size and step budgets, stored-state compatibility
+    across upgrades, key and audit hygiene, and removal of unused code.
+- **One conflict-free channel (`feedback/`), with two-way debate.** Concurrent roles
+  communicate through numbered notes (`feedback/YYYY-MM-DD-<role>-NNN-<topic>.md`) and
+  reply files, never editing files a builder is changing. No feedback is rubber-stamped and
+  none is ignored: every critique and every pushback states both what a change solves and
+  what it costs (size, latency, VM steps or language surface). Roles push back with
+  evidence when a proposal hurts the runtime, concede when shown wrong, and escalate
+  unresolved trade-offs to the owner.
+- **Corrections and trade-offs are written down with their reasons,** next to the design
+  they change (for example the "as built" notes in `docs/trust.md`), so any human or agent
+  arriving later sees what was planned, what was debated and what was done instead.
+
+## Living, agentic-first apps (direction)
+
+All roles share one goal: a small, solid runtime that agentic coders and people can build
+and refactor on with clear, immediate feedback, producing apps that are **live** (reloads
+and upgrades keep state and connections running), **responsive** (sub-millisecond ticks,
+native frames, bounded turns), **reactive** (every state change streams in order to every
+replica, screen and subscriber) and **progressive** (one plain `.tj` file offline on day
+one, growing into modules, `@server` authority, access/privacy rules, plugins and
+compliance without a rewrite). Proposed steps (`feedback/2026-11-20-critic-001-agentic-living-apps.md`
+and `feedback/2026-11-20-critic-003-two-way-case-and-refactoring.md`; not built yet, open
+for builder pushback and owner decision after the trust work):
+
+1. **Self-aware:** every app can state its own contract (`manifest`: object schemas,
+   access rules, personal-data map, plugins and code hash) and its live pulse (errors,
+   refusals, slow methods, queue depth and audit health).
+2. **Scoped operational roles:** observers/critics, testers, maintainers and human
+   operators use distinct, named credentials instead of one shared admin key. Critics
+   observe read-only with personal data masked; testers drive forked shadow state, never
+   live user records; leases show who is currently working on an app.
+3. **Self-protecting:** object invariants, per-turn VM step limits, per-object size caps,
+   outbound network rules and access/privacy checks fail closed before bad state reaches
+   the store.
+4. **Safe to evolve and keep fresh:** compile-time schema compatibility checks against the
+   deployed version, deterministic input-trace tests (`tj test`), shadow boot against
+   stored data with automatic rollback, and `tj retro` reports that flag dead code,
+   locale/layout regressions and budget drift.
 
 ## For the next review and retro
 
@@ -235,6 +305,9 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 - **DRY.** Each fact has one home: the catalog in `ui/catalog.rs`, builtins in
   `vm/builtins.rs`, and the protocol in `runtime/protocol.rs` plus `docs/host-protocol.md`.
 - **No dead code, no speculative abstractions, no placeholder files.**
+- **Strictly additive** (owner, 2026-11-20): no feature may add setup or ceremony to a
+  one-file app. `examples/todo/app.tj` stays zero-config; keys, privacy rules, manifests and
+  compliance switch on only when an app uses them.
 - Every language feature and runtime behaviour gets a test in `tj-core`.
 - Security: hosts bind to localhost by default, cap body sizes and never serve arbitrary paths.
 - CI is local-only for now (`cargo test`, `cargo clippy`).

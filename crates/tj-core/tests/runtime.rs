@@ -845,6 +845,103 @@ fn fetch_warns_once_per_plain_http_origin() {
     }
 }
 
+const ACCOUNTS: &str = r#"
+@server @read("owner", "support") object Account {
+  @pii("contact", "account") email: string = ""
+  @pii("health", "care") notes: string = ""
+  plan: string = "free"
+  @allow("owner") set(email: string, notes: string) {
+    this.email = email
+    this.notes = notes
+    this.schedule(60000, "remind")
+  }
+  @allow("owner") async check() { await fetch("https://example.com/verify") }
+  private remind() { this.plan = "reminded" }
+}
+"#;
+
+#[test]
+fn personal_data_reaches_its_owner_only() {
+    let mut rt = server(ACCOUNTS, false);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", "allergic to nuts"]), ana()).unwrap();
+    let get = |rt: &mut Runtime, caller: Option<Caller>| reply(&rt.handle(2.0, Input::Get { object: "Account/user:ana".into(), reply: Some(1), caller })).unwrap();
+    assert_eq!(get(&mut rt, ana()), json!({ "email": "ana@example.com", "notes": "allergic to nuts", "plan": "free" }));
+    let masked = json!({ "email": "•••", "notes": "•••", "plan": "free" });
+    assert_eq!(get(&mut rt, who("key:desk", &["support"])), masked, "a role that may read sees the rest");
+    assert_eq!(get(&mut rt, Some(Caller::trusted())), masked, "tools too");
+    let inspected = rt.inspect()["objects"].to_string();
+    assert!(inspected.contains("•••") && !inspected.contains("ana@example.com"), "{inspected}");
+}
+
+#[test]
+fn a_person_can_be_exported_and_erased() {
+    let store = Shared::default();
+    let boot = || Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let ana = || who("user:ana", &[]);
+    let mut rt = boot();
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", "allergic"]), ana()).unwrap();
+    call_as(&mut rt, 1.0, "Account/user:bo", "set", json!(["bo@example.com", ""]), who("user:bo", &[])).unwrap();
+
+    // Export: everything held about one person, unmasked, from memory or the store.
+    let mut fresh = boot();
+    assert_eq!(fresh.export_subject("user:ana").unwrap(), json!({ "Account/user:ana": { "email": "ana@example.com", "notes": "allergic", "plan": "free" } }));
+    assert_eq!(fresh.export_subject("user:nobody").unwrap(), json!({}));
+
+    // Not while a call is part way through the object.
+    let pending = rt.handle(2.0, Input::Call { object: "Account/user:ana".into(), method: "check".into(), args: vec![], reply: Some(5), call: None, caller: ana() });
+    let effect = pending.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(409));
+    rt.handle(3.0, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
+
+    // Erase: back to the defaults, alarms gone, and the blank state goes out as a change.
+    let (erased, out) = rt.erase_subject("user:ana").unwrap();
+    assert_eq!(erased, ["Account/user:ana"]);
+    let change = out.iter().find_map(|o| if let Output::Changed { object, state, seq } = o { Some((object.clone(), state.clone(), *seq)) } else { None }).expect("replicas hear of it");
+    assert_eq!((change.0.as_str(), &change.1), ("Account/user:ana", &json!({ "email": "", "notes": "", "plan": "free" })));
+    let stored = store.0.borrow().data.get("Account/user:ana").cloned().unwrap();
+    assert!(!stored.contains("ana@example.com") && !stored.contains("\"alarms\":[{"), "{stored}");
+    assert_eq!(boot().export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""), "after a restart too");
+    assert_eq!(boot().export_subject("user:bo").unwrap()["Account/user:bo"]["email"], json!("bo@example.com"), "nobody else");
+    // A device that reconnects later resumes after its change number and gets the blank.
+    assert!(rt.changed_since(&["Account/user:ana".into()], change.2 - 1).len() == 1);
+}
+
+#[test]
+fn a_failed_erasure_erases_nothing() {
+    let store = Flaky::default();
+    let mut rt = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["ana@example.com", ""]), who("user:ana", &[])).unwrap();
+    store.1.set(true);
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    store.1.set(false);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!("ana@example.com"), "and says so, rather than claiming it worked");
+    rt.handle(61_000.0, Input::Tick);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["plan"], json!("reminded"), "its alarms still run");
+}
+
+/// A server runs every object on one thread, so a runaway call is stopped sooner there
+/// (about 0.3 s), and the server answers the next call as usual.
+#[test]
+fn a_runaway_call_on_a_server_fails_and_the_server_carries_on() {
+    let src = r#"
+@server @read("anyone") object Spin {
+  n: number = 0
+  @allow("anyone") forever() { while (true) { this.n += 1 } }
+  @allow("anyone") ok(): string { return "alive" }
+}
+"#;
+    let mut rt = server(src, false);
+    let err = call_as(&mut rt, 1.0, "Spin/s", "forever", json!([]), who("", &[])).unwrap_err().1;
+    assert!(err.contains("ran too long"), "{err}");
+    let steps = rt.stats()["methods"]["Spin.forever"]["steps"].as_u64().unwrap();
+    assert!((20_000_000..20_000_100).contains(&steps), "{steps}");
+    assert_eq!(call_as(&mut rt, 2.0, "Spin/s", "ok", json!([]), who("", &[])), Ok(json!("alive")));
+    // Like any thrown error, it keeps the changes made before it failed (see
+    // feedback/2026-11-20-builder-005-failed-calls-keep-changes.md).
+    assert!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap() > 0);
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
@@ -902,6 +999,14 @@ fn rule_mistakes_are_compile_errors() {
     assert!(msg("object A { f() { invoke(\"A/a\", \"f\", []) } }").contains("is for plugin modules"), "apps cannot act as someone through invoke");
     assert!(msg("object A { @exclusive(\"x\") f() {} }").contains("@exclusive takes no arguments"));
     assert!(msg("object A { @exclusive @exclusive f() {} }").contains("repeated decorator @exclusive"));
+    // Personal data.
+    assert!(msg("object A { @pii(\"contact\", \"account\") email: string = \"\" }").contains("personal data lives in @server objects"));
+    assert!(msg("@server object A { @pii(\"emails\", \"account\") email: string = \"\" }").contains("'emails' is not a personal-data category | use one of: contact"));
+    assert!(msg("@server object A { @pii(\"contact\") email: string = \"\" }").contains("say what 'email' is for"));
+    assert!(msg("@server object A { @pii(\"contact\", \"for ads\") email: string = \"\" }").contains("say what 'email' is for"));
+    assert!(msg("@server object A { @pii(contact, \"x\") email: string = \"\" }").contains("as strings"));
+    assert!(msg("@server object A { @pii(\"contact\", \"a\") @pii(\"contact\", \"b\") email: string = \"\" }").contains("repeated field decorator"));
+    assert!(msg("@server object A { @every(\"1s\") n: number = 0 }").contains("fields take one @pii"));
 }
 
 /// An example app, examples/<name>: app.tj and the other files of its folder, as a bundle.
@@ -1132,9 +1237,10 @@ fn waits_are_bounded_and_timers_merge() {
     assert_eq!(rt.stats()["waiting"], json!({ "Slot": 100 }));
 }
 
-/// A store whose saves, or reads, can be made to fail, like a full or broken disk.
+/// A store whose saves, or reads, or saves of one key, can be made to fail, like a full or
+/// broken disk.
 #[derive(Clone, Default)]
-struct Flaky(Shared, Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>);
+struct Flaky(Shared, Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>, Rc<std::cell::RefCell<String>>);
 
 impl Store for Flaky {
     fn load(&mut self, key: &str) -> Result<Option<String>, String> {
@@ -1144,7 +1250,7 @@ impl Store for Flaky {
         self.0.load(key)
     }
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
-        if self.1.get() {
+        if self.1.get() || *self.3.borrow() == key {
             return Err("disk full".into());
         }
         self.0.save(key, value)
@@ -1171,6 +1277,38 @@ fn a_failed_save_fails_the_call_and_changes_nothing() {
     store.1.set(false);
     assert_eq!(answer(rt.handle(3.0, add("one", 3))), (Some(json!(1)), None));
     assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["one"]));
+}
+
+#[test]
+fn an_alarm_from_a_call_that_could_not_be_saved_never_fires() {
+    let store = Flaky::default();
+    let mut rt = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let ana = || who("user:ana", &[]);
+    store.1.set(true);
+    assert_eq!(call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["a@example.com", ""]), ana()).unwrap_err().0, Some(503));
+    store.1.set(false);
+    rt.handle(61_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 62_000.0, "Account/user:ana")["plan"], json!("free"), "the call failed, so its alarm is gone too");
+
+    // The alarm index is saved before the object, so a restart always finds the object's
+    // alarms; when the index cannot be saved, the call fails rather than claim it worked.
+    *store.3.borrow_mut() = "tj:alarms".into();
+    let refused = call_as(&mut rt, 70_000.0, "Account/user:bo", "set", json!(["b@example.com", ""]), who("user:bo", &[]));
+    assert_eq!(refused.unwrap_err().0, Some(503));
+    assert!(!store.0.0.borrow().data.contains_key("Account/user:bo"), "and nothing was saved");
+    store.3.borrow_mut().clear();
+    call_as(&mut rt, 71_000.0, "Account/user:bo", "set", json!(["b@example.com", ""]), who("user:bo", &[])).unwrap();
+    let mut restarted = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(72_000.0, 7) }).unwrap().0;
+    restarted.handle(132_000.0, Input::Tick);
+    assert_eq!(restarted.export_subject("user:bo").unwrap()["Account/user:bo"]["plan"], json!("reminded"), "found and run after a restart");
+}
+
+#[test]
+fn a_damaged_alarm_index_stops_the_boot() {
+    let store = Shared::default();
+    store.0.borrow_mut().data.insert("tj:alarms".into(), "{not json".into());
+    let err = Runtime::boot(compile(ACCOUNTS).unwrap(), Box::new(store), Options { server: true, render: false, ..Options::new(0.0, 7) }).err().unwrap();
+    assert!(err.message.contains("tj:alarms is damaged"), "{}", err.message);
 }
 
 #[test]

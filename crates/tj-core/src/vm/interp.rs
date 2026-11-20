@@ -10,7 +10,10 @@ use std::rc::Rc;
 
 const MAX_FRAMES: usize = 256;
 /// Instructions one run may execute before it is stopped as a runaway.
+/// Instructions one run may take before it fails as an endless loop. A server runs every
+/// object on one thread, so its limit is lower: about 0.3 s on a laptop, against 3 s.
 const STEP_BUDGET: u64 = 200_000_000;
+pub(crate) const SERVER_STEP_BUDGET: u64 = 20_000_000;
 
 #[derive(Default)]
 pub struct Fiber {
@@ -78,7 +81,8 @@ impl Runtime {
 
     /// Runs the fiber until it finishes, suspends or fails.
     pub(crate) fn run(&mut self, f: &mut Fiber) -> Result<Run, Failure> {
-        let mut budget = STEP_BUDGET;
+        let limit = if self.server { SERVER_STEP_BUDGET } else { STEP_BUDGET };
+        let mut budget = limit;
         if f.chain == 0 {
             f.chain = self.new_chain();
         }
@@ -88,8 +92,8 @@ impl Runtime {
         let r = self.run_steps(f, &mut budget);
         self.running_caller = outer;
         self.running_chain = outer_chain;
-        self.metrics.vm_steps += STEP_BUDGET - budget;
-        self.count_steps(f.stat, STEP_BUDGET - budget);
+        self.metrics.vm_steps += limit - budget;
+        self.count_steps(f.stat, limit - budget);
         r
     }
 

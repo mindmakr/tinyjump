@@ -129,6 +129,12 @@ impl Entry {
         self
     }
 
+    /// A person named by an admin request: written as their pseudonym.
+    pub fn person(mut self, key: &'static str, id: &str) -> Entry {
+        self.fields.push((key, Field::Subject(id.to_string())));
+        self
+    }
+
     pub fn ok(mut self, ok: bool) -> Entry {
         self.fields.push(("ok", Field::Bool(ok)));
         self
@@ -137,6 +143,8 @@ impl Entry {
 
 enum Job {
     Record(Entry),
+    /// Forgets a person's pseudonym after an erasure: their entries become anonymous.
+    Forget(String),
     /// A security event: answered once it is on disk.
     Wait(Entry, Sender<bool>),
 }
@@ -181,6 +189,12 @@ impl Audit {
         if let Err(TrySendError::Full(_)) = self.tx.try_send(Job::Record(e)) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Forgets `id`'s pseudonym, so the log no longer links to them; entries already
+    /// written stay, anonymous. Waits for room in the queue rather than dropping it.
+    pub fn forget(&self, id: &str) {
+        let _ = self.tx.send(Job::Forget(id.to_string()));
     }
 
     /// Writes a security event and waits until it is on disk. When it cannot be written, the
@@ -345,9 +359,10 @@ impl Writer {
     /// Writes a batch and syncs it. Security events hear whether it worked; ordinary entries
     /// that could not be written are counted as dropped.
     fn write(&mut self, jobs: Vec<Job>, now: u64) {
-        let (mut entries, mut acks, mut ordinary) = (Vec::with_capacity(jobs.len()), Vec::new(), 0);
+        let (mut entries, mut acks, mut ordinary, mut forget) = (Vec::with_capacity(jobs.len()), Vec::new(), 0, Vec::new());
         for job in jobs {
             match job {
+                Job::Forget(id) => forget.push(id),
                 Job::Record(e) => {
                     ordinary += 1;
                     entries.push(e);
@@ -387,6 +402,23 @@ impl Writer {
         for ack in acks {
             let _ = ack.send(r.is_ok());
         }
+        for id in forget {
+            if let Err(e) = self.forget(&id) {
+                eprintln!("[tj] audit log: could not forget a pseudonym: {e}");
+            }
+        }
+    }
+
+    fn forget(&mut self, id: &str) -> io::Result<()> {
+        self.names.remove(id);
+        match fs::remove_file(self.subject_file(id)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => sync_dir(&self.subjects),
+        }
+    }
+
+    fn subject_file(&self, id: &str) -> PathBuf {
+        self.subjects.join(hex(&hmac::sign(&self.keys.subjects, id.as_bytes()).as_ref()[..16]))
     }
 
     /// Opens the file for `now`'s day if it is not open. A new file starts with a checkpoint,
@@ -464,7 +496,7 @@ impl Writer {
         if let Some(t) = self.names.get(id) {
             return Ok(t.clone());
         }
-        let path = self.subjects.join(hex(&hmac::sign(&self.keys.subjects, id.as_bytes()).as_ref()[..16]));
+        let path = self.subject_file(id);
         let token = match fs::read_to_string(&path) {
             Ok(t) => t.trim().to_string(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -687,10 +719,15 @@ mod tests {
         assert_eq!(lines[0]["object"], json!(format!("Cart/{}", lines[0]["who"].as_str().unwrap())), "ids map alike wherever they appear");
         assert_eq!(lines[1]["method"], "add");
 
-        // Forgetting a person: their mapping goes, and the same id gets a new token.
-        fs::remove_dir_all(data.join("subjects")).unwrap();
-        let mut w = writer(&data, 365);
-        w.write(vec![call("ana@example.com", "Cart/x")], T0 + 1);
+        // Forgetting a person (after an erasure): their mapping goes, in memory and on disk,
+        // and the same id gets a new token. Others keep theirs.
+        let files = || fs::read_dir(data.join("subjects")).unwrap().count();
+        assert_eq!(files(), 2);
+        w.write(vec![Job::Forget("ana@example.com".into())], T0 + 1);
+        assert_eq!(files(), 1);
+        w.write(vec![call("ana@example.com", "Cart/bo")], T0 + 1);
+        let bo: Json = serde_json::from_str(log(&data).lines().last().unwrap()).unwrap();
+        assert_eq!(bo["object"], lines[1]["object"], "bo keeps his token");
         let again: Json = serde_json::from_str(log(&data).lines().last().unwrap()).unwrap();
         assert_ne!(again["who"], lines[0]["who"]);
         assert!(verify_with(&keys(), &data, None).is_ok());

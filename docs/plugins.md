@@ -92,6 +92,12 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
   restart without repeating a tool call.
 - **Approval:** a tool can be marked as needing approval. The agent then waits, durably, for
   an `approve()` call from a person.
+- **One memory per person.** Whatever goes into an agent's messages (questions, tool
+  results) reaches the model again on the next turn of that conversation. Keep a
+  conversation per person, `AgentMemory.get(caller.id)` with `@read("owner")`, so one
+  person's data never reaches another person's answer. The shop assistant in
+  `examples/durable-cart` shares one conversation on purpose, as a public counter for
+  anonymous shoppers; do not copy that into an app with signed-in users or `@pii` data.
 
 ## Rollout
 

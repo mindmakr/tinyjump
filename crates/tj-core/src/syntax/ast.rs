@@ -101,6 +101,8 @@ pub struct ObjectDecl {
 
 #[derive(Debug, Clone)]
 pub struct Field {
+    /// `@pii(...)`.
+    pub decorators: Vec<Decorator>,
     pub name: String,
     pub ty: Option<TypeExpr>,
     pub init: Option<Expr>,

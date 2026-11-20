@@ -275,6 +275,14 @@ fn handle(mut req: Request, front: &Front) {
             Ok(core) => Response::from_data(engine.stats().openmetrics(&core).into_bytes()).with_header(header("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")),
             Err((status, e)) => json_response(status, &json!({ "error": e })),
         },
+        // A person's data, or erasing it (docs/privacy.md); written to the audit log first.
+        (Method::Post, ["_tj", "privacy"]) => result_response(read_json(&mut req).and_then(|j| {
+            let (Some(action @ ("export" | "erase")), Some(subject)) = (j["action"].as_str(), j["subject"].as_str().filter(|s| !s.is_empty())) else {
+                return Err((400, "send {\"action\": \"export\" or \"erase\", \"subject\": \"<person id>\"}".into()));
+            };
+            front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", &format!("privacy {action}")).person("subject", subject))?;
+            engine.privacy(subject.to_string(), action == "erase")
+        })),
         (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
             let mut input = serde_json::from_value::<Input>(j).map_err(|e| (400, format!("not a protocol input: {e}")))?;
             // Automation is trusted (it already passed the admin key), so it says so explicitly.

@@ -151,6 +151,30 @@ pub struct ObjectDef {
     pub server: bool,
     /// `@read(...)`: who may read it remotely; `None` means nobody.
     pub read: Option<Rc<[Rc<str>]>>,
+    /// `@pii(category, purpose, ...)` fields (docs/privacy.md).
+    pub pii: Vec<Pii>,
+}
+
+/// A field that holds personal data about the object's subject: the person whose id is the
+/// object id.
+#[derive(Debug, Clone)]
+pub struct Pii {
+    pub field: Rc<str>,
+    pub category: Rc<str>,
+    pub purposes: Rc<[Rc<str>]>,
+}
+
+/// Personal-data categories, after GDPR articles 9 and 10 and the Saudi PDPL.
+pub const PII_CATEGORIES: &[&str] = &["contact", "identifier", "online-id", "location", "financial", "health", "genetic", "biometric", "religion", "politics", "union", "sexual", "criminal", "other"];
+
+/// The special categories, with stricter rules: GDPR article 9 (and the PDPL's sensitive
+/// data), and criminal records under article 10.
+pub const SPECIAL_CATEGORIES: &[&str] = &["health", "genetic", "biometric", "religion", "politics", "union", "sexual", "criminal"];
+
+impl ObjectDef {
+    pub fn pii(&self, field: &str) -> Option<&Pii> {
+        self.pii.iter().find(|p| &*p.field == field)
+    }
 }
 
 pub struct Program {

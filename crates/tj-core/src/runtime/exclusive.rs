@@ -268,6 +268,11 @@ impl Runtime {
         }
     }
 
+    /// Whether a call holds the object, or waits to.
+    pub(crate) fn exclusive_busy(&self, class: u16, id: &str) -> bool {
+        self.locks.iter().any(|l| l.key.0 == class && &*l.key.1 == id)
+    }
+
     /// Calls waiting, per class, for statistics.
     pub(crate) fn waiting_json(&self) -> Json {
         let mut by_class = Map::new();

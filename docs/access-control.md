@@ -147,6 +147,8 @@ in URLs, streams and logs.
   `403 not allowed`.
 - `tj dev` adds the reason to help development (`Cart.checkout needs owner or role
   staff`). `tj serve` never does, so it does not reveal what exists.
+- Fields marked `@pii` are masked (`•••`) for every reader but the object's owner, and for
+  every tool ([privacy.md](privacy.md)).
 - Each refusal is written to the audit log before the answer goes out: who (as a
   pseudonym), what was asked, the class and method, and the status. Tokens, arguments and
   object ids are never written (`docs/trust.md`, section 4). Runtime statistics count the

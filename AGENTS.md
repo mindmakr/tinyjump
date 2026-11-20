@@ -26,6 +26,12 @@ If a change does not serve a goal there, do not make it.
   slower or busier, than `scripts/budget.json` allows. Raise a budget only in the same
   commit as the change that needs it, and say why.
 - The web host stays plain ES2017 with no build step, so old browsers work.
+- Collaboration channel: read `feedback/README.md` and check open notes in `feedback/`
+  before starting a step and before merging. Critics, testers and maintainers post numbered
+  notes in `feedback/` and never edit files a builder is actively changing. Do not
+  rubber-stamp and do not ignore: reply to open items by putting the case both ways (what a
+  change solves vs its cost in size, speed or surface), push back with evidence when a
+  suggestion hurts the runtime, and concede when shown wrong.
 
 ## Commands
 
