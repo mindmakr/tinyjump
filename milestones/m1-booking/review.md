@@ -10,15 +10,18 @@ careless or hostile user would.
 tj check examples/booking/app.tj
 tj check examples/booking/app.tj --privacy --access
 tj check examples/booking/app.tj --compliance examples/members/gdpr-eu.sample.json
-tj dev examples/booking/app.tj --as ana:staff        # staff in the browser
-tj mcp --target http://127.0.0.1:4700                # inspect, act, call, review
+tj dev examples/booking/app.tj --as ana:staff        # staff, signed in, in the browser
+tj mcp --target http://127.0.0.1:4700                # inspect, act, review: the open tab answers
 ```
 
-- **More than one user:** run `tj serve` with API keys (`tj key ana --keys keys.json --role
-  staff`, and one key per customer). Call the HTTP API as each of them
-  (`POST /api/<Class>/<id>/<method>`, `Authorization: Bearer <key>`). Open the app in two
-  browsers.
-- **Racing:** send the two requests at once.
+- **More than one user:** run `tj serve --web` with API keys (`tj key ana --keys keys.json
+  --role staff`, and one key per customer, with `TJ_KEYS=keys.json`). Sign in with a key in
+  each browser window, or call the HTTP API as each person
+  (`POST /api/<Class>/<id>/<method>`, `Authorization: Bearer <key>`). The app's code shows
+  its classes and methods.
+- **Racing:** point `check-url` at a local endpoint that answers `200` after a second (the
+  server needs `TJ_ALLOW_PRIVATE_FETCH=1` to reach a local address). Then send the two
+  bookings at once.
 - **Offline:** use the browser's network toggle.
 - **Time:** use slots a few minutes ahead, and set `reminder-minutes` to 1.
 
