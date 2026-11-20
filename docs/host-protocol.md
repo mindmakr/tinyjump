@@ -48,6 +48,7 @@ id and it fails, the runtime reports the failure as an `error` output.
 | `changed` | `{ object, state, seq }`: state after a persisted change, with its change number |
 | `reply` | `{ reply, ok }` or `{ reply, error, status? }`. `status` marks a refused request: 400, 403, 422 or 503 |
 | `log` | `{ level, message }` |
+| `ran` | Servers only: `{ object, method, by, caller?, ok, ms }` when a call nobody requested ends. `by` is `timer`, `alarm` or `invoke`; `caller` is who it ran as (none: the system). For the audit log; never arguments, results or error text |
 | `error` | `{ message, trace }`: uncaught error in a handler, timer or render |
 | `wake` | `{ at }` |
 

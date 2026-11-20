@@ -17,7 +17,7 @@
 use super::access::Who;
 use super::objects::CallRecord;
 use super::protocol::{Effect, Output};
-use super::{Entry, Runtime, TimerKind};
+use super::{By, Entry, Runtime, TimerKind};
 use crate::vm::value::{ObjRef, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
@@ -234,7 +234,7 @@ impl Runtime {
                 continue;
             }
             match self.resolve_object(&i.object) {
-                Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, beat: false }),
+                Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, by: By::Invoke }),
                 Err(e) => self.reply(reply, Err(e)),
             }
         }

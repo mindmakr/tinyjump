@@ -166,7 +166,18 @@ pub struct Verified {
 }
 
 pub fn sha256_hex(text: &str) -> String {
-    digest(&SHA256, text.as_bytes()).as_ref().iter().map(|b| format!("{b:02x}")).collect()
+    hex(digest(&SHA256, text.as_bytes()).as_ref())
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Bytes from the system's secure random source.
+pub fn random<const N: usize>() -> Result<[u8; N], String> {
+    let mut bytes = [0u8; N];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| "no secure random source".to_string())?;
+    Ok(bytes)
 }
 
 fn clean_roles(roles: Vec<String>) -> Vec<String> {
@@ -285,9 +296,7 @@ pub fn new_key(name: &str, roles: &[String], file: &Path) -> Result<String, Stri
     if list.iter().any(|k| k["name"] == name) {
         return Err(format!("{} already has a key named {name}; remove its line to revoke it first", file.display()));
     }
-    let mut bytes = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| "no secure random source".to_string())?;
-    let key = format!("{KEY_PREFIX}{}", bytes.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    let key = format!("{KEY_PREFIX}{}", hex(&random::<32>()?));
     list.push(json!({ "name": name, "roles": clean_roles(roles.to_vec()), "sha256": sha256_hex(&key) }));
     let text = serde_json::to_string_pretty(&list).expect("JSON serializes");
     std::fs::write(file, text + "\n").map_err(|e| format!("cannot write {}: {e}", file.display()))?;

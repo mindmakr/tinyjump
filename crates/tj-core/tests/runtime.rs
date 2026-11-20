@@ -747,6 +747,39 @@ fn caller_belongs_to_each_call_alarms_and_timers() {
     assert_eq!(s["lastTick"], json!("system"));
 }
 
+/// For a server's audit log: calls nobody requested report how they ended (agent tools, run
+/// by `invoke`, in the agent test below). Requests do not; the server logs those itself.
+#[test]
+fn servers_report_timers_and_alarms_as_they_end() {
+    let src = r#"
+@server @read("anyone") object Desk {
+  n: number = 0
+  @allow("anyone") bump() { this.n += 1 }
+  @allow("signedIn") later(ms: number) { this.schedule(ms, "boom") }
+  private boom() { throw new Error("a secret detail") }
+  @every("1s") tick() { this.n += 1 }
+}
+"#;
+    let ran = |out: &[Output]| -> Vec<Json> { out.iter().filter(|o| matches!(o, Output::Ran { .. })).map(|o| serde_json::to_value(o).unwrap()).collect() };
+    let mut rt = server(src, false);
+    let out = rt.handle(1.0, Input::Call { object: "Desk/a".into(), method: "bump".into(), args: vec![], reply: Some(1), call: None, caller: who("user:ana", &[]) });
+    assert!(ran(&out).is_empty(), "requests are logged where they arrive");
+    call_as(&mut rt, 2.0, "Desk/a", "later", json!([10]), who("user:bo", &[])).unwrap();
+    let out = rt.handle(1500.0, Input::Tick);
+    assert_eq!(
+        ran(&out),
+        [
+            json!({ "type": "ran", "object": "Desk/a", "method": "boom", "by": "alarm", "caller": "user:bo", "ok": false, "ms": 0 }),
+            json!({ "type": "ran", "object": "Desk/a", "method": "tick", "by": "timer", "ok": true, "ms": 0 }),
+        ],
+        "never error text"
+    );
+
+    // Devices keep no audit log.
+    let mut device = Runtime::boot(compile(src).unwrap(), Box::new(Shared::default()), Options { render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    assert!(ran(&device.handle(1000.0, Input::Tick)).is_empty());
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);
@@ -947,7 +980,10 @@ import { act, Skill } from "tj:agent"
     // The model asks for a tool that is a method of the same object: it belongs to the
     // asking call's chain, so it enters at once.
     let tool = json!([{ "id": "t1", "name": "note", "input": { "text": "from the agent" } }]);
-    let second = plugin(&rt.handle(2.0, answered(first, model(tool, "")))).expect("the tool ran and the model is asked again");
+    let out = rt.handle(2.0, answered(first, model(tool, "")));
+    let second = plugin(&out).expect("the tool ran and the model is asked again");
+    // A server's audit log hears of each tool the agent ran, as whom (here the trusted host).
+    assert!(out.contains(&Output::Ran { object: "Desk/d".into(), method: "note".into(), by: "invoke".into(), caller: None, ok: true, ms: 0 }), "{out:?}");
     let out = rt.handle(3.0, answered(second, model(json!([]), "ok")));
     assert_eq!(replies(&out)[0].0, 1);
     assert!(plugin(&out).is_some(), "then the second question starts");

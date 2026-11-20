@@ -54,7 +54,7 @@ Next, agreed with the owner on 2026-11-20:
      (done);
    - `@exclusive` methods: actor-style turns where an `await` needs them, without
      deadlocks (done);
-   - a built-in, tamper-evident audit log;
+   - a built-in, tamper-evident audit log (done);
    - encryption at rest;
    - personal data with subject rights;
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.

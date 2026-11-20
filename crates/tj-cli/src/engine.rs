@@ -1,6 +1,8 @@
 //! Owns the runtime on its own thread and carries out its outputs:
-//! replies, HTTP effects (worker pool), realtime broadcasts, logs and timers.
+//! replies, HTTP effects (worker pool), realtime broadcasts, logs, timers and the audit log.
 
+use crate::audit::{Actor, Audit, Entry};
+use crate::identity::sha256_hex;
 use crate::mailbox::{Event, Mailbox};
 use crate::plugins::Plugins;
 use crate::stats::Stats;
@@ -55,8 +57,7 @@ pub fn now_ms() -> f64 {
 fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runtime, Vec<Output>), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let store = FileStore::open(data).map_err(|e| format!("cannot open data dir {}: {e}", data.display()))?;
-    let mut seed = [0u8; 8];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed).map_err(|_| "no secure random source")?;
+    let seed = crate::identity::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
     Runtime::boot(program, Box::new(store), opts).map_err(|e| format!("boot failed: {e}"))
@@ -64,7 +65,7 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runti
 
 impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
-    pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>) -> Result<Engine, String> {
+    pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
@@ -75,7 +76,8 @@ impl Engine {
             .spawn(move || match boot(&source, &data, render, explain) {
                 Ok((rt, out)) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(rt, out, rx, back, data, render, explain, plugins, measured);
+                    audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
+                    run(rt, out, rx, back, data, render, explain, plugins, measured, audit);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -160,6 +162,7 @@ struct Dispatch {
     subscribers: Vec<Arc<Mailbox>>,
     effects: Sender<(u32, Effect)>,
     stats: Arc<Stats>,
+    audit: Audit,
 }
 
 /// Who waits for a reply, and for calls, the method and when the call was sent.
@@ -174,8 +177,9 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Fai
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>) {
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back, plugins, stats.clone()), stats };
+fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit) {
+    let effects = effect_pool(back, plugins, stats.clone(), audit.clone());
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit };
     d.outputs(boot_out);
     loop {
         let msg = match rt.next_wake() {
@@ -230,6 +234,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Ok(Msg::Reload(source)) => match boot(&source, &data, render, explain) {
                 Ok((new_rt, out)) => {
                     rt = new_rt;
+                    d.audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
                     // Requests waiting on the old runtime get a "restarted" error.
                     d.replies.clear();
                     eprintln!("[tj] reloaded");
@@ -273,6 +278,14 @@ impl Dispatch {
                 }
                 Output::Changed { object, state, seq } => self.broadcast(changed_event(&object, &state, seq)),
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
+                Output::Ran { object, method, by, caller, ok, ms } => {
+                    let kind = match by.as_str() {
+                        "timer" => "timer",
+                        "alarm" => "alarm",
+                        _ => "invoke",
+                    };
+                    self.audit.record(Entry::new(kind).who(Actor::id(caller.as_deref())).object(&object).text("method", &method).ok(ok).num("ms", ms));
+                }
                 Output::Error { message, trace } => {
                     eprintln!("[app] error: {message}");
                     for t in trace {
@@ -299,12 +312,12 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>) -> Sender<(u32, Effect)> {
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit) -> Sender<(u32, Effect)> {
     let (tx, rx) = channel::<(u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     for i in 0..EFFECT_WORKERS {
-        let (rx, back, agent, plugins, stats) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone());
+        let (rx, back, agent, plugins, stats, audit) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
             let Ok((id, effect)) = job else { return };
@@ -313,9 +326,17 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>) -> S
                 Effect::Plugin { plugin, .. } => format!("plugin.{plugin}"),
                 Effect::Call { .. } => "call".to_string(),
             };
+            // Plugin calls are audited; fetches are not (URLs can carry secrets).
+            let plugin_call = match &effect {
+                Effect::Plugin { plugin, method, .. } => Some((plugin.clone(), method.clone())),
+                _ => None,
+            };
             let started = Instant::now();
             let result = perform(&agent, &plugins, effect);
             stats.effect(&kind, started.elapsed(), result.is_ok());
+            if let Some((plugin, method)) = plugin_call {
+                audit.record(Entry::new("plugin").text("plugin", &plugin).text("method", &method).ok(result.is_ok()).num("ms", started.elapsed().as_millis() as u64));
+            }
             if back.send(Msg::EffectDone(id, result)).is_err() {
                 return;
             }
@@ -379,7 +400,8 @@ mod tests {
     fn streams_resume_from_the_clients_change_number() {
         let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
-        let engine = Engine::start(source, data.clone(), false, false, Arc::default()).expect("boots");
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
         let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None, caller: Some(Caller::trusted()) });
         post("one").expect("posted");
 
@@ -399,7 +421,8 @@ mod tests {
     fn calls_are_timed_by_method_and_counted_by_the_core() {
         let data = std::env::temp_dir().join(format!("tj-engine-stats-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
-        let engine = Engine::start(source, data.clone(), false, false, Arc::default()).expect("boots");
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
         let call = |method: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: method.into(), args: vec![json!("ana"), json!("hi")], reply: None, call: None, caller: Some(Caller::trusted()) });
         call("post").expect("posted");
         call("post").expect("posted");

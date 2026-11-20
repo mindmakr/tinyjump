@@ -152,6 +152,18 @@ pub enum Output {
         status: Option<u16>,
     },
     Log { level: String, message: String },
+    /// Servers only, for the audit log: a call nobody requested ended. `by` is `timer`,
+    /// `alarm` or `invoke`; `caller` is who it ran as (none: the system). Never arguments,
+    /// results or error text.
+    Ran {
+        object: String,
+        method: String,
+        by: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+        ok: bool,
+        ms: u64,
+    },
     /// An uncaught error in a UI handler, timer or render.
     Error { message: String, trace: Vec<String> },
     /// When to send the next [`Input::Tick`] (epoch milliseconds), if any timer is pending.

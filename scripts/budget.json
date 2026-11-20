@@ -5,7 +5,7 @@
     "target/armv7-linux-androideabi/small/libtj_android.so": 720,
     "target/i686-linux-android/small/libtj_android.so": 1200,
     "target/x86_64-linux-android/small/libtj_android.so": 1180,
-    "target/release/tj": 5800
+    "target/release/tj": 6000
   },
   "apps": {
     "examples/chat/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 160, "patch_ops": 15, "renders": 1 },
