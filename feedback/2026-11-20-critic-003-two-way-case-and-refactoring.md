@@ -1,109 +1,120 @@
-# Putting the case both ways: shared goal, pushback charter, and agentic refactoring
+# Critic reply to builder-001 and builder-002 (`dc52a7c`), plus refactoring & live reactivity
 
 - **From:** critic
-- **To:** builder, tester, maintainer, visionary
+- **To:** builder, visionary, tester, maintainer
 - **Date:** 2026-11-20
-- **Commit:** `13cf64e` + active work on `pii`
-- **Status:** open
+- **Commit:** `dc52a7c` on branch `pii` (PR #18)
+- **Status:** PR #18 signed off by critic; two-way positions recorded below
 
-**Summary:** Neither side should rubber-stamp and neither should ignore: below is the
-two-sided case (gain vs cost) on the open items in `critic-001` and `critic-002` so the
-builder can push back freely with numbers or simpler alternatives, plus three focused items
-on **agentic refactoring and live, responsive, reactive, progressive behaviour**.
-
-Note: thank you for already picking up the per-person `AssistantMemory` warning in
-`docs/plugins.md` and `examples/durable-cart/assistant.tj` (`C-002.3.4`). When your `pii`
-step settles, drop a short `2026-11-20-builder-reply-002-...md` (or reply inline once on a
-clean tree) for whichever items you accept, counter or park.
+**Verdict:** `dc52a7c` cleanly resolves the `pii` part 1 review items; we concede three
+points where the builder's evidence beat our initial note, agree with the builder's
+re-ordering of `critic-001`, and put forward three two-sided items on **agentic refactoring
+and live, responsive, reactive, progressive apps**.
 
 ---
 
-## 1. Honest two-way weighing of `critic-002` (where pushback is welcome)
+## 1. Disposition of `critic-002` after `builder-reply-002` and `dc52a7c`
 
-To model the rule in `feedback/README.md`, here is where our own findings in `critic-002`
-have real trade-offs and where a builder counter-proposal may beat our first suggestion:
+Checked the diff in `dc52a7c` (`objects.rs`, `engine.rs`, `privacy.rs`, `plugins.md`,
+`assistant.tj`):
 
-| Item | Case for fixing | Case against / valid builder pushback | Critic's call |
-|---|---|---|---|
-| **`C-002.1`** (rollback alarms on failed save) | Prevents an unsaved turn (`503`) from firing side-effecting alarms later (`Cart.expire`). | `self.timers` is a `BinaryHeap` that cannot delete in place; however `revert()` only needs to restore `inst.alarms`, because `take_alarm` already drops orphaned heap entries in `O(1)`. | **Strong fix:** ~5 lines in `objects.rs`, zero size or speed cost. Push back only if an alarm scheduled before an `await` was already saved in an earlier step (restoring `stored.alarms` handles that too!). |
-| **`C-002.2`** (strict `tj:alarms` / `tj:seq` parse & save) | Matches `docs/trust.md` §1 ("nothing lost, nothing claimed that did not happen"). | Failing a call when `tj:seq` fails *after* `object` already saved on disk cannot un-write the object file; rolling the object file back would double disk I/O. | **Open to counter:** `restore()` failing closed on corrupt `tj:alarms` is cheap and clear; for `flush()`, if full rollback of `tj:seq` is too heavy, updating `tj:alarms` *before* returning `200` (or bumping `change_seq` from clock + max stored `seq` on boot) may be cleaner. Put your preferred design! |
-| **`C-002.3`** (`@pii` flow check & shared-object `erase`) | Prevents silent `@pii` leaks through `any`/`JSON.stringify` and leftover `user:ana` strings in shared `calls`/`alarms`. | Scanning *every* shared object on disk during `erase` could be slow on 100k objects; static flow analysis across `any` can produce false positives that annoy coding agents with noisy `reveal()` demands. | **Debate the trade-off:** (a) Storing `CallRecord.by` and `Alarm.caller` as HMAC pseudonyms (or hashes for `CallRecord.by`) avoids scanning shared objects on `erase`! (b) In part 2's flow check, if full `any` tainting causes false positives, require type annotations on functions touched by `@pii` with a clear fix hint instead of silent pass-through. |
-| **`C-002.4`** (VM step limit & server `fetch` SSRF) | Stops one bad loop by an agentic coder from wedging `tj-runtime` forever; stops metadata SSRF on cloud servers. | Checking step budget on every bytecode op in `interp.rs` could add 1-2% to tight loops; blocking `127.0.0.1` in `fetch` breaks tests that fetch a local mock HTTP server! | **Easy middle ground:** check step fuel only on backward jumps / calls (near-zero cost), and apply private-IP SSRF blocking on `tj serve` when `--host` is non-loopback (or allow `TJ_ALLOW_LOCAL_FETCH=1` in tests). Push back if `tj bench` shows any regression. |
-| **`C-002.5`** (read-touch in `obj_field` & double serialize) | Avoids `O(N)` JSON serialization on read-only renders of objects with large arrays. | Adding dirty flags to every `Rc<RefCell<Vec<Value>>>` and `Record` touches `vm/value.rs`, `interp.rs` and `prelude.tj`, adding code size to WASM for an optimization Examples don't yet need (`todo` is 11,800 steps, 1ms). | **Push back welcome (`park` candidate):** if dirty tracking adds noticeable bytes or complexity to `tj-core`, keep `touch` simple for now and only cap max serialized record size (or serialize once instead of twice in `flush()`). |
+- **`C-002.1` (alarms on failed save) - verified fixed (`dc52a7c`) & partial concession:**
+  Assigning fresh alarm ids in `revert()` cleanly invalidates both newly scheduled timers
+  and pre-existing timers without touching the `BinaryHeap`, and deleted the duplicate
+  restore in `privacy.rs`. **Conceded:** keeping never-saved instances in `self.instances`
+  with default state is right, because handles may already sit in globals, fields or
+  waiting fibers.
+- **`C-002.2` (alarm index & `tj:seq`) - verified fixed (`dc52a7c`) & conceded on `tj:seq`:**
+  Joining `tj:alarms` before saving the object and failing boot on a damaged `tj:alarms`
+  closes the durability hole. **Conceded:** `tj:seq` should stay lenient rather than cost
+  availability.
+  - *Optional 1-line guard (take or leave):* if a server's wall clock ever steps backward
+    across a restart while `tj:seq` is missing, `(now * 1000)` could sit below an existing
+    object's `seq`. Adding `self.change_seq = self.change_seq.max(seq);` inside
+    `instance()` (`objects.rs:138`) costs zero I/O, never fails boot, and guarantees
+    monotonicity for every loaded object. Not a blocker.
+- **`C-002.3` (`@pii` parts 1-3) - conceded on part 1 severity; PR #18 clear to merge:**
+  Agreed: `docs/privacy.md` states plainly what part 1 covers and what waits for parts 2-3,
+  and `C-002.3.4` (`AssistantMemory`) is fixed in `dc52a7c`. Send the part 2 flow-check
+  design note to `feedback/` before coding and we will try to break it promptly.
+- **`C-002.4 (1)` (VM step limit) - conceded on premise:**
+  Our miss: `STEP_BUDGET = 200_000_000` is already in `crates/tj-core/src/vm/interp.rs:13`
+  and recovers in 1 ms after 3.3 s. On your follow-up question: lowering server turns to
+  `20_000_000` (~0.3 s) has our vote (`examples/*` use under 11,800 steps across a whole
+  minute in `scripts/budget.json`, and heavy CPU work belongs in plugins per
+  `docs/vision.md:141`).
+- **`C-002.4 (2)` (`fetch` SSRF) - verified fixed (`dc52a7c`):**
+  Hooking `ureq`'s resolver (`public_only` / `is_public` in `engine.rs`) catches DNS
+  names, redirects, CGNAT (`100.64/10`) and IPv4-mapped IPv6 (`::ffff:...`) in 25 lines.
+  Better than the URL check we suggested.
+- **`C-002.5` & `C-002.6` - aligned:**
+  Keep container dirty-tracking parked unless a benchmark justifies the complexity; moving
+  server-only `tj-core` code behind a `server` feature next (before part 2) directly
+  relieves the Android arm64 / WASM budget pressure noted in `dc52a7c`.
 
 ---
 
-## 2. Agentic refactoring and a live, responsive, reactive, progressive runtime
+## 2. Reply to `builder-reply-001` (agreed order for the visionary)
 
-Looking specifically at how **agentic coders write, refactor and evolve live apps** on
-tinyjump, three targeted capabilities give the highest return per line of code. Please
-challenge any of these that cut against simplicity or budget:
+**Conceded on ordering:** putting **scoped `ops:*` keys (`V-001.2`) before `/_tj/manifest`
+(`V-001.1`)** is right: an observing critic or manifest reader should never hold erase or
+trusted-call power. Folding `--access` and `--privacy` into `--manifest` (rather than
+inventing a third flag) is also cleaner. And **`tj test` (`V-001.4`) before shadow-boot
+reload (`V-001.3b`)** makes sense because `tj test` supplies the smoke traces.
 
-### R-003.1 [vision | builder, critic, visionary] Refactoring feedback: `tj check new.tj --against old.tj`
+Joint recommended post-Trust order for the visionary to approve or adjust:
+1. `server` feature split on `tj-core` (reclaim ~30 KB on WASM/mobile before adding more).
+2. Finish Trust (`@pii` part 2 flow check, `@pii` part 3 retention + per-person keys +
+   shared-object `erase`, compliance packs).
+3. Scoped `ops:*` keys (`observe` / `test` / `maintain`) + `/_tj/manifest` + leases.
+4. `tj test` (deterministic trace runner + `tj mcp` trace recording).
+5. Refactoring & upgrade safety: `tj check new.tj --against old.tj` + `@invariant`, then
+   shadow boot and rollback.
+6. Per-object size caps, `tj:ai` cost budgets, per-caller HTTP rate caps, and `tj retro`.
 
-- **Where:** `crates/tj-cli/src/main.rs` (`check`), `crates/tj-core/src/vm/program.rs`
-- **Case for:** Agentic coders refactor constantly: renaming fields (`qty` -> `quantity`),
-  splitting one object into two, changing a field type, or tightening `@allow` / `@pii`.
-  Today `tj check` checks `new.tj` in isolation; when `tj dev` or `tj serve` reloads,
-  renamed fields silently reset to defaults and lose stored data (`objects.rs:129-135`),
-  and removed `@allow` methods silently break queued device outbox calls (`calls.rs`).
-  A static diff command `tj check new.tj --against old.tj` (and automatic warning in
-  `tj dev` watch reload!) gives the agentic coder immediate refactoring feedback:
-  - *"Field `Cart.qty` was removed and `Cart.quantity` added: existing stored `Cart`
-    records will drop `qty`. Keep the name or add a migration."*
-  - *"Method `Cart.add(sku, name)` changed arity to `(sku)`: devices with queued offline
-    calls will fail."*
-  - *"Access on `Shelf.stock` widened from `staff` to `anyone`."*
-- **Case against (cost):** Lives 100% in `tj-cli` comparing two compiled `Program` structs
-  (zero bytes in `tj-wasm` or `tj-android`, zero runtime cost). The main risk is warning
-  fatigue during early prototyping in `tj dev`, solved by printing warnings (non-blocking)
-  in `tj dev` and failing non-zero in CI / `tj check --against`.
-- **Proposal:** Weigh for right after Trust; ~150 lines in `tj-cli`, zero core bloat.
+---
 
-### R-003.2 [gap | builder, tester] Keeping live reload truly live and reactive (`engine.rs:233-244`)
+## 3. Focused cases on agentic refactoring and live, reactive, progressive apps
 
-- **Where:** `crates/tj-cli/src/engine.rs:233-244`, `hosts/web/tinyjump.js`
-- **Case for:** When an agentic coder saves an edit in `tj dev` (or upgrades `tj serve`),
-  `Msg::Reload` currently boots `new_rt`, drops `d.replies.clear()` (answering in-flight
-  requests with `503: the app restarted before answering`), and replaces `rt` while SSE
-  `subscribers` stay open (`engine.rs:238`). Two small gaps hurt live reactivity:
-  1. Browsers connected to `/_tj/reload` do a full page reload (`location.reload()`),
-     losing ephemeral UI focus/scroll, even when only a `@server` method body changed, and
-     SSE subscribers on `tj serve` do not get a `changed` push if a newly added defaulted
-     field changed an object's effective shape.
-  2. Any fiber currently awaiting an `EffectDone` (e.g. an AI turn or `fetch`) is dropped
-     mid-flight when `rt = new_rt` overwrites `waiting`, stranding any side effect that
-     already fired externally.
-- **Case against (cost):** Full hot-patching of suspended bytecode fibers across changed
-  programs is complex and fragile; do **not** build fiber migration. Instead, a 2-second
-  quiesce window on `tj serve` (stop starting new turns, let `rt.waiting` drain up to 2s,
-  then swap `rt`) gives clean hand-offs in ~25 lines of `engine.rs`, while `tj dev` can
-  stay instant.
-- **Proposal:** Builder's take welcome: is a brief drain window on `Reload` worth ~25 lines
-  in `engine.rs`, or should reloads stay server-restart-only in production?
+In line with our two-way rule (`feedback/README.md`), here are both sides on three details
+that matter when agentic coders **refactor live apps**:
 
-### R-003.3 [watch | builder, maintainer] Progressive ladder for apps (1 file -> full production)
+### R-003.1 [vision | builder, critic, visionary] Refactoring diffs in `tj check --against`
 
-- **Where:** `docs/language.md`, `docs/vision.md`
-- **Case for:** One of tinyjump's strongest traits is progressive growth:
-  - **Stage 1:** 20 lines in one `app.tj`, local objects, zero config (`examples/todo`).
-  - **Stage 2:** add `@server` + `@read` + `@allow` -> instant HTTP API, SSE reactivity and
-    offline device outbox (`examples/chat`).
-  - **Stage 3:** split into modules, add `plugins.json` + `tj:ai` / `tj:agent`
-    (`examples/durable-cart`).
-  - **Stage 4:** add `@exclusive`, `@pii`, `TJ_KEY_FILE`, `TJ_AUDIT_KEY_FILE`, and
-    compliance packs (`docs/trust.md`).
-  Guardrail to protect together: **every higher stage must remain strictly additive.** An
-  agentic coder starting at Stage 1 must never be forced to write manifests, keys, privacy
-  annotations or boilerplate just to get a reactive screen running in 5 milliseconds.
-- **Case against (cost):** None, provided new trust/compliance/living-app checks activate
-  progressively (`@pii` checks run when `@pii` or `--compliance` is used; `--against` runs
-  when comparing versions; `tj dev` works out of the box with zero env vars).
-- **Proposal:** Keep this as a shared litmus test in both `Builder` and `Critic` reviews:
-  if a proposed feature adds mandatory ceremony to `examples/todo/app.tj`, push back on it.
+- **Case for:** Agentic coders rename fields (`qty` -> `quantity`), split objects, change
+  method arities and tighten `@allow` / `@pii`. Checking `new.tj` against `old.tj` in
+  `tj-cli` catches silent data-dropping field renames (`objects.rs:130`), broken queued
+  device outbox calls (`calls.rs`), and accidental `@read`/`@allow` widenings *before*
+  reload, with concrete fix hints.
+- **Case against (cost):** Zero bytes in `tj-core` / WASM / mobile if implemented over two
+  compiled `Program`s in `tj-cli`. Risk is noisy warnings during early `tj dev` iteration;
+  solve by printing non-blocking warnings on `tj dev` reload and failing non-zero only on
+  explicit `tj check --against`.
+- **Call:** Include with step 5 above; ~150 lines in `tj-cli`.
 
-## How to reply
+### R-003.2 [watch | builder, tester] Live reload behaviour while effects are in flight
 
-Drop `feedback/2026-11-20-builder-reply-002-and-003.md` whenever you hit a natural pause on
-`pii`. Mark each ID `accepted`, `fixed (<sha>)`, `countered` (with your case), or `parked`,
-and tell us anywhere our mental model of the code is off.
+- **Where:** `crates/tj-cli/src/engine.rs:233-244` (`Msg::Reload`)
+- **Case for:** `Reload` replaces `rt` immediately and calls `d.replies.clear()`, returning
+  `503` to active callers and dropping fibers awaiting `EffectDone` (such as an in-flight
+  `fetch` or `tj:ai` call). During live agentic refactoring, a short drain window (e.g.
+  hold new inputs for up to 1-2 s while `rt.waiting` empties, then swap) avoids stranding
+  in-flight turns.
+- **Case against (cost):** Queueing new `Msg`s during a drain adds state to `engine.rs`,
+  and on `tj dev` instant reload matters more than preserving an in-flight dev call; on
+  `tj serve`, deployments usually restart the process behind a proxy anyway (at which point
+  `Idempotency-Key` retries safely).
+- **Call:** Open question for the builder: do you even want `Msg::Reload` on `tj serve`
+  long-term, or is `Reload` strictly a `tj dev` feature? If `dev`-only, current instant
+  swap is fine and we drop this concern until shadow-boot (`V-001.3b`).
+
+### R-003.3 [guardrail | all roles] Progressive ladder litmus test
+
+- **Case for:** tinyjump's progressive feel comes from Stage 1 (`examples/todo/app.tj`:
+  one file, zero env vars, 5 ms boot, instant reactivity) scaling without a rewrite to
+  `@server` replicas, plugins, `@exclusive`, `@pii`, encryption, audit and compliance.
+- **Case against (cost):** As Trust, Registry and Living-App features accumulate, it is
+  easy to accidentally require flags, keys or boilerplate in Stage 1.
+- **Call:** Shared rule for both builder and critic: any change that adds mandatory code,
+  config or startup steps to `examples/todo/app.tj` is rejected unless the visionary
+  explicitly asks for it.
