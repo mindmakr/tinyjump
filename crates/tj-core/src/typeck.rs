@@ -130,6 +130,7 @@ fn builtin(name: &str) -> Option<Ty> {
         "Error" => func(&[("message", Ty::Any, true)], None, rec(&[("name", Ty::Str), ("message", Ty::Str)])),
         "fetch" => func(&[("url", Ty::Str, false), ("init", Ty::Any, true)], None, Ty::Any),
         "caller" => rec(&[("id", Ty::Str), ("roles", Ty::Arr(Box::new(Ty::Str)))]),
+        "plugin" => func(&[("name", Ty::Str, false), ("method", Ty::Str, false), ("args", Ty::Any, true)], None, Ty::Any),
         _ => return None,
     })
 }

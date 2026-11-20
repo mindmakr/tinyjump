@@ -14,6 +14,30 @@ use crate::syntax::{closest, line_col, Diagnostic, Span};
 use std::collections::HashSet;
 
 pub const MARKER: &str = "//# file: ";
+
+/// The modules of the plugins that ship with tinyjump (docs/plugins.md), by import name.
+/// The compiler adds one to an app that imports it, so every host has them.
+pub const BUILT_IN: &[(&str, &str)] = &[("tj:ai", include_str!("../../../plugins/ai/plugin.tj"))];
+
+/// `src` plus the built-in plugin modules it imports and does not carry itself.
+pub fn with_built_ins(src: &str) -> std::borrow::Cow<'_, str> {
+    let present: Vec<String> = files(src).into_iter().map(|f| f.name).collect();
+    let missing: Vec<&(&str, &str)> = BUILT_IN.iter().filter(|(name, _)| src.contains(&format!("\"{name}\"")) && !present.iter().any(|p| p == name)).collect();
+    if missing.is_empty() {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let mut out = src.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for (name, module) in missing {
+        out.push_str(&format!("{MARKER}{name}\n{module}"));
+        if !module.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
 /// The entry's name when a bundle does not name it (a one-file app).
 pub const ENTRY: &str = "app.tj";
 
@@ -72,8 +96,13 @@ pub fn locate(src: &str, offset: usize) -> (Option<String>, usize, usize) {
 }
 
 /// The bundle name an import refers to, e.g. `./cart` from `lib/a.tj` is `lib/cart.tj`.
+/// A plugin's module is named as imported: `tj:ai` (docs/plugins.md).
 pub fn resolve(importer: &str, spec: &str) -> Result<String, Diagnostic> {
     let bad = |message: String, hint: &str| Err(Diagnostic::new(message, Span::default()).hint(hint));
+    if let Some(name) = spec.strip_prefix("tj:") {
+        let ok = name.chars().next().is_some_and(|c| c.is_ascii_lowercase()) && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        return if ok { Ok(spec.to_string()) } else { bad(format!("\"{spec}\" is not a plugin name"), "plugins are named like \"tj:ai\": lower-case letters, digits and -") };
+    }
     if !(spec.starts_with("./") || spec.starts_with("../")) {
         return bad(format!("cannot import \"{spec}\": only files of this app can be imported"), "use a relative path like \"./cart\"; packages are not supported");
     }
@@ -135,6 +164,10 @@ pub fn link(files: &[File], programs: &[Program], errors: &mut Vec<Diagnostic>) 
                 }
             };
             let Some(j) = files.iter().position(|f| f.name == target) else {
+                if target.starts_with("tj:") {
+                    errors.push(Diagnostic::new(format!("no plugin {target}"), imp.span).hint("tinyjump ships tj:ai; run your app with tj, which adds plugin modules to it"));
+                    continue;
+                }
                 let hint = match closest(&target, files.iter().map(|f| f.name.as_str())) {
                     Some(c) => format!("did you mean \"{}\"?", relative(&files[i].name, c)),
                     None => "check the path; it is relative to this file".into(),
@@ -216,5 +249,7 @@ mod tests {
         assert!(resolve("app.tj", "../x").is_err());
         assert_eq!(relative("app.tj", "lib/b.tj"), "./lib/b");
         assert_eq!(relative("lib/a.tj", "cart.tj"), "../cart");
+        assert_eq!(resolve("lib/a.tj", "tj:ai").unwrap(), "tj:ai", "plugins are named, not paths");
+        assert!(resolve("app.tj", "tj:AI").is_err());
     }
 }

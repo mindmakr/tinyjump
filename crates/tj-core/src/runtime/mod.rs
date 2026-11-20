@@ -351,6 +351,13 @@ impl Runtime {
         self.outputs.push(Output::Log { level: level.into(), message });
     }
 
+    pub(crate) fn plugin_call(&mut self, plugin: String, method: String, args: Json) -> u32 {
+        self.next_effect += 1;
+        let id = self.next_effect;
+        self.outputs.push(Output::Effect { id, effect: Effect::Plugin { plugin, method, args } });
+        id
+    }
+
     pub(crate) fn fetch(&mut self, url: String, method: String, headers: Json, body: Option<String>) -> u32 {
         self.next_effect += 1;
         let id = self.next_effect;

@@ -1,0 +1,25 @@
+// tj:ai: a language model, for apps and agents (docs/plugins.md). It runs on the server as
+// `tj plugin ai`, an MCP server that calls Claude with the server's ANTHROPIC_API_KEY, so
+// keys never reach devices. Call it from @server objects.
+
+/// A tool the model may ask to use. `input` is a JSON Schema for its arguments.
+export type Tool = { name: string, description: string, input: any }
+
+/// The model asked to use a tool.
+export type ToolCall = { id: string, name: string, input: any }
+
+/// What a tool returned; `error` marks a failure the model should know about.
+export type ToolResult = { id: string, output: string, error?: boolean }
+
+/// One turn of a conversation. A user turn has `text` or tool `results`. An assistant turn
+/// is kept exactly as the model returned it (`raw`), which the model needs on later turns.
+export type Message = { role: "user" | "assistant", text?: string, results?: ToolResult[], raw?: any }
+
+/// The model's turn: its `text`, the tools it wants to use, and why it stopped
+/// ("end_turn", "tool_use", "max_tokens" or "refusal"). Store `raw` as the assistant message.
+export type Reply = { text: string, calls: ToolCall[], stop: string, raw: any }
+
+/// One model turn: the system prompt, the conversation so far and the tools on offer.
+export async function complete(system: string, messages: Message[], tools: Tool[]): Promise<Reply> {
+  return await plugin("ai", "complete", { system, messages, tools })
+}

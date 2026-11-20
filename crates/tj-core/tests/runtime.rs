@@ -583,6 +583,9 @@ fn module_mistakes_say_how_to_fix_them() {
     let e = errors(&files(&[("app.tj", "import { Shop } from \"./shop\"\nfunction helper() { return 2 }\n"), shop]));
     assert!(e.contains("'helper' is already declared in") && e.contains("rename one"), "{e}");
 
+    let e = errors(&files(&[("app.tj", "type Line = { a: number }\n"), ("b.tj", "type Line = { b: string }\n")]));
+    assert!(e.contains("type 'Line' is already declared in app.tj"), "types share one namespace too: {e}");
+
     let e = errors(&files(&[("app.tj", "x"), ("lib/bad.tj", "const a = 1\nconst b = \n")]));
     assert!(e.contains("demo/lib/bad.tj:"), "errors name the file they are in: {e}");
 
@@ -773,6 +776,38 @@ fn example(name: &str) -> String {
         .collect();
     files.sort_by_key(|(n, _)| (n != "app.tj", n.clone()));
     tj_core::modules::bundle(&files)
+}
+
+#[test]
+fn the_shop_assistant_changes_the_cart_through_the_ai_plugin() {
+    let (mut server, _) = boot_as(&example("durable-cart"), Shared::default(), 0.0, true);
+    let plugin = |out: &[Output]| {
+        out.iter()
+            .find_map(|o| match o {
+                Output::Effect { id, effect: Effect::Plugin { plugin, method, args } } => Some((*id, plugin.clone(), method.clone(), args.clone())),
+                _ => None,
+            })
+            .expect("a plugin call")
+    };
+    let ask = Input::Call { object: "Assistant/demo".into(), method: "ask".into(), args: vec![json!("one tea please"), json!("ana")], reply: None, call: None, caller: who("", &[]) };
+    let (id, name, method, args) = plugin(&server.handle(1.0, ask));
+    assert_eq!((name.as_str(), method.as_str()), ("ai", "complete"));
+    assert_eq!(args["messages"], json!([{ "role": "user", "text": "one tea please" }]));
+    assert!(args["system"].as_str().unwrap().contains("Green tea") && args["tools"][0]["name"] == "add");
+
+    // The model asks for a tool; the assistant uses the cart, then asks the model again.
+    let tool_use = json!({ "text": "", "calls": [{ "id": "t1", "name": "add", "input": { "sku": "tea" } }], "stop": "tool_use", "raw": [{ "type": "tool_use", "id": "t1" }] });
+    let (id2, _, _, args2) = plugin(&server.handle(2.0, answered(id, tool_use)));
+    assert_eq!(args2["messages"][2]["results"][0]["id"], json!("t1"));
+    assert!(args2["messages"][2]["results"][0]["output"].as_str().unwrap().starts_with("done"));
+    let done = json!({ "text": "Added a green tea.", "calls": [], "stop": "end_turn", "raw": [{ "type": "text", "text": "Added a green tea." }] });
+    server.handle(3.0, answered(id2, done));
+
+    let cart = state(&mut server, 4.0, "Cart/demo");
+    assert_eq!((cart["lines"][0]["sku"].clone(), cart["changedBy"].clone()), (json!("tea"), json!("ana (via the assistant)")));
+    let assistant = state(&mut server, 4.0, "Assistant/demo");
+    assert_eq!(assistant["lines"], json!([{ "who": "ana", "text": "one tea please" }, { "who": "assistant", "text": "Added a green tea." }]));
+    assert_eq!(assistant["busy"], json!(false));
 }
 
 #[test]
