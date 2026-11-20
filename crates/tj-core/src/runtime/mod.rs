@@ -352,12 +352,16 @@ impl Runtime {
                         }
                         Ok(s)
                     });
-                    if state.is_ok() {
-                        // Reading is an event too: subscribers learn who is looking. It never
-                        // changes state, so a replica fetching state cannot start a loop.
-                        self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                    match state {
+                        Ok(s) => {
+                            // Reading is an event too: subscribers learn who is looking. It never
+                            // changes state, so a replica fetching state cannot start a loop.
+                            self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                            self.reply(reply, Ok(s));
+                        }
+                        // The rules admitted it, so this is the store failing.
+                        Err(e) => self.reply_status(reply, 503, e),
                     }
-                    self.reply(reply, state);
                 }
             },
             Input::Identity { user } => self.set_identity(user),

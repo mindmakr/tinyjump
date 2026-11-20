@@ -59,7 +59,9 @@ pub fn now_ms() -> f64 {
 /// requests are refused (`tj dev` only).
 fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runtime, Vec<Output>), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
-    let (store, _) = crate::sealed::open_store(data)?;
+    // Objects that belong to a person get keys of their own, so erasing them reaches backups.
+    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    let (store, _) = crate::sealed::open_store(data, &personal)?;
     let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
@@ -342,7 +344,14 @@ impl Dispatch {
                     }
                 }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
-                Output::Erased { object, reason } => self.audit.record(Entry::new("erased").object(&object).text("reason", &reason)),
+                Output::Erased { object, reason, forget } => {
+                    self.audit.record(Entry::new("erased").object(&object).text("reason", &reason));
+                    if forget {
+                        if let Some((_, person)) = object.split_once('/') {
+                            self.audit.forget(person);
+                        }
+                    }
+                }
                 Output::Ran { object, method, by, caller, ok, ms } => {
                     let kind = match by.as_str() {
                         "timer" => "timer",

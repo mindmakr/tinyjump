@@ -160,6 +160,10 @@ impl Runtime {
             dated = stored.created > 0.0 && stored.changed > 0.0;
             if dated {
                 (created, changed) = (stored.created, stored.changed);
+            } else if alarms.is_empty() && calls.is_empty() && Value::Rec(self.defaults(class)?.into()).to_json().ok() == Some(Json::Object(stored.state.clone())) {
+                // An erased record: no clock until it holds something again, and reading it
+                // writes nothing.
+                (created, changed, dated) = (0.0, 0.0, true);
             }
         }
         let remote = def.server && !self.server;

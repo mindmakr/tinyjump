@@ -188,6 +188,13 @@ impl ObjectDef {
     pub fn pii(&self, field: &str) -> Option<&Pii> {
         self.pii.iter().find(|p| &*p.field == field)
     }
+
+    /// Whether its objects can belong to a person (the one whose id is the object id): it
+    /// holds `@pii`, or has an `"owner"` rule. Erasure and per-person keys cover these.
+    pub fn belongs_to_a_person(&self) -> bool {
+        let owner = |r: &Option<Rc<[Rc<str>]>>| r.as_ref().is_some_and(|r| r.iter().any(|w| &**w == "owner"));
+        !self.pii.is_empty() || owner(&self.read) || self.methods.values().any(|m| owner(&m.allow))
+    }
 }
 
 pub struct Program {

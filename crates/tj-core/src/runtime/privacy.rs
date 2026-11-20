@@ -93,12 +93,20 @@ impl Runtime {
         let mut held = Vec::new();
         for class in 0..self.program.objects.len() as u16 {
             let def = &self.program.objects[class as usize];
-            let owner = |r: &Option<std::rc::Rc<[std::rc::Rc<str>]>>| r.as_ref().is_some_and(|r| r.iter().any(|w| &**w == "owner"));
-            if def.pii.is_empty() && !owner(&def.read) && !def.methods.values().any(|m| owner(&m.allow)) {
+            if !def.belongs_to_a_person() {
                 continue;
             }
             let key = format!("{}/{subject}", def.name);
-            if self.is_loaded(&key) || self.store.load(&key)?.is_some() {
+            let present = self.is_loaded(&key)
+                || match self.store.load(&key) {
+                    Ok(found) => found.is_some(),
+                    // A record whose key was already destroyed (an erasure that could not
+                    // finish, a copy from a backup) still counts, and erasing overwrites it.
+                    // Any other failure to read fails the erasure.
+                    Err(e) if !self.store.is_erased(&key)? => return Err(e),
+                    Err(_) => true,
+                };
+            if present {
                 held.push((class, key));
             }
         }
@@ -129,8 +137,13 @@ impl Runtime {
         if let Some((_, key)) = objects.iter().find(|(class, _)| self.in_use(*class, subject)) {
             return Err((409, format!("{key} is part way through a call; try again in a moment")));
         }
-        let (mut erased, mut held) = (Vec::new(), Vec::new());
+        let (mut erased, mut held, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
         for (class, key) in objects {
+            // Its key is gone, so it cannot be kept, held or not: it is overwritten.
+            if !self.is_loaded(&key) && self.store.is_erased(&key).map_err(|e| (503, e))? {
+                unreadable.push((class, key));
+                continue;
+            }
             let o = self.instance(class, subject).map_err(|e| (503, e.message()))?;
             if let Some(until) = self.held_until(class, &o) {
                 held.push((key, until));
@@ -141,8 +154,18 @@ impl Runtime {
             erased.push(key);
         }
         self.drop_alarms_of(subject, &held);
+        // First the stored copies' keys, so copies in backups cannot be read either; then the
+        // blank, under a new key.
+        for key in &erased {
+            self.store.forget(key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; nothing was erased; try again")))?;
+        }
         if !self.flush() {
-            return Err((503, "the erasure could not be saved; nothing was erased; try again".into()));
+            return Err((503, "the old data can no longer be read, but the blank could not be saved; try again".into()));
+        }
+        for (class, key) in unreadable {
+            self.store.forget(&key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; try again")))?;
+            self.write_blank(class, &key).map_err(|e| (503, format!("could not overwrite {key}: {e}; try again")))?;
+            erased.push(key);
         }
         if !held.is_empty() {
             for (key, until) in &held {
@@ -270,27 +293,37 @@ impl Runtime {
         if hold.is_some_and(|h| self.now < changed + h) {
             return Ok(());
         }
+        self.store.forget(key)?;
         if loaded {
             let o = self.instance(class, id).map_err(|e| e.message())?;
             let fresh = self.defaults(class).map_err(|e| e.message())?;
             self.reset(&o, fresh);
         } else {
-            // A blank record with a new change number, so devices that reconnect get it too.
-            self.change_seq += 1;
-            let seq = self.change_seq;
-            let Json::Object(state) = defaults else { unreachable!("state is a record") };
-            // No clock: it holds nothing until someone writes to it again.
-            let record = serde_json::json!({ "state": state, "seq": seq });
-            self.store.save(key, &record.to_string())?;
-            self.store.save("tj:seq", &seq.to_string())?;
-            self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
+            self.write_blank(class, key)?;
         }
         let reason = if waiting.is_some() { "erase after hold" } else { "retain" };
-        self.outputs.push(Output::Erased { object: key.to_string(), reason: reason.into() });
         if waiting.is_some() {
             self.erasures.remove(key);
             self.save_erasures()?;
         }
+        // The person was erased earlier; when nothing of theirs is held any more, the audit
+        // log forgets them too. Retention alone does not: the person may still be active.
+        let forget = waiting.is_some() && !self.erasures.keys().any(|k| k.split_once('/').is_some_and(|(_, i)| i == id));
+        self.outputs.push(Output::Erased { object: key.to_string(), reason: reason.into(), forget });
+        Ok(())
+    }
+
+    /// Writes a blank record for an object that is not loaded, with a new change number so
+    /// devices that reconnect get it too, and no clock: it holds nothing until someone writes
+    /// to it again.
+    fn write_blank(&mut self, class: u16, key: &str) -> Result<(), String> {
+        let Json::Object(state) = Value::Rec(self.defaults(class).map_err(|e| e.message())?.into()).to_json()? else { unreachable!("state is a record") };
+        self.change_seq += 1;
+        let seq = self.change_seq;
+        let record = serde_json::json!({ "state": state, "seq": seq });
+        self.store.save(key, &record.to_string())?;
+        self.store.save("tj:seq", &seq.to_string())?;
+        self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
         Ok(())
     }
 

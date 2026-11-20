@@ -159,8 +159,9 @@ pub enum Output {
     Log { level: String, message: String },
     /// Servers only, for the audit log: retention erased an object (`reason`: `retain`, or
     /// `erase after hold` when a person's erasure waited for a legal hold to end).
+    /// `forget`: nothing of the person is held any more, so the audit log forgets them.
     #[cfg(feature = "server")]
-    Erased { object: String, reason: String },
+    Erased { object: String, reason: String, forget: bool },
     /// Servers only, for the audit log: a call nobody requested ended. `by` is `timer`,
     /// `alarm` or `invoke`; `caller` is who it ran as (none: the system). Never arguments,
     /// results or error text.

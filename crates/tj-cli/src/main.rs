@@ -314,7 +314,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     plugins.start_all()?;
     // Checked before anything starts: a folder that mixes plain and sealed records, or a key
     // file that cannot be read, stops the server here.
-    let (_, storage) = sealed::open_store(&data)?;
+    let (_, storage) = sealed::open_store(&data, &[])?;
     let (audit, audit_key) = audit::Audit::start(&data)?;
     let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
     let addr = format!("{}:{}", args.host, args.port);

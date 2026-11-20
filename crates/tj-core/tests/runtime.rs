@@ -1169,7 +1169,7 @@ fn kept(store: &Shared, now: f64) -> Runtime {
 }
 
 fn erased_outputs(out: &[Output]) -> Vec<(String, String)> {
-    out.iter().filter_map(|o| if let Output::Erased { object, reason } = o { Some((object.clone(), reason.clone())) } else { None }).collect()
+    out.iter().filter_map(|o| if let Output::Erased { object, reason, .. } = o { Some((object.clone(), reason.clone())) } else { None }).collect()
 }
 
 #[test]
@@ -1265,6 +1265,100 @@ fn a_legal_hold_keeps_records_until_it_ends_then_the_erasure_happens() {
     let out = rt.handle(31.0 * DAY, Input::Tick);
     assert_eq!(erased_outputs(&out), [("Invoice/user:ana".into(), "erase after hold".into())]);
     assert_eq!(rt.export_subject("user:ana").unwrap()["Invoice/user:ana"]["amount"], json!(0));
+}
+
+/// A store that notes what it was asked to forget (an encrypted store destroys those keys).
+#[derive(Clone, Default)]
+struct Forgetful(Shared, Rc<RefCell<Vec<String>>>);
+
+impl Store for Forgetful {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        self.0.load(key)
+    }
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.0.save(key, value)
+    }
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        self.0.keys(prefix)
+    }
+    fn forget(&mut self, key: &str) -> Result<(), String> {
+        self.1.borrow_mut().push(key.to_string());
+        Ok(())
+    }
+}
+
+/// A store with one record that cannot be read until it is written again: because its key
+/// was destroyed (an erasure that could not finish, or a copy restored from a backup) when
+/// the flag says so, or because the disk fails.
+#[derive(Clone, Default)]
+struct Spoiled(Shared, Rc<RefCell<Option<String>>>, Rc<std::cell::Cell<bool>>);
+
+impl Store for Spoiled {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        if self.1.borrow().as_deref() == Some(key) {
+            return Err("cannot decrypt the record".into());
+        }
+        self.0.load(key)
+    }
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if self.1.borrow().as_deref() == Some(key) {
+            *self.1.borrow_mut() = None;
+        }
+        self.0.save(key, value)
+    }
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        self.0.keys(prefix)
+    }
+    fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        Ok(self.2.get() && self.1.borrow().as_deref() == Some(key))
+    }
+}
+
+#[test]
+fn erasing_again_overwrites_a_record_that_cannot_be_read() {
+    let store = Spoiled::default();
+    let boot = || Runtime::boot(compile(KEPT).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut boot(), 1000.0, "Account/user:ana", "set", json!(["a@example.com"]), who("user:ana", &[])).unwrap();
+    *store.1.borrow_mut() = Some("Account/user:ana".into());
+    let mut rt = boot();
+    // A disk that fails to read is not an erased record: nothing is destroyed or overwritten.
+    assert_eq!(rt.erase_subject("user:ana").err().map(|e| e.0), Some(503));
+    assert!(store.0 .0.borrow().data["Account/user:ana"].contains("a@example.com"), "kept as it was");
+    // A record whose key is gone is overwritten.
+    store.2.set(true);
+    let e = rt.erase_subject("user:ana").unwrap();
+    assert_eq!(e.erased, ["Account/user:ana"]);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""));
+}
+
+#[test]
+fn erasing_destroys_the_stored_copies_keys_and_holds_wait() {
+    let store = Forgetful::default();
+    let boot = |now: f64| Runtime::boot(compile(KEPT).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(now, 7) }).unwrap().0;
+    let mut rt = boot(0.0);
+    let ana = || who("user:ana", &[]);
+    call_as(&mut rt, 1000.0, "Invoice/user:ana", "bill", json!([120]), ana()).unwrap();
+    call_as(&mut rt, 1000.0, "Account/user:ana", "set", json!(["a@example.com"]), ana()).unwrap();
+    rt.erase_subject("user:ana").unwrap();
+    assert_eq!(*store.1.borrow(), ["Account/user:ana"], "the held invoice keeps its key");
+
+    // When the hold ends, its key goes too, and the audit log may forget the person.
+    let out = rt.handle(31.0 * DAY, Input::Tick);
+    assert_eq!(*store.1.borrow(), ["Account/user:ana", "Invoice/user:ana"]);
+    assert!(out.iter().any(|o| matches!(o, Output::Erased { reason, forget: true, .. } if reason == "erase after hold")), "{out:?}");
+
+    // Retention of an active person's old data destroys that object's key, but does not make
+    // the audit log forget them.
+    call_as(&mut rt, 32.0 * DAY, "Visit/user:bo", "set", json!(["Taif"]), who("user:bo", &[])).unwrap();
+    let out = rt.handle(33.5 * DAY, Input::Tick);
+    assert!(out.iter().any(|o| matches!(o, Output::Erased { reason, forget: false, .. } if reason == "retain")), "{out:?}");
+    assert!(store.1.borrow().contains(&"Visit/user:bo".to_string()));
+
+    // Reading an erased object writes nothing, and starts no clock.
+    let before = store.0 .0.borrow().data["Account/user:ana"].clone();
+    let mut rt = boot(34.0 * DAY);
+    state(&mut rt, 34.0 * DAY, "Account/user:ana");
+    assert_eq!(store.0 .0.borrow().data["Account/user:ana"], before);
 }
 
 #[test]
