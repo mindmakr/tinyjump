@@ -1905,3 +1905,21 @@ import { erase } from "tj:privacy"
     let record: Json = serde_json::from_str(&saved).unwrap();
     assert!(record["calls"].as_array().is_none_or(|c| c.is_empty()), "{saved}");
 }
+
+#[test]
+fn purposes_name_their_lawful_basis_when_declared() {
+    let obj = "@server @read(\"owner\") object Account {\n  @pii(\"contact\", \"account\", \"marketing\") email: string = \"\"\n}\n";
+    let with = |decl: &str| errors(&format!("{decl}\n{obj}"));
+    // Optional, and checked when present.
+    assert_eq!(errors(obj), "");
+    assert_eq!(with(r#"const purposes = { account: "contract", marketing: "consent" }"#), "");
+    assert_eq!(tj_core::lawful_bases(&format!("const purposes = {{ account: \"contract\", marketing: \"consent\" }}\n{obj}")), Some(vec![("account".into(), "contract".into()), ("marketing".into(), "consent".into())]));
+    let e = with(r#"const purposes = { account: "contract" }"#);
+    assert!(e.contains("purposes without a lawful basis: \"marketing\"") && e.contains("marketing: \"contract\""), "{e}");
+    let e = with(r#"const purposes = { account: "contract", marketing: "because" }"#);
+    assert!(e.contains("\"because\" is not a lawful basis") && e.contains("legitimate-interest"), "{e}");
+    let e = with(r#"const purposes = { account: "contract", marketing: "consent", billing: "contract" }"#);
+    assert!(e.contains("no @pii field is held for \"billing\""), "{e}");
+    assert!(with(r#"let purposes = { account: "contract", marketing: "consent" }"#).contains("must be declared with const"));
+    assert!(with(r#"const purposes = ["account"]"#).contains("must be a record of purposes"));
+}

@@ -6,6 +6,7 @@ mod audit;
 mod auth;
 mod bench;
 mod bytes;
+mod compliance;
 mod engine;
 mod http;
 mod identity;
@@ -35,10 +36,11 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj> [--access] [--privacy]
+  tj check <app.tj> [--access] [--privacy] [--compliance <pack.json>]
                                  compile and report errors; --access prints who may read and call what,
                                  --privacy the personal data the app holds and for what, and with
-                                 --record the record of processing (GDPR article 30) as Markdown
+                                 --record the record of processing (GDPR article 30) as Markdown;
+                                 --compliance checks the app against a compliance pack
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
@@ -66,6 +68,8 @@ OPTIONS:
   --target <url>  app automation endpoint (default http://127.0.0.1:4700; Android/iOS debug: :4701)
   --plugin <name=fake:file.json>
                   run plugin <name> as a scripted fake (tests, demos without keys)
+  --compliance <pack.json>
+                  `serve`: refuse to start while a control of the pack is not met
   --as <name:role,role>
                   `dev` only: requests without credentials act as this user (dev:<name>)
 
@@ -103,6 +107,7 @@ struct Args {
     access: bool,
     privacy: bool,
     record: bool,
+    compliance: Option<PathBuf>,
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
@@ -120,7 +125,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, compliance: None, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -134,6 +139,7 @@ fn parse_args() -> Result<Args, String> {
             "--access" => args.access = true,
             "--privacy" => args.privacy = true,
             "--record" => args.record = true,
+            "--compliance" => args.compliance = Some(PathBuf::from(value()?)),
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
@@ -182,7 +188,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.access, args.privacy, args.record)),
+        "check" => args.file().and_then(|f| check(f, args.access, args.privacy, args.record, args.compliance.as_deref())),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -252,7 +258,7 @@ fn read_source(file: &Path) -> Result<String, String> {
     app::read(file).map(|a| a.source)
 }
 
-fn check(file: &Path, access: bool, privacy: bool, record: bool) -> Result<(), String> {
+fn check(file: &Path, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
@@ -265,6 +271,14 @@ fn check(file: &Path, access: bool, privacy: bool, record: bool) -> Result<(), S
                 print!("{}", privacy::record(&src, &program));
             } else if privacy {
                 print!("{}", privacy::report(&program));
+            }
+            if let Some(pack) = pack {
+                let pack = compliance::Pack::load(pack)?;
+                let (report, ok) = pack.report(&pack.evaluate(&src, &program, None));
+                print!("{report}");
+                if !ok {
+                    return Err("some controls are not met (above)".into());
+                }
             }
             Ok(())
         }
@@ -320,6 +334,19 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // Checked before anything starts: a folder that mixes plain and sealed records, or a key
     // file that cannot be read, stops the server here.
     let (_, storage) = sealed::open_store(&data, &[])?;
+    if let Some(pack) = &args.compliance {
+        let pack = compliance::Pack::load(pack)?;
+        let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("
+
+"))?;
+        let encrypted = std::env::var_os(sealed::KEY_FILE_ENV).is_some_and(|v| !v.is_empty());
+        let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(encrypted)));
+        if !ok {
+            return Err(format!("{report}
+not starting: some controls of the compliance pack are not met (above)"));
+        }
+        eprintln!("compliance: {} ({}): every checked control is met", pack.title, pack.names.join(" + "));
+    }
     let (audit, audit_key) = audit::Audit::start(&data)?;
     let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
     let addr = format!("{}:{}", args.host, args.port);

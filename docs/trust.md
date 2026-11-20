@@ -208,7 +208,7 @@ As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
 - **`@pii(category, purpose)` marks a field.**
   - The categories follow GDPR articles 9 and 10 and the Saudi PDPL: `contact`,
     `identifier`, `online-id`, `location`, `financial`, `health`, `genetic`, `biometric`,
-    `religion`, `politics`, `union`, `sexual`, `criminal` and `other`.
+    `ethnicity`, `religion`, `politics`, `union`, `sexual`, `criminal` and `other`.
   - Every field states its purpose. A field read for a purpose it does not list is
     reported.
 - **One subject per object.** A personal-data object belongs to one person, its owner:
@@ -329,9 +329,13 @@ controls; it cannot weaken another pack's.
   - each consent is recorded with the text the person saw, its version and the time;
   - consent can be withdrawn;
   - `@needs("consent:marketing")` refuses a call without it.
-- **First packs:** `gdpr-eu` and `pdpl-ksa`, both marked draft until counsel reviews them.
-  Other regions (UAE, Qatar, Bahrain, UK, California, HIPAA) come as community drafts, and
-  are mostly "needs a person" because those regimes are largely organisational.
+- **As built, part 7A:** the pack format and loader with `extends`; `tj check --compliance`
+  and `tj serve --compliance`; `const purposes` with its compile check; and a sample GDPR
+  pack in `examples/members`. Reference: [compliance.md](compliance.md).
+- **Packs:** none ship with tinyjump (owner decision above). A sample GDPR pack shows the
+  format. Regional packs (Saudi PDPL, UAE, Qatar, Bahrain, UK, California, HIPAA) come from
+  counsel or contributors. They are mostly "person" controls, because those regimes are
+  largely organisational.
 
 ## Build order (agreed)
 
