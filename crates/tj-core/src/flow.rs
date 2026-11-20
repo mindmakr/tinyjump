@@ -757,9 +757,9 @@ impl Checker {
         if !t.revealed.is_empty() {
             self.field_revealed.entry((class.clone(), Rc::from(field))).or_default().extend(t.revealed.iter().cloned());
             // A copy of personal data is personal data: on the server it is kept only where
-            // retention, export and erasure reach it, which is a `@by` list, or a personal field
-            // of the object the code runs on. Device objects are cleared at sign-out.
-            let reached = self.classes.get(class).map_or(true, |c| !c.server || c.shared.contains(field) || (own && c.pii.contains_key(field)));
+            // export and erasure find whose it is, a `@by` list (`this` is no proof: a slot is
+            // not the person). Device objects are cleared at sign-out.
+            let reached = self.classes.get(class).map_or(true, |c| !c.server || c.shared.contains(field));
             if !reached {
                 let place = if own { format!("this.{field}") } else { format!("{class}.{field}") };
                 let d = Diagnostic::new(format!("personal data ({}) is kept in `{place}`, where export and erasure cannot find whose it is", t.revealed.iter().map(|(c, f)| format!("{c}.{f}")).collect::<Vec<_>>().join(", ")), span)
