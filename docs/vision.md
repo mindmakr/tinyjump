@@ -55,7 +55,7 @@ Next, agreed with the owner on 2026-11-20:
    - `@exclusive` methods: actor-style turns where an `await` needs them, without
      deadlocks (done);
    - a built-in, tamper-evident audit log (done);
-   - encryption at rest;
+   - encryption at rest (stored objects done; `crypto.*` for apps next);
    - personal data with subject rights;
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)

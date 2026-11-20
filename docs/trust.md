@@ -122,7 +122,7 @@ As built (`crates/tj-cli/src/audit.rs`):
   pseudonym. Entries still queued in memory when the process is killed are lost; batches
   are written as soon as they arrive.
 
-## 5. Encryption
+## 5. Encryption (stored data built; `crypto.*` and transport next)
 
 - **Stored data (servers):** the encryption lives in a store wrapper on the host, so the
   core stays free of cryptography.
@@ -152,6 +152,29 @@ As built (`crates/tj-cli/src/audit.rs`):
 - **Later:** device-side store encryption (the Android Keystore needs API 23 and minSdk
   is 21; WebCrypto is asynchronous while stores are synchronous), built-in TLS, and
   compression.
+
+As built (`crates/tj-cli/src/sealed.rs`), corrected after a closer look:
+
+- **One-time keys, not nonce counting.** Wrapping a fresh data key under the same
+  key-encryption key with random nonces wears that key out after about 2^32 saves (the
+  AES-GCM limit). Instead each save derives a one-time wrapping key from the
+  key-encryption key and a random salt, and every AES-GCM key seals exactly one message.
+  Rotation is still a re-wrap.
+- **What the authenticated data can and cannot do.** It binds the format and the stored
+  name, so a record moved to another object fails to open. It cannot stop an older copy of
+  the same record being put back (a rollback), so the change number is not bound; that
+  needs a counter kept off the disk.
+- **The key file** holds a `names` secret (it keys the stored names and must never change)
+  and key-encryption keys `<id> <64 hex>`, newest last. `tj store rekey` encrypts plain
+  folders and re-wraps under the newest key, after which older keys can be removed. The
+  plain files it replaces are deleted, but the disk may still hold their old contents.
+- **Fails closed.** A record that cannot be read or decrypted fails the call (503); it is
+  never treated as missing, on any store. The server refuses to start on a folder that
+  mixes plain and sealed records, so a forgotten `TJ_KEY_FILE` cannot write plain records
+  next to encrypted ones. Data files are readable by the server's user only.
+- **Not yet:** the audit log and the pseudonym mapping are not encrypted (they hold no
+  values, and the log is keyed); `crypto.*` needs a 256-bit secure seed from every host
+  and a cryptographic generator in the core, and comes next with the transport checks.
 
 ## 6. Personal data
 
@@ -248,7 +271,7 @@ controls; it cannot weaken another pack's.
 4. **The audit log:** HMAC chain, signed checkpoints, pseudonyms, the writer and `tj audit`
    (built).
 5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
-   hashed file names, and `crypto.*`.
+   hashed file names (built), and `crypto.*` with the transport checks (next).
 6. **Personal data:**
    - `@pii` for single-subject objects;
    - masking;

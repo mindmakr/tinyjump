@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::bytes::{hex, random};
 use tj_core::runtime::protocol::Caller;
 
 pub const KEYS_ENV: &str = "TJ_KEYS";
@@ -169,16 +170,6 @@ pub fn sha256_hex(text: &str) -> String {
     hex(digest(&SHA256, text.as_bytes()).as_ref())
 }
 
-pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Bytes from the system's secure random source.
-pub fn random<const N: usize>() -> Result<[u8; N], String> {
-    let mut bytes = [0u8; N];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut bytes).map_err(|_| "no secure random source".to_string())?;
-    Ok(bytes)
-}
 
 fn clean_roles(roles: Vec<String>) -> Vec<String> {
     roles.into_iter().filter(|r| !NOT_ROLES.contains(&r.as_str())).collect()
@@ -342,7 +333,7 @@ mod tests {
     }
 
     fn b64url(data: &[u8]) -> String {
-        crate::mcp::base64(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
+        crate::bytes::base64(data).replace('+', "-").replace('/', "_").trim_end_matches('=').to_string()
     }
 
     fn issuer() -> Issuer {

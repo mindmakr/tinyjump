@@ -82,10 +82,10 @@ impl Measure for JavaHost {
 }
 
 impl Store for JavaHost {
-    fn load(&mut self, key: &str) -> Option<String> {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
         match self.call("load", &[key], false) {
-            Some(Ret::Str(s)) => s,
-            _ => None,
+            Some(Ret::Str(s)) => Ok(s),
+            _ => Ok(None),
         }
     }
 
@@ -96,10 +96,10 @@ impl Store for JavaHost {
         }
     }
 
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         match self.call("keys", &[prefix], false) {
-            Some(Ret::Str(Some(json))) => tj_core::host::parse_keys(&json),
-            _ => Vec::new(),
+            Some(Ret::Str(Some(json))) => Ok(tj_core::host::parse_keys(&json)),
+            _ => Ok(Vec::new()),
         }
     }
 }

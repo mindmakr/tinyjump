@@ -1,8 +1,8 @@
 //! One JSON file per key, written atomically and durably: a temporary file is synced to disk,
 //! renamed over the old one, and the folder is synced, so a crash leaves the old record or
-//! the new one, never a torn or lost write.
+//! the new one, never a torn or lost write. Only the server's user can read the files.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tj_core::Store;
@@ -13,13 +13,44 @@ pub struct FileStore {
 
 impl FileStore {
     pub fn open(dir: &Path) -> io::Result<FileStore> {
-        fs::create_dir_all(dir)?;
+        private_dir(dir)?;
         Ok(FileStore { dir: dir.to_path_buf() })
     }
 
     fn path(&self, key: &str) -> PathBuf {
         self.dir.join(format!("{}.json", encode(key)))
     }
+
+    /// Deletes a record, durably (`tj store rekey` removes records it has re-saved sealed).
+    pub fn remove(&mut self, key: &str) -> Result<(), String> {
+        let path = self.path(key);
+        fs::remove_file(&path).and_then(|()| sync_dir(&self.dir)).map_err(|e| format!("{}: {e}", path.display()))
+    }
+}
+
+pub fn private_dir(dir: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dir)
+}
+
+/// Options for a file only the server's user can read.
+pub fn private_file() -> OpenOptions {
+    #[allow(unused_mut)] // only Unix sets a mode
+    let mut o = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o
+}
+
+/// A new or removed directory entry must reach the disk too. Windows cannot sync a folder;
+/// its renames and deletes complete in one step.
+pub fn sync_dir(_dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Percent-encodes everything but `[A-Za-z0-9._-]`, so keys can never escape the directory.
@@ -55,36 +86,37 @@ fn decode(name: &str) -> Option<String> {
 }
 
 impl Store for FileStore {
-    fn load(&mut self, key: &str) -> Option<String> {
-        fs::read_to_string(self.path(key)).ok()
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        let path = self.path(key);
+        match fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
     }
 
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
         let path = self.path(key);
         let tmp = path.with_extension("json.tmp");
         let write = || -> io::Result<()> {
-            let mut f = fs::File::create(&tmp)?;
+            let mut f = private_file().write(true).create(true).truncate(true).open(&tmp)?;
             f.write_all(value.as_bytes())?;
             f.sync_all()?;
             fs::rename(&tmp, &path)?;
-            // The rename itself must reach the disk. Windows cannot sync a folder; its rename
-            // replaces the file in one step.
-            #[cfg(unix)]
-            fs::File::open(&self.dir)?.sync_all()?;
-            Ok(())
+            sync_dir(&self.dir)
         };
         write().map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(&self.dir) else { return Vec::new() };
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let mut keys: Vec<String> = entries
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter_map(|n| decode(n.strip_suffix(".json")?))
             .filter(|k| k.starts_with(prefix))
             .collect();
         keys.sort();
-        keys
+        Ok(keys)
     }
 }
 
@@ -99,13 +131,14 @@ mod tests {
         s.save("Counter/main", "{\"a\":1}").unwrap();
         s.save("Counter/../x", "2").unwrap();
         s.save("Other/z", "3").unwrap();
-        assert_eq!(s.load("Counter/main").as_deref(), Some("{\"a\":1}"));
-        assert_eq!(s.keys("Counter/"), vec!["Counter/../x".to_string(), "Counter/main".to_string()]);
+        assert_eq!(s.load("Counter/main").unwrap().as_deref(), Some("{\"a\":1}"));
+        assert_eq!(s.load("Counter/none"), Ok(None));
+        assert_eq!(s.keys("Counter/").unwrap(), ["Counter/../x", "Counter/main"]);
         assert!(dir.join("%43ounter%2F..%2Fx.json").exists(), "keys never become paths");
         // Keys that differ only in case stay apart, even where the filesystem ignores case.
         s.save("Cart/Alice", "\"A\"").unwrap();
         s.save("Cart/alice", "\"a\"").unwrap();
-        assert_eq!((s.load("Cart/Alice").as_deref(), s.load("Cart/alice").as_deref()), (Some("\"A\""), Some("\"a\"")));
+        assert_eq!((s.load("Cart/Alice").unwrap(), s.load("Cart/alice").unwrap()), (Some("\"A\"".into()), Some("\"a\"".into())));
         fs::remove_dir_all(dir).unwrap();
     }
 }

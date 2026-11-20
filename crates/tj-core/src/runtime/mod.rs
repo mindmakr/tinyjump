@@ -308,7 +308,8 @@ impl Runtime {
                         let args = args.iter().map(Value::from_json).collect();
                         self.invoke(obj, &method, args, true, reply, Entry::new(who))
                     }
-                    (Err(e), _) => self.reply(reply, Err(e)),
+                    // The rules already admitted the class, so this is the store failing.
+                    (Err(e), _) => self.reply_status(reply, 503, e),
                 },
             },
             Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {

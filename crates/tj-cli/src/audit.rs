@@ -20,7 +20,8 @@
 //!   verifies, because the oldest file starts with a signed checkpoint.
 
 use crate::engine::{now_ms, Failure};
-use crate::identity::{hex, random};
+use crate::bytes::{hex, random, unhex};
+use crate::store::{private_dir, private_file, sync_dir};
 use ring::hmac;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use serde_json::{Map, Value as Json};
@@ -262,13 +263,6 @@ fn canonical(m: &Map<String, Json>) -> String {
     Json::Object(keys.into_iter().map(|k| (k.clone(), m[k].clone())).collect()).to_string()
 }
 
-fn unhex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
-        return None;
-    }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
-}
-
 /// The UTC date of epoch milliseconds, as `YYYY-MM-DD`.
 fn day(ms: u64) -> String {
     // Days to civil date (Howard Hinnant's algorithm), for dates after 1970.
@@ -281,30 +275,6 @@ fn day(ms: u64) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + u64::from(m <= 2);
     format!("{y:04}-{m:02}-{d:02}")
-}
-
-fn private_dir(dir: &Path) -> io::Result<()> {
-    let mut b = fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
-    b.create(dir)
-}
-
-/// Options for a file only the server's user can read.
-fn private_file() -> OpenOptions {
-    #[allow(unused_mut)] // only Unix sets a mode
-    let mut o = OpenOptions::new();
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o
-}
-
-/// A new directory entry must reach the disk too. Windows cannot sync a folder.
-fn sync_dir(_dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    File::open(_dir)?.sync_all()?;
-    Ok(())
 }
 
 /// The day files in `dir`, oldest first.
