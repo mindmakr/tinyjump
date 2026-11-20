@@ -1,0 +1,79 @@
+// UTC dates written as "YYYY-MM-DD HH:MM". The language has no Date parsing or
+// formatting, so the calendar arithmetic is done here (days from 1970-01-01).
+
+export const MINUTE = 60000
+const DAY = 86400000
+
+function daysFromCivil(year: number, month: number, day: number): number {
+  const y = month <= 2 ? year - 1 : year
+  const era = Math.floor(y / 400)
+  const yoe = y - era * 400
+  const mp = month > 2 ? month - 3 : month + 9
+  const doy = Math.floor((153 * mp + 2) / 5) + day - 1
+  const doe = yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100) + doy
+  return era * 146097 + doe - 719468
+}
+
+function pad2(n: number): string {
+  return String(n).padStart(2, "0")
+}
+
+/// "14:30" for a time in milliseconds since 1970, in UTC.
+export function formatTime(ms: number): string {
+  const inDay = ms - Math.floor(ms / DAY) * DAY
+  const minutes = Math.floor(inDay / MINUTE)
+  return pad2(Math.floor(minutes / 60)) + ":" + pad2(minutes % 60)
+}
+
+/// "2026-12-01 14:30" for a time in milliseconds since 1970, in UTC.
+export function formatStart(ms: number): string {
+  const z = Math.floor(ms / DAY) + 719468
+  const era = Math.floor(z / 146097)
+  const doe = z - era * 146097
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365)
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100))
+  const mp = Math.floor((5 * doy + 2) / 153)
+  const day = doy - Math.floor((153 * mp + 2) / 5) + 1
+  const month = mp < 10 ? mp + 3 : mp - 9
+  const year = yoe + era * 400 + (month <= 2 ? 1 : 0)
+  return String(year) + "-" + pad2(month) + "-" + pad2(day) + " " + formatTime(ms)
+}
+
+export function isDigits(s: string): boolean {
+  if (s.length === 0) {
+    return false
+  }
+  for (let i = 0; i < s.length; i += 1) {
+    if (!"0123456789".includes(s.charAt(i))) {
+      return false
+    }
+  }
+  return true
+}
+
+/// Milliseconds since 1970 for "YYYY-MM-DD HH:MM" in UTC, or null when the text is not a
+/// real date and time in that form.
+export function parseStart(text: string): number | null {
+  const s = text.trim()
+  if (s.length !== 16 || s.charAt(4) !== "-" || s.charAt(7) !== "-" || s.charAt(10) !== " " || s.charAt(13) !== ":") {
+    return null
+  }
+  const digits = s.slice(0, 4) + s.slice(5, 7) + s.slice(8, 10) + s.slice(11, 13) + s.slice(14, 16)
+  if (!isDigits(digits)) {
+    return null
+  }
+  const year = Number(s.slice(0, 4))
+  const month = Number(s.slice(5, 7))
+  const day = Number(s.slice(8, 10))
+  const hour = Number(s.slice(11, 13))
+  const minute = Number(s.slice(14, 16))
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) {
+    return null
+  }
+  const ms = daysFromCivil(year, month, day) * DAY + (hour * 60 + minute) * MINUTE
+  // 2026-02-30 would roll over into March: refuse it.
+  if (formatStart(ms) !== s) {
+    return null
+  }
+  return ms
+}

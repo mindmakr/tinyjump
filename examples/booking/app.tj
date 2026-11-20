@@ -1,0 +1,533 @@
+// Booking: a business publishes appointment slots; customers book and cancel them and get
+// a reminder before the appointment. Spec: milestones/m1-booking/spec.md.
+
+import { exportData, erase } from "tj:privacy"
+import { MINUTE, formatStart, formatTime, isDigits, parseStart } from "./time"
+
+const lawfulBasis = { booking: "contract" }
+
+type Slot = { id: string; title: string; start: number; minutes: number; booked: boolean; booking: number }
+type Booker = { slot: string; customer: string; name: string; phone: string }
+type Reminder = { slot: string; booking: number; text: string }
+
+/// The slots. Everyone may read them, so they never say who booked.
+@server @read("anyone") object Schedule {
+  slots: Slot[] = []
+  nextSlot: number = 1
+  nextBooking: number = 1
+
+  @allow("staff") publish(title: string, start: string, minutes: number) {
+    const name = (title ?? "").trim()
+    if (name.length < 1 || name.length > 80) {
+      throw new Error("Give the slot a title of 1 to 80 characters.")
+    }
+    const at = parseStart(start ?? "")
+    if (at === null) {
+      throw new Error("Write the start as YYYY-MM-DD HH:MM in UTC, for example 2026-12-01 14:30.")
+    }
+    if (at <= Date.now()) {
+      throw new Error("The start must be in the future.")
+    }
+    if (minutes === null || minutes < 5 || minutes > 480 || Math.floor(minutes) !== minutes) {
+      throw new Error("The length must be a whole number of minutes from 5 to 480.")
+    }
+    const id = "s" + this.nextSlot
+    this.nextSlot += 1
+    this.slots.push({ id, title: name, start: at, minutes, booked: false, booking: 0 })
+  }
+
+  @allow("staff") remove(slotId: string) {
+    const i = this.indexOf(slotId)
+    if (this.slots[i].booked) {
+      throw new Error("Cancel the booking before removing this slot.")
+    }
+    this.slots.splice(i, 1)
+  }
+
+  @allow("signedIn") async book(slotId: string) {
+    const profile = Profile.get(caller.id)
+    if (profile.name === "" || profile.phone === "") {
+      throw new Error("Save your name and phone under Your details before booking.")
+    }
+    this.openIndex(slotId)
+    const url = Settings.get("main").checkUrl
+    if (url !== "") {
+      const sep = url.includes("?") ? "&" : "?"
+      let status = 0
+      try {
+        const res = await fetch(url + sep + "slot=" + slotId)
+        status = res.status
+      } catch (e) {
+        throw new Error("Could not reach the business to check this booking (" + e.message + "). Try again.")
+      }
+      if (status !== 200) {
+        throw new Error(`The business did not accept this booking (answer ${status}).`)
+      }
+    }
+    // Check again after the wait: someone else may have booked it meanwhile.
+    const i = this.openIndex(slotId)
+    const slot = this.slots[i]
+    const booking = this.nextBooking
+    this.nextBooking += 1
+    this.slots[i] = { ...slot, booked: true, booking }
+    Roster.get("main").add({
+      slot: slotId,
+      customer: caller.id,
+      name: reveal(profile.name, "booking"),
+      phone: reveal(profile.phone, "booking"),
+    })
+    profile.addBooking(slotId)
+    const delay = slot.start - Settings.get("main").reminderMinutes * MINUTE - Date.now()
+    if (delay < 10) {
+      this.remind(slotId, booking)
+    } else {
+      this.schedule(delay, "remind", slotId, booking)
+    }
+  }
+
+  @allow("signedIn") cancel(slotId: string) {
+    const i = this.indexOf(slotId)
+    const slot = this.slots[i]
+    if (!slot.booked) {
+      throw new Error("This slot is not booked.")
+    }
+    const staff = caller.roles.includes("staff")
+    const entry = Roster.get("main").entries.find(e => e.slot === slotId)
+    if (!staff) {
+      if (entry === null || entry.customer !== caller.id) {
+        throw new Error("You can only cancel your own bookings.")
+      }
+      if (slot.start <= Date.now()) {
+        throw new Error("This appointment has already started.")
+      }
+    }
+    this.slots[i] = { ...slot, booked: false }
+    Roster.get("main").remove(slotId)
+    if (entry !== null) {
+      Profile.get(entry.customer).dropBooking(slotId)
+    }
+  }
+
+  /// Server code only: a person deleted their account. Their future slots open again,
+  /// and their name and phone leave the staff roster.
+  releaseCustomer(customer: string) {
+    const roster = Roster.get("main")
+    const now = Date.now()
+    for (const e of roster.entries.slice()) {
+      if (e.customer !== customer) {
+        continue
+      }
+      const i = this.slots.findIndex(s => s.id === e.slot)
+      if (i >= 0 && this.slots[i].start > now) {
+        this.slots[i] = { ...this.slots[i], booked: false }
+      }
+      roster.remove(e.slot)
+    }
+  }
+
+  private remind(slotId: string, booking: number) {
+    const slot = this.slots.find(s => s.id === slotId)
+    if (slot === null || !slot.booked || slot.booking !== booking) {
+      return
+    }
+    const entry = Roster.get("main").entries.find(e => e.slot === slotId)
+    if (entry === null) {
+      return
+    }
+    Profile.get(entry.customer).addReminder({ slot: slotId, booking, text: `${slot.title} at ${formatTime(slot.start)}` })
+  }
+
+  private indexOf(slotId: string): number {
+    const i = this.slots.findIndex(s => s.id === slotId)
+    if (i < 0) {
+      throw new Error("This slot no longer exists.")
+    }
+    return i
+  }
+
+  private openIndex(slotId: string): number {
+    const i = this.indexOf(slotId)
+    const slot = this.slots[i]
+    if (slot.start <= Date.now()) {
+      throw new Error("This slot has already started, so it cannot be booked.")
+    }
+    if (slot.booked) {
+      throw new Error("Sorry, this slot was just taken. Pick another one.")
+    }
+    return i
+  }
+}
+
+/// Who booked what, with their name and phone: staff only.
+@server @read("staff") object Roster {
+  entries: Booker[] = []
+
+  // Loops, not .filter/.map: arrow functions in methods other objects call crash the
+  // flow check ("RefCell already mutably borrowed").
+  add(entry: Booker) {
+    this.remove(entry.slot)
+    this.entries.push(entry)
+  }
+
+  remove(slotId: string) {
+    const kept: Booker[] = []
+    for (const e of this.entries) {
+      if (e.slot !== slotId) {
+        kept.push(e)
+      }
+    }
+    this.entries = kept
+  }
+
+  rename(customer: string, name: string, phone: string) {
+    const renamed: Booker[] = []
+    for (const e of this.entries) {
+      renamed.push(e.customer === customer ? { ...e, name, phone } : e)
+    }
+    this.entries = renamed
+  }
+}
+
+/// The business's settings: staff only.
+@server @read("staff") object Settings {
+  checkUrl: string = ""
+  reminderMinutes: number = 60
+
+  @allow("staff") setCheckUrl(url: string) {
+    const u = (url ?? "").trim()
+    if (u !== "" && !u.startsWith("https://") && !u.startsWith("http://")) {
+      throw new Error("The check address must start with https:// (or leave it empty).")
+    }
+    this.checkUrl = u
+  }
+
+  @allow("staff") setReminderMinutes(minutes: number) {
+    if (minutes === null || minutes < 1 || minutes > 1440 || Math.floor(minutes) !== minutes) {
+      throw new Error("Reminder minutes must be a whole number from 1 to 1440.")
+    }
+    this.reminderMinutes = minutes
+  }
+}
+
+/// One customer: their details, bookings and reminders. Id: the customer's id.
+@server @read("owner") @retain("1y") object Profile {
+  @pii("contact", "booking") name: string = ""
+  @pii("contact", "booking") phone: string = ""
+  bookings: string[] = []
+  reminders: Reminder[] = []
+
+  @allow("owner") save(name: string, phone: string) {
+    const n = (name ?? "").trim()
+    const p = (phone ?? "").trim()
+    if (n === "" || n.length > 80) {
+      throw new Error("Give a name of 1 to 80 characters.")
+    }
+    if (p === "" || p.length > 30) {
+      throw new Error("Give a phone number of 1 to 30 characters.")
+    }
+    this.name = n
+    this.phone = p
+    Roster.get("main").rename(this.id, reveal(this.name, "booking"), reveal(this.phone, "booking"))
+  }
+
+  addBooking(slotId: string) {
+    if (!this.bookings.includes(slotId)) {
+      this.bookings.push(slotId)
+    }
+  }
+
+  dropBooking(slotId: string) {
+    const bookings: string[] = []
+    for (const b of this.bookings) {
+      if (b !== slotId) {
+        bookings.push(b)
+      }
+    }
+    this.bookings = bookings
+    const reminders: Reminder[] = []
+    for (const r of this.reminders) {
+      if (r.slot !== slotId) {
+        reminders.push(r)
+      }
+    }
+    this.reminders = reminders
+  }
+
+  addReminder(reminder: Reminder) {
+    // A loop, not .some(...): with an arrow function here, tj check panics in the flow
+    // check ("RefCell already mutably borrowed").
+    for (const r of this.reminders) {
+      if (r.booking === reminder.booking) {
+        return
+      }
+    }
+    this.reminders.push(reminder)
+  }
+
+  @allow("owner") async myData(): any {
+    return await exportData(caller.id)
+  }
+
+  @allow("owner") async deleteAccount() {
+    Schedule.get("main").releaseCustomer(caller.id)
+    await erase(caller.id)
+  }
+}
+
+/// This device's screen state: what is typed and what went wrong.
+object Screen {
+  drafts: Record<string, string> = {}
+  notes: Record<string, string> = {}
+  now: number = 0
+
+  setDraft(key: string, value: string) {
+    this.drafts = { ...this.drafts, [key]: value }
+  }
+
+  clearDraft(key: string) {
+    this.drafts = { ...this.drafts, [key]: null }
+  }
+
+  note(key: string, text: string) {
+    this.notes = { ...this.notes, [key]: text }
+  }
+
+  // Redraw now and then, so slots turn "past" without anything else changing.
+  @every("15s") tick() {
+    this.now = Date.now()
+  }
+}
+
+// ---------------------------------------------------------------- actions
+
+async function publishSlot(ui: Screen) {
+  ui.note("publish-error", "")
+  const minutes = (ui.drafts["new-minutes"] ?? "30").trim()
+  if (!isDigits(minutes)) {
+    ui.note("publish-error", "The length must be a whole number of minutes from 5 to 480.")
+    return
+  }
+  try {
+    await Schedule.get("main").publish(ui.drafts["new-title"] ?? "", ui.drafts["new-start"] ?? "", Number(minutes))
+    ui.clearDraft("new-title")
+    ui.clearDraft("new-start")
+  } catch (e) {
+    ui.note("publish-error", e.message)
+  }
+}
+
+async function saveCheck(ui: Screen, current: string) {
+  ui.note("settings-message", "")
+  try {
+    await Settings.get("main").setCheckUrl(ui.drafts["check-url"] ?? current)
+    ui.clearDraft("check-url")
+    ui.note("settings-message", "Check address saved.")
+  } catch (e) {
+    ui.note("settings-message", e.message)
+  }
+}
+
+async function saveReminder(ui: Screen, current: number) {
+  ui.note("settings-message", "")
+  const text = (ui.drafts["reminder-minutes"] ?? String(current)).trim()
+  if (!isDigits(text)) {
+    ui.note("settings-message", "Reminder minutes must be a whole number from 1 to 1440.")
+    return
+  }
+  try {
+    await Settings.get("main").setReminderMinutes(Number(text))
+    ui.clearDraft("reminder-minutes")
+    ui.note("settings-message", "Reminder time saved.")
+  } catch (e) {
+    ui.note("settings-message", e.message)
+  }
+}
+
+async function removeSlot(ui: Screen, slotId: string) {
+  ui.note("slot-error", "")
+  try {
+    await Schedule.get("main").remove(slotId)
+  } catch (e) {
+    ui.note("slot-error", e.message)
+  }
+}
+
+async function bookSlot(ui: Screen, slotId: string) {
+  ui.note("book-error", "")
+  try {
+    await Schedule.get("main").book(slotId)
+  } catch (e) {
+    ui.note("book-error", e.message)
+  }
+}
+
+async function cancelSlot(ui: Screen, slotId: string) {
+  ui.note("book-error", "")
+  try {
+    await Schedule.get("main").cancel(slotId)
+  } catch (e) {
+    ui.note("book-error", e.message)
+  }
+}
+
+async function saveProfile(ui: Screen, profile: Profile) {
+  ui.note("profile-message", "")
+  try {
+    await profile.save(ui.drafts["profile-name"] ?? profile.name, ui.drafts["profile-phone"] ?? profile.phone)
+    ui.clearDraft("profile-name")
+    ui.clearDraft("profile-phone")
+    ui.note("profile-message", "Details saved.")
+  } catch (e) {
+    ui.note("profile-message", e.message)
+  }
+}
+
+async function showMyData(ui: Screen, profile: Profile) {
+  try {
+    const data = await profile.myData()
+    ui.note("my-data-view", JSON.stringify(data, null, 2))
+  } catch (e) {
+    ui.note("my-data-view", e.message)
+  }
+}
+
+async function deleteAccount(ui: Screen, profile: Profile) {
+  try {
+    await profile.deleteAccount()
+    ui.note("my-data-view", "")
+    ui.clearDraft("profile-name")
+    ui.clearDraft("profile-phone")
+    ui.note("profile-message", "Your account was deleted.")
+  } catch (e) {
+    ui.note("profile-message", e.message)
+  }
+}
+
+// ---------------------------------------------------------------- screen
+
+function Message(props: { id: string; text: string }) {
+  if (props.text === null || props.text === "") {
+    return null
+  }
+  return <Text id={props.id} color="#8a1c1c">{props.text}</Text>
+}
+
+function Field(props: { id: string; label: string; value: string; placeholder: string; ui: Screen }) {
+  return <Input
+    id={props.id}
+    label={props.label}
+    placeholder={props.placeholder}
+    value={props.value}
+    height={44}
+    onChange={t => props.ui.setDraft(props.id, t)}
+  />
+}
+
+function stateOf(slot: Slot, now: number): string {
+  if (slot.start <= now) {
+    return "past"
+  }
+  return slot.booked ? "booked" : "open"
+}
+
+function StaffPanel(props: { ui: Screen }) {
+  const ui = props.ui
+  const settings = Settings.get("main")
+  return <Column gap={8}>
+    <Text size={18}>Publish a slot</Text>
+    <Field id="new-title" label="Title" placeholder="Title, such as Haircut" value={ui.drafts["new-title"] ?? ""} ui={ui} />
+    <Field id="new-start" label="Start (UTC)" placeholder="YYYY-MM-DD HH:MM (UTC)" value={ui.drafts["new-start"] ?? ""} ui={ui} />
+    <Field id="new-minutes" label="Length in minutes" placeholder="Minutes (5 to 480)" value={ui.drafts["new-minutes"] ?? "30"} ui={ui} />
+    <Button id="publish" height={44} onPress={() => publishSlot(ui)}>Publish</Button>
+    <Message id="publish-error" text={ui.notes["publish-error"]} />
+
+    <Text size={18}>Settings</Text>
+    <Field id="check-url" label="Check address" placeholder="https://example.com/check (optional)" value={ui.drafts["check-url"] ?? settings.checkUrl} ui={ui} />
+    <Button id="save-check" height={44} onPress={() => saveCheck(ui, settings.checkUrl)}>Save check address</Button>
+    <Field id="reminder-minutes" label="Reminder minutes before" placeholder="Minutes before (1 to 1440)" value={ui.drafts["reminder-minutes"] ?? String(settings.reminderMinutes)} ui={ui} />
+    <Button id="save-reminder" height={44} onPress={() => saveReminder(ui, settings.reminderMinutes)}>Save reminder time</Button>
+    <Message id="settings-message" text={ui.notes["settings-message"]} />
+  </Column>
+}
+
+function CustomerPanel(props: { ui: Screen; profile: Profile; slots: Slot[] }) {
+  const ui = props.ui
+  const profile = props.profile
+  const mine = props.slots.filter(s => profile.bookings.includes(s.id))
+  return <Column gap={8}>
+    <Text size={18}>Your details</Text>
+    <Field id="profile-name" label="Name" placeholder="Name" value={ui.drafts["profile-name"] ?? profile.name} ui={ui} />
+    <Field id="profile-phone" label="Phone" placeholder="Phone" value={ui.drafts["profile-phone"] ?? profile.phone} ui={ui} />
+    <Button id="save-profile" height={44} onPress={() => saveProfile(ui, profile)}>Save details</Button>
+    <Message id="profile-message" text={ui.notes["profile-message"]} />
+
+    <Text size={18}>My bookings</Text>
+    <Column id="my-bookings" gap={4}>
+      {mine.length === 0 && <Text>No bookings yet.</Text>}
+      {mine.map(s => <Text key={s.id} id={"my-" + s.id}>{s.title}, {formatStart(s.start)} UTC, {s.minutes} min</Text>)}
+    </Column>
+
+    <Text size={18}>Reminders</Text>
+    <Column id="reminders" gap={4}>
+      {profile.reminders.length === 0 && <Text>No reminders.</Text>}
+      {profile.reminders.map(r => <Text key={"r" + r.booking} id={"reminder-" + r.slot}>{r.text}</Text>)}
+    </Column>
+
+    <Row gap={8}>
+      <Button id="my-data" height={44} onPress={() => showMyData(ui, profile)}>My data</Button>
+      <Button id="delete-account" height={44} onPress={() => deleteAccount(ui, profile)}>Delete my account</Button>
+    </Row>
+    {(ui.notes["my-data-view"] ?? "") !== "" && <Text id="my-data-view">{ui.notes["my-data-view"]}</Text>}
+  </Column>
+}
+
+function SlotRow(props: { key: string; slot: Slot; ui: Screen; staff: boolean; customer: boolean; mine: boolean; booker: Booker; now: number }) {
+  const s = props.slot
+  const state = stateOf(s, props.now)
+  return <Row key={props.key} id={"slot-" + s.id} gap={8} align="center" padding={8} border={1} radius={6}>
+    <Column grow={1} gap={2}>
+      <Text weight="bold">{s.title}</Text>
+      <Text>{formatStart(s.start)} UTC, {s.minutes} min</Text>
+      <Text id={"state-" + s.id}>{state}</Text>
+      {props.staff && props.booker !== null && <Text id={"booker-" + s.id}>{props.booker.name}, {props.booker.phone}</Text>}
+    </Column>
+    {props.customer && state === "open" && <Button id={"book-" + s.id} height={44} onPress={() => bookSlot(props.ui, s.id)}>Book</Button>}
+    {state === "booked" && (props.staff || (props.customer && props.mine)) && <Button id={"cancel-" + s.id} height={44} onPress={() => cancelSlot(props.ui, s.id)}>Cancel</Button>}
+    {props.staff && !s.booked && <Button id={"remove-" + s.id} height={44} onPress={() => removeSlot(props.ui, s.id)}>Remove</Button>}
+  </Row>
+}
+
+function App() {
+  const ui = Screen.get("main")
+  const slots = Schedule.get("main").slots.slice().sort((a, b) => a.start - b.start)
+  const signedIn = caller.id !== ""
+  const staff = caller.roles.includes("staff")
+  const customer = signedIn && !staff
+  const profile = customer ? Profile.get(caller.id) : null
+  const roster = staff ? Roster.get("main").entries : []
+  const now = Math.max(ui.now, Date.now())
+  return <Scroll>
+    <Column padding={16} gap={16}>
+      <Text size={24} weight="bold">Appointments</Text>
+      {!signedIn && <Text id="signin-prompt">Sign in to book an appointment.</Text>}
+      {staff && <StaffPanel ui={ui} />}
+      {customer && <CustomerPanel ui={ui} profile={profile} slots={slots} />}
+      <Text size={18}>Slots (times in UTC)</Text>
+      <Message id="book-error" text={ui.notes["book-error"]} />
+      <Message id="slot-error" text={ui.notes["slot-error"]} />
+      <Column id="slots" gap={8}>
+        {slots.length === 0 && <Text>No slots yet.</Text>}
+        {slots.map(s => <SlotRow
+          key={s.id}
+          slot={s}
+          ui={ui}
+          staff={staff}
+          customer={customer}
+          mine={customer && profile.bookings.includes(s.id)}
+          booker={roster.find(e => e.slot === s.id)}
+          now={now}
+        />)}
+      </Column>
+    </Column>
+  </Scroll>
+}
