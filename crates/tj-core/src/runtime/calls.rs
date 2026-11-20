@@ -89,7 +89,11 @@ impl Runtime {
     /// boot: if that input says a different user signed in (`identity`), their calls are
     /// dropped first, so nothing queued by one user leaves under another's token.
     pub(crate) fn load_outbox(&mut self) {
-        if let Some(outbox) = self.store.load(OUTBOX_KEY).and_then(|t| serde_json::from_str::<Outbox>(&t).ok()) {
+        let stored = self.store.load(OUTBOX_KEY).unwrap_or_else(|e| {
+            self.outputs.push(Output::Error { message: format!("could not read queued server calls: {e}"), trace: Vec::new() });
+            None
+        });
+        if let Some(outbox) = stored.and_then(|t| serde_json::from_str::<Outbox>(&t).ok()) {
             self.outbox_held = !outbox.pending.is_empty();
             self.outbox = outbox;
         }

@@ -11,13 +11,13 @@ use tj_core::{compile, Input, MemStore, Options, Output, PatchOp, Runtime, Store
 struct Shared(Rc<RefCell<MemStore>>);
 
 impl Store for Shared {
-    fn load(&mut self, key: &str) -> Option<String> {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
         self.0.borrow_mut().load(key)
     }
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
         self.0.borrow_mut().save(key, value)
     }
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.borrow_mut().keys(prefix)
     }
 }
@@ -1067,12 +1067,15 @@ fn waits_are_bounded_and_timers_merge() {
     assert_eq!(rt.stats()["waiting"], json!({ "Slot": 100 }));
 }
 
-/// A store whose saves can be made to fail, like a full or broken disk.
+/// A store whose saves, or reads, can be made to fail, like a full or broken disk.
 #[derive(Clone, Default)]
-struct Flaky(Shared, Rc<std::cell::Cell<bool>>);
+struct Flaky(Shared, Rc<std::cell::Cell<bool>>, Rc<std::cell::Cell<bool>>);
 
 impl Store for Flaky {
-    fn load(&mut self, key: &str) -> Option<String> {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        if self.2.get() {
+            return Err("permission denied".into());
+        }
         self.0.load(key)
     }
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
@@ -1081,7 +1084,7 @@ impl Store for Flaky {
         }
         self.0.save(key, value)
     }
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.keys(prefix)
     }
 }
@@ -1103,6 +1106,24 @@ fn a_failed_save_fails_the_call_and_changes_nothing() {
     store.1.set(false);
     assert_eq!(answer(rt.handle(3.0, add("one", 3))), (Some(json!(1)), None));
     assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["one"]));
+}
+
+#[test]
+fn a_record_that_cannot_be_read_fails_the_call_and_is_not_overwritten() {
+    let store = Flaky::default();
+    let boot = || Runtime::boot(compile(BOARD).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    let add = |text: &str| Input::Call { object: "Board/b".into(), method: "add".into(), args: vec![json!(text)], reply: Some(1), call: None, caller: Some(Caller::trusted()) };
+    boot().handle(1.0, add("kept"));
+
+    // After a restart the disk cannot be read: the object must not start empty, or its
+    // next save would replace what is stored.
+    let mut rt = boot();
+    store.2.set(true);
+    let out = rt.handle(2.0, add("lost"));
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { status: Some(503), error: Some(e), .. } if e.contains("could not be read"))), "{out:?}");
+    store.2.set(false);
+    rt.handle(3.0, add("next"));
+    assert_eq!(state(&mut rt, 4.0, "Board/b")["notes"], json!(["kept", "next"]));
 }
 
 #[test]

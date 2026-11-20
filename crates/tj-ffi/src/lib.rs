@@ -35,11 +35,11 @@ impl Measure for TjHost {
 }
 
 impl Store for TjHost {
-    fn load(&mut self, key: &str) -> Option<String> {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
         let mut buf = TjBuf(Vec::new());
         // SAFETY: the host promised valid callbacks for this runtime's lifetime.
         let found = unsafe { (self.load)(self.ctx, key.as_ptr(), key.len(), &mut buf) };
-        (found == 1).then(|| String::from_utf8(buf.0).ok()).flatten()
+        Ok((found == 1).then(|| String::from_utf8(buf.0).ok()).flatten())
     }
 
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
@@ -50,11 +50,11 @@ impl Store for TjHost {
         }
     }
 
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         let mut buf = TjBuf(Vec::new());
         // SAFETY: as above.
         unsafe { (self.keys)(self.ctx, prefix.as_ptr(), prefix.len(), &mut buf) };
-        String::from_utf8(buf.0).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default()
+        Ok(String::from_utf8(buf.0).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default())
     }
 }
 

@@ -93,8 +93,18 @@ Containers handle no layout props themselves. They place children at their frame
 ## Storage
 
 `Store` is synchronous: `load(key)`, `save(key, json)`, `keys(prefix)`. Keys are
-`Class/id` plus `tj:alarms`. The CLI uses one file per key, and the web host uses
-`localStorage`.
+`Class/id` plus `tj:alarms`. The CLI uses one file per key, readable by the server's user
+only, and the web host uses `localStorage`.
+
+A record that exists but cannot be read is an error, never "not found": an object that
+started empty would overwrite it on its next save. The call fails with status 503 instead.
+
+`tj serve` encrypts stored objects when `TJ_KEY_FILE` names a key file (made on first
+use). Names become keyed hashes and records are sealed with AES-256-GCM
+(`docs/trust.md`, section 5). A server refuses to start on a folder that mixes plain and
+encrypted records. `tj store rekey --data <dir>`, with the server stopped, encrypts an
+existing folder, or re-wraps it under the newest key after a line `k2 <64 hex>` is added
+to the key file.
 
 ## Foreign-language hosts
 

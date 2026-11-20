@@ -27,7 +27,8 @@
 use crate::audit::{Actor, Audit, Entry};
 use crate::auth::Automation;
 use crate::engine::{Engine, Failure};
-use crate::identity::{hex, random, sha256_hex, Identity};
+use crate::bytes::{hex, random};
+use crate::identity::{sha256_hex, Identity};
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;

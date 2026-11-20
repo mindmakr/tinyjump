@@ -124,7 +124,7 @@ impl Runtime {
         let mut seq = 0;
         let mut calls = Vec::new();
         let mut saved = String::new();
-        if let Some(text) = self.store.load(&handle.key()) {
+        if let Some(text) = self.store.load(&handle.key()).map_err(|e| Exc::msg(format!("{} could not be read: {e}", handle.key())))? {
             let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::msg(format!("{} has unreadable stored state: {e}", handle.key())))?;
             // Stored fields override defaults; fields no longer declared are dropped.
             let mut s = state.borrow_mut();
@@ -507,15 +507,16 @@ impl Runtime {
         let boot_err = |e: Exc| BootError { message: e.message(), trace: Vec::new() };
         // Change numbers start from the clock (x1000), so they keep growing even if the stored
         // counter is lost, as long as fewer than 1000 changes happen per millisecond.
-        let stored_seq = self.store.load(CHANGE_SEQ_KEY).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let read = |e: String| BootError { message: format!("could not read the store: {e}"), trace: Vec::new() };
+        let stored_seq = self.store.load(CHANGE_SEQ_KEY).map_err(read)?.and_then(|s| s.parse().ok()).unwrap_or(0);
         self.change_seq = stored_seq.max((self.now.max(0.0) as u64).saturating_mul(1000));
-        if let Some(text) = self.store.load(ALARM_INDEX_KEY) {
+        if let Some(text) = self.store.load(ALARM_INDEX_KEY).map_err(read)? {
             self.alarm_index = serde_json::from_str(&text).unwrap_or_default();
         }
         let mut keys: Vec<String> = self.alarm_index.iter().cloned().collect();
         let program = self.program.clone();
         for def in program.objects.iter().filter(|d| d.methods.values().any(|m| m.every.is_some())) {
-            keys.extend(self.store.keys(&format!("{}/", def.name)));
+            keys.extend(self.store.keys(&format!("{}/", def.name)).map_err(read)?);
         }
         for key in keys {
             let Some((class, id)) = key.split_once('/') else { continue };

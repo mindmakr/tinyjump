@@ -6,7 +6,6 @@ use crate::identity::sha256_hex;
 use crate::mailbox::{Event, Mailbox};
 use crate::plugins::Plugins;
 use crate::stats::Stats;
-use crate::store::FileStore;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,11 +55,11 @@ pub fn now_ms() -> f64 {
 /// requests are refused (`tj dev` only).
 fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runtime, Vec<Output>), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
-    let store = FileStore::open(data).map_err(|e| format!("cannot open data dir {}: {e}", data.display()))?;
-    let seed = crate::identity::random::<8>()?;
+    let (store, _) = crate::sealed::open_store(data)?;
+    let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
-    Runtime::boot(program, Box::new(store), opts).map_err(|e| format!("boot failed: {e}"))
+    Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))
 }
 
 impl Engine {

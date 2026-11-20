@@ -5,6 +5,7 @@ mod app;
 mod audit;
 mod auth;
 mod bench;
+mod bytes;
 mod engine;
 mod http;
 mod identity;
@@ -14,6 +15,7 @@ mod plugins;
 mod stats;
 mod mcp;
 mod review;
+mod sealed;
 mod store;
 
 use engine::Engine;
@@ -44,6 +46,8 @@ USAGE:
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
   tj key <name> --keys <file> [--role <r>]...
                                  make an API key (printed once; only its hash is stored in the file)
+  tj store rekey --data <dir>    with the server stopped: encrypt a folder's plain records, and re-wrap
+                                 sealed ones under the newest key in TJ_KEY_FILE
   tj audit verify --data <dir> [--checkpoints <copy>]
                                  check a server's audit log; with a copy of its checkpoints kept
                                  elsewhere, also catch a history rewritten by someone with the key
@@ -66,6 +70,8 @@ ENVIRONMENT (tj serve):
   TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
+  TJ_KEY_FILE     encrypts stored objects: a file only the server can read, made on first use.
+                  Back it up; add a line `k2 <64 hex>` and run `tj store rekey` to change keys
   TJ_AUDIT_KEY_FILE
                   the audit log's key (made on first start; default: audit.key in the data
                   folder). Keep it apart from the data, and back it up
@@ -159,6 +165,7 @@ fn main() -> ExitCode {
         "review" => review(&args.target),
         "stats" => inspect(&args.target).map(|s| print!("{}", stats::report(&s))),
         "audit" => audit_verify(&args),
+        "store" => store_rekey(&args),
         "mcp" => mcp::run(&args.target),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     };
@@ -235,6 +242,15 @@ fn check(file: &Path, access: bool) -> Result<(), String> {
     }
 }
 
+fn store_rekey(args: &Args) -> Result<(), String> {
+    let usage = "usage: tj store rekey --data <dir>  (with TJ_KEY_FILE set, and the server stopped)";
+    if args.file.as_deref() != Some(Path::new("rekey")) {
+        return Err(usage.into());
+    }
+    print!("{}", sealed::rekey(args.data.as_deref().ok_or(usage)?)?);
+    Ok(())
+}
+
 fn audit_verify(args: &Args) -> Result<(), String> {
     let usage = "usage: tj audit verify --data <dir> [--checkpoints <copy of checkpoints.jsonl>]";
     if args.file.as_deref() != Some(Path::new("verify")) {
@@ -271,6 +287,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // explains refusals, which a real server must not.
     let plugins = Arc::new(plugins::load(file, &args.plugins)?);
     plugins.start_all()?;
+    // Checked before anything starts: a folder that mixes plain and sealed records, or a key
+    // file that cannot be read, stops the server here.
+    let (_, storage) = sealed::open_store(&data)?;
     let (audit, audit_key) = audit::Audit::start(&data)?;
     let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
     let addr = format!("{}:{}", args.host, args.port);
@@ -289,7 +308,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let names = plugins.names();
     let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
     eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
-    eprintln!("audit log: {} (key: {audit_key})", data.join("audit").display());
+    eprintln!("storage: {storage}\naudit log: {} (key: {audit_key})", data.join("audit").display());
     http::serve(&addr, http::Front::new(engine, dev, automation, identity, audit))
 }
 

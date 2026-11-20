@@ -39,11 +39,11 @@ fn take_host_string(ptr: *mut u8, len: isize) -> Option<String> {
 }
 
 impl Store for HostStore {
-    fn load(&mut self, key: &str) -> Option<String> {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
         let mut out = std::ptr::null_mut();
         // SAFETY: valid key slice; the host writes a pointer to a fresh allocation into `out`.
         let len = unsafe { tj_host_load(key.as_ptr(), key.len(), &mut out) };
-        take_host_string(out, len)
+        Ok(take_host_string(out, len))
     }
 
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
@@ -54,11 +54,11 @@ impl Store for HostStore {
         }
     }
 
-    fn keys(&mut self, prefix: &str) -> Vec<String> {
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         let mut out = std::ptr::null_mut();
         // SAFETY: as in `load`.
         let len = unsafe { tj_host_keys(prefix.as_ptr(), prefix.len(), &mut out) };
-        take_host_string(out, len).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default()
+        Ok(take_host_string(out, len).map(|s| tj_core::host::parse_keys(&s)).unwrap_or_default())
     }
 }
 
