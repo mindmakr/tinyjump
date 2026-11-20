@@ -172,6 +172,9 @@ pub enum Effect {
     /// Call a method of an `@server` object on the server, sending `call` as the
     /// `Idempotency-Key` header; answer with its result, or with `unreachable` if no answer came.
     Call { object: String, method: String, args: Vec<Json>, call: String },
+    /// Call `method` of plugin `plugin` (docs/plugins.md); answer with its result. On a server,
+    /// `tj serve` runs the plugin as an MCP server: `tools/call` with `name = method`.
+    Plugin { plugin: String, method: String, args: Json },
 }
 
 /// One change to the native view tree. Node 0 is the host's root container.

@@ -24,6 +24,8 @@ const MAX_ERRORS: usize = 20;
 /// Compiles a source file (plus the prelude) to a program.
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
+    // Plugins that ship with tinyjump come with the compiler (see `modules::BUILT_IN`).
+    let src = &*modules::with_built_ins(src);
     // An app may be a bundle of files (see `modules`); each is parsed on its own.
     let files = modules::files(src);
     let mut errors = Vec::new();
@@ -153,6 +155,8 @@ struct Compiler {
     exports: Vec<HashSet<String>>,
     /// Names already reported as used without an import, so each is reported once per file.
     unimported: Vec<(u16, String)>,
+    /// Type names and the file declaring each: like values, they are shared by all files.
+    types: HashMap<String, u16>,
 }
 
 impl Compiler {
@@ -174,6 +178,7 @@ impl Compiler {
             imports: Vec::new(),
             exports: Vec::new(),
             unimported: Vec::new(),
+            types: HashMap::new(),
         };
         for (name, _) in GLOBALS {
             c.add_global(name, false, GKind::Builtin);
@@ -251,6 +256,15 @@ impl Compiler {
                         }
                     }
                 }
+                Item::TypeAlias { name, span, .. } if self.source == Source::User => match self.types.get(name) {
+                    Some(&other) if other != self.file => {
+                        let d = Diagnostic::new(format!("type '{name}' is already declared in {}", self.file_names[other as usize]), *span).hint("all files of an app share their top-level names; rename one");
+                        self.error(d);
+                    }
+                    _ => {
+                        self.types.insert(name.clone(), self.file);
+                    }
+                },
                 Item::TypeAlias { .. } => {}
             }
         }
@@ -618,6 +632,9 @@ impl Compiler {
     fn load_var(&mut self, name: &str, span: Span) {
         if let Some(Var::Global { .. }) = self.resolve(name) {
             self.check_imported(name, span);
+            if name == "plugin" && self.source == Source::User && !self.file_names.get(self.file as usize).is_some_and(|f| f.starts_with("tj:")) {
+                self.error(Diagnostic::new("`plugin()` is for plugin modules", span).hint("import the plugin's functions instead, e.g. import { complete } from \"tj:ai\""));
+            }
         }
         match self.resolve(name) {
             Some(Var::Local { slot, cell: false, .. }) => self.emit(Op::LoadLocal(slot), span),

@@ -1,7 +1,8 @@
 # Plugins
 
 How tinyjump gains capabilities (AI models, email, payments, device sensors) without
-growing its core. Status: design.
+growing its core. Status: server plugins and `tj:ai` are built, and the durable cart's shop
+assistant shows them. The `tj:agent` library and device plugins come next.
 
 ## Goals
 
@@ -29,7 +30,9 @@ import { complete } from "tj:ai"
 }
 ```
 
-Each plugin ships that module, `plugin.tj`: types and small `async` functions. Inside,
+Each plugin ships that module, `plugin.tj`: types and small `async` functions. Modules of
+plugins that ship with tinyjump live in `plugins/<name>/plugin.tj`. The compiler adds them
+to any app that imports them, so every host has them. Inside,
 they call the built-in `plugin(name, method, args)`. That built-in is allowed only in
 plugin modules, so app code has one way to reach a plugin: the typed import. A call becomes
 the effect `{ kind: "plugin", plugin, method, args }`. The caller's `await` waits for the
@@ -59,10 +62,11 @@ answer becomes an error. Why MCP:
 
 - `env` lists the variables passed through to the plugin. A plugin gets nothing else from
   the server's environment, so secrets reach only the plugin that needs them.
-- At start, `tj serve` checks that the plugin answers `initialize` and offers the tools the
-  plugin module uses. A missing tool fails at startup, not mid-request.
+- At start, `tj serve` checks that every plugin completes the MCP handshake. A broken
+  plugin fails at startup, not mid-request.
 - `tj dev` and the tests can use `--plugin ai=fake:<file.json>`, a scripted fake whose
-  answers are listed in a file. Tests then stay deterministic and free.
+  answers are listed in a file. Tests then stay deterministic and free. The durable cart
+  ships `fake-ai.json`.
 
 ## Device plugins (later)
 
@@ -91,10 +95,18 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
 
 ## Rollout
 
-1. **Core:** the `plugin` effect, `tj:` module names and the rule that only plugin modules
-   may call `plugin()`.
-2. **Server:** `plugins.json`, the stdio MCP client (startup check, timeouts, restart) and
-   the scripted fake.
-3. **`tj plugin ai`:** the Anthropic provider.
-4. **`tj:agent`:** the library, and a showcase app: a shop assistant for the durable cart
-   that adds and removes items on the shopper's behalf, within their permissions.
+1. **Done: core.** The `plugin` effect, `tj:` module names, and the rule that only plugin
+   modules may call `plugin()`.
+2. **Done: server.** `plugins.json`, the stdio MCP client (startup check, timeouts,
+   restart after a crash, cleared environment) and the scripted fake.
+3. **Done: `tj plugin ai`.** Claude through the Messages API:
+   - the model is `claude-opus-5-5` by default (`TJ_AI_MODEL`);
+   - effort is `medium` by default (`TJ_AI_EFFORT`);
+   - the API's refusal fallback is on;
+   - assistant turns are replayed unchanged.
+4. **Done: showcase.** `examples/durable-cart/assistant.tj` is a shop assistant. It adds
+   and removes items on the shopper's behalf, keeps the model's raw conversation in a
+   server-only object, and shows a public transcript.
+5. **Next: `tj:agent`.** A library that offers an app's methods as tools by name and
+   runs each tool call as the agent's caller under the access rules. The assistant
+   currently calls the cart from server code, which the rules do not check.

@@ -8,6 +8,8 @@ mod engine;
 mod http;
 mod identity;
 mod mailbox;
+mod plugin_server;
+mod plugins;
 mod stats;
 mod mcp;
 mod review;
@@ -36,6 +38,8 @@ USAGE:
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
   tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
+  tj plugin ai | fake <file.json>
+                                 run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
   tj key <name> --keys <file> [--role <r>]...
                                  make an API key (printed once; only its hash is stored in the file)
 
@@ -45,6 +49,8 @@ OPTIONS:
   --data <dir>    where objects are stored (default: .tj-data next to the app)
   --wasm <file>   web runtime for `dev` (default: the workspace's `cargo web` output)
   --target <url>  app automation endpoint (default http://127.0.0.1:4700; Android/iOS debug: :4701)
+  --plugin <name=fake:file.json>
+                  run plugin <name> as a scripted fake (tests, demos without keys)
   --as <name:role,role>
                   `dev` only: requests without credentials act as this user (dev:<name>)
 
@@ -69,6 +75,7 @@ struct Args {
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
+    plugins: Vec<String>,
 }
 
 impl Args {
@@ -81,7 +88,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new() };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new() };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -96,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
+            "--plugin" => args.plugins.push(value()?),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -103,6 +111,21 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
+    // `tj plugin <name> [file]` speaks MCP on stdio; it has its own arguments.
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("plugin") {
+        let Some(name) = raw.get(2) else {
+            eprintln!("error: tj plugin needs a name (ai, fake)\n\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        return match plugin_server::run(name, raw.get(3).map(Path::new)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -216,7 +239,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let identity = identity::Identity::new(args.as_user.as_deref())?;
     // In dev mode the browser runs the UI; the server keeps the backend objects. Dev also
     // explains refusals, which a real server must not.
-    let engine = Engine::start(source, data.clone(), false, dev_mode)?;
+    let plugins = Arc::new(plugins::load(file, &args.plugins)?);
+    plugins.start_all()?;
+    let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone())?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     let dev = if dev_mode {
@@ -230,7 +255,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     } else {
         None
     };
-    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
+    let names = plugins.names();
+    let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
+    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
     http::serve(&addr, http::Front::new(engine, dev, automation, identity))
 }
 

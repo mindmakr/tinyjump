@@ -19,6 +19,11 @@ pub fn read(entry: &Path) -> Result<App, String> {
     let mut i = 0;
     while i < names.len() {
         let path = dir.join(&names[i]);
+        // Plugin modules (`tj:ai`) are not files: the compiler adds them.
+        if names[i].starts_with("tj:") {
+            i += 1;
+            continue;
+        }
         match std::fs::read_to_string(&path) {
             Ok(src) => {
                 // Unparsable files still go in: compiling the bundle reports their errors.
@@ -39,7 +44,7 @@ pub fn read(entry: &Path) -> Result<App, String> {
         }
         i += 1;
     }
-    Ok(App { source: modules::bundle(&sources), files: names.iter().map(|n| dir.join(n)).collect() })
+    Ok(App { source: modules::bundle(&sources), files: names.iter().filter(|n| !n.starts_with("tj:")).map(|n| dir.join(n)).collect() })
 }
 
 #[cfg(test)]

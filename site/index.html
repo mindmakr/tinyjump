@@ -107,6 +107,8 @@
         <p class="note">Updated as each host lands. Old devices are in scope: Android 5.0+, 32-bit ARM, browsers without WebGPU.</p>
         <h2 style="margin-top:36px">Latest</h2>
         <ul class="log">
+          <li><b>Plugins and an AI shop assistant.</b> Capabilities come as plugins: typed modules backed by MCP servers, isolated in their own processes. The durable cart's assistant changes the cart in plain words through Claude, with the key kept on the server.</li>
+          <li><b>Secure by default.</b> Objects declare who may read them and call each method (<code>@read</code>, <code>@allow</code>, <code>caller</code>), and nothing is open without a rule. API keys, stream tickets and audit lines on the server; tokens on every host. Designed with an independent security review.</li>
           <li><b>Apps in several files.</b> <code>import { Cart } from "./cart"</code>, the TypeScript way, with errors that say which import to add. The durable cart is now three files.</li>
           <li><b>Calls that survive outages.</b> Server calls made offline wait in a durable outbox and run exactly once when the server is back. Replicas resume their change stream instead of refetching, and slow clients never build a backlog.</li>
           <li><b>Numbers to optimise.</b> <code>tj bench</code> times boot and rendering and counts the work; a size and speed budget fails any change that makes things worse. The server reports its latency and realtime fan-out lag.</li>

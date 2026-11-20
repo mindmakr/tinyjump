@@ -1,0 +1,16 @@
+{
+  "complete": [
+    {
+      "text": "",
+      "calls": [{ "id": "t1", "name": "add", "input": { "sku": "tea" } }],
+      "stop": "tool_use",
+      "raw": [{ "type": "tool_use", "id": "t1", "name": "add", "input": { "sku": "tea" } }]
+    },
+    {
+      "text": "Done: a green tea is in the cart.",
+      "calls": [],
+      "stop": "end_turn",
+      "raw": [{ "type": "text", "text": "Done: a green tea is in the cart." }]
+    }
+  ]
+}

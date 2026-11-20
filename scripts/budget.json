@@ -5,11 +5,11 @@
     "target/armv7-linux-androideabi/small/libtj_android.so": 720,
     "target/i686-linux-android/small/libtj_android.so": 1190,
     "target/x86_64-linux-android/small/libtj_android.so": 1170,
-    "target/release/tj": 5000
+    "target/release/tj": 5500
   },
   "apps": {
     "examples/chat/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 160, "patch_ops": 15, "renders": 1 },
-    "examples/durable-cart/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 930, "patch_ops": 37, "renders": 2 },
+    "examples/durable-cart/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 1120, "patch_ops": 42, "renders": 2 },
     "examples/smart-meter/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 10900, "patch_ops": 146, "renders": 13 },
     "examples/todo/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 11800, "patch_ops": 84, "renders": 61 }
   }

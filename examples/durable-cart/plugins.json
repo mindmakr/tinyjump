@@ -1,0 +1,3 @@
+{
+  "ai": { "command": ["tj", "plugin", "ai"], "env": ["ANTHROPIC_API_KEY", "TJ_AI_MODEL", "TJ_AI_EFFORT"] }
+}

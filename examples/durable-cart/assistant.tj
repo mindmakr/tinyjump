@@ -1,0 +1,89 @@
+// A shop assistant: ask in plain words ("two teas, please") and it changes the shared cart
+// through the same methods the screen uses. It calls a language model through the tj:ai
+// plugin, on the server, so the API key never reaches a device (see plugins.json).
+
+import { complete, Message, Tool, ToolCall, ToolResult } from "tj:ai"
+import { Cart } from "./cart"
+import { Shelf } from "./shelf"
+
+type ChatLine = { who: string, text: string }
+
+const SKU = { type: "object", properties: { sku: { type: "string", description: "the product's sku" } }, required: ["sku"] }
+const TOOLS: Tool[] = [
+  { name: "add", description: "Put one unit of a product in the shared cart.", input: SKU },
+  { name: "remove", description: "Take one unit of a product out of the shared cart.", input: SKU },
+]
+const MAX_STEPS = 6
+const STUCK_MS = 2 * 60 * 1000
+
+/// The model's side of the conversation. It holds the model's raw turns, so it has no
+/// @read rule: only server code sees it.
+@server object AssistantMemory {
+  messages: Message[] = []
+  remember(m: Message) { this.messages.push(m) }
+  forget() { this.messages = [] }
+}
+
+/// What everyone sees: questions and answers.
+export @server @read("anyone") object Assistant {
+  lines: ChatLine[] = []
+  busy: boolean = false
+  startedAt: number = 0
+
+  /// `name` is the shopper's display name.
+  @allow("anyone") async ask(question: string, name: string) {
+    const q = question.trim()
+    if (q === "") { throw new Error("ask something first") }
+    if (this.busy && Date.now() - this.startedAt < STUCK_MS) { throw new Error("the assistant is answering someone; try again in a moment") }
+    this.busy = true
+    this.startedAt = Date.now()
+    this.say(name, q)
+    const memory = AssistantMemory.get(this.id)
+    memory.remember({ role: "user", text: q })
+    try {
+      for (let step = 0; step < MAX_STEPS; step += 1) {
+        const reply = await complete(this.instructions(), memory.messages, TOOLS)
+        memory.remember({ role: "assistant", raw: reply.raw })
+        if (reply.text !== "") { this.say("assistant", reply.text) }
+        if (reply.stop === "refusal") { this.say("assistant", "I can't help with that.") }
+        if (reply.calls.length === 0) { break }
+        const results: ToolResult[] = []
+        for (const call of reply.calls) { results.push(this.use(call, name)) }
+        memory.remember({ role: "user", results })
+      }
+    } catch (e) {
+      // A broken turn would leave a tool call without its result; start the conversation over.
+      memory.forget()
+      this.say("assistant", `Sorry, I could not answer: ${e.message}`)
+    }
+    this.busy = false
+  }
+
+  private use(call: ToolCall, name: string): ToolResult {
+    const cart = Cart.get("demo")
+    try {
+      if (call.name === "add") {
+        cart.add(call.input.sku, `${name} (via the assistant)`)
+      } else if (call.name === "remove") {
+        cart.remove(call.input.sku, `${name} (via the assistant)`)
+      } else {
+        return { id: call.id, output: `there is no tool ${call.name}`, error: true }
+      }
+      return { id: call.id, output: `done; the cart total is ${cart.total}` }
+    } catch (e) {
+      return { id: call.id, output: e.message, error: true }
+    }
+  }
+
+  private instructions(): string {
+    const products = Shelf.get("main").products.map(p => ({ sku: p.sku, name: p.name, price: p.price, stock: p.stock }))
+    return "You are the assistant of a small tea shop. Change the shared cart with the tools when asked. " +
+      `Products: ${JSON.stringify(products)}. Cart now: ${JSON.stringify(Cart.get("demo").lines)}. ` +
+      "Answer in one or two short sentences."
+  }
+
+  private say(who: string, text: string) {
+    this.lines.push({ who, text })
+    if (this.lines.length > 20) { this.lines.shift() }
+  }
+}

@@ -2,6 +2,7 @@
 //! replies, HTTP effects (worker pool), realtime broadcasts, logs and timers.
 
 use crate::mailbox::{Event, Mailbox};
+use crate::plugins::Plugins;
 use crate::stats::Stats;
 use crate::store::FileStore;
 use serde_json::{json, Value as Json};
@@ -60,7 +61,7 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runti
 
 impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
-    pub fn start(source: String, data: PathBuf, render: bool, explain: bool) -> Result<Engine, String> {
+    pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
@@ -69,7 +70,7 @@ impl Engine {
             .spawn(move || match boot(&source, &data, render, explain) {
                 Ok((rt, out)) => {
                     let _ = ready_tx.send(Ok(()));
-                    run(rt, out, rx, back, data, render, explain);
+                    run(rt, out, rx, back, data, render, explain, plugins);
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -152,8 +153,9 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<(), Fai
     objects.iter().try_for_each(|o| rt.may_read(o, caller).map_err(|why| (403, why)))
 }
 
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool) {
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back) };
+#[allow(clippy::too_many_arguments)]
+fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>) {
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects: effect_pool(back, plugins) };
     d.outputs(boot_out);
     loop {
         let msg = match rt.next_wake() {
@@ -265,16 +267,16 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>) -> Sender<(u32, Effect)> {
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>) -> Sender<(u32, Effect)> {
     let (tx, rx) = channel::<(u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT).build();
     for i in 0..EFFECT_WORKERS {
-        let (rx, back, agent) = (rx.clone(), back.clone(), agent.clone());
+        let (rx, back, agent, plugins) = (rx.clone(), back.clone(), agent.clone(), plugins.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
             let Ok((id, effect)) = job else { return };
-            if back.send(Msg::EffectDone(id, perform(&agent, effect))).is_err() {
+            if back.send(Msg::EffectDone(id, perform(&agent, &plugins, effect))).is_err() {
                 return;
             }
         });
@@ -285,9 +287,11 @@ fn effect_pool(back: Sender<Msg>) -> Sender<(u32, Effect)> {
     tx
 }
 
-fn perform(agent: &ureq::Agent, effect: Effect) -> Result<Json, String> {
-    let Effect::Http { url, method, headers, body } = effect else {
-        return Err("server objects live here; there is no server to call".into());
+fn perform(agent: &ureq::Agent, plugins: &Plugins, effect: Effect) -> Result<Json, String> {
+    let (url, method, headers, body) = match effect {
+        Effect::Http { url, method, headers, body } => (url, method, headers, body),
+        Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args),
+        Effect::Call { .. } => return Err("server objects live here; there is no server to call".into()),
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(format!("only http(s) URLs can be fetched: {url}"));
@@ -335,7 +339,7 @@ mod tests {
     fn streams_resume_from_the_clients_change_number() {
         let data = std::env::temp_dir().join(format!("tj-engine-test-{}", std::process::id()));
         let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/chat/app.tj")).expect("chat example");
-        let engine = Engine::start(source, data.clone(), false, false).expect("boots");
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default()).expect("boots");
         let post = |text: &str| engine.request(Input::Call { object: "Room/lobby".into(), method: "post".into(), args: vec![json!("ana"), json!(text)], reply: None, call: None, caller: Some(Caller::trusted()) });
         post("one").expect("posted");
 

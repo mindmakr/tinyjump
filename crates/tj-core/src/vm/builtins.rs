@@ -25,6 +25,8 @@ pub const GLOBALS: &[Global] = &[
     ("parseFloat", || native("parseFloat", |_, a| Ok(Value::Num(parse_float_prefix(&arg(a, 0).display()))))),
     ("Error", || native("Error", |_, a| Ok(error_record(&arg(a, 0).display())))),
     ("__fetch", || native("fetch", fetch)),
+    // Only plugin modules (`tj:<name>`) may call it; apps import their typed functions.
+    ("plugin", || native("plugin", plugin)),
     ("__sort", || native("sort", sort)),
 ];
 
@@ -226,6 +228,14 @@ fn fetch(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
         Some(other) => Some(other.to_string()),
     };
     Ok(Value::Promise(rt.fetch(url.to_string(), method, headers, body)))
+}
+
+/// `plugin(name, method, args)`: a call to a plugin, answered by the host (docs/plugins.md).
+fn plugin(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let name = text(a, 0, "plugin")?.to_string();
+    let method = text(a, 1, "plugin")?.to_string();
+    let args = arg(a, 2).to_json().map_err(|e| Exc::msg(format!("plugin arguments must be data: {e}")))?;
+    Ok(Value::Promise(rt.plugin_call(name, method, args)))
 }
 
 fn sort(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {

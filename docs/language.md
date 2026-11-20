@@ -81,24 +81,51 @@ object Cart {
 ## Server objects
 
 ```tsx
-@server object Room {
+@server @read("anyone") object Room {
   messages: Message[] = []
-  post(author: string, text: string) { this.messages.push({ author, text, at: Date.now() }) }
+  @allow("signedIn") post(text: string) { this.messages.push({ author: caller.id, text, at: Date.now() }) }
 }
 ```
 
 An `@server` object lives on the server (`tj serve` / `tj dev`). Each device holds a
 replica of it:
 
-- **Reads** (`room.messages`) come from the replica. It's cached on the device, so it also
+- **Reads** (`room.messages`) come from the replica. It is cached on the device, so it also
   shows while offline.
-- **Method calls** run on the server and return a promise. `await room.post(...)` gives you
-  the result, and a failure (offline, or the method throws) arrives as an exception you can
-  catch.
+- **Method calls** run on the server and return a promise. While offline they wait in a
+  queue and run exactly once when the server is back. A method that throws rejects the
+  promise.
 - **Changes** from any device stream back over realtime, and every replica re-renders.
 
 The server is the single authority, so there are no conflicts to resolve. Timers on
 `@server` objects run on the server only.
+
+## Access: who may read and call
+
+Without a rule, nothing can be read or called from outside the server:
+
+- `@read("anyone" | "signedIn" | "owner" | "<role>", ...)` on an object says who may read
+  it remotely, including device replicas.
+- `@allow(...)` on a method says who may call it remotely.
+- `"owner"` is the caller whose id is the object's id, as in `Cart.get(caller.id)`.
+
+Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take identity from
+`caller.id`, never from arguments. `tj check app.tj --access` prints every rule. Details:
+[access control](access-control.md).
+
+## Plugins
+
+Capabilities such as AI models come as plugins: typed modules named `tj:<name>`, run on the
+server.
+
+```tsx
+import { complete } from "tj:ai"
+const reply = await complete("Be brief.", [{ role: "user", text: "Hi" }], [])
+```
+
+Inside a plugin module, `plugin(name, method, args)` calls the plugin; app code imports the
+plugin's functions instead. The server starts plugins from `plugins.json`. Details:
+[plugins](plugins.md).
 
 Plain objects (no decorator) live wherever the code runs: device-local state on a device,
 and backend state on the server.

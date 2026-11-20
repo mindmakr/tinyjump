@@ -26,7 +26,7 @@ pub fn report(source: &str) -> String {
             let where_ = if server { "@server object" } else { "object" };
             table.push_str(&format!("{where_} {}  read: {}\n", o.name, read.as_deref().unwrap_or("not remote")));
             if server && read.is_none() {
-                warnings.push(format!("@server object {} has no @read rule, so devices cannot hold replicas of it", o.name));
+                warnings.push(format!("@server object {} has no @read rule: only server code can read it, and devices cannot hold replicas (right for private data)", o.name));
             }
             for m in &o.methods {
                 let name = &m.func.name;
