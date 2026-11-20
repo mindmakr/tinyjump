@@ -95,3 +95,34 @@ The parts come in the order 1, 2, 3, 4. For each:
 The booking app is then rebuilt in Round 2, from the spec and the docs alone, by a new
 builder, and reviewed blind. Success means the new app contains none of the hand-written
 code in `lessons.md`.
+
+## Addendum: part 1 after measuring (wasm, `opt-level=z`, LTO; baseline 15 KB)
+
+| Option | Added size |
+|---|---|
+| `jiff` (parse, format, arithmetic) | +248 KB |
+| `time`, with format strings parsed at run time | +65 KB |
+| `time`, with fixed formats (compile-time macros) | +38 KB |
+| `time`, calendar arithmetic only | **+5 KB** |
+
+The devices' budget is about 725 KB, so `jiff` is out. A better split also follows the
+owner's "system libraries where possible":
+
+- **Display:** `<Time value={ms} show="date" | "time" | "datetime" />`, a catalog component
+  that the host formats with the platform's own formatter: `Intl.DateTimeFormat` on the
+  web, `java.time` `DateTimeFormatter` on Android, `DateFormatter` on iOS.
+  - It is right in the viewer's language and time zone at no cost to the core, and it is
+    the locale work the vision already plans.
+  - `zone="UTC"` is optional, for Milestone 1.
+- **Input:** `<Input type="date" | "time" | "datetime">` uses the native pickers and gives
+  milliseconds (UTC). Nobody parses dates by hand.
+- **Arithmetic in the core:** built-ins on the `time` crate, calendar part only (+5 KB):
+  - `Time.add(ms, { months: 1, minutes: 30 })`;
+  - `Time.startOf(ms, "day")`;
+  - `Time.parts(ms)`, giving `{ year, month, day, hour, minute, weekday }` in UTC.
+- **Text built in code** (a reminder that reads "Cut at 14:30"):
+  - store the time, and show it with `<Time>`;
+  - for text that has to leave the app (an email), servers get
+    `Time.format(ms, pattern, zone)` on the full `time` crate with the system's zone data.
+    That is a server-only built-in, with no cost on devices, and the compiler says so if a
+    device uses it.
