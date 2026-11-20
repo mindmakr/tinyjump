@@ -2432,6 +2432,9 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
     // Marked @pii but not a @by list: export and erasure still could not find it.
     let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Cache {{\n  @pii(\"contact\", \"booking\") names: string[] = []\n}}\n@server @read(\"owner\") object P {{\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") copy() {{ Cache.get(\"c\").names.push(reveal(this.name, \"booking\")) }}\n}}\n"));
     assert!(e.contains("where export and erasure cannot find whose it is"), "{e}");
+    // A personal field on a shared object's own method is no better: the slot is not the person.
+    let e = msg("@server @read(\"owner\") object Profile {\n  @pii(\"contact\", \"booking\") name: string = \"\"\n}\n@server @read(\"anyone\") object Slot {\n  @pii(\"contact\", \"booking\") bookerName: string = \"\"\n  @allow(\"signedIn\") book() { this.bookerName = reveal(Profile.get(caller.id).name, \"booking\") }\n}\n");
+    assert!(e.contains("is kept in `this.bookerName`, where export and erasure cannot find whose it is"), "{e}");
     // A device object may hold what the server revealed: it is cleared at sign-out.
     let e = msg("@server @read(\"owner\") object P {\n  @pii(\"contact\", \"booking\") name: string = \"\"\n  @allow(\"owner\") mine(): string { return reveal(this.name, \"booking\") }\n}\nobject Screen {\n  shown: string = \"\"\n  async load() { this.shown = await P.get(caller.id).mine() }\n}\n");
     assert_eq!(e, "", "a device object may show it");
