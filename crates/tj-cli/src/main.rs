@@ -55,6 +55,8 @@ OPTIONS:
                   `dev` only: requests without credentials act as this user (dev:<name>)
 
 ENVIRONMENT (tj serve):
+  TJ_ISSUER       sign-in provider (OpenID Connect issuer URL); TJ_AUDIENCE: the app's client id
+  TJ_ROLES_CLAIM  where tokens carry roles, e.g. realm_access.roles (none by default)
   TJ_KEYS         file of API key hashes (see `tj key`)
   TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)

@@ -242,6 +242,8 @@ can come later, as a plugin.
 
 ## Rollout in this repo
 
+All five steps are done.
+
 1. **Core:**
    - the `@read` and `@allow` decorators, with their compile errors;
    - `caller` on fibers and alarms;

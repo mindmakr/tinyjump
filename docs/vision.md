@@ -43,8 +43,8 @@ and plugins with `tj:ai`.
 
 Next, agreed with the owner on 2026-11-20:
 
-1. **Sign-in tokens** from OpenID Connect providers, proven against a built-in test issuer
-   (no real accounts needed in tests).
+1. **Sign-in tokens (done)** from OpenID Connect providers, proven against a built-in test
+   issuer (no real accounts needed in tests).
 2. **The agent library (`tj:agent`):** an agent's tools are the app's own methods, called
    under the same access rules as the person it acts for.
 3. **Servers talking to each other:** replicas of another server's objects, then webhooks.
@@ -137,7 +137,7 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
    call carries an id, and the server drops duplicates, so a retry never runs twice.
 3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
    objects, and durable object-to-object messages on the server.
-4. **Backpressure and access control (done; OIDC sign-in tokens next).** Slow subscribers
+4. **Backpressure and access control (done, with sign-in tokens).** Slow subscribers
    are coalesced to the latest state, and each object declares who may read and call it
    (`docs/access-control.md`).
 
