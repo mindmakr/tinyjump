@@ -74,6 +74,9 @@ impl Taint {
 enum Val {
     Data(Taint),
     Handle { class: Rc<str>, other: bool },
+    /// A list of a class's objects (`Class.all()`), which may be anyone's: each element is a
+    /// handle, so only their `@pii` fields count as personal data.
+    Handles { class: Rc<str> },
     /// An array or record: the taint of everything put in it, shared by its aliases.
     Cell(Rc<RefCell<Taint>>),
     Func(Rc<FnDecl>),
@@ -347,17 +350,21 @@ impl Checker {
         }
     }
 
+    /// Every personal field of a class's objects, as one value.
+    fn whole(&self, class: &Rc<str>, other: bool) -> Taint {
+        let Some(info) = self.classes.get(class) else { return Taint::default() };
+        let fields: BTreeSet<Field> = info.pii.keys().map(|f| (class.clone(), f.clone())).collect();
+        let from = (!fields.is_empty()).then(|| Rc::from(format!("the whole {class} object")));
+        Taint { fields, other, from, ..Taint::default() }
+    }
+
     fn flatten(&self, v: &Val) -> Taint {
         match v {
             Val::Data(t) => t.clone(),
             Val::Cell(c) => c.borrow().clone(),
             Val::Func(_) => Taint::default(),
-            Val::Handle { class, other } => {
-                let Some(info) = self.classes.get(class) else { return Taint::default() };
-                let fields: BTreeSet<Field> = info.pii.keys().map(|f| (class.clone(), f.clone())).collect();
-                let from = (!fields.is_empty()).then(|| Rc::from(format!("the whole {class} object")));
-                Taint { fields, other: *other, from, ..Taint::default() }
-            }
+            Val::Handle { class, other } => self.whole(class, *other),
+            Val::Handles { class } => self.whole(class, true),
         }
     }
 
@@ -559,8 +566,11 @@ impl Checker {
             }
             Stmt::ForOf { pattern, iter, body } => {
                 let v = self.expr(iter, fr);
-                let t = self.flatten(&v);
-                self.bind(pattern, Val::Data(t), fr);
+                let elem = match &v {
+                    Val::Handles { class } => Val::Handle { class: class.clone(), other: true },
+                    v => Val::Data(self.flatten(v)),
+                };
+                self.bind(pattern, elem, fr);
                 self.block(body, fr);
             }
             Stmt::For { init, cond, update, body } => {
@@ -913,6 +923,9 @@ impl Checker {
                     }
                     _ => {}
                 }
+                if name == "all" && self.classes.contains_key(ns.as_str()) {
+                    return Val::Handles { class: Rc::from(ns.as_str()) };
+                }
                 if name == "get" && self.classes.contains_key(ns.as_str()) {
                     let own = args.first().is_some_and(|a| is_member(a, "this", "id") || (fr.owner_only && is_member(a, "caller", "id")));
                     self.union(&arg_refs, fr);
@@ -961,6 +974,37 @@ impl Checker {
             if let Some(m) = method {
                 let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
                 return Val::Data(self.call(&m, vals, Some((class.clone(), *other)), Endpoint::Internal, None));
+            }
+        }
+        // A list of objects keeps being one through filter, sort and slice; its elements are
+        // handles in callbacks and through find.
+        if let Val::Handles { class } = &recv {
+            if CALLBACK_METHODS.contains(&name) || name == "slice" {
+                let elem = Val::Handle { class: class.clone(), other: true };
+                if let (Some(ExprKind::Arrow(f)), true) = (args.first().map(|a| &a.kind), CALLBACK_METHODS.contains(&name)) {
+                    let this = fr.this.clone();
+                    // reduce's callback takes the accumulator first, then the element; what
+                    // it returns becomes the accumulator, so both run through it.
+                    let cb_args = if name == "reduce" {
+                        let init = args.get(1).map(|a| self.expr(a, fr)).unwrap_or_else(clean);
+                        let mut acc = self.flatten(&init);
+                        acc.join(&self.whole(class, true));
+                        vec![Val::Data(acc), elem.clone(), clean(), recv.clone()]
+                    } else {
+                        vec![elem.clone(), clean(), recv.clone()]
+                    };
+                    let ret = self.call(f, cb_args, this, Endpoint::Internal, Some(&mut fr.vars));
+                    return match name {
+                        "map" | "flatMap" | "reduce" => Val::Data(ret),
+                        "some" | "every" | "findIndex" | "forEach" => clean(),
+                        "find" => elem,
+                        _ => recv.clone(),
+                    };
+                }
+                return recv.clone();
+            }
+            if name == "length" {
+                return clean();
             }
         }
         let rt = self.flatten(&recv);

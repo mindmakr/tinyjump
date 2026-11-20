@@ -66,7 +66,8 @@ pub type Rule = Rc<[Rc<str>]>;
 /// Whether the caller with id `caller_id` owns the object with id `object_id`: the object
 /// is theirs. Anonymous callers own nothing, even an object with an empty id.
 pub fn owns(caller_id: &str, object_id: &str) -> bool {
-    !caller_id.is_empty() && caller_id == object_id
+    // `*` is a whole class (`Slot/*`), which nobody owns.
+    !caller_id.is_empty() && object_id != "*" && caller_id == object_id
 }
 
 /// Whether `rule` lets `who` act on the object with id `object_id`.

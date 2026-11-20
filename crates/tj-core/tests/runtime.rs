@@ -1044,6 +1044,18 @@ function tools(o: string) { return [{ name: "email", object: o, method: "myEmail
     let e = flow(r#"@allow("support") async look(id: string): any { return await exportData(id) }"#, export);
     assert!(e.contains("exportData(...)") && e.contains("is returned here to callers who do not own it"), "{e}");
 
+    // A list from Class.all() may be anyone's: personal fields from it are other people's,
+    // the rest are not personal at all.
+    let e = flow(r#"@allow("signedIn") everyone(): string[] { return Account.all().map(a => a.email) }"#, "");
+    assert!(e.contains("is returned here to callers who do not own it"), "{e}");
+    let e = flow(r#"@allow("signedIn") plans(): string[] { return Account.all().filter(a => a.plan !== "").map(a => a.plan) }"#, "");
+    assert_eq!(e, "", "plain fields of anyone's objects are not personal data");
+    // reduce's callback takes the accumulator first: the element is still anyone's object.
+    let e = flow(r#"@allow("signedIn") joined(): string { return Account.all().reduce((acc, a) => acc + a.email, "") }"#, "");
+    assert!(e.contains("is returned here to callers who do not own it"), "{e}");
+    let e = flow(r#"@allow("signedIn") both(): any { return Account.all().concat(Account.all().map(a => a.email)) }"#, "");
+    assert!(e.contains("is returned here"), "concat's argument is checked: {e}");
+
     // Purposes are enforced, and mixing fields for different purposes is refused.
     assert_eq!(flow(r#"@allow("owner") async bill() { await fetch("https://pay.example/?e=" + reveal(this.email, "billing")) }"#, ""), "");
     let e = flow(r#"@allow("owner") async ad() { await fetch("https://ads.example/?e=" + reveal(this.email, "ads")) }"#, "");
@@ -2306,4 +2318,98 @@ function App() {
     let create = patches(&out).into_iter().find(|op| matches!(op, PatchOp::Create { props, .. } if props.get("id") == Some(&json!("new-title")))).expect("the title input");
     let PatchOp::Create { props, .. } = create else { unreachable!() };
     assert_eq!(props.get("label"), Some(&json!("Title")));
+}
+
+#[test]
+fn an_alarm_can_be_cancelled_by_its_handle_even_after_a_restart() {
+    let src = r#"@server object Booking {
+  reminder: number = 0
+  sent: string[] = []
+  book(at: number) { this.reminder = this.schedule(at, "remind", "first") }
+  cancel(): boolean { return this.unschedule(this.reminder) }
+  remind(what: string) { this.sent.push(what) }
+}
+"#;
+    let store = Shared::default();
+    let opts = || Options { server: true, render: false, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    call(&mut rt, 1.0, "Booking/b", "book", json!([1000])).unwrap();
+    let handle = state(&mut rt, 2.0, "Booking/b")["reminder"].clone();
+    assert!(handle.as_f64().unwrap() > 0.0);
+    // After a restart the saved handle still names the same alarm.
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { now: 10.0, ..opts() }).unwrap().0;
+    assert_eq!(state(&mut rt, 11.0, "Booking/b")["reminder"], handle);
+    assert_eq!(call(&mut rt, 12.0, "Booking/b", "cancel", json!([])).unwrap(), json!(true));
+    assert_eq!(call(&mut rt, 13.0, "Booking/b", "cancel", json!([])).unwrap(), json!(false), "already gone");
+    rt.handle(5000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 5001.0, "Booking/b")["sent"], json!([]), "a cancelled alarm never runs");
+    // One that is not cancelled runs once.
+    call(&mut rt, 6000.0, "Booking/b", "book", json!([100])).unwrap();
+    rt.handle(6200.0, Input::Tick);
+    assert_eq!(state(&mut rt, 6201.0, "Booking/b")["sent"], json!(["first"]));
+}
+
+const SLOTS: &str = r#"@server @read("anyone") object Slot {
+  title: string = ""
+  @allow("anyone") name(t: string) { this.title = t }
+}
+@server object Desk {
+  titles: string[] = []
+  look() { this.titles = Slot.all().filter(s => s.title !== "").map(s => s.title) }
+}
+"#;
+
+#[test]
+fn all_lists_a_class_from_storage_on_a_server_and_by_class_stream_on_a_device() {
+    let store = Shared::default();
+    let opts = || Options { server: true, render: false, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(SLOTS).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    for (id, t) in [("s2", "Shave"), ("s1", "Cut")] {
+        call_as(&mut rt, 1.0, &format!("Slot/{id}"), "name", json!([t]), who("", &[])).unwrap();
+    }
+    // A fresh server finds them in storage, in id order.
+    let mut rt = Runtime::boot(compile(SLOTS).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    call(&mut rt, 2.0, "Desk/main", "look", json!([])).unwrap();
+    assert_eq!(state(&mut rt, 3.0, "Desk/main")["titles"], json!(["Cut", "Shave"]));
+
+    // A device asks for the whole class, and the list fills as the server sends it.
+    let src = format!("{SLOTS}\nfunction App() {{\n  return <Column>{{Slot.all().map(s => <Text key={{s.id}}>{{s.title}}</Text>)}}</Column>\n}}\n");
+    let (mut device, out) = boot_as(&src, Shared::default(), 0.0, false);
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, .. } if object == "Slot/*")), "{out:?}");
+    let out = device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
+    assert!(format!("{out:?}").contains("Beard"), "a slot the device had never seen is shown: {out:?}");
+    assert!(compile("@server object A {}\nobject B { f() { A.get(\"*\") } }").is_ok(), "compiles; `*` is refused when run");
+}
+
+#[test]
+fn a_class_stream_resumes_with_the_newest_changes_and_starts_over_for_a_new_user() {
+    // Over the cap, catching up keeps the most recent changes, whatever the ids.
+    let mut rt = server(SLOTS, false);
+    for i in 0..1005 {
+        call_as(&mut rt, 1.0 + i as f64, &format!("Slot/s{:04}", 1005 - i), "name", json!(["x"]), who("", &[])).unwrap();
+    }
+    let seq = |o: &Output| match o {
+        Output::Changed { seq, .. } => *seq,
+        _ => 0,
+    };
+    let all = rt.changed_since(&["Slot/*".into()], 0);
+    assert_eq!(all.len(), 1000);
+    let newest = all.iter().map(seq).max().unwrap();
+    assert!(all.iter().any(|o| matches!(o, Output::Changed { object, .. } if object == "Slot/s0001")), "the last one changed is sent");
+    let resumed = rt.changed_since(&["Slot/*".into(), "Slot/s0001".into()], newest - 1);
+    assert_eq!(resumed.len(), 1, "resuming sends the newest change once: {resumed:?}");
+
+    // A device lists the replicas it kept, offline, before the server answers.
+    let src = format!("{SLOTS}\nfunction App() {{\n  return <Column>{{Slot.all().map(s => <Text key={{s.id}}>{{s.title}}</Text>)}}</Column>\n}}\n");
+    let store = Shared::default();
+    let (mut device, _) = boot_as(&src, store.clone(), 0.0, false);
+    device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
+    device.handle(1.5, Input::Tick);
+    let (mut device, out) = boot_as(&src, store, 2.0, false);
+    assert!(format!("{out:?}").contains("Beard"), "kept replicas are listed offline: {out:?}");
+    // Another user signs in: the class is asked for again, and the old replicas are not members.
+    let out = device.handle(3.0, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
+    assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, .. } if object == "Slot/*")), "{out:?}");
+    assert!(!format!("{out:?}").contains("Beard"), "{out:?}");
+    assert!(!tj_core::runtime::access::owns("*", "*"), "nobody owns a whole class");
 }

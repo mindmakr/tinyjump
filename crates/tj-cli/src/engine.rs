@@ -662,6 +662,37 @@ mod tests {
     }
 
     #[test]
+    fn a_class_stream_carries_every_object_of_the_class_its_reader_may_read() {
+        let data = std::env::temp_dir().join(format!("tj-engine-class-{}", std::process::id()));
+        let source = "@server @read(\"anyone\") object Slot {
+  title: string = \"\"
+  @allow(\"anyone\") name(t: string) { this.title = t }
+}
+@server @read(\"owner\") object Profile {
+  name: string = \"\"
+}
+".to_string();
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
+        let anyone = || Some(Caller::Remote { id: String::new(), roles: Vec::new() });
+        let name = |id: &str, t: &str| engine.request(Input::Call { object: format!("Slot/{id}"), method: "name".into(), args: vec![json!(t)], reply: None, call: None, caller: anyone() }).expect("named");
+        name("s1", "Cut");
+        let (events, refused) = engine.subscribe(vec!["Slot/*".into(), "Profile/*".into()], 0, anyone()).expect("opens");
+        assert_eq!(refused, ["Profile/*"], "a class read only by its owners cannot be streamed whole");
+        let read = |until: &str| {
+            let (mut text, start) = (String::new(), std::time::Instant::now());
+            while !text.contains(until) && start.elapsed() < Duration::from_secs(2) {
+                text.extend(events.take(Duration::from_millis(200)).into_iter().map(|e| e.text));
+            }
+            text
+        };
+        assert!(read("Cut").contains("\"object\":\"Slot/s1\""), "it starts with the class's objects");
+        name("s2", "Shave");
+        assert!(read("Shave").contains("\"object\":\"Slot/s2\""), "and carries new ones");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
     fn servers_fetch_only_public_addresses() {
         for inside in ["127.0.0.1:80", "[::1]:80", "10.1.2.3:443", "192.168.1.1:80", "172.16.0.9:80", "169.254.169.254:80", "100.64.0.1:80", "0.0.0.0:80", "[fd00::1]:80", "[fe80::1]:80", "[::ffff:127.0.0.1]:80", "localhost:80"] {
             assert!(public_only(inside).is_err(), "{inside}");

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Names an object instance provides itself; fields and methods may not use them.
-const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule"];
+const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule", "unschedule"];
 const MAX_ERRORS: usize = 20;
 
 /// What the checks know about an app's personal data, for reports: `tj check --privacy

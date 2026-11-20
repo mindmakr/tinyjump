@@ -33,6 +33,13 @@ final class Sync: NSObject, URLSessionDataDelegate {
     /// Starts keeping `key` current; `seq` is the change number of its cached state.
     func subscribe(_ key: String, seq: UInt64) {
         guard server != nil, replicas[key] == nil else { return }
+        // Already in a class stream (`Slot/*`): nothing new to ask for.
+        if !key.hasSuffix("/*"), replicas[String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"] != nil { return }
+        if key.hasSuffix("/*") {
+            // The class stream covers the objects of the class asked for one by one.
+            let prefix = String(key.dropLast())
+            replicas = replicas.filter { !$0.key.hasPrefix(prefix) }
+        }
         replicas[key] = seq
         cursor = replicas.values.min() ?? 0
         connect()
@@ -88,8 +95,12 @@ final class Sync: NSObject, URLSessionDataDelegate {
 
     private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
         cursor = max(cursor, seq) // the stream is in change order
-        guard let have = replicas[key] else { return }
-        replicas[key] = max(have, seq)
+        // An object of a class streamed whole (`Slot/*`): the class's entry keeps the change
+        // number, so a reconnect resumes and the stream address stays short.
+        let whole = String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"
+        let entry = replicas[whole] != nil ? whole : key
+        guard let have = replicas[entry] else { return }
+        replicas[entry] = max(have, seq)
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 
