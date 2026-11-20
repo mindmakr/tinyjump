@@ -200,8 +200,12 @@ type Booker = { customer: string, name: string, at: number }
 }
 ```
 
-Personal data copied into a field must go into a `@pii` field like this one; the compiler
-refuses other copies.
+Each entry must be a record with the `@by` field as a `string` (the person's id), and the
+time field as a `number` when the object has `@retain`. `@read("anyone")` is not allowed
+on these objects, and an object holds either one person's data (its id is theirs) or
+shared lists, not both. Personal data revealed and copied onto another server object must
+go into a list like this one; the compiler refuses other copies. Objects that live only on
+the device may hold it, as they are cleared when the person signs out.
 
 ## Plugins
 

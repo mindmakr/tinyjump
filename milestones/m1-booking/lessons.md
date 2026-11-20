@@ -21,6 +21,11 @@ proven implementation, not written again from scratch.
 | 9 | Building the check URL by joining strings | ~5 | `encodeURIComponent`, or a URL builder | built-ins | Rust `url` or `percent-encoding` (small) |
 | 10 | Showing a raw network error to customers, which leaked the check address (reviewer 1) | n/a | Errors with a message for people, separate from the technical one | runtime: error records | n/a |
 
+**Deferred (engine, not needed at milestone scale):** retention and erasure of `@by`
+entries load every object of the class into memory, unbatched (critic-029 S4-3). Fine for
+hundreds of objects; read stored records without loading them, in batches of 500, when an
+app needs thousands.
+
 **Total:** roughly 250 of the app's 612 lines are things tinyjump or its libraries should
 do.
 
