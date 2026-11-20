@@ -97,7 +97,9 @@ impl Runtime {
                 continue;
             }
             let key = format!("{}/{subject}", def.name);
-            if self.is_loaded(&key) || self.store.load(&key)?.is_some() {
+            // A record that cannot be read (its key already destroyed by an erasure that could
+            // not finish, or a copy from a backup) still counts: erasing overwrites it.
+            if self.is_loaded(&key) || !matches!(self.store.load(&key), Ok(None)) {
                 held.push((class, key));
             }
         }
@@ -128,8 +130,12 @@ impl Runtime {
         if let Some((_, key)) = objects.iter().find(|(class, _)| self.in_use(*class, subject)) {
             return Err((409, format!("{key} is part way through a call; try again in a moment")));
         }
-        let (mut erased, mut held) = (Vec::new(), Vec::new());
+        let (mut erased, mut held, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
         for (class, key) in objects {
+            if !self.is_loaded(&key) && self.store.load(&key).is_err() {
+                unreadable.push((class, key));
+                continue;
+            }
             let o = self.instance(class, subject).map_err(|e| (503, e.message()))?;
             if let Some(until) = self.held_until(class, &o) {
                 held.push((key, until));
@@ -147,6 +153,11 @@ impl Runtime {
         }
         if !self.flush() {
             return Err((503, "the old data can no longer be read, but the blank could not be saved; try again".into()));
+        }
+        for (class, key) in unreadable {
+            self.store.forget(&key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; try again")))?;
+            self.write_blank(class, &key).map_err(|e| (503, format!("could not overwrite {key}: {e}; try again")))?;
+            erased.push(key);
         }
         if !held.is_empty() {
             for (key, until) in &held {
@@ -280,15 +291,7 @@ impl Runtime {
             let fresh = self.defaults(class).map_err(|e| e.message())?;
             self.reset(&o, fresh);
         } else {
-            // A blank record with a new change number, so devices that reconnect get it too.
-            self.change_seq += 1;
-            let seq = self.change_seq;
-            let Json::Object(state) = defaults else { unreachable!("state is a record") };
-            // No clock: it holds nothing until someone writes to it again.
-            let record = serde_json::json!({ "state": state, "seq": seq });
-            self.store.save(key, &record.to_string())?;
-            self.store.save("tj:seq", &seq.to_string())?;
-            self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
+            self.write_blank(class, key)?;
         }
         let reason = if waiting.is_some() { "erase after hold" } else { "retain" };
         if waiting.is_some() {
@@ -299,6 +302,20 @@ impl Runtime {
         // log forgets them too. Retention alone does not: the person may still be active.
         let forget = waiting.is_some() && !self.erasures.keys().any(|k| k.split_once('/').is_some_and(|(_, i)| i == id));
         self.outputs.push(Output::Erased { object: key.to_string(), reason: reason.into(), forget });
+        Ok(())
+    }
+
+    /// Writes a blank record for an object that is not loaded, with a new change number so
+    /// devices that reconnect get it too, and no clock: it holds nothing until someone writes
+    /// to it again.
+    fn write_blank(&mut self, class: u16, key: &str) -> Result<(), String> {
+        let Json::Object(state) = Value::Rec(self.defaults(class).map_err(|e| e.message())?.into()).to_json()? else { unreachable!("state is a record") };
+        self.change_seq += 1;
+        let seq = self.change_seq;
+        let record = serde_json::json!({ "state": state, "seq": seq });
+        self.store.save(key, &record.to_string())?;
+        self.store.save("tj:seq", &seq.to_string())?;
+        self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
         Ok(())
     }
 

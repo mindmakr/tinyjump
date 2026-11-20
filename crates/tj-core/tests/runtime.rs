@@ -1287,6 +1287,41 @@ impl Store for Forgetful {
     }
 }
 
+/// A store with one record that cannot be read until it is written again (an erasure that
+/// could not finish, or a copy restored from a backup).
+#[derive(Clone, Default)]
+struct Spoiled(Shared, Rc<RefCell<Option<String>>>);
+
+impl Store for Spoiled {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        if self.1.borrow().as_deref() == Some(key) {
+            return Err("cannot decrypt the record".into());
+        }
+        self.0.load(key)
+    }
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        if self.1.borrow().as_deref() == Some(key) {
+            *self.1.borrow_mut() = None;
+        }
+        self.0.save(key, value)
+    }
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        self.0.keys(prefix)
+    }
+}
+
+#[test]
+fn erasing_again_overwrites_a_record_that_cannot_be_read() {
+    let store = Spoiled::default();
+    let boot = || Runtime::boot(compile(KEPT).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut boot(), 1000.0, "Account/user:ana", "set", json!(["a@example.com"]), who("user:ana", &[])).unwrap();
+    *store.1.borrow_mut() = Some("Account/user:ana".into());
+    let mut rt = boot();
+    let e = rt.erase_subject("user:ana").unwrap();
+    assert_eq!(e.erased, ["Account/user:ana"]);
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""));
+}
+
 #[test]
 fn erasing_destroys_the_stored_copies_keys_and_holds_wait() {
     let store = Forgetful::default();

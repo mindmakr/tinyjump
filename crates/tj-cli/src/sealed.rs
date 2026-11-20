@@ -219,8 +219,8 @@ pub struct Sealed<S: Store> {
     keys: Keyring,
     /// Classes whose objects belong to a person, and so get keys of their own.
     personal: HashSet<String>,
-    /// Objects' own keys already read or made, by their stored names.
-    own: HashMap<String, [u8; 32]>,
+    /// Objects' own keys already read or made, by their stored names: generation and key.
+    own: HashMap<String, (String, [u8; 32])>,
 }
 
 impl<S: Store> Sealed<S> {
@@ -237,38 +237,47 @@ impl<S: Store> Sealed<S> {
         self.keys.name(&format!("tj:own/{key}"))
     }
 
-    /// The own key stored as `name`; made when `create` and there is none.
-    fn own_key(&mut self, name: &str, create: bool) -> Result<Option<[u8; 32]>, String> {
-        if let Some(k) = self.own.get(name) {
-            return Ok(Some(*k));
+    /// The own key kept at `slot`, with its generation; made when `create` and there is none.
+    /// Each key has a random generation: a record names the generation it was sealed under,
+    /// so a copy from before an erasure is recognised as erased even after a new key has been
+    /// made for the same object.
+    fn own_key(&mut self, slot: &str, create: bool) -> Result<Option<(String, [u8; 32])>, String> {
+        if let Some(k) = self.own.get(slot) {
+            return Ok(Some(k.clone()));
         }
-        let key = name;
-        let k = match self.own_store.load(name)? {
+        let k = match self.own_store.load(slot)? {
             Some(text) => {
                 let env: Json = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-                let k = self.keys.unwrap(name, &env).and_then(|k| k.try_into().ok()).ok_or_else(|| format!("cannot open the key stored as {key}: it is not sealed with a key in the key file"))?;
-                Some(k)
+                let key = self.keys.unwrap(slot, &env).and_then(|k| k.try_into().ok()).ok_or_else(|| format!("cannot open the key stored as {slot}: it is not sealed with a key in the key file"))?;
+                Some((env["gen"].as_str().unwrap_or_default().to_string(), key))
             }
             None if create => {
-                let k = random::<32>()?;
-                let mut env = self.keys.wrap(name, &k)?;
+                let (key, gen) = (random::<32>()?, hex(&random::<8>()?));
+                let mut env = self.keys.wrap(slot, &key)?;
                 env["f"] = FORMAT.into();
-                self.own_store.save(name, &env.to_string())?;
-                Some(k)
+                env["gen"] = gen.clone().into();
+                self.own_store.save(slot, &env.to_string())?;
+                Some((gen, key))
             }
             None => None,
         };
-        if let Some(k) = k {
-            self.own.insert(name.to_string(), k);
+        if let Some(k) = &k {
+            self.own.insert(slot.to_string(), k.clone());
         }
         Ok(k)
     }
 
+    /// The key a record sealed under `own` (`slot#generation`) needs, if it still exists.
+    fn own_for(&mut self, own: &str) -> Result<Option<[u8; 32]>, String> {
+        let (slot, gen) = own.split_once('#').unwrap_or((own, ""));
+        Ok(self.own_key(slot, false)?.filter(|(g, _)| g == gen).map(|(_, k)| k))
+    }
+
     /// Opens the record stored as `name`, with its own key when it has one.
     fn open(&mut self, name: &str, text: &str) -> Result<(String, String), String> {
-        let own_name = serde_json::from_str::<Json>(text).ok().and_then(|e| e["own"].as_str().map(str::to_string));
-        let own = match own_name {
-            Some(n) => self.own_key(&n, false)?,
+        let own_ref = serde_json::from_str::<Json>(text).ok().and_then(|e| e["own"].as_str().map(str::to_string));
+        let own = match own_ref {
+            Some(o) => self.own_for(&o)?,
             None => None,
         };
         self.keys.open_record(name, text, own.as_ref())
@@ -287,9 +296,9 @@ impl<S: Store> Store for Sealed<S> {
     }
 
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
-        let own_name = self.own_name(key);
-        let own = if self.is_personal(key) { self.own_key(&own_name, true)? } else { None };
-        let text = self.keys.seal_record(key, value, own.as_ref().map(|k| (own_name.as_str(), k)))?;
+        let slot = self.own_name(key);
+        let own = if self.is_personal(key) { self.own_key(&slot, true)?.map(|(gen, k)| (format!("{slot}#{gen}"), k)) } else { None };
+        let text = self.keys.seal_record(key, value, own.as_ref().map(|(r, k)| (r.as_str(), k)))?;
         self.inner.save(&self.keys.name(key), &text)
     }
 
@@ -319,9 +328,10 @@ impl<S: Store> Store for Sealed<S> {
             let Some(text) = self.inner.load(&name)? else { continue };
             // The real key is inside. A record whose own key was destroyed (an erased person's,
             // copied back from a backup) cannot be opened, so it is not listed.
-            let destroyed = serde_json::from_str::<Json>(&text).ok().and_then(|e| e["own"].as_str().map(str::to_string)).is_some_and(|n| self.own_store.load(&n).ok().flatten().is_none());
-            if destroyed {
-                continue;
+            if let Some(own) = serde_json::from_str::<Json>(&text).ok().and_then(|e| e["own"].as_str().map(str::to_string)) {
+                if self.own_for(&own)?.is_none() {
+                    continue;
+                }
             }
             let (key, _) = self.open(&name, &text)?;
             if key.starts_with(prefix) {
@@ -390,6 +400,9 @@ pub fn rekey(data: &Path) -> Result<String, String> {
     let mut own_files = FileStore::open(&own).map_err(|e| format!("cannot open {}: {e}", own.display()))?;
     rewrapped += rekey_with(&keys, &mut own_files)?.1;
     let mut report = format!("{sealed} record(s) encrypted, {rewrapped} re-wrapped under key {}\n", keys.current().0);
+    if sealed > 0 {
+        report += "records of objects that belong to a person get a key of their own when the server next saves them; until then, erasing them does not reach backups\n";
+    }
     if created {
         report += &format!("new key file {}: back it up, as without it the data cannot be read\n", Path::new(&path).display());
     }
@@ -513,7 +526,8 @@ mod tests {
         s.save("Account/user:ana", r#"{"email":""}"#).unwrap();
         assert_eq!(s.load("Account/user:ana").unwrap().as_deref(), Some(r#"{"email":""}"#));
         s.inner.data.insert(name.clone(), backup);
-        assert!(s.load("Account/user:ana").is_err());
+        assert!(s.load("Account/user:ana").unwrap_err().contains("was erased"), "the old copy asks for an older key");
+        assert_eq!(s.keys("Account/").unwrap(), Vec::<String>::new(), "and is skipped, so listing the class still works");
 
         // A new key-encryption key re-wraps the object's key, never the record under it.
         let both = keys(&format!("k2 {}\n", "44".repeat(32)));
