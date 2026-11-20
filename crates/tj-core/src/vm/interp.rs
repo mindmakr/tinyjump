@@ -212,7 +212,7 @@ impl Runtime {
                     Op::StoreGlobal(g) => self.globals[g as usize] = top!().clone(),
                     Op::GetField(k) => {
                         let obj = pop!();
-                        let v = tri!(self.get_field(&obj, &name!(k)));
+                        let v = tri!(self.get_field(f.frames[fi].this.as_deref(), &obj, &name!(k)));
                         f.stack.push(v);
                     }
                     Op::SetField(k) => {
@@ -224,7 +224,7 @@ impl Runtime {
                     Op::GetIndex => {
                         let idx = pop!();
                         let obj = pop!();
-                        let v = tri!(self.get_index(&obj, &idx));
+                        let v = tri!(self.get_index(f.frames[fi].this.as_deref(), &obj, &idx));
                         f.stack.push(v);
                     }
                     Op::SetIndex => {
@@ -243,8 +243,8 @@ impl Runtime {
                     }
                     Op::ArrSpread => {
                         let v = pop!();
-                        let items = match &v {
-                            Value::Arr(other) => other.borrow().clone(),
+                        let items: Vec<Value> = match &v {
+                            Value::Arr(other) => other.borrow().iter().map(|x| Value::inside(other.readonly, x.clone())).collect(),
                             Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
                             other => throw!(Exc::msg(format!("cannot spread a {} into an array", other.type_name()))),
                         };
@@ -274,7 +274,7 @@ impl Runtime {
                     Op::RecSpread => {
                         let v = pop!();
                         let entries: Vec<(Rc<str>, Value)> = match &v {
-                            Value::Rec(src) => src.borrow().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                            Value::Rec(src) => src.borrow().iter().map(|(k, v)| (k.clone(), Value::inside(src.readonly, v.clone()))).collect(),
                             Value::Null => Vec::new(),
                             other => throw!(Exc::msg(format!("cannot spread a {} into a record", other.type_name()))),
                         };
@@ -397,8 +397,15 @@ impl Runtime {
                         continue 'frames;
                     }
                     Op::Return => {
-                        let v = pop!();
+                        let mut v = pop!();
                         let fr = f.frames.pop().expect("frame");
+                        // A method handing its own containers to code outside its object hands
+                        // read-only views (`list() { return this.items }`).
+                        if let (Some(o), Some(caller)) = (&fr.this, f.frames.last()) {
+                            if caller.this.as_deref() != Some(&**o) {
+                                v = self.protect_returned(o, v);
+                            }
+                        }
                         if let (true, Some(o)) = (fr.exclusive, &fr.this) {
                             self.release_object(o);
                         }
@@ -605,12 +612,12 @@ impl Runtime {
         }
     }
 
-    pub(crate) fn get_field(&mut self, obj: &Value, name: &str) -> Result<Value, Exc> {
+    pub(crate) fn get_field(&mut self, this: Option<&ObjRef>, obj: &Value, name: &str) -> Result<Value, Exc> {
         match obj {
-            Value::Rec(r) => Ok(r.borrow().get(name).cloned().unwrap_or(Value::Null)),
+            Value::Rec(r) => Ok(Value::inside(r.readonly, r.borrow().get(name).cloned().unwrap_or(Value::Null))),
             Value::Arr(a) if name == "length" => Ok(Value::Num(a.borrow().len() as f64)),
             Value::Str(s) if name == "length" => Ok(Value::Num(s.chars().count() as f64)),
-            Value::Obj(o) => self.obj_field(o, name),
+            Value::Obj(o) => self.obj_field(this, o, name),
             Value::Null => Err(Exc::msg(format!("cannot read '{name}' of null; check for null first or use ?."))),
             other => Err(Exc::msg(format!("a {} has no field '{name}'", other.type_name()))),
         }
@@ -619,7 +626,7 @@ impl Runtime {
     fn set_field(&mut self, this: Option<&ObjRef>, obj: &Value, name: &str, v: Value) -> Result<(), Exc> {
         match obj {
             Value::Rec(r) => {
-                r.borrow_mut().insert(Rc::from(name), v);
+                r.writable()?.borrow_mut().insert(Rc::from(name), v);
                 Ok(())
             }
             Value::Obj(o) => self.set_obj_field(this, o, name, v),
@@ -628,17 +635,17 @@ impl Runtime {
         }
     }
 
-    fn get_index(&mut self, obj: &Value, idx: &Value) -> Result<Value, Exc> {
+    fn get_index(&mut self, this: Option<&ObjRef>, obj: &Value, idx: &Value) -> Result<Value, Exc> {
         match (obj, idx) {
-            (Value::Arr(a), Value::Num(n)) => Ok(if *n >= 0.0 && n.fract() == 0.0 { a.borrow().get(*n as usize).cloned().unwrap_or(Value::Null) } else { Value::Null }),
+            (Value::Arr(a), Value::Num(n)) => Ok(Value::inside(a.readonly, if *n >= 0.0 && n.fract() == 0.0 { a.borrow().get(*n as usize).cloned().unwrap_or(Value::Null) } else { Value::Null })),
             (Value::Str(s), Value::Num(n)) => Ok(if *n >= 0.0 && n.fract() == 0.0 {
                 s.chars().nth(*n as usize).map_or(Value::Null, |c| Value::str(&c.to_string()))
             } else {
                 Value::Null
             }),
-            (Value::Rec(r), Value::Str(k)) => Ok(r.borrow().get(&**k).cloned().unwrap_or(Value::Null)),
-            (Value::Rec(r), Value::Num(n)) => Ok(r.borrow().get(fmt_num(*n).as_str()).cloned().unwrap_or(Value::Null)),
-            (Value::Obj(o), Value::Str(k)) => self.obj_field(o, k),
+            (Value::Rec(r), Value::Str(k)) => Ok(Value::inside(r.readonly, r.borrow().get(&**k).cloned().unwrap_or(Value::Null))),
+            (Value::Rec(r), Value::Num(n)) => Ok(Value::inside(r.readonly, r.borrow().get(fmt_num(*n).as_str()).cloned().unwrap_or(Value::Null))),
+            (Value::Obj(o), Value::Str(k)) => self.obj_field(this, o, k),
             (Value::Null, _) => Err(Exc::msg("cannot index null; check for null first or use ?.[]")),
             (o, i) => Err(Exc::msg(format!("cannot index a {} with a {}", o.type_name(), i.type_name()))),
         }
@@ -648,7 +655,7 @@ impl Runtime {
         match (obj, idx) {
             (Value::Arr(a), Value::Num(n)) if *n >= 0.0 && n.fract() == 0.0 => {
                 let i = *n as usize;
-                let mut a = a.borrow_mut();
+                let mut a = a.writable()?.borrow_mut();
                 if i > a.len() + 1_000_000 {
                     return Err(Exc::msg("array index too far past the end"));
                 }
@@ -659,11 +666,11 @@ impl Runtime {
                 Ok(())
             }
             (Value::Rec(r), Value::Str(k)) => {
-                r.borrow_mut().insert(k.clone(), v);
+                r.writable()?.borrow_mut().insert(k.clone(), v);
                 Ok(())
             }
             (Value::Rec(r), Value::Num(n)) => {
-                r.borrow_mut().insert(Rc::from(fmt_num(*n).as_str()), v);
+                r.writable()?.borrow_mut().insert(Rc::from(fmt_num(*n).as_str()), v);
                 Ok(())
             }
             (Value::Obj(o), Value::Str(k)) => self.set_obj_field(this, o, k, v),

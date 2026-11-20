@@ -1067,6 +1067,75 @@ export function App() { return <Column><Text>{me.email}</Text></Column> }"#),
     assert!(compile("object A { n: number = 0\n  f() { console.log(this.n) } }").is_ok());
 }
 
+/// Only an object's own methods change its fields, containers included: from outside, they
+/// are read-only views (critic-008, builder-reply-007-008).
+#[test]
+fn other_objects_fields_are_read_only_from_outside() {
+    let src = r#"
+type Msg = { text: string }
+@server @read("anyone") object Room {
+  messages: Msg[] = [{ text: "hello" }]
+  meta: { tags: string[] } = { tags: [] }
+  @allow("anyone") post(text: string) { this.messages.push({ text: text }) }
+  list(): Msg[] { return this.messages }
+  fresh(): Msg[] { return this.messages.filter(m => m.text !== "") }
+  first(): Msg { return this.messages[0] }
+  wrapped(): { list: Msg[] } { return { list: this.messages } }
+  looped(): any {
+    const w: any = { list: this.messages }
+    w.self = w
+    return w
+  }
+}
+@server @read("anyone") object Poster {
+  @allow("anyone") direct() { Room.get("lobby").messages.push({ text: "x" }) }
+  @allow("anyone") alias() { const m = Room.get("lobby").messages; m.push({ text: "x" }) }
+  @allow("anyone") nested() { Room.get("lobby").meta.tags.push("x") }
+  @allow("anyone") element() { Room.get("lobby").messages[0].text = "changed" }
+  @allow("anyone") returned() { Room.get("lobby").list().push({ text: "x" }) }
+  @allow("anyone") firstOne() { Room.get("lobby").first().text = "changed" }
+  @allow("anyone") wrapper(): number {
+    const w = Room.get("lobby").wrapped()
+    w.list.push({ text: "x" })
+    return 0
+  }
+  @allow("anyone") looped() { Room.get("lobby").looped().self.list.push({ text: "x" }) }
+  @allow("anyone") values() { Object.values(Room.get("lobby").meta)[0].push("x") }
+  @allow("anyone") entries() { Object.entries(Room.get("lobby").meta)[0][1].push("x") }
+  @allow("anyone") sorted() { Room.get("lobby").meta.tags.sort((a, b) => 0) }
+  @allow("anyone") newWrapper(): number {
+    const w = Room.get("lobby").wrapped()
+    w.list = []
+    return w.list.length + 1
+  }
+  @allow("anyone") copy(): number {
+    const c = Room.get("lobby").messages.slice()
+    c.push({ text: "mine" })
+    return c.length
+  }
+  @allow("anyone") copyInside() { const c = [...Room.get("lobby").messages]; c[0].text = "changed" }
+  @allow("anyone") freshResult(): number {
+    const f = Room.get("lobby").fresh()
+    f.push({ text: "mine" })
+    return f.length
+  }
+}
+"#;
+    let mut rt = server(src, false);
+    let anyone = || who("", &[]);
+    for method in ["direct", "alias", "nested", "element", "returned", "copyInside", "firstOne", "wrapper", "looped", "values", "entries", "sorted"] {
+        let err = call_as(&mut rt, 1.0, "Poster/p", method, json!([]), anyone()).unwrap_err().1;
+        assert!(err.contains("only that object's own methods can change it"), "{method}: {err}");
+    }
+    assert_eq!(call_as(&mut rt, 2.0, "Poster/p", "copy", json!([]), anyone()), Ok(json!(2)), "a copy is the caller's");
+    assert_eq!(call_as(&mut rt, 2.0, "Poster/p", "freshResult", json!([]), anyone()), Ok(json!(2)), "so is a new array a method returns");
+    assert_eq!(call_as(&mut rt, 2.0, "Poster/p", "newWrapper", json!([]), anyone()), Ok(json!(1)), "and a new record around Room's data");
+    call_as(&mut rt, 3.0, "Room/lobby", "post", json!(["hi"]), anyone()).unwrap();
+    let room = state(&mut rt, 4.0, "Room/lobby");
+    assert_eq!(room["messages"], json!([{ "text": "hello" }, { "text": "hi" }]), "only Room's own method changed it");
+    assert_eq!(room["meta"], json!({ "tags": [] }));
+}
+
 #[test]
 fn a_call_id_belongs_to_one_caller_and_one_call() {
     let mut rt = server(GUARDED, false);

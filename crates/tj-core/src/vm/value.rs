@@ -7,6 +7,47 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 pub type Record = IndexMap<Rc<str>, Value>;
+
+/// An array or record, shared by everything that holds it. `readonly` when it was reached
+/// from outside the object whose field it is: only that object's own methods may change
+/// it. Reading is never restricted, and costs nothing extra.
+#[derive(Clone)]
+pub struct Shared<T> {
+    cell: Rc<RefCell<T>>,
+    pub readonly: bool,
+}
+
+impl<T> Shared<T> {
+    pub fn new(v: T) -> Shared<T> {
+        Shared { cell: Rc::new(RefCell::new(v)), readonly: false }
+    }
+
+    /// The same container, read-only.
+    pub fn read_only(&self) -> Shared<T> {
+        Shared { cell: self.cell.clone(), readonly: true }
+    }
+
+    /// For changing it in place: refused when it belongs to another object.
+    pub fn writable(&self) -> Result<&Rc<RefCell<T>>, Exc> {
+        if self.readonly {
+            return Err(Exc::msg("this belongs to another object's field, and only that object's own methods can change it; call one of its methods, or change a copy (.slice(), [...a] or { ...r })"));
+        }
+        Ok(&self.cell)
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = Rc<RefCell<T>>;
+    fn deref(&self) -> &Rc<RefCell<T>> {
+        &self.cell
+    }
+}
+
+impl<T> From<Rc<RefCell<T>>> for Shared<T> {
+    fn from(cell: Rc<RefCell<T>>) -> Shared<T> {
+        Shared { cell, readonly: false }
+    }
+}
 pub type NativeFn = fn(&mut Runtime, &[Value]) -> Result<Value, Exc>;
 
 #[derive(Clone)]
@@ -15,8 +56,8 @@ pub enum Value {
     Bool(bool),
     Num(f64),
     Str(Rc<str>),
-    Arr(Rc<RefCell<Vec<Value>>>),
-    Rec(Rc<RefCell<Record>>),
+    Arr(Shared<Vec<Value>>),
+    Rec(Shared<Record>),
     Func(Rc<Closure>),
     Native(Native),
     /// A handle to a durable object instance.
@@ -96,11 +137,29 @@ impl Value {
     }
 
     pub fn arr(v: Vec<Value>) -> Value {
-        Value::Arr(Rc::new(RefCell::new(v)))
+        Value::Arr(Shared::new(v))
     }
 
     pub fn rec(r: Record) -> Value {
-        Value::Rec(Rc::new(RefCell::new(r)))
+        Value::Rec(Shared::new(r))
+    }
+
+    /// The value as seen from outside its object: containers become read-only.
+    pub fn read_only(&self) -> Value {
+        match self {
+            Value::Arr(a) => Value::Arr(a.read_only()),
+            Value::Rec(r) => Value::Rec(r.read_only()),
+            v => v.clone(),
+        }
+    }
+
+    /// `v`, read out of a container: what is inside a read-only container is read-only too.
+    pub fn inside(readonly: bool, v: Value) -> Value {
+        if readonly {
+            v.read_only()
+        } else {
+            v
+        }
     }
 
     pub fn truthy(&self) -> bool {

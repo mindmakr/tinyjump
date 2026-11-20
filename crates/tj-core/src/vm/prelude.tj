@@ -62,6 +62,7 @@ function __arr_flatMap(a, f) {
 // Stable merge sort with a compare function; sorts in place like JavaScript.
 function __arr_sort(a, cmp) {
   if (cmp === null) { return __sort(a) }
+  a.splice(0, 0)    // fails at once on another object's array, before any comparison
   let src = a.slice(0)
   let width = 1
   while (width < src.length) {

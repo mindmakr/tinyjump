@@ -127,9 +127,9 @@ fn json_parse(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     serde_json::from_str(&s).map(|j| Value::from_json(&j)).map_err(|e| Exc::msg(format!("JSON.parse: {e}")))
 }
 
-fn record_arg(a: &[Value], what: &str) -> Result<Rc<std::cell::RefCell<Record>>, Exc> {
+fn record_arg<'a>(a: &'a [Value], what: &str) -> Result<&'a super::value::Shared<Record>, Exc> {
     match arg(a, 0) {
-        Value::Rec(r) => Ok(r.clone()),
+        Value::Rec(r) => Ok(r),
         v => Err(Exc::msg(format!("{what} expects a record, got {}", v.type_name()))),
     }
 }
@@ -142,13 +142,13 @@ fn object_keys(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 
 fn object_values(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let r = record_arg(a, "Object.values")?;
-    let values = r.borrow().values().cloned().collect();
+    let values = r.borrow().values().map(|v| Value::inside(r.readonly, v.clone())).collect();
     Ok(Value::arr(values))
 }
 
 fn object_entries(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let r = record_arg(a, "Object.entries")?;
-    let entries = r.borrow().iter().map(|(k, v)| Value::arr(vec![Value::Str(k.clone()), v.clone()])).collect();
+    let entries = r.borrow().iter().map(|(k, v)| Value::arr(vec![Value::Str(k.clone()), Value::inside(r.readonly, v.clone())])).collect();
     Ok(Value::arr(entries))
 }
 
@@ -258,7 +258,7 @@ fn invoke(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 
 fn sort(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let Value::Arr(arr) = arg(a, 0) else { return Err(Exc::msg("sort expects an array")) };
-    let mut items = arr.borrow_mut();
+    let mut items = arr.writable()?.borrow_mut();
     if items.iter().all(|v| matches!(v, Value::Num(_))) {
         items.sort_by(|x, y| match (x, y) {
             (Value::Num(x), Value::Num(y)) => x.total_cmp(y),
@@ -298,48 +298,56 @@ fn rel_index(i: f64, len: usize) -> usize {
     }
 }
 
-fn the_arr(v: &Value) -> &Rc<std::cell::RefCell<Vec<Value>>> {
+fn the_arr(v: &Value) -> &super::value::Shared<Vec<Value>> {
     match v {
         Value::Arr(a) => a,
         _ => unreachable!("array method on non-array"),
     }
 }
 
+/// The array, to change in place: refused when it belongs to another object.
+fn the_mut_arr(v: &Value) -> Result<&Rc<std::cell::RefCell<Vec<Value>>>, Exc> {
+    the_arr(v).writable()
+}
+
 fn array_method(name: &str) -> Option<NativeMethod> {
     Some(match name {
         "push" => |_, r, a| {
-            let mut v = the_arr(r).borrow_mut();
+            let mut v = the_mut_arr(r)?.borrow_mut();
             v.extend_from_slice(a);
             Ok(Value::Num(v.len() as f64))
         },
-        "pop" => |_, r, _| Ok(the_arr(r).borrow_mut().pop().unwrap_or(Value::Null)),
+        "pop" => |_, r, _| Ok(the_mut_arr(r)?.borrow_mut().pop().unwrap_or(Value::Null)),
         "shift" => |_, r, _| {
-            let mut v = the_arr(r).borrow_mut();
+            let mut v = the_mut_arr(r)?.borrow_mut();
             Ok(if v.is_empty() { Value::Null } else { v.remove(0) })
         },
         "unshift" => |_, r, a| {
-            let mut v = the_arr(r).borrow_mut();
+            let mut v = the_mut_arr(r)?.borrow_mut();
             v.splice(0..0, a.iter().cloned());
             Ok(Value::Num(v.len() as f64))
         },
         "slice" => |_, r, a| {
-            let v = the_arr(r).borrow();
+            let arr = the_arr(r);
+            let v = arr.borrow();
             let start = rel_index(opt_num(a, 0, 0.0), v.len());
             let end = rel_index(opt_num(a, 1, v.len() as f64), v.len());
-            Ok(Value::arr(if start < end { v[start..end].to_vec() } else { Vec::new() }))
+            let items = if start < end { v[start..end].iter().map(|x| Value::inside(arr.readonly, x.clone())).collect() } else { Vec::new() };
+            Ok(Value::arr(items))
         },
         "splice" => |_, r, a| {
-            let mut v = the_arr(r).borrow_mut();
+            let mut v = the_mut_arr(r)?.borrow_mut();
             let start = rel_index(opt_num(a, 0, 0.0), v.len());
             let count = (opt_num(a, 1, (v.len() - start) as f64).max(0.0) as usize).min(v.len() - start);
             let removed: Vec<Value> = v.splice(start..start + count, a.iter().skip(2).cloned()).collect();
             Ok(Value::arr(removed))
         },
         "concat" => |_, r, a| {
-            let mut out = the_arr(r).borrow().clone();
+            let arr = the_arr(r);
+            let mut out: Vec<Value> = arr.borrow().iter().map(|x| Value::inside(arr.readonly, x.clone())).collect();
             for x in a {
                 match x {
-                    Value::Arr(other) => out.extend(other.borrow().iter().cloned()),
+                    Value::Arr(other) => out.extend(other.borrow().iter().map(|x| Value::inside(other.readonly, x.clone()))),
                     other => out.push(other.clone()),
                 }
             }
@@ -359,14 +367,14 @@ fn array_method(name: &str) -> Option<NativeMethod> {
             Ok(Value::str(&v.iter().map(|x| if matches!(x, Value::Null) { String::new() } else { x.display() }).collect::<Vec<_>>().join(&sep)))
         },
         "reverse" => |_, r, _| {
-            the_arr(r).borrow_mut().reverse();
+            the_mut_arr(r)?.borrow_mut().reverse();
             Ok(r.clone())
         },
         "at" => |_, r, a| {
             let v = the_arr(r).borrow();
             let i = opt_num(a, 0, 0.0);
             let idx = if i < 0.0 { v.len() as f64 + i } else { i };
-            Ok(if idx >= 0.0 { v.get(idx as usize).cloned().unwrap_or(Value::Null) } else { Value::Null })
+            Ok(Value::inside(the_arr(r).readonly, if idx >= 0.0 { v.get(idx as usize).cloned().unwrap_or(Value::Null) } else { Value::Null }))
         },
         _ => return None,
     })
