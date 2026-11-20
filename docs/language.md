@@ -105,6 +105,27 @@ replica of it:
 The server is the single authority, so there are no conflicts to resolve. Timers on
 `@server` objects run on the server only.
 
+## Checking input
+
+- **Types are checked for you.** A call from outside (the HTTP API, a device) must give
+  arguments that fit the method's declared types: `minutes: number` refuses `"30"`. A
+  wrong, missing or extra argument is refused with 400, naming the parameter, before the
+  method runs. Type aliases and records are followed.
+- **Rules on values** use `check(ok, field, message)`. Unless `ok`, it throws
+  `{ name: "Error", message, field }`.
+  - Write the rules once, in a function that both the UI and the server method call:
+
+    ```ts
+    function validSlot(title: string, minutes: number) {
+      check(title.trim() !== "", "title", "Give the slot a title")
+      check(minutes >= 5 && minutes <= 480, "minutes", "A slot lasts 5 to 480 minutes")
+    }
+    ```
+
+  - In the UI, `catch (e)` gives `e.field` and `e.message`.
+  - A server refusing the call gives the message to the device's promise, without the
+    field.
+
 ## Access: who may read and call
 
 Without a rule, nothing can be read or called from outside the server:
@@ -252,7 +273,9 @@ async load(city: string) {
 `fetch(url, { method, headers, body })` returns `{ status, ok, headers, text(), json() }`.
 A network failure throws. On a server, `fetch` reaches public addresses only: a private
 or local one (`127.0.0.1`, `10.x`, `192.168.x`) throws, unless the server runs with
-`TJ_ALLOW_PRIVATE_FETCH=1` (for tests against a local service).
+`TJ_ALLOW_PRIVATE_FETCH=1` (for tests against a local service). A failed request says
+what went wrong (`the request failed: Connection Failed`), never the address, as an
+address may be private.
 
 ### One call at a time: `@exclusive`
 
@@ -323,6 +346,10 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   - `null` while the entry is empty or not a real date (February 30).
   - Dates are in the viewer's zone, or in UTC with `zone="UTC"`.
   - Agents may type `2026-12-01 14:30` into one, and it is read as a person's entry is.
+- `import { Field, Notice } from "tj:ui"` gives two ready-made pieces:
+  - `<Field label="Minutes" error={e} id="minutes">…</Field>`: a visible label over its
+    control, with the error below in red (`minutes-error`);
+  - `<Notice text={t} kind="ok" | "error">`: good news in green, or an error in red.
 - Give lists a `key`: `{items.map(i => <Row key={i.id}>…</Row>)}`.
 - `{cond && <X/>}` renders nothing when `cond` is false or null. Bare strings and numbers
   inside `Column`, `Row` and `Scroll` become `Text`.

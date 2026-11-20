@@ -127,3 +127,6 @@ configurable. On top of it, `tj:agent` is a library written in tinyjump:
    MCP server, because it acts on the runtime's own objects.
 7. **Done: `tj:consent`** (`plugins/consent/plugin.tj`): consent records, owned by the
    person. `@needs("consent:x")` checks them in the runtime (docs/compliance.md).
+8. **Done: `tj:ui`** (`plugins/ui/plugin.tj`): `Field` and `Notice`, written in tinyjump
+   from the catalog's components, so no host changes. Found missing in Milestone 1:
+   labels vanished once a field was filled, and good news was shown in red.

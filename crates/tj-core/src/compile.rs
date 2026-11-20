@@ -191,6 +191,8 @@ struct Compiler {
     unimported: Vec<(u16, String)>,
     /// Type names and the file declaring each: like values, they are shared by all files.
     types: HashMap<String, u16>,
+    /// Type aliases by name, so parameters can be checked as JSON shapes (`ArgTy`).
+    aliases: HashMap<String, TypeExpr>,
 }
 
 impl Compiler {
@@ -213,6 +215,7 @@ impl Compiler {
             exports: Vec::new(),
             unimported: Vec::new(),
             types: HashMap::new(),
+            aliases: HashMap::new(),
         };
         for (name, _) in GLOBALS {
             c.add_global(name, false, GKind::Builtin);
@@ -290,16 +293,19 @@ impl Compiler {
                         }
                     }
                 }
-                Item::TypeAlias { name, span, .. } if self.source == Source::User => match self.types.get(name) {
+                Item::TypeAlias { name, ty, .. } if self.source != Source::User => {
+                    self.aliases.insert(name.clone(), ty.clone());
+                }
+                Item::TypeAlias { name, span, ty, .. } => match self.types.get(name) {
                     Some(&other) if other != self.file => {
                         let d = Diagnostic::new(format!("type '{name}' is already declared in {}", self.file_names[other as usize]), *span).hint("all files of an app share their top-level names; rename one");
                         self.error(d);
                     }
                     _ => {
                         self.types.insert(name.clone(), self.file);
+                        self.aliases.insert(name.clone(), ty.clone());
                     }
                 },
-                Item::TypeAlias { .. } => {}
             }
         }
     }
@@ -361,6 +367,31 @@ impl Compiler {
             return None;
         }
         Some(words.into())
+    }
+
+    /// A declared type as a JSON shape for checking calls from outside. Aliases are followed a
+    /// few levels deep; deeper (or recursive) types accept anything.
+    fn arg_ty(&self, t: &TypeExpr, depth: u8) -> ArgTy {
+        if depth > 8 {
+            return ArgTy::Any;
+        }
+        match t {
+            TypeExpr::Named(n, args) => match n.as_str() {
+                "number" => ArgTy::Num,
+                "string" => ArgTy::Str,
+                "boolean" => ArgTy::Bool,
+                "null" | "undefined" | "void" => ArgTy::Null,
+                "Record" if args.len() == 2 => ArgTy::Dict(Box::new(self.arg_ty(&args[1], depth + 1))),
+                "Array" if args.len() == 1 => ArgTy::Arr(Box::new(self.arg_ty(&args[0], depth + 1))),
+                _ => self.aliases.get(n).map_or(ArgTy::Any, |a| self.arg_ty(a, depth + 1)),
+            },
+            TypeExpr::Array(t) => ArgTy::Arr(Box::new(self.arg_ty(t, depth + 1))),
+            TypeExpr::Union(ts) => ArgTy::Union(ts.iter().map(|t| self.arg_ty(t, depth + 1)).collect()),
+            TypeExpr::Record(fields) => ArgTy::Rec(fields.iter().map(|(k, opt, t)| (Rc::from(k.as_str()), *opt, self.arg_ty(t, depth + 1))).collect()),
+            TypeExpr::Func(..) => ArgTy::Any,
+            TypeExpr::StrLit(s) => ArgTy::StrLit(Rc::from(s.as_str())),
+            TypeExpr::NumLit(n) => ArgTy::NumLit(*n),
+        }
     }
 
     /// `@needs("consent:<purpose>", ...)`: the purposes, for a method of a server object that
@@ -484,7 +515,15 @@ impl Compiler {
                 }
             }
             let proto = self.function(&m.func, FnKind::Method(&needs));
-            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive });
+            let params = m.func.params.iter().map(|p| {
+                let name = match &p.pattern {
+                    Pattern::Ident(n, _) => Rc::from(n.as_str()),
+                    _ => Rc::from("argument"),
+                };
+                (name, p.optional || p.default.is_some(), p.ty.as_ref().map_or(ArgTy::Any, |t| self.arg_ty(t, 0)))
+            });
+            let params = params.collect();
+            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive, params });
         }
         let def = &mut self.objects[class];
         def.fields = fields;

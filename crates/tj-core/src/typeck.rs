@@ -145,6 +145,7 @@ fn builtin(name: &str) -> Option<Ty> {
         "parseInt" => func(&[("text", Ty::Any, false), ("radix", Ty::Num, true)], None, Ty::Num),
         "parseFloat" => func(&[("text", Ty::Any, false)], None, Ty::Num),
         "Error" => func(&[("message", Ty::Any, true)], None, rec(&[("name", Ty::Str), ("message", Ty::Str)])),
+        "check" => func(&[("ok", Ty::Bool, false), ("field", Ty::Str, false), ("message", Ty::Str, false)], None, Ty::Null),
         "fetch" => func(&[("url", Ty::Str, false), ("init", Ty::Any, true)], None, Ty::Any),
         "caller" => rec(&[("id", Ty::Str), ("roles", Ty::Arr(Box::new(Ty::Str)))]),
         "plugin" => func(&[("name", Ty::Str, false), ("method", Ty::Str, false), ("args", Ty::Any, true)], None, Ty::Any),

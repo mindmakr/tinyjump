@@ -141,6 +141,89 @@ pub struct MethodDef {
     pub allow: Option<Rc<[Rc<str>]>>,
     /// `@exclusive`: one exclusive call at a time per object (see `runtime/exclusive.rs`).
     pub exclusive: bool,
+    /// Its parameters: name, whether it may be left out, and type. A call from outside (the
+    /// HTTP API, another device) is checked against them before the method runs.
+    pub params: Vec<(Rc<str>, bool, ArgTy)>,
+}
+
+/// A parameter's declared type, as far as a call from outside can be checked: JSON shapes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ArgTy {
+    Any,
+    Num,
+    Str,
+    Bool,
+    Null,
+    StrLit(Rc<str>),
+    NumLit(f64),
+    Arr(Box<ArgTy>),
+    /// Fields: name, optional, type.
+    Rec(Rc<[(Rc<str>, bool, ArgTy)]>),
+    /// `Record<string, T>`.
+    Dict(Box<ArgTy>),
+    Union(Vec<ArgTy>),
+}
+
+impl ArgTy {
+    fn fits(&self, v: &serde_json::Value) -> bool {
+        use serde_json::Value as J;
+        match (self, v) {
+            (ArgTy::Any, _) | (ArgTy::Num, J::Number(_)) | (ArgTy::Str, J::String(_)) | (ArgTy::Bool, J::Bool(_)) | (ArgTy::Null, J::Null) => true,
+            (ArgTy::StrLit(s), J::String(x)) => **s == **x,
+            (ArgTy::NumLit(n), J::Number(x)) => x.as_f64() == Some(*n),
+            (ArgTy::Arr(t), J::Array(xs)) => xs.iter().all(|x| t.fits(x)),
+            (ArgTy::Rec(fields), J::Object(m)) => fields.iter().all(|(k, opt, t)| m.get(&**k).map_or(*opt, |x| (*opt && x.is_null()) || t.fits(x))) && m.keys().all(|k| fields.iter().any(|(f, _, _)| **f == **k)),
+            (ArgTy::Dict(t), J::Object(m)) => m.values().all(|x| t.fits(x)),
+            (ArgTy::Union(ts), x) => ts.iter().any(|t| t.fits(x)),
+            _ => false,
+        }
+    }
+
+    /// How a person would name the type, for errors.
+    pub fn describe(&self) -> String {
+        match self {
+            ArgTy::Any => "anything".into(),
+            ArgTy::Num => "a number".into(),
+            ArgTy::Str => "text".into(),
+            ArgTy::Bool => "true or false".into(),
+            ArgTy::Null => "null".into(),
+            ArgTy::StrLit(s) => format!("\"{s}\""),
+            ArgTy::NumLit(n) => n.to_string(),
+            ArgTy::Arr(t) => format!("a list of {}", t.describe()),
+            ArgTy::Rec(fields) => format!("a record with {}", fields.iter().map(|(k, o, _)| if *o { format!("{k}?") } else { k.to_string() }).collect::<Vec<_>>().join(", ")),
+            ArgTy::Dict(t) => format!("a record of {}", t.describe()),
+            ArgTy::Union(ts) => ts.iter().map(ArgTy::describe).collect::<Vec<_>>().join(" or "),
+        }
+    }
+}
+
+/// Whether a call from outside gives `args` that fit the method's parameters; the reason if
+/// not, naming the parameter.
+pub fn check_args(params: &[(Rc<str>, bool, ArgTy)], args: &[serde_json::Value]) -> Result<(), String> {
+    if args.len() > params.len() {
+        let names: Vec<&str> = params.iter().map(|(n, _, _)| &**n).collect();
+        return Err(format!("it takes {} argument(s) ({}), got {}", params.len(), names.join(", "), args.len()));
+    }
+    for (i, (name, optional, ty)) in params.iter().enumerate() {
+        match args.get(i) {
+            None if *optional => {}
+            None => return Err(format!("`{name}` is missing")),
+            Some(v) if *optional && v.is_null() => {}
+            Some(v) if !ty.fits(v) => {
+                let got = match v {
+                    serde_json::Value::String(_) => "text".to_string(),
+                    serde_json::Value::Number(_) => "a number".into(),
+                    serde_json::Value::Bool(_) => "true or false".into(),
+                    serde_json::Value::Null => "null".into(),
+                    serde_json::Value::Array(_) => "a list".into(),
+                    serde_json::Value::Object(_) => "a record".into(),
+                };
+                return Err(format!("`{name}` must be {}, got {got}: {v}", ty.describe()));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

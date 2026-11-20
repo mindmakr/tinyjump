@@ -337,6 +337,12 @@ impl Runtime {
                     }
                     self.reply_status(reply, status, why)
                 }
+                // A call from outside gives JSON: it must fit the method's declared types, or it
+                // is refused before the method runs, naming the parameter.
+                Ok(who) if matches!(who, Who::Remote { .. }) && self.bad_args(&object, &method, &args).is_some() => {
+                    let why = self.bad_args(&object, &method, &args).unwrap_or_default();
+                    self.reply_status(reply, 400, why)
+                }
                 Ok(who) => match (self.resolve_object(&object), call) {
                     (Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
                     (Ok(obj), None) => {
@@ -566,6 +572,14 @@ impl Runtime {
             return refused(503, "too many objects are loaded; try again later").map(|_| Who::System);
         }
         Ok(who)
+    }
+
+    /// Why `args` do not fit `Class.method`'s declared parameters, if they do not.
+    fn bad_args(&self, object: &str, method: &str, args: &[Json]) -> Option<String> {
+        let class = object.split_once('/').and_then(|(c, _)| self.program.object(c))?;
+        let m = self.program.objects[class as usize].methods.get(method)?;
+        let def = &self.program.objects[class as usize];
+        crate::vm::program::check_args(&m.params, args).err().map(|e| format!("{}.{method}: {e}", def.name))
     }
 
     /// Who runs code that no request started: the system on a server, the signed-in user on
