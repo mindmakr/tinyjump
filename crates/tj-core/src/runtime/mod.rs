@@ -104,6 +104,8 @@ enum TimerKind {
     /// The next step of the retention sweep (`privacy.rs`).
     #[cfg(feature = "server")]
     Retain,
+    /// The start of the next minute, for a screen that shows the time.
+    Clock,
 }
 
 /// How a method call starts: who it is for, its chain (0: a new one, see `exclusive.rs`),
@@ -216,6 +218,10 @@ pub struct Runtime {
     explain: bool,
     max_objects: usize,
     ran_code: bool,
+    /// Set by `Date.now()`: a screen that read it is drawn again each minute.
+    pub(crate) read_clock: bool,
+    /// When the pending `Clock` timer fires.
+    clock: Option<f64>,
     now: f64,
     rng: u64,
     /// Behind `crypto.randomId()` and device ids; unguessable once `strong`.
@@ -289,6 +295,8 @@ impl Runtime {
             explain: opts.explain,
             max_objects: opts.max_objects,
             ran_code: false,
+            read_clock: false,
+            clock: None,
             now: opts.now,
             rng: if opts.seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { opts.seed },
             drbg: crate::crypto::Drbg::new(&[opts.seed.to_le_bytes(), opts.now.to_bits().to_le_bytes()].concat()),
@@ -736,6 +744,10 @@ impl Runtime {
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),
+                TimerKind::Clock => {
+                    self.clock = None;
+                    self.ran_code = true;
+                }
                 TimerKind::Expire => self.expire_waiters(),
                 #[cfg(feature = "server")]
                 TimerKind::Retain => self.retain_step(),

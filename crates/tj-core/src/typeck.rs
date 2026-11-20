@@ -149,6 +149,7 @@ fn builtin(name: &str) -> Option<Ty> {
         "Number" => func(&[("value", Ty::Any, false)], None, Ty::Num),
         "parseInt" => func(&[("text", Ty::Any, false), ("radix", Ty::Num, true)], None, Ty::Num),
         "parseFloat" => func(&[("text", Ty::Any, false)], None, Ty::Num),
+        "encodeURIComponent" => func(&[("text", Ty::Any, false)], None, Ty::Str),
         "Error" => func(&[("message", Ty::Any, true)], None, rec(&[("name", Ty::Str), ("message", Ty::Str)])),
         "check" => func(&[("ok", Ty::Bool, false), ("field", Ty::Str, false), ("message", Ty::Str, false)], None, Ty::Null),
         "fetch" => func(&[("url", Ty::Str, false), ("init", Ty::Any, true)], None, Ty::Any),

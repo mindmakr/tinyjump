@@ -176,7 +176,8 @@ reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's cal
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
 `@retain("90d")` erases objects of a class that long after their last change, and
 `@legalHold("6y")` keeps them that long even when erased. `tj privacy export` and
-`tj privacy erase` act on everything held about one person: every object whose id is theirs (copies the app put on other objects are the app's to clear); from app code,
+`tj privacy erase` act on everything held about one person: every object whose id is
+theirs, and their entries in shared lists (below); from app code,
 `import { exportData, erase } from "tj:privacy"` does the same for the person themselves or
 the `privacy` role. `tj check app.tj --privacy` prints the data map, and with `--record`
 the record of processing. Optionally, `const lawfulBasis = { account: "contract" }` gives each
@@ -186,6 +187,25 @@ app against a region's rules. For a purpose that rests on consent, `tj:consent` 
 people's consents (`Consent.get(caller.id).give(purpose, text, version)`, `withdraw`), and
 `@needs("consent:news")` on a method makes it refuse to run without consent. Details: [personal data](privacy.md),
 [compliance packs](compliance.md).
+
+A list holding several people's entries, such as a staff roster of who booked, says whose
+each entry is with `@by`. Readers the object's `@read` rule admits see the entries, tools
+see `•••`, and export, erasure and `@retain` (counted from each entry's own time) reach
+each entry:
+
+```tsx
+type Booker = { customer: string, name: string, at: number }
+@server @read("staff") @retain("90d") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+}
+```
+
+Each entry must be a record with the `@by` field as a `string` (the person's id), and the
+time field as a `number` when the object has `@retain`. `@read("anyone")` is not allowed
+on these objects, and an object holds either one person's data (its id is theirs) or
+shared lists, not both. Personal data revealed and copied onto another server object must
+go into a list like this one; the compiler refuses other copies. Objects that live only on
+the device may hold it, as they are cleared when the person signs out.
 
 ## Plugins
 
@@ -377,7 +397,7 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 `console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/min/max/random/PI`,
 `JSON.stringify(v, null, 2)/parse`, `Object.keys/values/entries`, `Array.isArray`,
 `Date.now()`, `crypto.randomId/hmac/timingSafeEqual`, `String(x)`, `Number(x)`, `parseInt`,
-`parseFloat`, `fetch`, `Error`.
+`parseFloat`, `encodeURIComponent`, `fetch`, `Error`.
 
 - Strings: `length`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`,
   `includes`, `startsWith`, `endsWith`, `indexOf`, `slice`, `substring`, `split`,
@@ -388,8 +408,9 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   `findIndex`, `some`, `every`, `forEach`, `reduce`, `flatMap`.
 
 `Date.now()` and `Math.random()` come from the host, so a run can be replayed exactly.
-`Date.now()` may be used anywhere, the UI included; a screen that shows the time is drawn
-again when something changes, so add an `@every` timer to redraw it on a clock.
+`Date.now()` may be used anywhere, the UI included. A screen that reads it is drawn again
+at the start of each minute, and whenever something changes, so a slot turns "past" on
+time with no timer in the app.
 
 Times are plain numbers: milliseconds since 1970 in UTC, in fields, JSON and the HTTP API
 alike. Compare them with `<` and subtract them. For the calendar, use `Time`:

@@ -2480,3 +2480,24 @@ fn a_class_stream_resumes_with_the_newest_changes_and_starts_over_for_a_new_user
     assert!(!format!("{out:?}").contains("Beard"), "{out:?}");
     assert!(!tj_core::runtime::access::owns("*", "*"), "nobody owns a whole class");
 }
+
+#[test]
+fn a_screen_that_shows_the_time_is_drawn_again_each_minute() {
+    let src = "function App() {\n  return <Text id=\"t\">{Date.now() >= 120000 ? \"past\" : \"soon\"}</Text>\n}\n";
+    let (mut rt, out) = boot_with(src, Shared::default(), 0.0);
+    assert!(format!("{out:?}").contains("soon"), "{out:?}");
+    assert_eq!(rt.inspect()["wake"], json!(60000.0), "it wakes at the next minute");
+    assert!(!format!("{:?}", rt.handle(119_000.0, Input::Tick)).contains("past"));
+    let out = rt.handle(120_000.0, Input::Tick);
+    assert!(format!("{out:?}").contains("past"), "drawn again on the minute: {out:?}");
+
+    // A screen that never reads the clock is not woken.
+    let (rt, _) = boot_with("function App() {\n  return <Text>hi</Text>\n}\n", Shared::default(), 0.0);
+    assert_eq!(rt.inspect()["wake"], Json::Null);
+}
+
+#[test]
+fn encode_uri_component_works_as_in_javascript() {
+    let mut rt = boot("object U {\n  enc(s: string): string { return encodeURIComponent(s) }\n}\n");
+    assert_eq!(call(&mut rt, 1.0, "U/u", "enc", json!(["a b&c/é?x=1-_.!~*'()"])).unwrap(), json!("a%20b%26c%2F%C3%A9%3Fx%3D1-_.!~*'()"));
+}

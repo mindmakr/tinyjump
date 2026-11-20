@@ -12,10 +12,17 @@ impl Runtime {
     pub(crate) fn render_app(&mut self) {
         let Some(slot) = self.program.app else { return };
         let app = self.globals[slot as usize].clone();
+        self.read_clock = false;
         let result = self.fiber_for(&app, Vec::new()).map_err(|e| (e.message(), Vec::new())).and_then(|mut f| {
             f.caller = self.local();
             self.run_sync(f).map_err(|fail| (fail.message, fail.trace))
         });
+        // A screen that shows the time is drawn again at the start of each minute.
+        if self.read_clock && self.clock.is_none() {
+            let at = (self.now / 60_000.0).floor() * 60_000.0 + 60_000.0;
+            self.clock = Some(at);
+            self.push_timer(at, super::TimerKind::Clock);
+        }
         let nodes = result.and_then(|v| {
             let mut out = Vec::new();
             nodes(&v, &mut out).map(|()| out).map_err(|e| (e, Vec::new()))

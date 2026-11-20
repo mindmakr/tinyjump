@@ -69,9 +69,9 @@ the goal; being in the market early, to gain momentum and contributors, is.
     - dates and times;
     - declared validation;
     - queries (`Class.all()`) and cancellable alarms;
-    - personal data on shared objects (`@by`).
-  - **Next:** three small built-ins, then round 2: a new blind builder and two blind
-    reviewers.
+    - personal data on shared objects (`@by`);
+    - a clock redraw and `encodeURIComponent`.
+  - **Next:** round 2, with a new blind builder and two blind reviewers.
 
 ### The rest of the agreed order
 

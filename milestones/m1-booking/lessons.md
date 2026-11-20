@@ -21,6 +21,11 @@ proven implementation, not written again from scratch.
 | 9 | Building the check URL by joining strings | ~5 | `encodeURIComponent`, or a URL builder | built-ins | Rust `url` or `percent-encoding` (small) |
 | 10 | Showing a raw network error to customers, which leaked the check address (reviewer 1) | n/a | Errors with a message for people, separate from the technical one | runtime: error records | n/a |
 
+**Deferred (engine, not needed at milestone scale):** retention and erasure of `@by`
+entries load every object of the class into memory, unbatched (critic-029 S4-3). Fine for
+hundreds of objects; read stored records without loading them, in batches of 500, when an
+app needs thousands.
+
 **Total:** roughly 250 of the app's 612 lines are things tinyjump or its libraries should
 do.
 
@@ -29,14 +34,14 @@ do.
 | # | Status | What there is now |
 |---|---|---|
 | 1 | Done | `Time.add`, `startOf`, `parts` and `from`, on the `time` crate (calendar only, 12 KB on devices); `<Time>` is formatted by each platform in the viewer's zone |
-| 2 | Mostly done | `<Input type="number" \| "date" \| "time" \| "datetime">` with the platforms' own pickers, returning typed values. `Number.isInteger` is next |
+| 2 | Done | `<Input type="number" \| "date" \| "time" \| "datetime">` with the platforms' own pickers, returning typed values. `Number.isInteger` was dropped: `Math.trunc(x) === x` says it already |
 | 3 | Done, differently | Parameter types are checked at every call from outside, and `check(ok, field, message)` is one rule for the UI and the server. `@range` was dropped: the TypeScript types and `check` cover it with one way to do each thing |
 | 4 | Done | `tj:ui`: `<Field>` (a visible label, the value and the error) and `<Notice>` |
-| 5 | Next | A screen that shows the time redraws on the clock without an `@every` timer |
+| 5 | Done | A screen that reads `Date.now()` is drawn again at the start of each minute |
 | 6 | Done | `Class.all()`, filtered like any list; devices stream the whole class. There are no indexes yet: a full scan is fine at this size |
 | 7 | Done | `this.schedule` returns a handle; `this.unschedule(handle)` |
 | 8 | Done | `@pii(...) @by("customer", "at")` lists: masked for tools, exported, erased and kept per entry |
-| 9 | Next | `encodeURIComponent` |
+| 9 | Done | `encodeURIComponent` |
 | 10 | Done | A failed fetch shows only the kind of failure, never the address |
 
 ## Found in tinyjump itself, already fixed (`m1-fixes-1`)
