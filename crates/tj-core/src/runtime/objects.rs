@@ -156,7 +156,7 @@ impl Runtime {
                 self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
             }
         }
-        let state_text = Value::Rec(state.clone()).to_json().map(|j| j.to_string()).unwrap_or_default();
+        let state_text = Value::Rec(state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
         self.instances.insert(key, Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text });
         Ok(handle)
     }
@@ -172,7 +172,7 @@ impl Runtime {
         let init = Rc::new(Closure { proto: self.program.objects[class as usize].init, upvals: Vec::new(), this: None });
         let f = self.fiber_for(&Value::Func(init), Vec::new())?;
         match self.run_sync(f).map_err(|fail| Exc::msg(fail.message))? {
-            Value::Rec(state) => Ok(state),
+            Value::Rec(state) => Ok(Rc::clone(&state)),
             _ => unreachable!("object init returns a record"),
         }
     }
@@ -301,12 +301,15 @@ impl Runtime {
         self.touched.insert((o.class, o.id.clone()));
     }
 
-    pub(crate) fn obj_field(&mut self, o: &Rc<ObjRef>, name: &str) -> Result<Value, Exc> {
+    /// A field of `o`, read by code running in `this`'s methods (or none). Only `o`'s own
+    /// methods get containers they can change; everyone else gets a read-only view.
+    pub(crate) fn obj_field(&mut self, this: Option<&ObjRef>, o: &Rc<ObjRef>, name: &str) -> Result<Value, Exc> {
         if name == "id" {
             return Ok(Value::Str(o.id.clone()));
         }
         let v = self.inst(o).state.borrow().get(name).cloned();
         match v {
+            Some(v) if this != Some(&**o) => Ok(v.read_only()),
             Some(v) => {
                 // Containers can be changed in place, so the object may need saving.
                 if matches!(v, Value::Arr(_) | Value::Rec(_)) {
@@ -318,6 +321,18 @@ impl Runtime {
                 Err(Exc::msg(format!("'{name}' is a method; call it: .{name}()")))
             }
             None => Err(Exc::msg(format!("{} has no field '{name}'", o.class_name))),
+        }
+    }
+
+    /// Whether `v` is one of `o`'s own containers (one of its fields), which a method must not
+    /// hand out for others to change.
+    pub(crate) fn is_own_field(&self, o: &ObjRef, v: &Value) -> bool {
+        let Some(inst) = self.instances.get(&(o.class, o.id.clone())) else { return false };
+        let state = inst.state.borrow();
+        match v {
+            Value::Arr(a) => state.values().any(|f| matches!(f, Value::Arr(x) if Rc::ptr_eq(x, a))),
+            Value::Rec(r) => state.values().any(|f| matches!(f, Value::Rec(x) if Rc::ptr_eq(x, r))),
+            _ => false,
         }
     }
 
@@ -373,7 +388,7 @@ impl Runtime {
     }
 
     pub(crate) fn object_state(&self, o: &ObjRef) -> Result<Json, String> {
-        Value::Rec(self.inst(o).state.clone()).to_json()
+        Value::Rec(self.inst(o).state.clone().into()).to_json()
     }
 
     /// For a server resuming a client's stream: the current state of each of `objects` that
@@ -396,7 +411,7 @@ impl Runtime {
     /// Every loaded object, for tools: personal data is always masked here.
     pub(crate) fn object_states(&self) -> Json {
         let state = |i: &Instance| {
-            let mut s = Value::Rec(i.state.clone()).to_json().unwrap_or(Json::Null);
+            let mut s = Value::Rec(i.state.clone().into()).to_json().unwrap_or(Json::Null);
             self.mask(i.handle.class, &mut s);
             s
         };
@@ -442,7 +457,7 @@ impl Runtime {
         for key in touched {
             let Some(inst) = self.instances.get(&key) else { continue };
             let object = inst.handle.key();
-            let state = match Value::Rec(inst.state.clone()).to_json() {
+            let state = match Value::Rec(inst.state.clone().into()).to_json() {
                 Ok(Json::Object(m)) => m,
                 Ok(_) => unreachable!("state is a record"),
                 Err(e) => {
@@ -537,7 +552,7 @@ impl Runtime {
         let restored = fresh.borrow().clone();
         *inst.state.borrow_mut() = restored;
         inst.calls = calls;
-        inst.state_text = Value::Rec(inst.state.clone()).to_json().map(|j| j.to_string()).unwrap_or_default();
+        inst.state_text = Value::Rec(inst.state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
         let handle = inst.handle.clone();
         for a in &mut alarms {
             self.next_alarm += 1;

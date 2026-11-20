@@ -72,7 +72,9 @@ object Cart {
 - Fields are saved after every change and survive restarts. When you add a field, its
   default fills old instances; when you remove one, its stored value is dropped.
 - Anyone can **read** fields (`cart.total`). Only the object's own methods, and arrow
-  functions created inside them, can **change** fields. Other code calls a method.
+  functions created inside them, can **change** fields, arrays and records inside them
+  included: from outside, `room.messages.push(x)` fails. Other code calls a method, or
+  changes a copy (`room.messages.slice()`, `[...room.messages]`).
 - `this.id` is the instance id. `id`, `emit` and `schedule` are reserved names.
 - Durations: `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"`, or a number of milliseconds (at least 10ms).
 - If a device sleeps through several `@every` beats, the timer fires once and carries on.
