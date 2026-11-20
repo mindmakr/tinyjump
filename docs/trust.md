@@ -332,6 +332,12 @@ controls; it cannot weaken another pack's.
 - **As built, part 7A:** the pack format and loader with `extends`; `tj check --compliance`
   and `tj serve --compliance`; `const lawfulBasis` with its compile check; and a sample GDPR
   pack in `examples/members`. Reference: [compliance.md](compliance.md).
+- **As built, part 7B:**
+  - the flow check keeps revealed data in view and records each place it leaves the
+    server: a fixed host, an unknown URL, or a plugin;
+  - a pack's `transfers` list allows destinations, each with its basis;
+  - the `transfers` control;
+  - the record of processing lists recipients.
 - **Packs:** none ship with tinyjump (owner decision above). A sample GDPR pack shows the
   format. Regional packs (Saudi PDPL, UAE, Qatar, Bahrain, UK, California, HIPAA) come from
   counsel or contributors. They are mostly "person" controls, because those regimes are

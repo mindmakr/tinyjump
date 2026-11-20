@@ -9,8 +9,9 @@ tj check app.tj --compliance gdpr-eu.json    # a report; fails when a checked co
 tj serve app.tj --compliance gdpr-eu.json    # refuses to start while a control is not met
 ```
 
-A new region or industry is a new file, never a new version of tinyjump. A worked example,
-with a sample GDPR pack, is in [examples/members](../examples/members).
+A new region or industry is a new file, never a new version of tinyjump. A worked example
+is in [examples/members](../examples/members). It has a sample GDPR pack, and the club's
+own pack, which extends the sample with the mail provider the club uses.
 
 ## The report
 
@@ -47,7 +48,12 @@ Not covered by this pack:
     { "check": "retention", "source": "<law, article>" },
     { "person": "Keep patient records for the period health rules set", "source": "<law, article>" }
   ],
-  "notCovered": ["clinical research"]
+  "notCovered": ["clinical research"],
+  "transfers": [
+    { "to": "api.mailer.example", "basis": "processor contract (art. 28), EU servers" },
+    { "to": "*.eu.example.com", "basis": "..." },
+    { "to": "tj:ai", "basis": "..." }
+  ]
 }
 ```
 
@@ -56,7 +62,7 @@ Not covered by this pack:
 - **`reviewedBy`** names the counsel who reviewed the pack. Until it is set, every report
   says the pack is not reviewed.
 - **`extends`** lists other packs, by path relative to this file. A pack can only add to
-  the packs it extends: their controls, special categories and `notCovered` all
+  the packs it extends: their controls, special categories, transfers and `notCovered` all
   remain. Two packs may extend the same base; it is merged once.
 - **`special`** lists the `@pii` categories this law treats as special or sensitive. An
   unknown category does not load.
@@ -69,6 +75,12 @@ Not covered by this pack:
   - **`check`**: one tinyjump checks, from the list below. An unknown name does not load;
   - **`person`**: a duty for people, in plain words.
 - **`notCovered`** says plainly what the pack leaves out. The report lists it.
+- **`transfers`** lists where personal data may be sent:
+  - a host (`api.mailer.example`), or every subdomain of one (`*.example.com`);
+  - a plugin module (`tj:ai`).
+
+  Each comes with the basis that allows it. A regional pack usually lists none; an
+  organisation's own pack extends the regional one and lists its providers.
 
 ## What tinyjump checks
 
@@ -82,6 +94,7 @@ Not covered by this pack:
 | `audit-log` | reads and changes of personal data are logged, tamper-evident, under a key outside the data folder (`TJ_AUDIT_KEY_FILE`; checked by `tj serve`) |
 | `encryption-at-rest` | the server runs with `TJ_KEY_FILE`, kept outside the data folder so backups do not carry it (checked by `tj serve`) |
 | `encryption-in-transit` | the server is reached over TLS (`TJ_TLS_TERMINATED=1`), or listens on this machine only (checked by `tj serve`) |
+| `transfers` | personal data leaves the server only for destinations in the pack's `transfers` (below) |
 
 An app with no personal data meets every check.
 
@@ -99,3 +112,15 @@ const lawfulBasis = { account: "contract", billing: "legal-obligation" }
   - every purpose a `@pii` field names must be listed;
   - only those purposes may be listed;
   - each basis must be one of the six.
+
+## Where personal data is sent
+
+Personal data reaches `fetch` and plugins only through `reveal(value, purpose)`. The check
+follows the revealed value, through helper functions too, and records every place it
+leaves the server:
+- **`fetch`**: the host, when the code writes it out (`"https://api.mailer.example/send"`,
+  or a template that starts with the host). A URL whose host comes from a variable is an
+  unknown destination, and `transfers` is not met until the host is written out.
+- **A plugin** such as `tj:ai`: the plugin's name.
+
+`tj check --privacy --record` lists these destinations as the recipients.

