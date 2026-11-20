@@ -242,7 +242,8 @@ fn plugin(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     let mut args = arg(a, 2).to_json().map_err(|e| Exc::msg(format!("plugin arguments must be data: {e}")))?;
     // tj:privacy acts for the running call's caller, which code cannot choose.
     if name == "privacy" {
-        args["caller"] = rt.running_caller.record().to_json().map_err(Exc::msg)?;
+        let serde_json::Value::Object(fields) = &mut args else { return Err(Exc::msg("tj:privacy takes a record of arguments")) };
+        fields.insert("caller".into(), rt.running_caller.record().to_json().map_err(Exc::msg)?);
     }
     Ok(Value::Promise(rt.plugin_call(name, method, args)))
 }

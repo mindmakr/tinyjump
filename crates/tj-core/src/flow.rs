@@ -675,7 +675,7 @@ impl Checker {
                     }
                     if module == "tj:privacy" && name == "exportData" {
                         // Everything held about a person: their own when asked for by them.
-                        let own = fr.owner_only && args.first().is_some_and(|a| is_member(a, "caller", "id"));
+                        let own = fr.owner_only && args.first().is_some_and(|a| is_member(a, "caller", "id") || is_member(a, "this", "id"));
                         let fields: BTreeSet<Field> = self.classes.iter().flat_map(|(c, info)| info.pii.keys().map(move |f| (c.clone(), f.clone()))).collect();
                         return Val::Data(Taint { fields, other: !own, from: Some(Rc::from("exportData(...)")) });
                     }

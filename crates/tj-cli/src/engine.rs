@@ -329,8 +329,15 @@ fn privacy_effects(rt: &mut Runtime, d: &mut Dispatch) {
             d.outputs(rt, out);
         }
     }
+    // Not while a call of theirs is still running: what it does next is written under
+    // their name, so they are forgotten after it ends.
+    let running = |d: &Dispatch, rt: &Runtime, person: &str| rt.runs_for(person) || d.replies.values().any(|w| matches!(&w.call, Some((_, _, Caller::Remote { id, .. }, _)) if id == person));
     for person in std::mem::take(&mut d.forget_after) {
-        d.audit.forget(&person);
+        if running(d, rt, &person) {
+            d.forget_after.push(person);
+        } else {
+            d.audit.forget(&person);
+        }
     }
 }
 
@@ -340,10 +347,12 @@ fn privacy_effect(rt: &mut Runtime, d: &mut Dispatch, effect: u32, method: &str,
     let person = args["id"].as_str().filter(|id| !id.is_empty()).ok_or("give the id of the person")?;
     let by = args["caller"]["id"].as_str().unwrap_or_default();
     let roles: Vec<&str> = args["caller"]["roles"].as_array().map(|r| r.iter().filter_map(Json::as_str).collect()).unwrap_or_default();
+    let who = if roles.contains(&"system") { Actor::System } else { Actor::id(Some(by)) };
     if !((by == person) || roles.contains(&"privacy") || roles.contains(&"system")) {
+        // A security event; without the person, since any id can be given.
+        d.audit.record(Entry::new("refused").who(who).text("request", &format!("privacy {method}")).num("status", 403));
         return Err("only the person themselves, the privacy role or the server's own code may export or erase someone's data".into());
     }
-    let who = if roles.contains(&"system") { Actor::System } else { Actor::id(Some(by)) };
     d.audit.record(Entry::new("privacy").who(who).text("request", method).person("subject", person));
     match method {
         "export" => rt.export_subject(person),
@@ -614,6 +623,11 @@ import { erase, exportData } from "tj:privacy"
     return this.email
   }
   @allow("signedIn") async eraseOther(id: string) { await erase(id) }
+  @allow("owner") async deleteThenWait(): string {
+    await erase(caller.id)
+    try { await fetch("http://127.0.0.1:9/") } catch (e) { }
+    return "done"
+  }
 }
 "#
         .to_string();
@@ -629,17 +643,21 @@ import { erase, exportData } from "tj:privacy"
         let refused = call("Account/user:bo", "eraseOther", vec![json!("user:ana")], "user:bo").unwrap_err();
         assert!(refused.1.contains("only the person themselves"), "{refused:?}");
         assert_eq!(call("Account/user:ana", "deleteMe", vec![], "user:ana"), Ok(json!("")));
+        // A call that goes on after erasing its caller: they are forgotten once it ends.
+        call("Account/user:cy", "set", vec![json!("cy@example.com")], "user:cy").expect("set");
+        assert_eq!(call("Account/user:cy", "deleteThenWait", vec![], "user:cy"), Ok(json!("done")));
 
         // The audit log has the call, written before the person was forgotten: no pseudonym
         // of theirs is left behind (bo's remains).
         let log = || std::fs::read_dir(data.join("audit")).unwrap().filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl")).map(|e| std::fs::read_to_string(e.path()).unwrap()).collect::<String>();
         let mut tries = 0;
-        while !log().contains("\"method\":\"deleteMe\"") && tries < 50 {
+        while !log().contains("\"method\":\"deleteThenWait\"") && tries < 50 {
             std::thread::sleep(Duration::from_millis(50));
             tries += 1;
         }
         let entries = log();
         assert!(entries.contains("\"kind\":\"privacy\"") && entries.contains("\"method\":\"deleteMe\""), "{entries}");
+        assert!(entries.contains("\"kind\":\"refused\"") && entries.contains("\"request\":\"privacy erase\""), "the refusal is a security event: {entries}");
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(std::fs::read_dir(data.join("subjects")).unwrap().count(), 1, "only bo's pseudonym is left");
         let _ = std::fs::remove_dir_all(&data);

@@ -1039,6 +1039,8 @@ function tools(o: string) { return [{ name: "email", object: o, method: "myEmail
     let export = "import { exportData } from \"tj:privacy\"\n";
     let e = flow(r#"@allow("owner") async mine(): any { return await exportData(caller.id) }"#, export);
     assert_eq!(e, "", "a person's own data, to them");
+    let e = flow(r#"@allow("owner") async mine(): any { return await exportData(this.id) }"#, export);
+    assert_eq!(e, "", "this.id is the owner's id in an owner-only method");
     let e = flow(r#"@allow("support") async look(id: string): any { return await exportData(id) }"#, export);
     assert!(e.contains("exportData(...)") && e.contains("is returned here to callers who do not own it"), "{e}");
 
@@ -1857,4 +1859,49 @@ fn smart_meter_workflow_moves_through_states() {
     // Reading the meter is an event too.
     let out = meter.handle(18_000.0, Input::Get { object: "Meter/home".into(), reply: Some(1), caller: Some(Caller::trusted()) });
     assert!(out.iter().any(|o| matches!(o, Output::Emit { object, name, .. } if object == "Meter/home" && name == "read")));
+}
+/// What a host does with `tj:privacy` (tj-cli's engine): runs the erasure the effect asks
+/// for and answers it.
+fn erase_effects(rt: &mut Runtime, now: f64, out: Vec<Output>) -> Vec<Output> {
+    let mut all = Vec::new();
+    for o in out {
+        match o {
+            Output::Effect { id, effect: Effect::Plugin { plugin, method, args } } if plugin == "privacy" && method == "erase" => {
+                let e = rt.erase_subject(args["id"].as_str().unwrap(), Some(id)).map_err(|e| e.1);
+                let (ok, error) = match e {
+                    Ok(e) => (Some(json!({ "erased": e.erased })), None),
+                    Err(e) => (None, Some(e)),
+                };
+                let next = rt.handle(now, Input::EffectDone { id, ok, error, unreachable: false });
+                all.extend(erase_effects(rt, now, next));
+            }
+            o => all.push(o),
+        }
+    }
+    all
+}
+
+#[test]
+fn a_person_erases_themselves_from_an_exclusive_method_and_no_record_of_the_call_is_kept() {
+    let src = r#"
+import { erase } from "tj:privacy"
+
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") set(e: string) { this.email = e }
+  @exclusive @allow("owner") async deleteMe(): any { return await erase(caller.id) }
+}
+"#;
+    let store = Shared::default();
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut rt, 1.0, "Account/user:ana", "set", json!(["a@example.com"]), who("user:ana", &[])).unwrap();
+    // A device's call, run once under its id: its result must not be kept on the object it erased.
+    let out = rt.handle(2.0, Input::Call { object: "Account/user:ana".into(), method: "deleteMe".into(), args: vec![], reply: Some(1), call: Some("k1".into()), caller: who("user:ana", &[]) });
+    let out = erase_effects(&mut rt, 2.0, out);
+    let reply = out.iter().find_map(|o| if let Output::Reply { ok, error, .. } = o { Some((ok.clone(), error.clone())) } else { None }).expect("answered");
+    assert_eq!(reply, (Some(json!({ "erased": ["Account/user:ana"] })), None), "its own lock does not block it");
+    let saved = store.0.borrow().data["Account/user:ana"].clone();
+    assert!(!saved.contains("erased") && !saved.contains("a@example.com"), "{saved}");
+    let record: Json = serde_json::from_str(&saved).unwrap();
+    assert!(record["calls"].as_array().is_none_or(|c| c.is_empty()), "{saved}");
 }

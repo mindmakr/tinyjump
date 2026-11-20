@@ -268,10 +268,11 @@ impl Runtime {
         }
     }
 
-    /// Whether a call holds the object, or waits to.
+    /// Whether a call holds the object, or waits to; a lock held by `own_chain` with nobody
+    /// waiting does not count (the call asking holds it).
     #[cfg(feature = "server")]
-    pub(crate) fn exclusive_busy(&self, class: u16, id: &str) -> bool {
-        self.locks.iter().any(|l| l.key.0 == class && &*l.key.1 == id)
+    pub(crate) fn exclusive_busy(&self, class: u16, id: &str, own_chain: Option<u64>) -> bool {
+        self.locks.iter().any(|l| l.key.0 == class && &*l.key.1 == id && (Some(l.chain) != own_chain || !l.queue.is_empty()))
     }
 
     /// Calls waiting, per class, for statistics.

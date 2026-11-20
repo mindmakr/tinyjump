@@ -151,6 +151,13 @@ impl Runtime {
                 held.push((key, until));
                 continue;
             }
+            // A call still running on it (the one erasing, from the person's own method)
+            // keeps no record there: its result would come back after the erasure.
+            for (on, _, record) in self.call_replies.values_mut() {
+                if on.class == o.class && on.id == o.id {
+                    *record = false;
+                }
+            }
             let fresh = self.defaults(class).map_err(|e| (503, e.message()))?;
             self.reset(&o, fresh);
             erased.push(key);
@@ -334,7 +341,14 @@ impl Runtime {
     fn in_use(&self, class: u16, id: &str, awaiting: Option<u32>) -> bool {
         let here = |o: &Option<std::rc::Rc<crate::vm::value::ObjRef>>| o.as_ref().is_some_and(|o| o.class == class && &*o.id == id);
         let waiting = self.waiting.iter().filter(|(p, _)| Some(**p) != awaiting).any(|(_, (f, _))| f.frames.iter().any(|fr| here(&fr.this)));
-        waiting || self.exclusive_busy(class, id)
+        let own_chain = awaiting.and_then(|p| self.waiting.get(&p)).map(|(f, _)| f.chain);
+        waiting || self.exclusive_busy(class, id, own_chain)
+    }
+
+    /// Whether a call made by the person `id` is still running (waiting on something), so
+    /// what it does next would be written to the audit log under their name.
+    pub fn runs_for(&self, id: &str) -> bool {
+        self.waiting.values().any(|(f, _)| matches!(&f.caller, super::access::Who::Remote { id: i, .. } if &**i == id))
     }
 }
 
