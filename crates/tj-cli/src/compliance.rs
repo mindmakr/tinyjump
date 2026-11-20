@@ -13,7 +13,7 @@ use tj_core::vm::program::Program;
 
 /// The controls tinyjump can check, and what each means.
 const CHECKS: &[(&str, &str)] = &[
-    ("lawful-basis", "every purpose personal data is held for names its lawful basis (`const purposes`)"),
+    ("lawful-basis", "every purpose personal data is held for names its lawful basis (`const lawfulBasis`)"),
     ("special-basis", "data in a special category is held only on consent, or a person confirms another condition"),
     ("retention", "every object holding personal data is erased after a set time (`@retain`)"),
     ("subject-rights", "people can get a copy of their data and have it erased (`tj privacy`, `tj:privacy`)"),
@@ -120,7 +120,7 @@ impl Pack {
                         None => {
                             let used: BTreeSet<&str> = held.iter().flat_map(|o| o.pii.iter().flat_map(|p| p.purposes.iter().map(|s| &**s))).collect();
                             let example: Vec<String> = used.iter().map(|p| format!("{p}: \"contract\"")).collect();
-                            Verdict::NotMet(format!("declare the lawful basis of each purpose: const purposes = {{ {} }}", example.join(", ")))
+                            Verdict::NotMet(format!("declare the lawful basis of each purpose: const lawfulBasis = {{ {} }}", example.join(", ")))
                         }
                     },
                     "special-basis" => {
@@ -251,12 +251,12 @@ mod tests {
         let (r, ok) = pack.report(&pack.evaluate(src, &program, None));
         assert!(!ok);
         assert!(r.starts_with("p (p from 2018-05-25)\nThis report is not legal advice. Not reviewed by counsel: p."), "{r}");
-        assert!(r.contains("NOT MET   lawful-basis: declare the lawful basis of each purpose: const purposes = { care: \"contract\" }"), "{r}");
+        assert!(r.contains("NOT MET   lawful-basis: declare the lawful basis of each purpose: const lawfulBasis = { care: \"contract\" }"), "{r}");
         assert!(r.contains("NOT MET   special-basis: special-category data held without consent: Patient.notes (health) for care"), "{r}");
         assert!(r.contains("NOT MET   retention: kept forever: Patient."), "{r}");
         assert!(r.contains("at serve  encryption-at-rest") && r.contains("person    Appoint a DPO  [art. 37]"), "{r}");
 
-        let src = "const purposes = { care: \"consent\" }\n@server @read(\"owner\") @retain(\"2y\") object Patient {\n  @pii(\"health\", \"care\") notes: string = \"\"\n}\n";
+        let src = "const lawfulBasis = { care: \"consent\" }\n@server @read(\"owner\") @retain(\"2y\") object Patient {\n  @pii(\"health\", \"care\") notes: string = \"\"\n}\n";
         let program = tj_core::compile(src).unwrap();
         let (r, ok) = pack.report(&pack.evaluate(src, &program, Some(true)));
         assert!(ok && !r.contains("NOT MET"), "{r}");

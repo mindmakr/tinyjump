@@ -330,7 +330,7 @@ controls; it cannot weaken another pack's.
   - consent can be withdrawn;
   - `@needs("consent:marketing")` refuses a call without it.
 - **As built, part 7A:** the pack format and loader with `extends`; `tj check --compliance`
-  and `tj serve --compliance`; `const purposes` with its compile check; and a sample GDPR
+  and `tj serve --compliance`; `const lawfulBasis` with its compile check; and a sample GDPR
   pack in `examples/members`. Reference: [compliance.md](compliance.md).
 - **Packs:** none ship with tinyjump (owner decision above). A sample GDPR pack shows the
   format. Regional packs (Saudi PDPL, UAE, Qatar, Bahrain, UK, California, HIPAA) come from

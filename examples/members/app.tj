@@ -5,7 +5,7 @@
 
 import { erase, exportData } from "tj:privacy"
 
-const purposes = { account: "contract" }
+const lawfulBasis = { account: "contract" }
 
 @server @read("owner") @retain("2y") object Member {
   @pii("contact", "account") name: string = ""

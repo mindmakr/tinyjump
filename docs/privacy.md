@@ -166,7 +166,7 @@ Devices do not run the check: they run apps the command line has checked.
 
 ## Lawful basis and compliance packs
 
-`const purposes = { account: "contract" }` names the lawful basis of each purpose. Apps
+`const lawfulBasis = { account: "contract" }` names the lawful basis of each purpose. Apps
 can be checked against a region's rules with `tj check --compliance <pack.json>`. Both
 are described in [compliance.md](compliance.md).
 

@@ -11,7 +11,7 @@ pub mod flow;
 pub mod host;
 pub mod modules;
 #[cfg(feature = "check")]
-pub mod purposes;
+pub mod lawful_basis;
 pub mod runtime;
 pub mod syntax;
 pub mod typeck;

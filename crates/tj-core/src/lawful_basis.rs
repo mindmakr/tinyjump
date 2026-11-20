@@ -1,7 +1,7 @@
 //! The lawful basis of each purpose personal data is held for (docs/privacy.md):
 //!
 //! ```ts
-//! const purposes = { account: "contract", marketing: "consent" }
+//! const lawfulBasis = { account: "contract", marketing: "consent" }
 //! ```
 //!
 //! Optional: an app without it compiles as before. When present, every purpose a `@pii`
@@ -23,13 +23,13 @@ pub fn declared(files: &[(&str, &Program)]) -> Option<Vec<(String, String)>> {
 /// Checks the declaration against the `@pii` fields.
 pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
     let Some(Found { entries, span, mutable }) = find(files) else { return Vec::new() };
-    let fix = "write `const purposes = { account: \"contract\" }`, one entry per purpose";
+    let fix = "write `const lawfulBasis = { account: \"contract\" }`, one entry per purpose";
     let Some(entries) = entries else {
-        return vec![Diagnostic::new("`purposes` must be a record of purposes and their lawful bases", span).hint(fix)];
+        return vec![Diagnostic::new("`lawfulBasis` must be a record of purposes and their lawful bases", span).hint(fix)];
     };
     let mut errors = Vec::new();
     if mutable {
-        errors.push(Diagnostic::new("`purposes` must be declared with const", span).hint(fix));
+        errors.push(Diagnostic::new("`lawfulBasis` must be declared with const", span).hint(fix));
     }
     let used = used(files);
     let hint_bases = format!("the bases are {}", BASES.join(", "));
@@ -47,7 +47,7 @@ pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
     if !missing.is_empty() {
         let names: Vec<String> = missing.iter().map(|p| format!("\"{p}\"")).collect();
         let example: Vec<String> = missing.iter().map(|p| format!("{p}: \"contract\"")).collect();
-        errors.push(Diagnostic::new(format!("purposes without a lawful basis: {}", names.join(", ")), span).hint(format!("add them to `purposes`, e.g. {}; {hint_bases}", example.join(", "))));
+        errors.push(Diagnostic::new(format!("purposes without a lawful basis: {}", names.join(", ")), span).hint(format!("add them to `lawfulBasis`, e.g. {}; {hint_bases}", example.join(", "))));
     }
     errors
 }
@@ -62,10 +62,10 @@ struct Found {
     mutable: bool,
 }
 
-/// The app's top-level `purposes` declaration.
+/// The app's top-level `lawfulBasis` declaration.
 fn find(files: &[(&str, &Program)]) -> Option<Found> {
     let items = files.iter().filter(|(name, _)| !name.starts_with("tj:")).flat_map(|(_, p)| &p.items);
-    items.filter_map(|i| if let Item::Let(d) = i { Some(d) } else { None }).find(|d| matches!(&d.pattern, Pattern::Ident(n, _) if n == "purposes")).map(|d| {
+    items.filter_map(|i| if let Item::Let(d) = i { Some(d) } else { None }).find(|d| matches!(&d.pattern, Pattern::Ident(n, _) if n == "lawfulBasis")).map(|d| {
         let entries = match d.init.as_ref().map(|e| &e.kind) {
             Some(ExprKind::Record(fields)) => fields
                 .iter()

@@ -69,7 +69,7 @@ Not covered by this pack:
 
 | `check` | Met when |
 |---|---|
-| `lawful-basis` | every purpose personal data is held for names its lawful basis (`const purposes`, below) |
+| `lawful-basis` | every purpose personal data is held for names its lawful basis (`const lawfulBasis`, below) |
 | `special-basis` | data in the pack's special categories is held only for purposes based on consent (otherwise, a person must confirm another condition) |
 | `retention` | every object holding personal data has `@retain` |
 | `subject-rights` | always: people can get a copy of their data and have it erased (`tj privacy`, `tj:privacy`) |
@@ -84,7 +84,7 @@ An app with no personal data meets every check.
 Each purpose that `@pii` fields name gets its lawful basis, once, at the top of the app:
 
 ```ts
-const purposes = { account: "contract", billing: "legal-obligation" }
+const lawfulBasis = { account: "contract", billing: "legal-obligation" }
 ```
 
 - The bases are `consent`, `contract`, `legal-obligation`, `vital-interest`, `public-task`

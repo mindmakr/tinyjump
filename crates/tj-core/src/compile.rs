@@ -37,14 +37,14 @@ pub fn reveals(src: &str) -> Vec<crate::flow::Reveal> {
     crate::flow::reveals(&named)
 }
 
-/// The lawful basis of each purpose, when the app declares them (`const purposes`).
+/// The lawful basis of each purpose, when the app declares them (`const lawfulBasis`).
 #[cfg(feature = "check")]
 pub fn lawful_bases(src: &str) -> Option<Vec<(String, String)>> {
     let src = &*modules::with_built_ins(src);
     let files = modules::files(src);
     let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
     let named: Vec<(&str, &crate::syntax::ast::Program)> = files.iter().map(|f| f.name.as_str()).zip(&parsed).collect();
-    crate::purposes::declared(&named)
+    crate::lawful_basis::declared(&named)
 }
 
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
@@ -71,7 +71,7 @@ pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     {
         let named: Vec<(&str, &crate::syntax::ast::Program)> = linked.order.iter().map(|&i| (files[i].name.as_str(), &parsed[i])).collect();
         errors.extend(crate::flow::check(&named));
-        errors.extend(crate::purposes::check(&named));
+        errors.extend(crate::lawful_basis::check(&named));
     }
     let mut c = Compiler::new();
     c.file_names = files.into_iter().map(|f| f.name).collect();
