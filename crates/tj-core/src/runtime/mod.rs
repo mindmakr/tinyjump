@@ -339,18 +339,15 @@ impl Runtime {
                 }
                 // A call from outside gives JSON: it must fit the method's declared types, or it
                 // is refused before the method runs, naming the parameter.
-                Ok(who) if matches!(who, Who::Remote { .. }) && self.bad_args(&object, &method, &args).is_some() => {
-                    let why = self.bad_args(&object, &method, &args).unwrap_or_default();
-                    self.reply_status(reply, 400, why)
-                }
-                Ok(who) => match (self.resolve_object(&object), call) {
-                    (Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
-                    (Ok(obj), None) => {
+                Ok(who) => match (matches!(who, Who::Remote { .. }).then(|| self.bad_args(&object, &method, &args)).flatten(), self.resolve_object(&object), call) {
+                    (Some(why), _, _) => self.reply_status(reply, 400, why),
+                    (None, Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
+                    (None, Ok(obj), None) => {
                         let args = args.iter().map(Value::from_json).collect();
                         self.invoke(obj, &method, args, true, reply, Entry::new(who))
                     }
                     // The rules already admitted the class, so this is the store failing.
-                    (Err(e), _) => self.reply_status(reply, 503, e),
+                    (None, Err(e), _) => self.reply_status(reply, 503, e),
                 },
             },
             Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
@@ -575,7 +572,7 @@ impl Runtime {
     }
 
     /// Why `args` do not fit `Class.method`'s declared parameters, if they do not.
-    fn bad_args(&self, object: &str, method: &str, args: &[Json]) -> Option<String> {
+    pub(crate) fn bad_args(&self, object: &str, method: &str, args: &[Json]) -> Option<String> {
         let class = object.split_once('/').and_then(|(c, _)| self.program.object(c))?;
         let m = self.program.objects[class as usize].methods.get(method)?;
         let def = &self.program.objects[class as usize];

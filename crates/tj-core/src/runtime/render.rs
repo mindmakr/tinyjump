@@ -107,6 +107,15 @@ fn elem(e: &Elem) -> Result<VNode, String> {
             for c in &e.children {
                 nodes(c, &mut children)?;
             }
+            // A labelled group around one control without a label (a form field, `tj:ui`'s
+            // Field): the label names the control, for screen readers and agents alike.
+            let unnamed = |n: &VNode| matches!(&*n.kind, "Input" | "Toggle") && !n.props.contains_key("label");
+            if props.contains_key("label") && children.iter().filter(|c| unnamed(c)).count() == 1 {
+                let label = props.remove("label").expect("checked");
+                if let Some(control) = children.iter_mut().find(|c| unnamed(c)) {
+                    control.props.insert("label".into(), label);
+                }
+            }
         }
         Content::None => {}
     }

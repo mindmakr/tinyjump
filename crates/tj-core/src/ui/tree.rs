@@ -57,7 +57,7 @@ impl Tree {
         let found = match target {
             Target::Node { node } => walk(&self.roots, &|n| n.id == *node),
             Target::Id { id } => walk(&self.roots, &|n| prop_is(n, "id", id)),
-            Target::Text { text } => walk(&self.roots, &|n| prop_is(n, "text", text) || prop_is(n, "label", text)),
+            Target::Text { text } => walk(&self.roots, &|n| prop_is(n, "text", text) || prop_is(n, "label", text) || prop_is(n, "placeholder", text)),
         };
         found.map(|n| n.id)
     }

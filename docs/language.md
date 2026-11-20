@@ -116,12 +116,14 @@ The server is the single authority, so there are no conflicts to resolve. Timers
   - Write the rules once, in a function that both the UI and the server method call:
 
     ```ts
-    function validSlot(title: string, minutes: number) {
+    function validSlot(title: string, minutes: number | null) {
       check(title.trim() !== "", "title", "Give the slot a title")
-      check(minutes >= 5 && minutes <= 480, "minutes", "A slot lasts 5 to 480 minutes")
+      check(minutes !== null && minutes >= 5 && minutes <= 480, "minutes", "A slot lasts 5 to 480 minutes")
     }
     ```
 
+  - Typed inputs give `null` while empty, so check for it first, as above: comparing
+    `null` with a number throws.
   - In the UI, `catch (e)` gives `e.field` and `e.message`.
   - A server refusing the call gives the message to the device's promise, without the
     field.
