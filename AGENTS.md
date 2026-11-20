@@ -13,6 +13,9 @@ If a change does not serve a goal there, do not make it.
 - Foreign-language boundary: `crates/tj-core/src/host.rs`. `tj-wasm` and `tj-android` stay thin.
   - Builtins: `crates/tj-core/src/vm/builtins.rs`; array callbacks in `vm/prelude.tj`.
   - Protocol: `crates/tj-core/src/runtime/protocol.rs` plus `docs/host-protocol.md`.
+  - Plugin modules: `plugins/<name>/plugin.tj`, listed in `modules::BUILT_IN`
+    (`docs/plugins.md`).
+  - Access rules: checked in `crates/tj-core/src/runtime/access.rs` (`docs/access-control.md`).
 - Language changes must keep agents in mind: TypeScript syntax, one way to do each thing,
   and an error message with a fix hint for anything unsupported.
 - Every language feature and runtime behaviour gets a test. End-to-end tests are in

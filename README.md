@@ -36,7 +36,9 @@ Examples (`cargo tj dev examples/<name>/app.tj`):
 
 - **durable-cart:** one cart shared by every device, the backend, the HTTP API and AI agents.
   Change it anywhere, and every subscribed screen updates at once. Held stock is released
-  by a durable timer on the backend.
+  by a durable timer on the backend. A shop assistant changes the cart in plain words
+  through the `tj:ai` plugin (set `ANTHROPIC_API_KEY`, or run with
+  `--plugin ai=fake:examples/durable-cart/fake-ai.json`). Staff restock with an API key.
 - **smart-meter:** an event-driven workflow. Timer readings, API readings, actions and
   durable alarms move it between normal, high and alert, and every step notifies
   subscribers.

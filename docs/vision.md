@@ -139,9 +139,10 @@ Raised by the owner. To be discussed and critiqued before any work starts:
     connect systems that are not tinyjump (incoming: a signed request becomes a method
     call; outgoing: change subscriptions delivered by HTTP with retries).
   - **Topics across objects** (`Room/*`): add when an app needs them.
-- **Plugins and the agent loop (agreed):** plugins are typed `.tj` modules backed by MCP
-  servers (`docs/plugins.md`). The agent loop is a plugin plus a library, whose tools are
-  the app's own methods under the access rules.
+- **Plugins and the agent loop (agreed; plugins and `tj:ai` done):** plugins are typed
+  `.tj` modules backed by MCP servers (`docs/plugins.md`). The durable cart has a shop
+  assistant. Next is the `tj:agent` library, whose tools are the app's own methods under
+  the access rules.
 - **Docker-like features:** park until the retro. First decide whether this means packaging
   and deploying apps as sealed units, or isolating running apps. The runtime is already
   sandboxed: it has no I/O except through its host.
