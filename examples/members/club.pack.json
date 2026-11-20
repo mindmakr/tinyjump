@@ -1,0 +1,11 @@
+{
+  "name": "members-club",
+  "title": "Members' club: GDPR plus our processors",
+  "effective": "2026-11-20",
+  "reviewedBy": null,
+  "extends": ["gdpr-eu.sample.json"],
+  "controls": [],
+  "transfers": [
+    { "to": "api.mailer.example", "basis": "processor contract (art. 28); servers in the EU, so no transfer outside it" }
+  ]
+}

@@ -54,16 +54,19 @@ pub fn record(src: &str, program: &Program) -> String {
         }
     }
     out.push_str("\n## Where it is let out\n\nPersonal data cannot leave its owner (network, plugins and AI models, events, errors, logs, other callers) except here, each with a stated purpose:\n\n");
-    let full = modules::with_built_ins(src);
-    let files = modules::files(&full);
-    let reveals = tj_core::reveals(src);
-    if reveals.is_empty() {
+    let facts = tj_core::facts(src);
+    if facts.reveals.is_empty() {
         out.push_str("- Nowhere.\n");
     }
-    for r in reveals {
-        let at = r.at as usize;
-        let place = files.iter().rfind(|f| f.start <= at && at < f.end).map_or_else(String::new, |f| format!("{}:{}", f.name, full[f.start..at].matches('\n').count() + 1));
-        out.push_str(&format!("- `{place}`: {}, for {}\n", r.fields.join(", "), r.purpose));
+    for r in &facts.reveals {
+        out.push_str(&format!("- `{}`: {}, for {}\n", place(src, r.at), r.fields.join(", "), r.purpose));
+    }
+    out.push_str("\n## Where it is sent (recipients)\n\n");
+    if facts.transfers.is_empty() {
+        out.push_str("- Nowhere outside the server.\n");
+    }
+    for t in &facts.transfers {
+        out.push_str(&format!("- `{}`: {} to {}\n", place(src, t.at), t.fields.join(", "), destination(&t.to)));
     }
     out.push_str("\n## How long it is kept\n\n");
     for o in program.objects.iter().filter(|o| o.belongs_to_a_person()) {
@@ -71,6 +74,23 @@ pub fn record(src: &str, program: &Program) -> String {
     }
     out.push_str("\n## Security measures the runtime provides\n\n- Access rules on every object and method (`tj check --access`), refusals audited.\n- Personal fields masked for every reader but their owner, and for every tool.\n- A tamper-evident audit log of calls, reads of personal data, refusals and admin requests, with people as pseudonyms.\n- With `TJ_KEY_FILE`: encryption at rest, and a key per person-owned object, destroyed on erasure so backups cannot be read.\n- Exports and erasures on request (`tj privacy`, `tj:privacy`), audited.\n- Whether encryption is on for a given server is in its startup line: ____\n");
     out
+}
+
+/// `file:line` of a byte offset into `src` with its built-in modules added (as the checks
+/// report offsets).
+pub fn place(src: &str, at: u32) -> String {
+    let full = modules::with_built_ins(src);
+    let at = at as usize;
+    modules::files(&full).iter().rfind(|f| f.start <= at && at < f.end).map_or_else(String::new, |f| format!("{}:{}", f.name, full[f.start..at].matches('\n').count() + 1))
+}
+
+/// Where personal data goes, in words.
+pub fn destination(to: &tj_core::Destination) -> String {
+    match to {
+        tj_core::Destination::Host(h) => h.clone(),
+        tj_core::Destination::Plugin(m) => format!("the plugin {m}"),
+        tj_core::Destination::Unknown => "a URL whose host the code does not fix".into(),
+    }
 }
 
 /// `tj privacy export|erase <person> [--target <url>]`.

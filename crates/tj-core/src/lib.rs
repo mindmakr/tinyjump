@@ -20,7 +20,10 @@ pub mod vm;
 
 pub use compile::compile;
 #[cfg(feature = "check")]
-pub use {compile::lawful_bases, compile::reveals, flow::Reveal};
+pub use {
+    compile::{facts, Facts},
+    flow::{Destination, Reveal, Transfer},
+};
 pub use runtime::protocol::{Input, Output, PatchOp, Target};
 pub use runtime::store::{MemStore, Store};
 pub use runtime::{BootError, Options, Runtime};

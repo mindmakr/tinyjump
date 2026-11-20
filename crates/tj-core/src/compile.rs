@@ -21,32 +21,34 @@ use std::rc::Rc;
 const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule"];
 const MAX_ERRORS: usize = 20;
 
-/// Compiles a source file (plus the prelude) to a program.
-/// Every place an app lets personal data out with `reveal(value, purpose)`, for the record
-/// of processing (`tj check --privacy --record`). Offsets are into `src` with the built-in
-/// modules it imports added, as `modules::with_built_ins` gives it.
+/// What the checks know about an app's personal data, for reports: `tj check --privacy
+/// --record` and `--compliance`. Offsets are into `src` with the built-in modules it imports
+/// added, as `modules::with_built_ins` gives it.
 #[cfg(feature = "check")]
-pub fn reveals(src: &str) -> Vec<crate::flow::Reveal> {
+#[derive(Debug, Default)]
+pub struct Facts {
+    /// Every `reveal(value, purpose)`.
+    pub reveals: Vec<crate::flow::Reveal>,
+    /// Every place revealed personal data leaves the server.
+    pub transfers: Vec<crate::flow::Transfer>,
+    /// The lawful basis of each purpose, when the app declares them (`const lawfulBasis`).
+    pub lawful_basis: Option<Vec<(String, String)>>,
+}
+
+#[cfg(feature = "check")]
+pub fn facts(src: &str) -> Facts {
     let src = &*modules::with_built_ins(src);
     let files = modules::files(src);
     let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
     if parsed.len() != files.len() {
-        return Vec::new();
+        return Facts::default();
     }
     let named: Vec<(&str, &crate::syntax::ast::Program)> = files.iter().map(|f| f.name.as_str()).zip(&parsed).collect();
-    crate::flow::reveals(&named)
+    let (reveals, transfers) = crate::flow::reveals_and_transfers(&named);
+    Facts { reveals, transfers, lawful_basis: crate::lawful_basis::declared(&named) }
 }
 
-/// The lawful basis of each purpose, when the app declares them (`const lawfulBasis`).
-#[cfg(feature = "check")]
-pub fn lawful_bases(src: &str) -> Option<Vec<(String, String)>> {
-    let src = &*modules::with_built_ins(src);
-    let files = modules::files(src);
-    let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
-    let named: Vec<(&str, &crate::syntax::ast::Program)> = files.iter().map(|f| f.name.as_str()).zip(&parsed).collect();
-    crate::lawful_basis::declared(&named)
-}
-
+/// Compiles a source file (plus the prelude) to a program.
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
     // Plugins that ship with tinyjump come with the compiler (see `modules::BUILT_IN`).

@@ -37,6 +37,9 @@ struct Taint {
     other: bool,
     /// How the first source was written, for messages.
     from: Option<Rc<str>>,
+    /// Personal data let out with `reveal`: no longer an error anywhere, but where it is
+    /// sent is recorded (transfers).
+    revealed: BTreeSet<Field>,
 }
 
 impl Taint {
@@ -45,6 +48,7 @@ impl Taint {
     }
 
     fn join(&mut self, o: &Taint) {
+        self.revealed.extend(o.revealed.iter().cloned());
         if o.is_clean() {
             return;
         }
@@ -56,8 +60,8 @@ impl Taint {
     }
 
     fn sig(&self) -> String {
-        let fields: Vec<String> = self.fields.iter().map(|(c, f)| format!("{c}.{f}")).collect();
-        format!("{}{}", fields.join(","), if self.other { "!" } else { "" })
+        let names = |s: &BTreeSet<Field>| s.iter().map(|(c, f)| format!("{c}.{f}")).collect::<Vec<_>>().join(",");
+        format!("{}{}/{}", names(&self.fields), if self.other { "!" } else { "" }, names(&self.revealed))
     }
 }
 
@@ -111,6 +115,50 @@ struct Checker {
     active: HashSet<String>,
     /// Every place personal data is let out on purpose, for the record of processing.
     reveals: Vec<Reveal>,
+    /// Every place revealed personal data leaves the server.
+    transfers: Vec<Transfer>,
+}
+
+/// Where personal data goes when it leaves the server.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Destination {
+    /// A `fetch` to this host, written as a constant in the code.
+    Host(String),
+    /// A plugin module, such as `tj:ai`.
+    Plugin(String),
+    /// A `fetch` whose host is not a constant in the code.
+    Unknown,
+}
+
+/// Revealed personal data sent somewhere: where in the source, to whom, and which fields.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Transfer {
+    pub at: u32,
+    pub to: Destination,
+    pub fields: Vec<String>,
+}
+
+/// The host a `fetch` URL names, when the code fixes it: a string, or a template whose
+/// text up to the host is written out.
+fn destination(url: &Expr) -> Destination {
+    let start = match &url.kind {
+        ExprKind::Str(s) => s.as_str(),
+        ExprKind::Template(pieces) => match pieces.first() {
+            Some(crate::syntax::ast::TplPiece::Str(s)) => s.as_str(),
+            _ => "",
+        },
+        _ => "",
+    };
+    let Some(rest) = start.strip_prefix("https://").or_else(|| start.strip_prefix("http://")) else { return Destination::Unknown };
+    // The host must end inside the constant text, before a path, query, port or the end of
+    // a plain string; a template that goes on after the host's first part is not fixed.
+    let end = rest.find(['/', '?', '#', ':']);
+    let whole = matches!(url.kind, ExprKind::Str(_));
+    match end {
+        Some(i) if i > 0 => Destination::Host(rest[..i].to_ascii_lowercase()),
+        None if whole && !rest.is_empty() => Destination::Host(rest.to_ascii_lowercase()),
+        _ => Destination::Unknown,
+    }
 }
 
 /// A `reveal(value, purpose)`: where (a byte offset in the app's source), for what, and
@@ -138,19 +186,23 @@ pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
     analyze(files).map(|c| c.errors).unwrap_or_default()
 }
 
-/// Every `reveal` in the app, in source order.
-pub fn reveals(files: &[(&str, &Program)]) -> Vec<Reveal> {
-    let mut r = analyze(files).map(|c| c.reveals).unwrap_or_default();
+/// Every `reveal` in the app, and every place revealed personal data leaves the server,
+/// in source order.
+pub fn reveals_and_transfers(files: &[(&str, &Program)]) -> (Vec<Reveal>, Vec<Transfer>) {
+    let Some(c) = analyze(files) else { return Default::default() };
+    let (mut r, mut t) = (c.reveals, c.transfers);
     r.sort_by_key(|x| x.at);
     r.dedup();
-    r
+    t.sort_by(|a, b| (a.at, &a.to).cmp(&(b.at, &b.to)));
+    t.dedup();
+    (r, t)
 }
 
 fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
         return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new() };
     let user: Vec<&Program> = files.iter().filter(|(name, _)| !name.starts_with("tj:")).map(|(_, p)| *p).collect();
     for (name, p) in files.iter().filter(|(name, _)| name.starts_with("tj:")) {
         for item in &p.items {
@@ -240,7 +292,7 @@ impl Checker {
                 let Some(info) = self.classes.get(class) else { return Taint::default() };
                 let fields: BTreeSet<Field> = info.pii.keys().map(|f| (class.clone(), f.clone())).collect();
                 let from = (!fields.is_empty()).then(|| Rc::from(format!("the whole {class} object")));
-                Taint { fields, other: *other, from }
+                Taint { fields, other: *other, from, ..Taint::default() }
             }
         }
     }
@@ -272,6 +324,15 @@ impl Checker {
             [] => "these fields are for different purposes: reveal each for its own purpose before combining them".into(),
             [p] => format!("if this is intended, write reveal(value, \"{p}\"); otherwise do not send it"),
             many => format!("if this is intended, write reveal(value, \"<purpose>\") with the purpose it is sent for ({}); otherwise do not send it", many.join(", ")),
+        }
+    }
+
+    /// Records where revealed personal data in `v` is sent.
+    fn transfer(&mut self, v: &Val, span: crate::syntax::Span, to: &Destination) {
+        let t = self.flatten(v);
+        if !t.revealed.is_empty() {
+            let fields = t.revealed.iter().map(|(c, f)| format!("{c}.{f}")).collect();
+            self.transfers.push(Transfer { at: span.start, to: to.clone(), fields });
         }
     }
 
@@ -514,7 +575,7 @@ impl Checker {
                         }
                         let from = if matches!(obj.kind, ExprKind::This) { format!("this.{name}") } else { format!("{class}.{name}") };
                         let fields = BTreeSet::from([(class.clone(), Rc::from(name.as_str()))]);
-                        Val::Data(Taint { fields, other, from: Some(Rc::from(from)) })
+                        Val::Data(Taint { fields, other, from: Some(Rc::from(from)), ..Taint::default() })
                     }
                     v => Val::Data(self.flatten(&v)),
                 }
@@ -658,12 +719,20 @@ impl Checker {
                 "reveal" => {
                     let v = args.first().map_or_else(clean, |a| self.expr(a, fr));
                     self.reveal(&v, args.get(1), span);
-                    clean()
+                    let t = self.flatten(&v);
+                    Val::Data(Taint { revealed: t.fields.union(&t.revealed).cloned().collect(), ..Taint::default() })
                 }
                 "fetch" | "plugin" | "invoke" => {
+                    let to = match name.as_str() {
+                        "fetch" => Some(args.first().map_or(Destination::Unknown, destination)),
+                        _ => None,
+                    };
                     for a in args {
                         let v = self.expr(a, fr);
                         self.sink(&v, a.span, &format!("`{name}`"));
+                        if let Some(to) = &to {
+                            self.transfer(&v, a.span, to);
+                        }
                     }
                     clean()
                 }
@@ -672,12 +741,16 @@ impl Checker {
                     for a in args {
                         let v = self.expr(a, fr);
                         self.sink(&v, a.span, &format!("the plugin {module}"));
+                        // tj:privacy is the server itself; every other plugin is a recipient.
+                        if &*module != "tj:privacy" {
+                            self.transfer(&v, a.span, &Destination::Plugin(module.to_string()));
+                        }
                     }
                     if module == "tj:privacy" && name == "exportData" {
                         // Everything held about a person: their own when asked for by them.
                         let own = fr.owner_only && args.first().is_some_and(|a| is_member(a, "caller", "id") || is_member(a, "this", "id"));
                         let fields: BTreeSet<Field> = self.classes.iter().flat_map(|(c, info)| info.pii.keys().map(move |f| (c.clone(), f.clone()))).collect();
-                        return Val::Data(Taint { fields, other: !own, from: Some(Rc::from("exportData(...)")) });
+                        return Val::Data(Taint { fields, other: !own, from: Some(Rc::from("exportData(...)")), ..Taint::default() });
                     }
                     clean()
                 }

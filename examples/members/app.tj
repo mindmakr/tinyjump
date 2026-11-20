@@ -1,7 +1,8 @@
 // A members' club that holds personal data the way the law expects: each purpose names its
-// lawful basis, records are erased after two years, and members can download or delete
-// their own data. Check it against the sample GDPR pack:
-//   tj check examples/members/app.tj --compliance examples/members/gdpr-eu.sample.json
+// lawful basis, records are erased after two years, members can download or delete their
+// own data, and the welcome email goes only to the mail provider the club's pack allows.
+// club.pack.json extends the sample GDPR pack with that provider:
+//   tj check examples/members/app.tj --compliance examples/members/club.pack.json
 
 import { erase, exportData } from "tj:privacy"
 
@@ -13,6 +14,13 @@ const lawfulBasis = { account: "contract" }
 
   @allow("owner") setName(name: string) { this.name = name.trim() }
   @allow("owner") setEmail(email: string) { this.email = email.trim() }
+
+  @allow("owner") async welcome() {
+    await fetch("https://api.mailer.example/send", {
+      method: "POST",
+      body: JSON.stringify({ to: reveal(this.email, "account"), template: "welcome" }),
+    })
+  }
 
   @allow("owner") async myData(): any { return await exportData(caller.id) }
 
@@ -29,6 +37,7 @@ function App() {
     <Input id="name" value={me.name} placeholder="Your name" onSubmit={(t) => me.setName(t)} />
     <Input id="email" value={me.email} placeholder="Your email" onSubmit={(t) => me.setEmail(t)} />
     <Row gap={8}>
+      <Button id="welcome" onPress={() => me.welcome()}>Send me the welcome email</Button>
       <Button id="download" onPress={() => me.myData()}>Download my data</Button>
       <Button id="leave" onPress={() => me.leave()}>Delete my account</Button>
     </Row>
