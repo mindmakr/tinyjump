@@ -41,23 +41,27 @@ Done so far, in order: resumable change streams, the benchmark and size budget, 
 calls and backpressure, modules, the language reference, server metrics, access control,
 and plugins with `tj:ai`.
 
-### Milestone 1 (active, set by the owner on 2026-11-20): one small app, end to end
+### Milestone 1 (set by the owner on 2026-11-20): one small app, end to end
 
-One milestone at a time. The first is a small app that agents build from the docs alone
-and that runs end to end on the happy path, so every piece of plumbing is proven together
-before anything is enhanced. Release is not the goal; being in the market early, to gain
-momentum and contributors, is.
+One milestone at a time. The first is a small app that runs end to end on the happy path,
+so every piece of plumbing is proven together before anything is enhanced. Release is not
+the goal; being in the market early, to gain momentum and contributors, is.
 
-- **Done when** one small app (chosen with the owner) is written by agents from
-  `docs/language.md`, runs in `tj dev` on the web, on Android and on the iOS Simulator,
-  is served by a `tj serve` binary on Linux with sign-in, keeps working offline and syncs
-  when back, updates live on every screen, is driven and checked by an agent through
-  `tj mcp` and `tj review`, and is deployed as documented.
-- **How:** other agents build it and post every gap they hit to `feedback/`; the builder
-  fixes what blocks the happy path and lists the rest. Nothing beyond the happy path is
-  built in this milestone.
-- **Paused until it is done:** the rest of the trust work below (personal data parts 2 and
-  3, compliance packs).
+- **The app:** appointment booking. A business publishes slots, customers book and
+  cancel, and reminders go out by alarm (`@exclusive` keeps a slot from being booked
+  twice).
+- **When:** after the work in flight is finished. The trust work keeps going alongside.
+- **How, kept simple:**
+  1. A short spec: what the app does, written as behaviours that can be tested (given,
+     when, then), reviewed before anyone builds.
+  2. Other AI developers build it from the spec and `docs/language.md` alone.
+  3. Blind reviewers, who never saw the builders' conversation, check it against the spec
+     and score it; gaps go to `feedback/`. Build and review repeat until the score is
+     acceptable.
+- **Done when** it runs in `tj dev` on the web, on Android and on the iOS Simulator, is
+  served by `tj serve` on Linux with sign-in, keeps working offline and syncs when back,
+  updates live on every screen, and passes the spec's behaviours, driven by an agent
+  through `tj mcp` and `tj review`.
 
 ### The rest of the agreed order
 
@@ -75,7 +79,7 @@ momentum and contributors, is.
    - a built-in, tamper-evident audit log (done);
    - encryption at rest, `crypto.*` for apps and the plain-HTTP checks (done);
    - personal data with subject rights (`@pii`, masking, export and erase done; the flow
-     check, retention and per-person keys after Milestone 1);
+     check, retention and per-person keys next);
    - region compliance packs (GDPR and Saudi PDPL first) that third parties can extend.
    - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
      scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,
