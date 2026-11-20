@@ -590,9 +590,14 @@ impl Runtime {
             Err(fail) => {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
-                self.count_error(f.stat);
+                match fail.status {
+                    Some(_) => self.count_refused_slot(f.stat),
+                    None => self.count_error(f.stat),
+                }
                 match (reply, fail.status) {
-                    (Some(_), Some(status)) => self.reply_status(reply, status, fail.message),
+                    // Through `refuse_start`, so a call run once (a device's) keeps the status
+                    // and no record of the refusal is kept for it.
+                    (Some(_), Some(status)) => self.refuse_start(reply, status, fail.message),
                     (Some(_), None) => self.reply(reply, Err(fail.message)),
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }

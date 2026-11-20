@@ -5,7 +5,8 @@
 // has consented to that purpose and not withdrawn it.
 
 /// One consent: the text the person was shown, its version, when it was given, and when it
-/// was withdrawn (0 while it stands).
+/// was withdrawn (0 while it stands). Each purpose keeps its latest consent; earlier gives
+/// and withdrawals are calls in the audit log.
 export type Given = { text: string, version: string, at: number, withdrawn: number }
 
 export @server @read("owner") object Consent {

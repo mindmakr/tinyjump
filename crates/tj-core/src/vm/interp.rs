@@ -471,7 +471,7 @@ impl Runtime {
                     }
                     Op::Throw => {
                         let v = pop!();
-                        throw!(Exc(v));
+                        throw!(Exc(v, crate::vm::value::Refusal(false)));
                     }
                     Op::TryBegin(t) => f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize }),
                     Op::TryEnd => {

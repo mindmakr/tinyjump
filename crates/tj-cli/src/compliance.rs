@@ -216,7 +216,7 @@ impl Pack {
                         let on_consent: Vec<&str> = bases.iter().flatten().filter(|(_, b)| b == "consent").map(|(p, _)| p.as_str()).collect();
                         if on_consent.is_empty() {
                             Verdict::Met("no purpose rests on consent".into())
-                        } else if program.object("Consent").is_some() {
+                        } else if tj_core::modules::files(&tj_core::modules::with_built_ins(src)).iter().any(|f| f.name == "tj:consent") {
                             Verdict::Met(format!("{}: recorded with tj:consent; the data is revealed only in methods marked @needs", on_consent.join(", ")))
                         } else {
                             Verdict::NotMet(format!("purposes resting on consent, which the app does not record: {}. Import {{ consented }} from \"tj:consent\", let people give it with Consent.get(caller.id).give(purpose, text, version), and mark the methods that use the data @needs(\"consent:<purpose>\")", on_consent.join(", ")))

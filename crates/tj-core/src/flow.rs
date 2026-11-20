@@ -663,6 +663,7 @@ impl Checker {
             }
             ExprKind::Assign { target, value, .. } => {
                 let v = self.expr(value, fr);
+                self.consent_to_store(target, value, e.span, fr);
                 self.assign(target, v.clone(), e.span, fr);
                 v
             }
@@ -731,6 +732,22 @@ impl Checker {
             let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
                 .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
             self.report(d);
+        }
+    }
+
+    /// Writing into this object's field held only for purposes that rest on consent (collecting
+    /// it) needs one of those consents checked. Clearing it to a literal does not, so data can
+    /// be dropped once consent is withdrawn.
+    fn consent_to_store(&mut self, target: &Expr, value: &Expr, span: crate::syntax::Span, fr: &Frame) {
+        let (ExprKind::This, Some(field)) = (&Self::root(target).0.kind, Self::root(target).1) else { return };
+        let Some((class, _)) = &fr.this else { return };
+        let Some((_, purposes)) = self.classes.get(class).and_then(|c| c.pii.get(field)) else { return };
+        let literal = matches!(&value.kind, ExprKind::Str(_) | ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Null) || matches!(&value.kind, ExprKind::Array(a) if a.is_empty());
+        if literal || purposes.is_empty() || !purposes.iter().all(|p| self.consent_purposes.contains(p)) {
+            return;
+        }
+        if !self.needs.last().is_some_and(|n| purposes.iter().any(|p| n.contains(p))) {
+            self.report(Diagnostic::new(format!("{class}.{field} is held only for {}, which rests on consent, and this method stores it without checking", purposes.join(", ")), span).hint(format!("add @needs(\"consent:{}\") to this method", purposes[0])));
         }
     }
 

@@ -381,7 +381,7 @@ impl Compiler {
         let personal = words("read", &o.decorators) || o.fields.iter().any(|f| f.decorators.iter().any(|d| d.name == "pii")) || o.methods.iter().any(|m| words("allow", &m.decorators));
         if !server || !personal {
             self.error(Diagnostic::new(format!("@needs is for methods of a @server object that belongs to a person, and {} is not one", o.name), d.span).hint("consent is a person's: put the method on their object, e.g. @server @read(\"owner\") object Member, so its id is theirs"));
-        } else if !self.objects.iter().any(|c| &*c.name == "Consent") {
+        } else if !self.file_names.iter().any(|f| f == "tj:consent") {
             self.error(Diagnostic::new("@needs(\"consent:...\") checks the consents kept by tj:consent", d.span).hint("add import { consented } from \"tj:consent\", and let people give consent with Consent.get(caller.id).give(purpose, text, version)"));
         }
         purposes
@@ -463,7 +463,10 @@ impl Compiler {
             let mut needs: Vec<String> = Vec::new();
             for d in &m.decorators {
                 match d.name.as_str() {
-                    "needs" if needs.is_empty() => needs = self.needs(d, o),
+                    "needs" => {
+                        let more = self.needs(d, o);
+                        needs.extend(more);
+                    }
                     "every" => match d.args.first().and_then(duration_ms) {
                         Some(ms) if d.args.len() == 1 && ms >= 10.0 => every = Some(ms),
                         _ => self.error(Diagnostic::new("@every needs one duration of at least 10ms", d.span).hint("e.g. @every(\"5s\"), @every(\"500ms\"), @every(\"1h\")")),
