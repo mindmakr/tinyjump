@@ -4,10 +4,12 @@
 /// when there is one. With an `id`, the error text is `<id>-error`.
 export function Field(props: { label: string, error?: string | null, id?: string, children?: any }) {
   const error = props.error === null ? "" : props.error
-  return <Column gap={4}>
+  const id = props.id === null ? "" : props.id
+  // The label also names the control inside, for screen readers and agents.
+  return <Column gap={4} label={props.label}>
     <Text weight="bold">{props.label}</Text>
     {props.children}
-    {error !== "" && <Text id={props.id === null ? null : `${props.id}-error`} color="#b00020">{error}</Text>}
+    {error !== "" && <Text id={id === "" ? null : `${id}-error`} color="#b00020">{error}</Text>}
   </Column>
 }
 

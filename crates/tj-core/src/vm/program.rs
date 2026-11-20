@@ -156,6 +156,7 @@ pub enum ArgTy {
     Null,
     StrLit(Rc<str>),
     NumLit(f64),
+    BoolLit(bool),
     Arr(Box<ArgTy>),
     /// Fields: name, optional, type.
     Rec(Rc<[(Rc<str>, bool, ArgTy)]>),
@@ -171,6 +172,7 @@ impl ArgTy {
             (ArgTy::Any, _) | (ArgTy::Num, J::Number(_)) | (ArgTy::Str, J::String(_)) | (ArgTy::Bool, J::Bool(_)) | (ArgTy::Null, J::Null) => true,
             (ArgTy::StrLit(s), J::String(x)) => **s == **x,
             (ArgTy::NumLit(n), J::Number(x)) => x.as_f64() == Some(*n),
+            (ArgTy::BoolLit(b), J::Bool(x)) => b == x,
             (ArgTy::Arr(t), J::Array(xs)) => xs.iter().all(|x| t.fits(x)),
             (ArgTy::Rec(fields), J::Object(m)) => fields.iter().all(|(k, opt, t)| m.get(&**k).map_or(*opt, |x| (*opt && x.is_null()) || t.fits(x))) && m.keys().all(|k| fields.iter().any(|(f, _, _)| **f == **k)),
             (ArgTy::Dict(t), J::Object(m)) => m.values().all(|x| t.fits(x)),
@@ -189,6 +191,7 @@ impl ArgTy {
             ArgTy::Null => "null".into(),
             ArgTy::StrLit(s) => format!("\"{s}\""),
             ArgTy::NumLit(n) => n.to_string(),
+            ArgTy::BoolLit(b) => b.to_string(),
             ArgTy::Arr(t) => format!("a list of {}", t.describe()),
             ArgTy::Rec(fields) => format!("a record with {}", fields.iter().map(|(k, o, _)| if *o { format!("{k}?") } else { k.to_string() }).collect::<Vec<_>>().join(", ")),
             ArgTy::Dict(t) => format!("a record of {}", t.describe()),
@@ -218,7 +221,12 @@ pub fn check_args(params: &[(Rc<str>, bool, ArgTy)], args: &[serde_json::Value])
                     serde_json::Value::Array(_) => "a list".into(),
                     serde_json::Value::Object(_) => "a record".into(),
                 };
-                return Err(format!("`{name}` must be {}, got {got}: {v}", ty.describe()));
+                // A short look at what came, never a whole large body.
+                let mut shown = v.to_string();
+                if shown.chars().count() > 60 {
+                    shown = shown.chars().take(57).collect::<String>() + "...";
+                }
+                return Err(format!("`{name}` must be {}, got {got}: {shown}", ty.describe()));
             }
             Some(_) => {}
         }

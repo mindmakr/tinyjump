@@ -1532,6 +1532,15 @@ fn the_shop_assistant_acts_within_the_askers_rights() {
     assert_eq!(args4["messages"].as_array().unwrap().last().unwrap()["results"][0]["output"], json!("done"));
     server.handle(7.0, answered(id4, reply(json!([]), "Restocked.")));
     assert_eq!(state(&mut server, 8.0, "Shelf/main")["products"][2]["stock"], json!(7));
+
+    // A model's arguments are checked like any from outside: text where a number belongs is
+    // refused before the method runs.
+    let (id5, _, _, _) = plugin(&server.handle(9.0, ask("restock lots of pots", who("key:sync", &["staff"]))));
+    let wrong = json!([{ "id": "t5", "name": "restock", "input": { "sku": "pot", "qty": "lots" } }]);
+    let (_, _, _, args6) = plugin(&server.handle(10.0, answered(id5, reply(wrong, ""))));
+    let result = &args6["messages"].as_array().unwrap().last().unwrap()["results"][0];
+    assert!(result["output"].as_str().unwrap().contains("`qty` must be a number") && result["error"] == json!(true), "{result}");
+    assert_eq!(state(&mut server, 11.0, "Shelf/main")["products"][2]["stock"], json!(7));
 }
 
 const TURNS: &str = r#"
@@ -2210,6 +2219,7 @@ fn calls_from_outside_must_fit_the_declared_parameter_types() {
   @allow("anyone") publish(title: string, minutes: number, kind: "cut" | "shave", tags?: string[]) { this.last = title }
   @allow("anyone") put(slot: Slot) { this.last = slot.title }
   @allow("anyone") loose(x: any) { this.last = "any" }
+  @allow("anyone") confirm(really: true) { this.last = "confirmed" }
 }
 "#;
     let mut rt = server(src, false);
@@ -2228,7 +2238,14 @@ fn calls_from_outside_must_fit_the_declared_parameter_types() {
     assert!(call(&mut rt, "put", json!([{ "title": "Cut", "minutes": 30 }])).is_ok());
     assert!(call(&mut rt, "put", json!([{ "title": "Cut", "minutes": 30, "admin": true }])).unwrap_err().1.contains("`slot` must be a record with title, minutes, note?"));
     assert!(call(&mut rt, "loose", json!([{ "anything": [1, "x"] }])).is_ok(), "any takes anything");
-    assert_eq!(state(&mut rt, 2.0, "Board/b")["last"], json!("any"));
+    // A large wrong value is not echoed back whole.
+    let big = "x".repeat(10_000);
+    let e = call(&mut rt, "publish", json!([big, 30, "cut"])).is_ok();
+    assert!(e, "a long title is still a string");
+    let e = call(&mut rt, "publish", json!(["Cut", [big], "cut"])).unwrap_err().1;
+    assert!(e.len() < 200 && e.ends_with("..."), "{}", e.len());
+    assert!(call(&mut rt, "confirm", json!([false])).unwrap_err().1.contains("`really` must be true"));
+    assert!(call(&mut rt, "confirm", json!([true])).is_ok());
 }
 
 #[test]
@@ -2285,6 +2302,10 @@ function App() {
     assert!(shown.contains("minutes-error") && shown.contains("A slot lasts 5 to 480 minutes") && shown.contains("#b00020"));
     assert!(!shown.contains("title-error"), "no error, no error text");
     assert!(shown.contains("#1b5e20") && !shown.contains("quiet"), "good news in green; an empty notice shows nothing");
+    // The field's label names its control, for screen readers and agents.
+    let create = patches(&out).into_iter().find(|op| matches!(op, PatchOp::Create { props, .. } if props.get("id") == Some(&json!("new-title")))).expect("the title input");
+    let PatchOp::Create { props, .. } = create else { unreachable!() };
+    assert_eq!(props.get("label"), Some(&json!("Title")));
 }
 
 #[test]

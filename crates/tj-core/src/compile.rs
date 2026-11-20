@@ -191,8 +191,9 @@ struct Compiler {
     unimported: Vec<(u16, String)>,
     /// Type names and the file declaring each: like values, they are shared by all files.
     types: HashMap<String, u16>,
-    /// Type aliases by name, so parameters can be checked as JSON shapes (`ArgTy`).
-    aliases: HashMap<String, TypeExpr>,
+    /// Type aliases by name, so parameters can be checked as JSON shapes (`ArgTy`). A generic
+    /// alias (`type Box<T> = …`) is not followed: its parameters could be anything.
+    aliases: HashMap<String, Option<TypeExpr>>,
 }
 
 impl Compiler {
@@ -293,17 +294,17 @@ impl Compiler {
                         }
                     }
                 }
-                Item::TypeAlias { name, ty, .. } if self.source != Source::User => {
-                    self.aliases.insert(name.clone(), ty.clone());
+                Item::TypeAlias { name, ty, generics, .. } if self.source != Source::User => {
+                    self.aliases.insert(name.clone(), generics.is_empty().then(|| ty.clone()));
                 }
-                Item::TypeAlias { name, span, ty, .. } => match self.types.get(name) {
+                Item::TypeAlias { name, span, ty, generics } => match self.types.get(name) {
                     Some(&other) if other != self.file => {
                         let d = Diagnostic::new(format!("type '{name}' is already declared in {}", self.file_names[other as usize]), *span).hint("all files of an app share their top-level names; rename one");
                         self.error(d);
                     }
                     _ => {
                         self.types.insert(name.clone(), self.file);
-                        self.aliases.insert(name.clone(), ty.clone());
+                        self.aliases.insert(name.clone(), generics.is_empty().then(|| ty.clone()));
                     }
                 },
             }
@@ -381,9 +382,14 @@ impl Compiler {
                 "string" => ArgTy::Str,
                 "boolean" => ArgTy::Bool,
                 "null" | "undefined" | "void" => ArgTy::Null,
+                "true" => ArgTy::BoolLit(true),
+                "false" => ArgTy::BoolLit(false),
                 "Record" if args.len() == 2 => ArgTy::Dict(Box::new(self.arg_ty(&args[1], depth + 1))),
                 "Array" if args.len() == 1 => ArgTy::Arr(Box::new(self.arg_ty(&args[0], depth + 1))),
-                _ => self.aliases.get(n).map_or(ArgTy::Any, |a| self.arg_ty(a, depth + 1)),
+                _ => match self.aliases.get(n) {
+                    Some(Some(a)) => self.arg_ty(a, depth + 1),
+                    _ => ArgTy::Any,
+                },
             },
             TypeExpr::Array(t) => ArgTy::Arr(Box::new(self.arg_ty(t, depth + 1))),
             TypeExpr::Union(ts) => ArgTy::Union(ts.iter().map(|t| self.arg_ty(t, depth + 1)).collect()),
