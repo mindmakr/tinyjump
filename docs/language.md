@@ -299,9 +299,10 @@ Built-in components, drawn as real native widgets:
 | `Spacer` | | | none |
 | `Text` | `lines` | | text |
 | `Button` | `disabled` | `onPress()` | text |
-| `Input` | `value`, `placeholder`, `secure`, `multiline` | `onChange(text)`, `onSubmit(text)` | none |
+| `Input` | `value`, `placeholder`, `secure`, `multiline`, `type`, `zone` | `onChange(text)`, `onSubmit(text)` | none |
 | `Toggle` | `value` | `onChange(checked)` | text (label) |
 | `Image` | `src`, `fit` | | none |
+| `Time` | `value`, `show`, `style`, `zone` | | none |
 
 Every built-in component also accepts `id` (the automation handle), `key` (list identity),
 `label` (accessibility), and the layout and style props `padding`, `margin`, `gap`,
@@ -310,6 +311,18 @@ Every built-in component also accepts `id` (the automation handle), `key` (list 
 (`"bold"` or `"normal"`) and `border` (a width, or `"2px #ccc"`). Numbers are pixels.
 Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
 
+- `<Time value={ms} />` shows a time the way the viewer's phone or browser writes it, in
+  their language and time zone. Options:
+  - `show="date" | "time" | "datetime"` (the default is `datetime`);
+  - `zone="UTC"` instead of the viewer's zone;
+  - `style="iso"` for `2026-12-01 14:30`.
+- `<Input type="number" | "date" | "time" | "datetime">` opens the platform's own keypad or
+  picker. Its `value` and what `onChange` receives are numbers, not text:
+  - milliseconds for `date` and `datetime`;
+  - milliseconds since midnight for `time`;
+  - `null` while the entry is empty or not a real date (February 30).
+  - Dates are in the viewer's zone, or in UTC with `zone="UTC"`.
+  - Agents may type `2026-12-01 14:30` into one, and it is read as a person's entry is.
 - Give lists a `key`: `{items.map(i => <Row key={i.id}>…</Row>)}`.
 - `{cond && <X/>}` renders nothing when `cond` is false or null. Bare strings and numbers
   inside `Column`, `Row` and `Scroll` become `Text`.

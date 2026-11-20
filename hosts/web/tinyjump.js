@@ -321,14 +321,88 @@ export async function start(opts) {
         break;
       }
       case 'Image': el = document.createElement('img'); break;
+      case 'Time': el = document.createElement('span'); el.className = 'tj-text'; el.__time = {}; break;
       default: el = document.createElement('div'); el.className = 'tj-' + kind.toLowerCase();
     }
     return el;
   }
 
+  // ---------- times: the platform formats and parses them (docs/language.md, Time) ----------
+
+  // A time as `YYYY-MM-DD HH:MM` in `zone` ("UTC", or the viewer's when absent), as the
+  // platform writes it (Swedish dates are ISO-shaped).
+  function isoParts(ms, zone) {
+    const f = new Intl.DateTimeFormat('sv-SE', { timeZone: zone || undefined, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+    return f.format(new Date(ms)); // "2026-12-01 14:30"
+  }
+
+  // What a `<Time>` shows.
+  function showTime(t) {
+    if (typeof t.value !== 'number' || !isFinite(t.value)) return '';
+    const show = t.show || 'datetime';
+    if (t.style === 'iso') {
+      const iso = isoParts(t.value, t.zone);
+      return show === 'date' ? iso.slice(0, 10) : show === 'time' ? iso.slice(11) : iso;
+    }
+    const opts = { timeZone: t.zone || undefined };
+    if (show !== 'time') opts.dateStyle = 'medium';
+    if (show !== 'date') opts.timeStyle = 'short';
+    return new Intl.DateTimeFormat(undefined, opts).format(new Date(t.value));
+  }
+
+  // A typed input's text as a value: milliseconds for dates and times (a time of day is
+  // milliseconds since midnight), a number for numbers; null when it is not one. Agents
+  // may send `2026-12-01 14:30` as well as the picker's `2026-12-01T14:30`.
+  function typedValue(type, zone, text) {
+    if (typeof text !== 'string') return text;
+    const v = text.trim().replace(' ', 'T');
+    if (v === '') return null;
+    let ms = NaN;
+    if (type === 'number') {
+      ms = Number(v);
+    } else if (type === 'time') {
+      const d = new Date('1970-01-01T' + v + 'Z');
+      ms = d.getTime();
+    } else if (type === 'date' || type === 'datetime') {
+      const full = type === 'date' ? v + 'T00:00' : v;
+      ms = new Date(full + (zone === 'UTC' ? 'Z' : '')).getTime();
+      // The platform rolls 2026-02-30 over into March: a date that does not exist is null.
+      if (isFinite(ms) && isoParts(ms, zone).replace(' ', 'T') !== full.slice(0, 16)) ms = NaN;
+    } else {
+      return text;
+    }
+    return isFinite(ms) ? ms : null;
+  }
+
+  // A value as a typed input's text.
+  function typedText(type, zone, v) {
+    if (typeof v !== 'number' || !isFinite(v)) return '';
+    if (type === 'number') return String(v);
+    if (type === 'time') return new Date(v).toISOString().slice(11, 16);
+    const iso = isoParts(v, zone);
+    return type === 'date' ? iso.slice(0, 10) : iso.replace(' ', 'T');
+  }
+
   function setProp(el, kind, k, v) {
     const s = el.style;
     const none = v === null || v === undefined;
+    if (kind === 'Time' && (k === 'value' || k === 'show' || k === 'style' || k === 'zone')) {
+      el.__time[k] = none ? undefined : v;
+      el.textContent = showTime(el.__time);
+      return;
+    }
+    if (kind === 'Input' && (k === 'type' || k === 'zone')) {
+      el['__' + k] = none ? undefined : v;
+      if (k === 'type' && el.tagName === 'INPUT') el.type = { number: 'number', date: 'date', time: 'time', datetime: 'datetime-local' }[v] || 'text';
+      if (el.__value !== undefined) el.value = typedText(el.__type, el.__zone, el.__value);
+      return;
+    }
+    if (kind === 'Input' && k === 'value' && el.__type && el.__type !== 'text') {
+      el.__value = v;
+      const text = typedText(el.__type, el.__zone, v);
+      if (el.value !== text) el.value = text;
+      return;
+    }
     switch (k) {
       case 'text':
         if (kind === 'Toggle') el.lastChild.textContent = none ? '' : v;
@@ -374,9 +448,10 @@ export async function start(opts) {
     };
     if (kind === 'Button') el.addEventListener('click', () => fire('onPress', null));
     if (kind === 'Input') {
-      el.addEventListener('input', () => fire('onChange', el.value));
+      const value = () => (el.__type && el.__type !== 'text' ? typedValue(el.__type, el.__zone, el.value) : el.value);
+      el.addEventListener('input', () => fire('onChange', value()));
       el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (el.tagName === 'INPUT' || e.ctrlKey || e.metaKey)) fire('onSubmit', el.value);
+        if (e.key === 'Enter' && (el.tagName === 'INPUT' || e.ctrlKey || e.metaKey)) fire('onSubmit', value());
       });
     }
     if (kind === 'Toggle') el.firstChild.addEventListener('change', () => fire('onChange', el.firstChild.checked));
@@ -426,6 +501,8 @@ export async function start(opts) {
       const r = el ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
       const visible = !!el && r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
       return Object.assign({}, n, {
+        // A time shows what the platform made of it, so agents read what people see.
+        props: el && el.__time ? Object.assign({}, n.props, { text: el.textContent }) : n.props,
         bounds: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
         visible,
         children: withBounds(n.children),
@@ -433,16 +510,27 @@ export async function start(opts) {
     });
   }
 
+  // An agent types text into a date, time or number input as a person would: the input
+  // turns it into its value, as it does for the picker.
+  function forAgent(input) {
+    if (input.type !== 'ui' || typeof input.value !== 'string' || !input.target) return input;
+    let el = null;
+    if (input.target.node !== undefined) el = nodes.get(input.target.node);
+    else if (input.target.id !== undefined) nodes.forEach((n) => { if (n.dataset && n.dataset.tjId === input.target.id) el = n; });
+    if (el && el.__tj && el.__tj.kind === 'Input' && el.__type && el.__type !== 'text') input.value = typedValue(el.__type, el.__zone, input.value);
+    return input;
+  }
+
   const api = {
     /** Semantic tree with bounds and viewport visibility, plus object states. */
     inspect: () => request({ type: 'inspect' }).then((s) => Object.assign(s, { tree: withBounds(s.tree), viewport: { w: window.innerWidth, h: window.innerHeight } })),
     /** Fire a UI event. target: {id} | {text} | {node} */
-    act: (target, event, value) => request({ type: 'ui', target, event, value: value === undefined ? null : value }),
+    act: (target, event, value) => request(forAgent({ type: 'ui', target, event, value: value === undefined ? null : value })),
     call: (object, method, args) => request({ type: 'call', object, method, args: args || [] }),
     get: (object) => request({ type: 'get', object }),
     /** Any protocol input (docs/host-protocol.md): those that take a reply resolve with it. */
     input: (i) => {
-      if (['call', 'get', 'ui', 'inspect'].indexOf(i.type) >= 0) return request(Object.assign({}, i));
+      if (['call', 'get', 'ui', 'inspect'].indexOf(i.type) >= 0) return request(forAgent(Object.assign({}, i)));
       send(Object.assign({}, i));
       return Promise.resolve(null);
     },

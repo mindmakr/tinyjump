@@ -11,6 +11,7 @@ final class EventTarget: NSObject, UITextFieldDelegate {
     @objc func press() { fire("onPress", NSNull()) }
     @objc func changed(_ sender: UITextField) { fire("onChange", sender.text ?? "") }
     @objc func toggled(_ sender: UISwitch) { fire("onChange", sender.isOn) }
+    @objc func picked(_ sender: UIDatePicker) { fire("onChange", Times.picked(sender)) }
 
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         fire("onSubmit", textField.text ?? "")
@@ -229,7 +230,7 @@ final class Renderer {
             img.contentMode = .scaleAspectFit
             img.clipsToBounds = true
             return Node(id: id, kind: kind, view: img, container: nil)
-        case "Text":
+        case "Text", "Time":
             let label = PaddedLabel()
             label.numberOfLines = 0
             label.textAlignment = .natural
@@ -242,6 +243,11 @@ final class Renderer {
     private func target(for n: Node) -> EventTarget {
         let t = EventTarget { [weak self, weak n] event, value in
             guard let self = self, let n = n, !n.quiet, n.events.contains(event) else { return }
+            // A number input's text is sent as its number (pickers send numbers already).
+            var value = value
+            if let s = value as? String, let type = n.props["type"] as? String, Times.typed(type) {
+                value = Times.value(type, n.props["zone"] as? String, s)
+            }
             self.tj?.send(["type": "ui", "target": ["node": n.id], "event": event, "value": value])
         }
         n.target = t
@@ -264,6 +270,14 @@ final class Renderer {
     private func setProp(_ n: Node, _ k: String, _ v: Any?) {
         let view = n.view
         let label = (view as? UILabel) ?? (view as? ToggleView)?.label
+        if n.kind == "Time" {
+            if ["value", "show", "style", "zone"].contains(k) { label?.text = Times.show(n.props) }
+            return
+        }
+        if let f = view as? UITextField, k == "type" || k == "zone" || (k == "value" && Times.typed(n.props["type"] as? String)) {
+            typed(f, n)
+            return
+        }
         switch k {
         case "text":
             let s = v.map { "\($0)" } ?? ""
@@ -373,10 +387,43 @@ final class Renderer {
         return ["w": Int(size.width), "h": Int(size.height)]
     }
 
+    /// Sets an input up for its `type`: a number keypad, or the system's date picker as its
+    /// keyboard; and shows its value.
+    private func typed(_ f: UITextField, _ n: Node) {
+        let type = n.props["type"] as? String ?? ""
+        let zone = n.props["zone"] as? String
+        f.keyboardType = type == "number" ? .decimalPad : .default
+        if ["date", "time", "datetime"].contains(type) {
+            let p = Times.picker(type, zone, n.props["value"])
+            if let t = n.target { p.addTarget(t, action: #selector(EventTarget.picked(_:)), for: .valueChanged) }
+            f.inputView = p
+        } else {
+            f.inputView = nil
+        }
+        let s = Times.typed(type) ? Times.text(type, zone, n.props["value"]) : (n.props["value"].map { "\($0)" } ?? "")
+        if f.text != s { f.text = s }
+    }
+
+    /// An agent typing into a date, time or number input: its text becomes the value, as a
+    /// person's entry does (`POST /_tj/input`).
+    func forAgent(_ input: [String: Any]) -> [String: Any] {
+        guard input["type"] as? String == "ui", let text = input["value"] as? String, let target = input["target"] as? [String: Any] else { return input }
+        let node: Node? = (target["node"] as? Int).flatMap { nodes[$0] } ?? (target["id"] as? String).flatMap { id in nodes.values.first { $0.props["id"] as? String == id } }
+        guard let n = node, n.kind == "Input", let type = n.props["type"] as? String, Times.typed(type) else { return input }
+        var out = input
+        out["value"] = Times.value(type, n.props["zone"] as? String, text)
+        return out
+    }
+
     /// Adds bounds (points, on screen) and visibility to an inspect tree, like the other hosts.
     func addBounds(_ tree: [[String: Any]]) -> [[String: Any]] {
         tree.map { node in
             var n = node
+            // A time shows what the platform made of it, so agents read what people see.
+            if let id = n["id"] as? Int, let shown = nodes[id], shown.kind == "Time", var props = n["props"] as? [String: Any] {
+                props["text"] = (shown.view as? UILabel)?.text ?? ""
+                n["props"] = props
+            }
             if let id = n["id"] as? Int, let v = nodes[id]?.view {
                 let frame = v.convert(v.bounds, to: nil)
                 let screen = v.window?.bounds ?? .zero

@@ -274,7 +274,8 @@ final class Renderer {
 
                     @Override
                     public void afterTextChanged(Editable s) {
-                        fire(n, "onChange", s.toString());
+                        String type = n.props.optString("type", "");
+                        fire(n, "onChange", Times.typed(type) ? Times.value(type, n.props.optString("zone", ""), s.toString()) : s.toString());
                     }
                 });
                 e.setOnEditorActionListener(new TextView.OnEditorActionListener() {
@@ -282,7 +283,8 @@ final class Renderer {
                     public boolean onEditorAction(TextView v, int action, KeyEvent event) {
                         boolean enter = event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER && event.getAction() == KeyEvent.ACTION_DOWN;
                         if (action == EditorInfo.IME_ACTION_DONE || enter) {
-                            fire(n, "onSubmit", e.getText().toString());
+                            String type = n.props.optString("type", "");
+                            fire(n, "onSubmit", Times.typed(type) ? Times.value(type, n.props.optString("zone", ""), e.getText().toString()) : e.getText().toString());
                             return n.events.contains("onSubmit");
                         }
                         return false;
@@ -306,6 +308,7 @@ final class Renderer {
                 img.setAdjustViewBounds(true);
                 return new Node(id, kind, img, null);
             }
+            case "Time":
             case "Text": {
                 TextView t = new TextView(ctx);
                 // Align to the layout's start (right in RTL), like the web, not to the text's own direction.
@@ -345,6 +348,18 @@ final class Renderer {
         TextView text = view instanceof TextView ? (TextView) view : null;
         n.quiet = true;
         try {
+            if ("Time".equals(n.kind)) {
+                if (text != null && ("value".equals(k) || "show".equals(k) || "style".equals(k) || "zone".equals(k))) text.setText(Times.show(n.props));
+                return;
+            }
+            String type = n.props.optString("type", "");
+            if (view instanceof EditText && ("type".equals(k) || "zone".equals(k) || ("value".equals(k) && Times.typed(type)))) {
+                typed((EditText) view, n, type);
+                if (!"value".equals(k)) return;
+                String s = Times.text(type, n.props.optString("zone", ""), v);
+                if (!s.contentEquals(((EditText) view).getText())) ((EditText) view).setText(s);
+                return;
+            }
             switch (k) {
                 case "text":
                     if (text != null) text.setText(none ? "" : String.valueOf(v));
@@ -530,11 +545,49 @@ final class Renderer {
         return out.toByteArray();
     }
 
+    /** Sets an input up for its `type`: a number keypad, or the system's pickers for times. */
+    private void typed(final EditText e, final Node n, String type) {
+        boolean picker = "date".equals(type) || "time".equals(type) || "datetime".equals(type);
+        e.setInputType("number".equals(type) ? InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED : InputType.TYPE_CLASS_TEXT);
+        e.setFocusable(!picker);
+        e.setOnClickListener(!picker ? null : new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                final String t = n.props.optString("type", "");
+                Times.pick(e.getContext(), t, n.props.optString("zone", ""), n.props.opt("value"), new Times.Picked() {
+                    @Override
+                    public void value(Object ms) {
+                        fire(n, "onChange", ms);
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * An agent typing into a date, time or number input: its text becomes the value, as a
+     * person's entry does (`POST /_tj/input`).
+     */
+    void forAgent(JSONObject input) throws JSONException {
+        if (!"ui".equals(input.optString("type")) || !(input.opt("value") instanceof String)) return;
+        JSONObject target = input.optJSONObject("target");
+        if (target == null) return;
+        Node node = null;
+        if (target.has("node")) node = nodes.get(target.getInt("node"));
+        for (Node c : nodes.values()) if (node == null && target.optString("id", "\u0000").equals(c.props.optString("id"))) node = c;
+        if (node == null || !"Input".equals(node.kind) || !Times.typed(node.props.optString("type", ""))) return;
+        input.put("value", Times.value(node.props.optString("type"), node.props.optString("zone", ""), input.getString("value")));
+    }
+
     /** Adds bounds (dp, on screen) and visibility to an inspect tree, like the web host does. */
     void addBounds(JSONArray tree) throws JSONException {
         for (int i = 0; i < tree.length(); i++) {
             JSONObject n = tree.getJSONObject(i);
             Node node = nodes.get(n.getInt("id"));
+            if (node != null && "Time".equals(node.kind)) {
+                // What the platform made of it, so agents read what people see.
+                n.getJSONObject("props").put("text", ((TextView) node.view).getText().toString());
+            }
             if (node != null) {
                 int[] loc = new int[2];
                 node.view.getLocationOnScreen(loc);
