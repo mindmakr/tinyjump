@@ -551,7 +551,7 @@ impl Runtime {
                 let caller_this = f.frames.last().and_then(|fr| fr.this.clone());
                 let own = caller_this.as_deref() == Some(&**o);
                 match name {
-                    "emit" | "schedule" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
+                    "emit" | "schedule" | "unschedule" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
                     "emit" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
@@ -562,8 +562,15 @@ impl Runtime {
                     "schedule" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
-                        self.schedule_alarm(o, &args, &f.caller)?;
-                        f.stack.push(Value::Null);
+                        let handle = self.schedule_alarm(o, &args, &f.caller)?;
+                        f.stack.push(handle);
+                        Ok(())
+                    }
+                    "unschedule" => {
+                        let args = f.stack.split_off(pos + 1);
+                        f.stack.truncate(pos);
+                        let gone = self.unschedule_alarm(o, args.first().unwrap_or(&Value::Null));
+                        f.stack.push(gone);
                         Ok(())
                     }
                     _ if self.is_remote(o) => {
@@ -586,9 +593,15 @@ impl Runtime {
                 }
             }
             Value::Class(c) => {
+                if name == "all" {
+                    f.stack.truncate(pos);
+                    let list = self.all_objects(*c)?.into_iter().map(Value::Obj).collect();
+                    f.stack.push(Value::arr(list));
+                    return Ok(());
+                }
                 if name != "get" {
                     let n = &self.program.objects[*c as usize].name;
-                    return Err(Exc::msg(format!("{n}.{name} does not exist; use {n}.get(id)")));
+                    return Err(Exc::msg(format!("{n}.{name} does not exist; use {n}.get(id) or {n}.all()")));
                 }
                 let id = match f.stack.get(pos + 1) {
                     Some(Value::Str(s)) => s.to_string(),

@@ -229,8 +229,9 @@ export async function start(opts) {
     });
     stream.addEventListener('changed', (e) => {
       const d = JSON.parse(e.data);
-      if (!replicas.has(d.object)) return;
-      replicas.set(d.object, Math.max(replicas.get(d.object), d.seq));
+      // An object of a class streamed whole (`Slot/*`) is new to the device: keep it.
+      if (!replicas.has(d.object) && !replicas.has(d.object.split('/')[0] + '/*')) return;
+      replicas.set(d.object, Math.max(replicas.get(d.object) || 0, d.seq));
       send({ type: 'sync', object: d.object, state: d.state, seq: d.seq });
     });
     // Objects this user may not read (a replica kept from before they signed in as someone
@@ -263,6 +264,8 @@ export async function start(opts) {
   function subscribe(key, seq) {
     if (server === undefined || replicas.has(key)) return;
     replicas.set(key, seq || 0);
+    // Already in a class stream: nothing new to ask for.
+    if (key.slice(-2) !== '/*' && replicas.has(key.split('/')[0] + '/*')) return;
     clearTimeout(reconnect);
     reconnect = setTimeout(connectRealtime, 0);
   }

@@ -14,6 +14,8 @@ const ALARM_INDEX_KEY: &str = "tj:alarms";
 /// The last change number handed out, so numbers keep growing across restarts.
 const CHANGE_SEQ_KEY: &str = "tj:seq";
 const MAX_ID_LEN: usize = 128;
+/// How many objects a class stream starts with, newest changes first.
+pub(crate) const CLASS_STREAM_CAP: usize = 1000;
 /// How many recent call ids an object remembers, so retries of them do not run twice.
 const MAX_CALL_RECORDS: usize = 100;
 /// How long the result of a call made once is kept for repeats (72 hours). After that,
@@ -97,7 +99,9 @@ impl CallRecord {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct Alarm {
-    #[serde(skip)]
+    /// The handle `this.schedule` returned, kept across restarts so `this.unschedule` finds
+    /// it. Records from before handles were saved read as 0 and get a new one.
+    #[serde(default)]
     id: u64,
     at: f64,
     pub method: String,
@@ -127,8 +131,9 @@ pub(crate) struct Stored {
 impl Runtime {
     /// Returns the handle of `Class/id`, loading or creating the instance.
     pub(crate) fn instance(&mut self, class: u16, id: &str) -> Result<Rc<ObjRef>, Exc> {
-        if id.is_empty() || id.len() > MAX_ID_LEN || id.contains('/') || id.chars().any(char::is_control) {
-            return Err(Exc::msg(format!("invalid object id {id:?}: use 1-{MAX_ID_LEN} characters without '/'")));
+        // `*` names a whole class in a stream (`Slot/*`), so it is no object's id.
+        if id.is_empty() || id == "*" || id.len() > MAX_ID_LEN || id.contains('/') || id.chars().any(char::is_control) {
+            return Err(Exc::msg(format!("invalid object id {id:?}: use 1-{MAX_ID_LEN} characters without '/', and not `*`")));
         }
         let key = (class, Rc::<str>::from(id));
         if let Some(inst) = self.instances.get(&key) {
@@ -179,8 +184,7 @@ impl Runtime {
                 }
             }
             for a in &mut alarms {
-                self.next_alarm += 1;
-                a.id = self.next_alarm;
+                self.keep_alarm_id(a);
                 self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
             }
         }
@@ -460,7 +464,8 @@ impl Runtime {
     }
 
     /// `this.schedule(delayMs, "method", ...args)`: a durable one-shot timer.
-    pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<(), Exc> {
+    /// `this.schedule(ms, "method", ...args)`: its handle, for `this.unschedule`.
+    pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<Value, Exc> {
         let (Some(Value::Num(delay)), Some(Value::Str(method))) = (args.first(), args.get(1)) else {
             return Err(Exc::msg("schedule(delayMs, \"method\", ...args) needs a delay and a method name"));
         };
@@ -469,12 +474,42 @@ impl Runtime {
         }
         self.method(o.class, method)?;
         let args = args[2..].iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("schedule arguments: {e}")))?;
-        self.next_alarm += 1;
-        let alarm = Alarm { id: self.next_alarm, at: self.now + delay, method: method.to_string(), args, caller: who.to_caller() };
+        let alarm = Alarm { id: self.new_alarm_id(), at: self.now + delay, method: method.to_string(), args, caller: who.to_caller() };
+        let handle = alarm.id;
         self.push_timer(alarm.at, TimerKind::Alarm { obj: o.clone(), alarm: alarm.id });
         self.inst_mut(o).alarms.push(alarm);
         self.touch(o);
-        Ok(())
+        Ok(Value::Num(handle as f64))
+    }
+
+    /// `this.unschedule(handle)`: cancels the alarm; false when it already ran or never was.
+    pub(crate) fn unschedule_alarm(&mut self, o: &Rc<ObjRef>, handle: &Value) -> Value {
+        let Value::Num(h) = handle else { return Value::Bool(false) };
+        let inst = self.inst_mut(o);
+        let before = inst.alarms.len();
+        inst.alarms.retain(|a| a.id as f64 != *h);
+        let removed = inst.alarms.len() < before;
+        if removed {
+            // Its timer still fires, finds nothing and does nothing.
+            self.touch(o);
+        }
+        Value::Bool(removed)
+    }
+
+    /// A handle no alarm had before, not even before a restart: at least the time in
+    /// microseconds, as handles are saved with their alarms.
+    fn new_alarm_id(&mut self) -> u64 {
+        self.next_alarm = (self.next_alarm + 1).max((self.now * 1000.0) as u64);
+        self.next_alarm
+    }
+
+    /// A loaded alarm keeps its handle; one saved before handles were saved gets one.
+    fn keep_alarm_id(&mut self, a: &mut Alarm) {
+        if a.id == 0 {
+            a.id = self.new_alarm_id();
+        } else {
+            self.next_alarm = self.next_alarm.max(a.id);
+        }
     }
 
     pub(crate) fn take_alarm(&mut self, o: &ObjRef, id: u64) -> Option<Alarm> {
@@ -493,7 +528,15 @@ impl Runtime {
     /// changed after change number `since`, oldest change first. Unknown objects are skipped.
     pub fn changed_since(&mut self, objects: &[String], since: u64) -> Vec<Output> {
         let mut out = Vec::new();
+        // A class stream (`Slot/*`) starts with the class's objects.
+        let mut keys: Vec<String> = Vec::new();
         for key in objects {
+            match key.strip_suffix("/*").and_then(|c| self.program.object(c)) {
+                Some(class) => keys.extend(self.class_ids(class).into_iter().take(CLASS_STREAM_CAP).map(|id| format!("{key}").replace('*', &id))),
+                None => keys.push(key.clone()),
+            }
+        }
+        for key in &keys {
             let Ok(o) = self.resolve_object(key) else { continue };
             let seq = self.inst(&o).seq;
             if seq > since {
@@ -504,6 +547,42 @@ impl Runtime {
         }
         out.sort_by_key(|(seq, _)| *seq);
         out.into_iter().map(|(_, o)| o).collect()
+    }
+
+    /// The ids of a class's objects: stored or loaded, never an erased person's blank, sorted.
+    pub(crate) fn class_ids(&mut self, class: u16) -> Vec<String> {
+        let prefix = format!("{}/", self.program.objects[class as usize].name);
+        let mut ids: Vec<String> = self.store.keys(&prefix).unwrap_or_default().into_iter().filter_map(|k| k.strip_prefix(&prefix).map(str::to_string)).collect();
+        ids.extend(self.instances.values().filter(|i| i.handle.class == class).map(|i| i.handle.id.to_string()));
+        ids.sort();
+        ids.dedup();
+        ids.retain(|id| !self.store.is_erased(&format!("{prefix}{id}")).unwrap_or(true));
+        ids
+    }
+
+    /// `Class.all()`: every object of the class. On a device, a server class's replicas, and
+    /// the first call subscribes to the whole class, so the list fills as the server sends it.
+    pub(crate) fn all_objects(&mut self, class: u16) -> Result<Vec<Rc<ObjRef>>, Exc> {
+        let def = &self.program.objects[class as usize];
+        if def.server && !self.server {
+            if self.class_streams.insert(class) {
+                self.outputs.push(Output::Subscribe { object: format!("{}/*", def.name), seq: 0 });
+            }
+            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote).map(|i| i.handle.clone()).collect();
+            list.sort_by(|a, b| a.id.cmp(&b.id));
+            return Ok(list);
+        }
+        let defaults = Value::Rec(self.defaults(class)?.into()).to_json().map_err(Exc::msg)?;
+        let mut list = Vec::new();
+        for id in self.class_ids(class) {
+            let o = self.instance(class, &id)?;
+            // An erased object is a blank with nothing in it: not a member any more.
+            let blank = { let i = self.inst(&o); i.alarms.is_empty() && i.calls.is_empty() && i.created == 0.0 && Value::Rec(i.state.clone().into()).to_json().ok().as_ref() == Some(&defaults) };
+            if !blank {
+                list.push(o);
+            }
+        }
+        Ok(list)
     }
 
     /// Every loaded object, for tools: personal data is always masked here.
@@ -674,8 +753,7 @@ impl Runtime {
         inst.state_text = Value::Rec(inst.state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
         let handle = inst.handle.clone();
         for a in &mut alarms {
-            self.next_alarm += 1;
-            a.id = self.next_alarm;
+            self.keep_alarm_id(a);
             self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
         }
         if let Some(inst) = self.instances.get_mut(key) {

@@ -34,6 +34,8 @@ final class Sync: NSObject, URLSessionDataDelegate {
     func subscribe(_ key: String, seq: UInt64) {
         guard server != nil, replicas[key] == nil else { return }
         replicas[key] = seq
+        // Already in a class stream (`Slot/*`): nothing new to ask for.
+        if !key.hasSuffix("/*"), replicas[String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"] != nil { return }
         cursor = replicas.values.min() ?? 0
         connect()
     }
@@ -88,8 +90,10 @@ final class Sync: NSObject, URLSessionDataDelegate {
 
     private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
         cursor = max(cursor, seq) // the stream is in change order
-        guard let have = replicas[key] else { return }
-        replicas[key] = max(have, seq)
+        // An object of a class streamed whole (`Slot/*`) is new to the device: keep it.
+        let classStream = String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"
+        guard replicas[key] != nil || replicas[classStream] != nil else { return }
+        replicas[key] = max(replicas[key] ?? 0, seq)
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 

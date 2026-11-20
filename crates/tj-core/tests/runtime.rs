@@ -2286,3 +2286,32 @@ function App() {
     assert!(!shown.contains("title-error"), "no error, no error text");
     assert!(shown.contains("#1b5e20") && !shown.contains("quiet"), "good news in green; an empty notice shows nothing");
 }
+
+#[test]
+fn an_alarm_can_be_cancelled_by_its_handle_even_after_a_restart() {
+    let src = r#"@server object Booking {
+  reminder: number = 0
+  sent: string[] = []
+  book(at: number) { this.reminder = this.schedule(at, "remind", "first") }
+  cancel(): boolean { return this.unschedule(this.reminder) }
+  remind(what: string) { this.sent.push(what) }
+}
+"#;
+    let store = Shared::default();
+    let opts = || Options { server: true, render: false, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    call(&mut rt, 1.0, "Booking/b", "book", json!([1000])).unwrap();
+    let handle = state(&mut rt, 2.0, "Booking/b")["reminder"].clone();
+    assert!(handle.as_f64().unwrap() > 0.0);
+    // After a restart the saved handle still names the same alarm.
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { now: 10.0, ..opts() }).unwrap().0;
+    assert_eq!(state(&mut rt, 11.0, "Booking/b")["reminder"], handle);
+    assert_eq!(call(&mut rt, 12.0, "Booking/b", "cancel", json!([])).unwrap(), json!(true));
+    assert_eq!(call(&mut rt, 13.0, "Booking/b", "cancel", json!([])).unwrap(), json!(false), "already gone");
+    rt.handle(5000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 5001.0, "Booking/b")["sent"], json!([]), "a cancelled alarm never runs");
+    // One that is not cancelled runs once.
+    call(&mut rt, 6000.0, "Booking/b", "book", json!([100])).unwrap();
+    rt.handle(6200.0, Input::Tick);
+    assert_eq!(state(&mut rt, 6201.0, "Booking/b")["sent"], json!(["first"]));
+}

@@ -189,6 +189,8 @@ pub struct Runtime {
     invocations: std::collections::VecDeque<calls::Invocation>,
     /// Who the fiber running now belongs to, and its chain (see `vm::interp::Runtime::run`).
     pub(crate) running_caller: Who,
+    /// On a device: server classes whose whole stream `Class.all()` asked for.
+    pub(crate) class_streams: std::collections::HashSet<u16>,
     /// On a device, the signed-in user's roles (`Input::Identity`), for `caller.roles` in UI
     /// code.
     pub(crate) device_roles: Rc<[Rc<str>]>,
@@ -268,6 +270,7 @@ impl Runtime {
             outbox_held: false,
             invocations: std::collections::VecDeque::new(),
             running_caller: Who::System,
+            class_streams: std::collections::HashSet::new(),
             device_roles: Rc::from([]),
             running_chain: 0,
             next_chain: 0,

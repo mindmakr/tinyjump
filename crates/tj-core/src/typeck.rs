@@ -1052,11 +1052,16 @@ impl<'a> Checker<'a> {
                 }
             }
             Ty::Obj(class) => {
-                if matches!(name, "emit" | "schedule") {
+                if matches!(name, "emit" | "schedule" | "unschedule") {
                     for a in args {
                         self.expr(a, None);
                     }
-                    return Ty::Void;
+                    return match name {
+                        // A handle, for `unschedule`, which says whether it cancelled one.
+                        "schedule" => Ty::Num,
+                        "unschedule" => Ty::Bool,
+                        _ => Ty::Void,
+                    };
                 }
                 let info = &self.objects[&class];
                 let method = info.methods.get(name).cloned();
@@ -1077,8 +1082,12 @@ impl<'a> Checker<'a> {
                     let get = FnTy { params: vec![(Rc::from("id"), Ty::Str, false)], rest: None, ret: Ty::Obj(class.clone()) };
                     self.args(&get, args, span);
                     Ty::Obj(class)
+                } else if name == "all" {
+                    let all = FnTy { params: Vec::new(), rest: None, ret: Ty::Arr(Box::new(Ty::Obj(class.clone()))) };
+                    self.args(&all, args, span);
+                    Ty::Arr(Box::new(Ty::Obj(class)))
                 } else {
-                    self.errors.push(Diagnostic::new(format!("{class}.{name} does not exist"), span).hint(format!("use {class}.get(id)")));
+                    self.errors.push(Diagnostic::new(format!("{class}.{name} does not exist"), span).hint(format!("use {class}.get(id) or {class}.all()")));
                     Ty::Any
                 }
             }

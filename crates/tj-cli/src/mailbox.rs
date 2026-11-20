@@ -69,7 +69,8 @@ impl Mailbox {
         if q.closed {
             return false;
         }
-        if !e.object.is_empty() && self.only.as_ref().is_some_and(|only| !only.contains(&e.object)) {
+        let class_stream = || e.object.split_once('/').map(|(c, _)| format!("{c}/*"));
+        if !e.object.is_empty() && self.only.as_ref().is_some_and(|only| !only.contains(&e.object) && !class_stream().is_some_and(|c| only.contains(&c))) {
             return true;
         }
         if e.merge.is_some() {
