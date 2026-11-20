@@ -1,0 +1,100 @@
+# Plugins
+
+How tinyjump gains capabilities (AI models, email, payments, device sensors) without
+growing its core. Status: design.
+
+## Goals
+
+- **The core stays small and provider-free.** A capability is a plugin, and apps that do not
+  use it do not carry it.
+- **Replaceable and upgradeable.** You can swap the AI provider, or update a plugin,
+  without touching the runtime or the app's code.
+- **Isolated.** A plugin that crashes or hangs cannot take the server down.
+- **Typed and testable.** Apps call plugins through typed functions. Tests swap in a fake.
+- **Secrets stay on the server.** API keys live in the server's environment, never on
+  devices.
+
+## The app's side
+
+A plugin's API is a `.tj` module the app imports by name:
+
+```ts
+import { complete } from "tj:ai"
+
+@server @read("owner") object Assistant {
+  reply: string = ""
+  @allow("owner") async ask(question: string) {
+    this.reply = await complete("You are a helpful shop assistant.", [{ role: "user", text: question }])
+  }
+}
+```
+
+Each plugin ships that module, `plugin.tj`: types and small `async` functions. Inside,
+they call the built-in `plugin(name, method, args)`. That built-in is allowed only in
+plugin modules, so app code has one way to reach a plugin: the typed import. A call becomes
+the effect `{ kind: "plugin", plugin, method, args }`. The caller's `await` waits for the
+answer, like `fetch`. Plugin calls run on the server, from `@server` objects. A device that
+needs a plugin calls a server object, which keeps keys and rules on the server.
+
+## The server's side: plugins are MCP servers
+
+A server plugin is a separate process that speaks the
+[Model Context Protocol](https://modelcontextprotocol.io) over stdio. `plugin(name, method,
+args)` becomes `tools/call` with `name = method` and `arguments = args`. The answer's
+`structuredContent` (or its text, parsed as JSON when possible) is the result. An `isError`
+answer becomes an error. Why MCP:
+
+- **One protocol, already standard.** Any existing MCP server (GitHub, Slack, databases,
+  search) can be a tinyjump plugin, written in any language.
+- **Process isolation.** A plugin is restarted after a crash, with backoff. Calls get a
+  timeout (30 seconds by default), and a hung plugin cannot block the runtime.
+- **The same tools serve the agent loop.** The agent can be offered a plugin's tools as
+  well as the app's own methods.
+
+`tj serve` starts the plugins named in `plugins.json`, next to the app:
+
+```json
+{ "ai": { "command": ["tj", "plugin", "ai"], "env": ["ANTHROPIC_API_KEY"] } }
+```
+
+- `env` lists the variables passed through to the plugin. A plugin gets nothing else from
+  the server's environment, so secrets reach only the plugin that needs them.
+- At start, `tj serve` checks that the plugin answers `initialize` and offers the tools the
+  plugin module uses. A missing tool fails at startup, not mid-request.
+- `tj dev` and the tests can use `--plugin ai=fake:<file.json>`, a scripted fake whose
+  answers are listed in a file. Tests then stay deterministic and free.
+
+## Device plugins (later)
+
+Cameras, sensors, files and notifications must run inside the app, so on devices a plugin
+is native code registered with the host (Java, Swift or JavaScript) under the same name. It
+answers the same effect. The app's side does not change. These come with the device
+capabilities work.
+
+## The agent loop, as a plugin and a library
+
+The first plugin is `tj:ai`, a model call. Its implementation is `tj plugin ai`, an MCP
+server that calls the Anthropic Messages API with `ANTHROPIC_API_KEY`; the model is
+configurable. On top of it, `tj:agent` is a library written in tinyjump:
+
+- **An agent's state is a durable object:** its messages, its pending tool calls and its
+  status. It survives restarts and can be inspected like any object.
+- **Its tools are the app's own methods,** listed by name, for example
+  `tools: ["Cart.add", "Cart.remove"]`. The model sees their names, parameter types and doc
+  comments. Each tool call runs as the agent's caller, so access-control rules apply to the
+  agent exactly as to a person. An agent acting for a user can do what that user can do,
+  and nothing more.
+- **Each step is a server call that runs once** (Idempotency-Key). An agent resumes after a
+  restart without repeating a tool call.
+- **Approval:** a tool can be marked as needing approval. The agent then waits, durably, for
+  an `approve()` call from a person.
+
+## Rollout
+
+1. **Core:** the `plugin` effect, `tj:` module names and the rule that only plugin modules
+   may call `plugin()`.
+2. **Server:** `plugins.json`, the stdio MCP client (startup check, timeouts, restart) and
+   the scripted fake.
+3. **`tj plugin ai`:** the Anthropic provider.
+4. **`tj:agent`:** the library, and a showcase app: a shop assistant for the durable cart
+   that adds and removes items on the shopper's behalf, within their permissions.

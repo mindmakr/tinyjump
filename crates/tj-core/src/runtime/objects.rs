@@ -1,6 +1,7 @@
 //! Durable objects: loading, field access rules, events, alarms and persistence.
 
-use super::protocol::Output;
+use super::access::Who;
+use super::protocol::{Caller, Output};
 use super::{BootError, Runtime, TimerKind};
 use crate::vm::interp::Fiber;
 use crate::vm::value::{Closure, Exc, ObjRef, Record, Value};
@@ -33,13 +34,53 @@ pub(crate) struct Instance {
     state_text: String,
 }
 
+/// A call made with an id: who made it and with what, so a repeat is recognised, and its
+/// result (see `calls.rs`).
 #[derive(Serialize, Deserialize, Clone)]
 pub(crate) struct CallRecord {
     id: String,
+    by: String,
+    method: String,
+    /// A hash of the arguments.
+    args: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ok: Option<Json>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+impl CallRecord {
+    pub(crate) fn new(id: &str, who: &Who, method: &str, args: &[Json]) -> CallRecord {
+        let by = match who {
+            Who::Remote { id, .. } => id.to_string(),
+            Who::System => "system".into(),
+            Who::Local => String::new(),
+        };
+        let text = serde_json::to_string(args).expect("JSON values serialize");
+        // FNV-1a: telling one call's arguments from another's, not hiding them.
+        let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+        CallRecord { id: id.to_string(), by, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None }
+    }
+
+    /// The same caller, method and arguments.
+    pub(crate) fn same_call(&self, other: &CallRecord) -> bool {
+        self.by == other.by && self.method == other.method && self.args == other.args
+    }
+
+    pub(crate) fn with_result(mut self, r: &Result<Json, String>) -> CallRecord {
+        match r {
+            Ok(v) => self.ok = Some(v.clone()),
+            Err(e) => self.error = Some(e.clone()),
+        }
+        self
+    }
+
+    pub(crate) fn result(&self) -> Result<Json, String> {
+        match &self.error {
+            Some(e) => Err(e.clone()),
+            None => Ok(self.ok.clone().unwrap_or(Json::Null)),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -49,6 +90,9 @@ pub(crate) struct Alarm {
     at: f64,
     pub method: String,
     pub args: Vec<Json>,
+    /// Who scheduled it, if a remote caller: the alarm runs as them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<Caller>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,11 +119,7 @@ impl Runtime {
         let program = self.program.clone();
         let def = &program.objects[class as usize];
         let handle = Rc::new(ObjRef { class, class_name: def.name.clone(), id: key.1.clone() });
-        let init = Rc::new(Closure { proto: def.init, upvals: Vec::new(), this: None });
-        let f = self.fiber_for(&Value::Func(init), Vec::new())?;
-        let Value::Rec(state) = self.run_sync(f).map_err(|fail| Exc::msg(fail.message))? else {
-            unreachable!("object init returns a record")
-        };
+        let state = self.defaults(class)?;
         let mut alarms = Vec::new();
         let mut seq = 0;
         let mut calls = Vec::new();
@@ -121,6 +161,38 @@ impl Runtime {
         Ok(handle)
     }
 
+    /// Whether `Class/id` is loaded already (so a request for it adds nothing to memory).
+    pub(crate) fn is_loaded(&self, key: &str) -> bool {
+        let Some((class, id)) = key.split_once('/') else { return false };
+        self.program.object(class).is_some_and(|c| self.instances.contains_key(&(c, Rc::from(id))))
+    }
+
+    /// A fresh record of the default state of class `class`.
+    fn defaults(&mut self, class: u16) -> Result<Rc<RefCell<Record>>, Exc> {
+        let init = Rc::new(Closure { proto: self.program.objects[class as usize].init, upvals: Vec::new(), this: None });
+        let f = self.fiber_for(&Value::Func(init), Vec::new())?;
+        match self.run_sync(f).map_err(|fail| Exc::msg(fail.message))? {
+            Value::Rec(state) => Ok(state),
+            _ => unreachable!("object init returns a record"),
+        }
+    }
+
+    /// Resets every replica to its defaults and resubscribes from scratch, after the device's
+    /// user changed: what one user could read must not stay for the next.
+    pub(crate) fn clear_replicas(&mut self) {
+        let replicas: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.remote).map(|i| i.handle.clone()).collect();
+        for o in replicas {
+            let Ok(fresh) = self.defaults(o.class) else { continue };
+            let inst = self.inst_mut(&o);
+            let fresh = fresh.borrow().clone();
+            *inst.state.borrow_mut() = fresh;
+            inst.seq = 0;
+            self.touch(&o);
+            self.ran_code = true;
+            self.outputs.push(Output::Subscribe { object: o.key(), seq: 0 });
+        }
+    }
+
     pub(crate) fn is_remote(&self, o: &ObjRef) -> bool {
         self.inst(o).remote
     }
@@ -135,23 +207,15 @@ impl Runtime {
         Ok(Value::Promise(self.queue_call(o.key(), method.to_string(), args)))
     }
 
-    /// The recorded result of call `id` on `o`, if it already ran.
-    pub(crate) fn call_result(&self, o: &ObjRef, id: &str) -> Option<Result<Json, String>> {
-        let r = self.inst(o).calls.iter().find(|c| c.id == id)?;
-        Some(match &r.error {
-            Some(e) => Err(e.clone()),
-            None => Ok(r.ok.clone().unwrap_or(Json::Null)),
-        })
+    /// The record of call `id` on `o`, if it already ran.
+    pub(crate) fn call_record(&self, o: &ObjRef, id: &str) -> Option<CallRecord> {
+        self.inst(o).calls.iter().find(|c| c.id == id).cloned()
     }
 
-    /// Remembers the result of call `id`; it is saved with the object's state.
-    pub(crate) fn record_call(&mut self, o: &ObjRef, id: &str, r: &Result<Json, String>) {
-        let (ok, error) = match r {
-            Ok(v) => (Some(v.clone()), None),
-            Err(e) => (None, Some(e.clone())),
-        };
+    /// Remembers a finished call; it is saved with the object's state.
+    pub(crate) fn record_call(&mut self, o: &ObjRef, record: CallRecord) {
         let calls = &mut self.inst_mut(o).calls;
-        calls.push(CallRecord { id: id.to_string(), ok, error });
+        calls.push(record);
         if calls.len() > MAX_CALL_RECORDS {
             calls.remove(0);
         }
@@ -279,7 +343,7 @@ impl Runtime {
     }
 
     /// `this.schedule(delayMs, "method", ...args)`: a durable one-shot timer.
-    pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value]) -> Result<(), Exc> {
+    pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<(), Exc> {
         let (Some(Value::Num(delay)), Some(Value::Str(method))) = (args.first(), args.get(1)) else {
             return Err(Exc::msg("schedule(delayMs, \"method\", ...args) needs a delay and a method name"));
         };
@@ -289,7 +353,7 @@ impl Runtime {
         self.method(o.class, method)?;
         let args = args[2..].iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("schedule arguments: {e}")))?;
         self.next_alarm += 1;
-        let alarm = Alarm { id: self.next_alarm, at: self.now + delay, method: method.to_string(), args };
+        let alarm = Alarm { id: self.next_alarm, at: self.now + delay, method: method.to_string(), args, caller: who.to_caller() };
         self.push_timer(alarm.at, TimerKind::Alarm { obj: o.clone(), alarm: alarm.id });
         self.inst_mut(o).alarms.push(alarm);
         self.touch(o);

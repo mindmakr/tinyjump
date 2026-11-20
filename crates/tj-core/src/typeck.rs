@@ -129,6 +129,7 @@ fn builtin(name: &str) -> Option<Ty> {
         "parseFloat" => func(&[("text", Ty::Any, false)], None, Ty::Num),
         "Error" => func(&[("message", Ty::Any, true)], None, rec(&[("name", Ty::Str), ("message", Ty::Str)])),
         "fetch" => func(&[("url", Ty::Str, false), ("init", Ty::Any, true)], None, Ty::Any),
+        "caller" => rec(&[("id", Ty::Str), ("roles", Ty::Arr(Box::new(Ty::Str)))]),
         _ => return None,
     })
 }

@@ -208,6 +208,10 @@ impl Compiler {
             self.error(Diagnostic::new(format!("'{name}' is a built-in component"), span).hint("pick another name"));
             return false;
         }
+        if name == "caller" {
+            self.error(Diagnostic::new("'caller' is built in: who is making the current call", span).hint("pick another name"));
+            return false;
+        }
         if let Some(g) = self.globals.get(name) {
             let d = if g.kind == GKind::Builtin {
                 Diagnostic::new(format!("'{name}' is a built-in"), span)
@@ -234,7 +238,7 @@ impl Compiler {
                 }
                 Item::Object(o) => {
                     if self.check_top_name(&o.name, o.span) {
-                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false });
+                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None });
                         self.add_global(&o.name, false, GKind::Object);
                     }
                 }
@@ -289,12 +293,36 @@ impl Compiler {
         self.end_fn()
     }
 
+    /// The words of an `@read` / `@allow` rule (see docs/access-control.md).
+    fn rule(&mut self, d: &Decorator) -> Option<Rc<[Rc<str>]>> {
+        let mut words = Vec::new();
+        for a in &d.args {
+            let ExprKind::Str(w) = &a.kind else {
+                self.error(Diagnostic::new(format!("@{} takes rule words as strings", d.name), a.span).hint("e.g. @read(\"anyone\"), @allow(\"owner\", \"staff\")"));
+                return None;
+            };
+            let role_like = w.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            if !role_like || w == "system" {
+                self.error(Diagnostic::new(format!("'{w}' is not a rule word or role"), a.span).hint("use \"anyone\", \"signedIn\", \"owner\" or a role name such as \"staff\" (\"system\" is reserved)"));
+                return None;
+            }
+            words.push(Rc::from(w.as_str()));
+        }
+        if words.is_empty() {
+            self.error(Diagnostic::new(format!("@{} needs at least one rule word", d.name), d.span).hint("e.g. @read(\"anyone\"); without a rule, nobody outside the server may"));
+            return None;
+        }
+        Some(words.into())
+    }
+
     fn object(&mut self, o: &ObjectDecl, class: usize) {
         let mut server = false;
+        let mut read = None;
         for d in &o.decorators {
             match (d.name.as_str(), d.args.is_empty()) {
                 ("server", true) => server = true,
-                _ => self.error(Diagnostic::new(format!("unknown object decorator @{}", d.name), d.span).hint("supported: @server (the object lives on the server; devices hold a synced replica)")),
+                ("read", _) if read.is_none() => read = self.rule(d),
+                _ => self.error(Diagnostic::new(format!("unknown or repeated object decorator @{}", d.name), d.span).hint("supported: @server (the object lives on the server) and @read(...) (who may read it remotely)")),
             }
         }
         let mut seen: HashSet<&str> = HashSet::new();
@@ -335,23 +363,32 @@ impl Compiler {
                 continue;
             }
             let mut every = None;
+            let mut allow = None;
             for d in &m.decorators {
                 match d.name.as_str() {
                     "every" => match d.args.first().and_then(duration_ms) {
                         Some(ms) if d.args.len() == 1 && ms >= 10.0 => every = Some(ms),
                         _ => self.error(Diagnostic::new("@every needs one duration of at least 10ms", d.span).hint("e.g. @every(\"5s\"), @every(\"500ms\"), @every(\"1h\")")),
                     },
-                    other => self.error(Diagnostic::new(format!("unknown decorator @{other}"), d.span).hint("supported: @every(\"5s\")")),
+                    "allow" if m.private => self.error(Diagnostic::new("private methods cannot be called remotely", d.span).hint("remove `private` or the @allow rule")),
+                    "allow" if allow.is_none() => {
+                        allow = self.rule(d);
+                        if read.is_none() {
+                            self.error(Diagnostic::new(format!("{} can be called remotely but not read", o.name), d.span).hint(format!("add @read(...) to {}, e.g. @read(\"owner\") to keep it private to its user", o.name)));
+                        }
+                    }
+                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\") and @allow(...) (who may call it remotely)")),
                 }
             }
             let proto = self.function(&m.func, FnKind::Method);
-            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every });
+            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow });
         }
         let def = &mut self.objects[class];
         def.fields = fields;
         def.init = init;
         def.methods = methods;
         def.server = server;
+        def.read = read;
     }
 
     // ---------- functions and scopes ----------
@@ -587,6 +624,7 @@ impl Compiler {
             Some(Var::Local { slot, cell: true, .. }) => self.emit(Op::LoadCell(slot), span),
             Some(Var::Upval { idx, .. }) => self.emit(Op::LoadUpval(idx), span),
             Some(Var::Global { slot, .. }) => self.emit(Op::LoadGlobal(slot), span),
+            None if name == "caller" => self.emit(Op::Caller, span),
             None => {
                 self.unknown_name(name, span);
                 self.emit(Op::Null, span)
@@ -596,7 +634,11 @@ impl Compiler {
 
     fn store_var(&mut self, name: &str, span: Span) {
         let Some(var) = self.resolve(name) else {
-            self.unknown_name(name, span);
+            if name == "caller" {
+                self.error(Diagnostic::new("'caller' cannot be changed", span).hint("it is whoever made the current call; copy what you need into a variable"));
+            } else {
+                self.unknown_name(name, span);
+            }
             return;
         };
         if let Var::Global { .. } = var {

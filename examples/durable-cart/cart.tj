@@ -7,14 +7,16 @@ type Line = { sku: string, name: string, price: number, qty: number }
 
 const HOLD_MS = 10 * 60 * 1000
 
-export @server object Cart {
+// One shared demo cart: anyone may read it and shop. `name` is a display name people choose;
+// with sign-in, per-user carts would be `Cart.get(caller.id)` with @read("owner").
+export @server @read("anyone") object Cart {
   lines: Line[] = []
   status: "open" | "checked out" | "released" = "open"
   total: number = 0
   changedBy: string = ""
   changedAt: number = 0
 
-  add(sku: string, by: string) {
+  @allow("anyone") add(sku: string, name: string) {
     this.mustBeOpen()
     const shelf = Shelf.get("main")
     const product = shelf.products.find(p => p.sku === sku)
@@ -26,32 +28,32 @@ export @server object Cart {
     } else {
       line.qty += 1
     }
-    this.changed(by)
+    this.changed(name)
   }
 
-  remove(sku: string, by: string) {
+  @allow("anyone") remove(sku: string, name: string) {
     this.mustBeOpen()
     const line = this.lines.find(l => l.sku === sku)
     if (line === null) { return }
     line.qty -= 1
     if (line.qty === 0) { this.lines = this.lines.filter(l => l.sku !== sku) }
     Shelf.get("main").give(sku, 1)
-    this.changed(by)
+    this.changed(name)
   }
 
-  checkout(by: string): number {
+  @allow("anyone") checkout(name: string): number {
     this.mustBeOpen()
     if (this.lines.length === 0) { throw new Error("the cart is empty") }
     this.status = "checked out"
-    this.changed(by)
-    this.emit("checkedOut", { total: this.total, by })
+    this.changed(name)
+    this.emit("checkedOut", { total: this.total, by: name })
     return this.total
   }
 
-  startOver(by: string) {
+  @allow("anyone") startOver(name: string) {
     this.release()
     this.status = "open"
-    this.changed(by)
+    this.changed(name)
   }
 
   private mustBeOpen() {

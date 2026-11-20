@@ -118,7 +118,7 @@ input '{"type":"ui","target":{"id":"name"},"event":"onChange","value":"iPhone"}'
 input '{"type":"ui","target":{"id":"draft"},"event":"onChange","value":"Hello from iOS"}'
 input '{"type":"ui","target":{"id":"send"},"event":"onPress"}'
 expect http://127.0.0.1:4700/api/Room/lobby 'Hello from iOS'
-curl -sf -X POST http://127.0.0.1:4700/api/Room/lobby/post -d '["server","hi phone"]' >/dev/null
+curl -sf -X POST http://127.0.0.1:4700/api/Room/lobby/post -H 'content-type: application/json' -d '["server","hi phone"]' >/dev/null
 expect "$api/_tj/inspect" 'hi phone'
 curl -sf "$api/_tj/screenshot" -o "$out/chat.png"
 "$tj" review --target "$api"

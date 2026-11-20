@@ -74,7 +74,7 @@ pub fn bench(name: &str, source: &str) -> Result<Bench, String> {
         let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render(name, source)).collect::<Vec<_>>().join("\n\n"))?;
         let compile_ms = ms(t);
         let t = Instant::now();
-        let opts = Options { now: START, seed: 1, render: true, server: true };
+        let opts = Options { server: true, ..Options::new(START, 1) };
         let (mut rt, out) = Runtime::boot(program, Box::new(MemStore::default()), opts).map_err(|e| format!("boot failed: {e}"))?;
         let boot_ms = ms(t);
         let first_render_ops = check(&out)?;

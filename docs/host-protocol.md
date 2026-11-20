@@ -24,12 +24,13 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 
 | type | fields | reply |
 |---|---|---|
-| `call` | `object: "Class/id"`, `method`, `args: []`, optional `call` id: a call with an id runs once, and repeats get the first result | method result |
-| `get` | `object` | state |
+| `call` | `object: "Class/id"`, `method`, `args: []`, `caller` (below), optional `call` id: a call with an id runs once for that caller, and repeats get the first result | method result |
+| `get` | `object`, `caller` | state |
 | `ui` | `target: {node}\|{id}\|{text}`, `event`, `value` | handler result |
 | `effectDone` | `id`, and either `ok` or `error`; `unreachable: true` when a server call got no answer | — |
 | `online` | — : the server is reachable again (the change stream connected), so queued server calls are retried now | — |
 | `sync` | `object`, `state`, `seq`: the server's state for a replica and its change number. States no newer than the replica's are ignored | — |
+| `identity` | `user`: the signed-in user's id, or `null`. Devices only. A new user drops the server calls queued by the previous one and clears the replicas | — |
 | `tick` | — | — |
 | `inspect` | — | `{ tree, objects, wake }` |
 
@@ -45,7 +46,7 @@ id and it fails, the runtime reports the failure as an `error` output.
 | `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams) |
 | `emit` | `{ object, name, data }`: realtime event |
 | `changed` | `{ object, state, seq }`: state after a persisted change, with its change number |
-| `reply` | `{ reply, ok }` or `{ reply, error }` |
+| `reply` | `{ reply, ok }` or `{ reply, error, status? }`. `status` marks a refused request: 400, 403, 422 or 503 |
 | `log` | `{ level, message }` |
 | `error` | `{ message, trace }`: uncaught error in a handler, timer or render |
 | `wake` | `{ at }` |
@@ -131,6 +132,15 @@ Imports (module `env`): `tj_host_load(key, len, out_ptr) -> len | -1`,
 `tj_host_save(key, klen, val, vlen) -> 0 | 1`, `tj_host_keys(prefix, len, out_ptr) -> len`.
 For `load` and `keys`, the host allocates the result with `tj_alloc`, writes its pointer
 to `out_ptr` and returns its length. Rust then owns that memory.
+
+## Callers and access control
+
+`call` and `get` carry `caller`: `{ "id": "user:ana", "roles": ["staff"] }` for a remote
+caller, or `"trusted"` for the host itself (automation, a device's own UI). A server runtime
+checks remote callers against the app's `@read` and `@allow` rules before it loads
+anything, and it refuses a `call` or `get` without `caller`. Devices treat a missing
+`caller` as their own UI. Hosts give the runtime a seed from a secure random source, and
+apply the user's token as described in [access control](access-control.md).
 
 ## Change streams
 

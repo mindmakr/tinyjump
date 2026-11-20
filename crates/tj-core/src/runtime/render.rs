@@ -12,7 +12,10 @@ impl Runtime {
     pub(crate) fn render_app(&mut self) {
         let Some(slot) = self.program.app else { return };
         let app = self.globals[slot as usize].clone();
-        let result = self.fiber_for(&app, Vec::new()).map_err(|e| (e.message(), Vec::new())).and_then(|f| self.run_sync(f).map_err(|fail| (fail.message, fail.trace)));
+        let result = self.fiber_for(&app, Vec::new()).map_err(|e| (e.message(), Vec::new())).and_then(|mut f| {
+            f.caller = self.local();
+            self.run_sync(f).map_err(|fail| (fail.message, fail.trace))
+        });
         let nodes = result.and_then(|v| {
             let mut out = Vec::new();
             nodes(&v, &mut out).map(|()| out).map_err(|e| (e, Vec::new()))

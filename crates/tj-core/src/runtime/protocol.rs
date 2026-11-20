@@ -4,6 +4,32 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value as Json};
 
+/// Who is making a `call` or `get` (docs/access-control.md). `"trusted"` is the host itself
+/// (automation, a device's own UI); the rules do not apply to it. A server runtime refuses
+/// a `call` or `get` without a caller, so a network path that forgets it fails closed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Caller {
+    Trusted(Trust),
+    Remote {
+        id: String,
+        #[serde(default)]
+        roles: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Trust {
+    Trusted,
+}
+
+impl Caller {
+    pub fn trusted() -> Caller {
+        Caller::Trusted(Trust::Trusted)
+    }
+}
+
 /// What a host sends to the runtime, always with the current time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -19,12 +45,16 @@ pub enum Input {
         reply: Option<u64>,
         #[serde(default)]
         call: Option<String>,
+        #[serde(default)]
+        caller: Option<Caller>,
     },
     /// Read an object's state.
     Get {
         object: String,
         #[serde(default)]
         reply: Option<u64>,
+        #[serde(default)]
+        caller: Option<Caller>,
     },
     /// A UI event from the user or from an automation client.
     Ui {
@@ -66,6 +96,12 @@ pub enum Input {
     /// The host reached the server again (its change stream connected): queued server calls
     /// are retried now instead of waiting out their backoff.
     Online,
+    /// Devices: the signed-in user changed (`null` when signed out). Server calls queued by
+    /// someone else are dropped, never sent as the new user, and replicas are cleared.
+    Identity {
+        #[serde(default)]
+        user: Option<String>,
+    },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -109,6 +145,11 @@ pub enum Output {
         ok: Option<Json>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// For an error that is about the request rather than the app, its HTTP status:
+        /// 400 (no caller), 403 (not allowed), 422 (a call id reused for another call),
+        /// 503 (too many objects loaded).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
     },
     Log { level: String, message: String },
     /// An uncaught error in a UI handler, timer or render.

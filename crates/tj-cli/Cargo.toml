@@ -17,3 +17,4 @@ tj-core.workspace = true
 serde_json.workspace = true
 tiny_http = "0.12"
 ureq = "2"
+ring = "0.17"

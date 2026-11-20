@@ -110,8 +110,9 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
    call carries an id, and the server drops duplicates, so a retry never runs twice.
 3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
    objects, and durable object-to-object messages on the server.
-4. **Backpressure (done) and access control.** Slow subscribers are coalesced to the latest
-   state, and each object has an access policy for who may read and call it.
+4. **Backpressure and access control (done; OIDC sign-in tokens next).** Slow subscribers
+   are coalesced to the latest state, and each object declares who may read and call it
+   (`docs/access-control.md`).
 
 Deliberately not planned: a general-purpose message broker, or "exactly-once" promises.
 Those are separate products, and exactly-once cannot be honestly guaranteed over a network;
@@ -129,17 +130,18 @@ Raised by the owner. To be discussed and critiqued before any work starts:
   (effects in, events out, through the existing protocol) plus catalog components
   (`<Camera>`, `<VideoCall>`). Hosts opt in, the core stays tiny, and permissions are
   declared per app. Calls build on WebRTC rather than a custom media stack.
-- **Messaging, what is left (needs a decision):**
-  - **Access control** needs an identity first: who is calling? Options include a signed
-    token (for example a JWT from any sign-in provider) that the server checks and passes
-    to methods as the caller, or sessions issued by `tj serve` itself. Each object then
-    declares who may read it and call each method. Until this lands, `tj serve` must stay
-    on localhost or behind an authenticating proxy.
-  - **Durable object-to-object messages:** one server runtime already calls between objects
-    atomically (one input, one write), so this only matters with several servers. Proposed:
-    drop it until there is more than one server.
-  - **Topics across objects:** subscribe to every object of a class (`Room/*`), for
-    dashboards and agents. Cheap to add; worth it only if an app needs it.
+- **Messaging, agreed with the owner (2026-11-20):**
+  - **Access control:** done with API keys (`docs/access-control.md`). Sign-in tokens from
+    OpenID Connect providers come next.
+  - **Objects on different servers and apps talking to each other:** wanted. A server holds
+    replicas of another server's objects and calls them through the same outbox, change
+    streams and once-only calls that devices use, authenticated with API keys. Webhooks
+    connect systems that are not tinyjump (incoming: a signed request becomes a method
+    call; outgoing: change subscriptions delivered by HTTP with retries).
+  - **Topics across objects** (`Room/*`): add when an app needs them.
+- **Plugins and the agent loop (agreed):** plugins are typed `.tj` modules backed by MCP
+  servers (`docs/plugins.md`). The agent loop is a plugin plus a library, whose tools are
+  the app's own methods under the access rules.
 - **Docker-like features:** park until the retro. First decide whether this means packaging
   and deploying apps as sealed units, or isolating running apps. The runtime is already
   sandboxed: it has no I/O except through its host.
@@ -155,6 +157,12 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 | Linux (server/CLI, static: x86_64, aarch64, armv7) | working |
 | Linux desktop UI | after mobile |
 | Microcontrollers | out of scope for now |
+
+## Size work to do
+
+- Server-only parts of the core (access checks, call records, stream catch-up) are compiled
+  into device builds too, about 30 KB of the web runtime. Put them behind a `server` feature,
+  as layout is, and lower the budget again.
 
 ## Old devices are in scope
 

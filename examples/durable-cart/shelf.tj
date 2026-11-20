@@ -2,7 +2,11 @@
 
 type Product = { sku: string, name: string, price: number, stock: number }
 
-export @server object Shelf {
+// Anyone may see the stock. Only staff may add stock by hand: with an API key, e.g.
+//   tj key restocker --keys keys.json --role staff
+//   curl -X POST localhost:4700/api/Shelf/main/stock -H 'content-type: application/json' \
+//        -H "Authorization: Bearer $KEY" -d '["pot", 3]'
+export @server @read("anyone") object Shelf {
   products: Product[] = [
     { sku: "tea", name: "Green tea", price: 4.5, stock: 12 },
     { sku: "mug", name: "Stone mug", price: 12, stock: 5 },
@@ -20,6 +24,11 @@ export @server object Shelf {
   give(sku: string, qty: number) {
     const p = this.products.find(p => p.sku === sku)
     if (p !== null) { p.stock += qty }
+  }
+
+  @allow("staff") stock(sku: string, qty: number) {
+    if (qty <= 0 || qty > 100) { throw new Error("stock 1 to 100 at a time") }
+    this.give(sku, qty)
   }
 
   // The backend changes things too: one unit of anything running low, every minute.

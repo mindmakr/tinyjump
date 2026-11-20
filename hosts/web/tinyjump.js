@@ -52,8 +52,10 @@ function localStore(prefix) {
 
 /**
  * Boots an app.
- * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean}} opts
+ * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean, token?: string, user?: string}} opts
  *   server: base URL of a `tj serve` backend for `@server` objects ('' = same origin).
+ *   token, user: the signed-in user's token for the server and their id (see setToken).
+ *   seed: for replaying a run; by default it comes from crypto.getRandomValues.
  *   dir: 'ltr' or 'rtl'; defaults to the page's dir, then the browser language.
  */
 export async function start(opts) {
@@ -173,28 +175,77 @@ export async function start(opts) {
   const replicas = new Map(); // object key -> change number of the state this device has
   let events = null;
   let reconnect = null;
+  let token = opts.token || null; // sent as `Authorization: Bearer` (docs/access-control.md)
+  let user = opts.user || null;
+  const auth = (headers) => (token ? Object.assign({ authorization: 'Bearer ' + token }, headers) : headers);
+  // A 401: the embedding app should refresh the token and call setToken.
+  const tokenExpired = () => window.dispatchEvent(new CustomEvent('tinyjump:tokenExpired'));
 
   const objectUrl = (key) => server + '/api/' + key.split('/').map(encodeURIComponent).join('/');
 
   // One realtime stream for all replicas, reopened when the set changes. It resumes from the
-  // oldest replica's change number, so the server sends only what this device missed; after a
-  // dropped connection the browser resumes by itself from the last event id.
+  // oldest replica's change number, so the server sends only what this device missed. Without
+  // a token, the browser reconnects by itself from the last event id. With one, EventSource
+  // cannot send it, so the page gets a one-time ticket first, and reconnects itself (a used
+  // ticket cannot be reused).
   function connectRealtime() {
     if (events) events.close();
+    events = null;
+    if (!replicas.size) return;
     let since = Infinity;
-    const query = [];
-    replicas.forEach((seq, k) => { since = Math.min(since, seq); query.push('object=' + encodeURIComponent(k)); });
-    events = new EventSource(server + '/api/events?' + query.join('&') + '&since=' + since);
+    const keys = [];
+    replicas.forEach((seq, k) => { since = Math.min(since, seq); keys.push(k); });
+    if (!token) {
+      openStream(server + '/api/events?' + keys.map((k) => 'object=' + encodeURIComponent(k)).join('&') + '&since=' + since);
+      return;
+    }
+    fetch(server + '/api/events/ticket', { method: 'POST', headers: auth({ 'content-type': 'application/json' }), body: JSON.stringify({ objects: keys }) })
+      .then((r) => {
+        if (r.status === 401) tokenExpired();
+        return r.json();
+      })
+      .then((j) => {
+        if (!j.ok) throw new Error(j.error);
+        openStream(server + '/api/events?ticket=' + encodeURIComponent(j.ok.ticket) + '&since=' + since);
+      })
+      .catch(() => { clearTimeout(reconnect); reconnect = setTimeout(connectRealtime, 2000); });
+  }
+
+  function openStream(url) {
+    const stream = new EventSource(url);
+    events = stream;
     // The server is reachable again: queued calls go now rather than after their backoff.
-    events.addEventListener('open', () => send({ type: 'online' }));
-    events.addEventListener('changed', (e) => {
+    stream.addEventListener('open', () => send({ type: 'online' }));
+    stream.addEventListener('error', () => {
+      if (!token || events !== stream) return;
+      stream.close();
+      clearTimeout(reconnect);
+      reconnect = setTimeout(connectRealtime, 2000);
+    });
+    stream.addEventListener('changed', (e) => {
       const d = JSON.parse(e.data);
       if (!replicas.has(d.object)) return;
       replicas.set(d.object, Math.max(replicas.get(d.object), d.seq));
       send({ type: 'sync', object: d.object, state: d.state, seq: d.seq });
     });
     // Server-side events (emit, read) reach the page like local ones.
-    events.addEventListener('emit', (e) => window.dispatchEvent(new CustomEvent('tinyjump:emit', { detail: JSON.parse(e.data) })));
+    stream.addEventListener('emit', (e) => window.dispatchEvent(new CustomEvent('tinyjump:emit', { detail: JSON.parse(e.data) })));
+  }
+
+  // The signed-in user changed: calls queued by the previous one are dropped and replicas
+  // start over, so nothing one user could see or send carries over to the next.
+  function setToken(newToken, newUser) {
+    token = newToken || null;
+    if ((newUser || null) !== user) {
+      user = newUser || null;
+      replicas.clear();
+      if (events) events.close();
+      events = null;
+      send({ type: 'identity', user });
+    } else {
+      clearTimeout(reconnect);
+      reconnect = setTimeout(connectRealtime, 0);
+    }
   }
 
   function subscribe(key, seq) {
@@ -211,12 +262,16 @@ export async function start(opts) {
     }
     // The call id makes retries safe: the server runs each call once. No answer (offline, a
     // 5xx, an unreadable reply) is `unreachable`, and the runtime retries the call later.
+    // A 401 is retried too, once the embedding app has refreshed the token.
     fetch(objectUrl(effect.object) + '/' + encodeURIComponent(effect.method), {
       method: 'POST',
-      headers: { 'content-type': 'application/json', 'idempotency-key': effect.call },
+      headers: auth({ 'content-type': 'application/json', 'idempotency-key': effect.call }),
       body: JSON.stringify(effect.args),
     })
-      .then((r) => (r.status >= 500 ? Promise.reject(new Error('server error ' + r.status)) : r.json()))
+      .then((r) => {
+        if (r.status === 401) tokenExpired();
+        return r.status >= 500 || r.status === 401 ? Promise.reject(new Error('server answered ' + r.status)) : r.json();
+      })
       .then((j) => send(j.error ? { type: 'effectDone', id, error: j.error } : { type: 'effectDone', id, ok: j.ok }))
       .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e), unreachable: true }));
   }
@@ -374,12 +429,19 @@ export async function start(opts) {
     call: (object, method, args) => request({ type: 'call', object, method, args: args || [] }),
     get: (object) => request({ type: 'get', object }),
     tick: () => send({ type: 'tick' }),
+    /** The signed-in user's token and id; a new id drops what the previous user queued or saw. */
+    setToken,
+    /** Forgets the token, the replicas and every queued server call. */
+    signOut: () => setToken(null, null),
   };
 
   // ---------- boot ----------
 
   const [p, n] = writeStr(opts.source);
-  const code = ex.tj_boot(p, n, Date.now(), opts.seed || Date.now(), 1);
+  // A secure seed: device and call ids derive from it, so they must not be guessable.
+  const words = crypto.getRandomValues(new Uint32Array(2));
+  const seed = opts.seed || (words[0] & 0x1fffff) * 4294967296 + words[1];
+  const code = ex.tj_boot(p, n, Date.now(), seed, 1);
   ex.tj_free(p, n);
   const out = result();
   if (code === 1) {
@@ -391,6 +453,8 @@ export async function start(opts) {
     throw new Error(out.message);
   }
   apply(out);
+  // Before any other input, so calls held from the last session are checked against it.
+  if (opts.user !== undefined) send({ type: 'identity', user: opts.user || null });
   window.tinyjump = api;
   return api;
 }

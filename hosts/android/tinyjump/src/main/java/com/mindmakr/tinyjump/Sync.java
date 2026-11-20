@@ -35,6 +35,12 @@ final class Sync {
     private volatile int generation;
     private volatile HttpURLConnection stream;
     private volatile boolean stopped;
+    /** Sent as `Authorization: Bearer` (docs/access-control.md); null when signed out. */
+    private volatile String token;
+    /** The signed-in user's id. Main thread only. */
+    private String user;
+    /** Told when the server answers 401, so the embedding app can refresh the token. */
+    volatile Runnable onTokenExpired;
 
     /** The call got an answer, an error: retrying would not help. Anything else is unreachable. */
     static final class CallFailed extends Exception {
@@ -53,6 +59,35 @@ final class Sync {
         if (server == null || replicas.containsKey(key)) return;
         replicas.put(key, seq);
         connect(new ArrayList<>(replicas.keySet()), Collections.min(replicas.values()));
+    }
+
+    /**
+     * Sets the token; returns true if the user changed, in which case replicas start over
+     * (the runtime drops what the previous user queued, and resubscribes).
+     */
+    boolean setToken(String newToken, String newUser) {
+        token = newToken;
+        boolean changed = newUser == null ? user != null : !newUser.equals(user);
+        user = newUser;
+        if (changed) {
+            replicas.clear();
+            generation++;
+            HttpURLConnection s = stream;
+            if (s != null) s.disconnect();
+        } else if (!replicas.isEmpty()) {
+            connect(new ArrayList<>(replicas.keySet()), Collections.min(replicas.values()));
+        }
+        return changed;
+    }
+
+    private void authorize(HttpURLConnection c) {
+        String t = token;
+        if (t != null) c.setRequestProperty("Authorization", "Bearer " + t);
+    }
+
+    private void tokenExpired() {
+        Runnable r = onTokenExpired;
+        if (r != null) tj.main.post(r);
     }
 
     void stop() {
@@ -74,11 +109,15 @@ final class Sync {
             c.setDoOutput(true);
             c.setRequestProperty("Content-Type", "application/json");
             c.setRequestProperty("Idempotency-Key", effect.getString("call"));
+            authorize(c);
             JSONArray args = effect.getJSONArray("args");
             try (OutputStream out = c.getOutputStream()) {
                 out.write(args.toString().getBytes("UTF-8"));
             }
-            if (c.getResponseCode() >= 500) throw new IOException("server error " + c.getResponseCode());
+            int status = c.getResponseCode();
+            // A 401 is retried too, once the embedding app has refreshed the token.
+            if (status == 401) tokenExpired();
+            if (status >= 500 || status == 401) throw new IOException("server answered " + status);
             JSONObject reply = new JSONObject(body(c));
             if (reply.has("error")) throw new CallFailed(reply.getString("error"));
             return reply.opt("ok");
@@ -154,7 +193,9 @@ final class Sync {
                         HttpURLConnection c = (HttpURLConnection) new URL(url.toString()).openConnection();
                         c.setConnectTimeout(TIMEOUT_MS);
                         c.setReadTimeout(0); // the server sends keep-alives; wait indefinitely
+                        authorize(c);
                         stream = c;
+                        if (c.getResponseCode() == 401) tokenExpired();
                         BufferedReader r = new BufferedReader(new InputStreamReader(c.getInputStream(), "UTF-8"));
                         online(); // reachable again: queued calls go now, not after their backoff
                         String event = null;
