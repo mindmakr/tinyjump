@@ -2446,6 +2446,29 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
 ").contains("mixes a list of several people's entries"));
     assert!(mixed("  @allow(\"owner\") f() {}
 ").contains("mixes a list of several people's entries"));
+    // Entries are taken out of the list, or moved to another, without revealing them again.
+    let moves = r#"type Booker = { customer: string, name: string, at: number }
+@server @read("staff") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+  drop(slot: string) { this.entries = this.entries.filter(e => e.customer !== slot) }
+  @allow("signedIn") first() { this.entries.splice(0, 1) }
+  @allow("signedIn") park() { Waiting.get("w").entries.push(this.entries[0]) }
+}
+@server @read("staff") object Waiting {
+  @pii("contact", "booking") @by("customer", "at") entries: Booker[] = []
+}
+@server @read("anyone") object Slot {
+  @allow("signedIn") cancel() { const r = Roster.get("main"); r.drop(this.id); r.first(); r.park() }
+}
+"#;
+    assert_eq!(msg(moves), "");
+    // Anywhere else, the list's entries are still personal data about several people.
+    let e = msg(&format!("{ROSTER}@server @read(\"staff\") object Log {{
+  last: string = \"\"
+  @allow(\"signedIn\") note() {{ this.last = Roster.get(\"r\").entries[0].name }}
+}}
+"));
+    assert!(e.contains("reaches `this.last`"), "{e}");
 }
 
 #[test]
