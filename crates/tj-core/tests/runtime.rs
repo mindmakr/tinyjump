@@ -2294,14 +2294,102 @@ object Form {
     assert_eq!((state(&mut ui, 2.0, "Form/f")["error"].clone(), state(&mut ui, 2.0, "Form/f")["field"].clone()), (json!("Give the slot a title"), json!("title")));
 }
 
+const PROFILE: &str = r#"import { Form, FormInput, Notice } from "tj:ui"
+@server @read("owner") object Customer {
+  @pii("contact", "booking") name: string = ""
+  @allow("owner") save(name: string) { this.name = name }
+}
+function validName(name: string) { check(name.trim() !== "", "name", "Give your name") }
+function App() {
+  const me = Customer.get(caller.id)
+  const f = Form.get("profile")
+  return <Column>
+    <FormInput form={f} name="name" label="Name" saved={me.name} />
+    <Button id="save" disabled={f.busy()} onPress={() => f.submit(() => {
+      validName(f.value("name", me.name))
+      return me.save(f.value("name", me.name))
+    })}>Save</Button>
+    <Notice id="form-error" text={f.error} />
+  </Column>
+}
+"#;
+
+#[test]
+fn a_form_keeps_drafts_shows_errors_at_their_field_and_sends_once() {
+    let store = Shared::default();
+    let (mut device, _) = boot_as(PROFILE, store.clone(), 0.0, false);
+    device.handle(0.5, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    let out = device.handle(1.0, Input::Sync { object: "Customer/user:ana".into(), state: json!({ "name": "Ana" }), seq: Some(1) });
+    assert!(format!("{out:?}").contains("Ana"), "the saved value shows: {out:?}");
+    let ui = |id: &str, event: &str, value: Json| Input::Ui { target: Target::Id { id: id.into() }, event: event.into(), value, reply: None };
+    let call = |out: &[Output]| out.iter().find_map(|o| match o {
+        Output::Effect { id, effect: Effect::Call { method, args, .. } } => Some((*id, method.clone(), args.clone())),
+        _ => None,
+    });
+    // A rule broken on the device shows at its field, and nothing is sent.
+    device.handle(2.0, ui("name", "onChange", json!(" ")));
+    let out = device.handle(2.1, ui("save", "onPress", Json::Null));
+    assert!(call(&out).is_none() && format!("{out:?}").contains("Give your name") && format!("{out:?}").contains("name-error"), "{out:?}");
+    // Typing clears it; saving sends once, however often it is pressed while waiting.
+    let form = |device: &Runtime| device.inspect()["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Form/profile").unwrap()["state"].clone();
+    device.handle(3.0, ui("name", "onChange", json!("Bo")));
+    assert_eq!(form(&device)["errors"]["name"], json!(""));
+    let out = device.handle(3.1, ui("save", "onPress", Json::Null));
+    let (effect, method, args) = call(&out).expect("sent");
+    assert_eq!((method.as_str(), args), ("save", vec![json!("Bo")]));
+    assert!(call(&device.handle(3.2, ui("save", "onPress", Json::Null))).is_none(), "one at a time");
+    // The answer comes: the draft goes, and the input shows what is saved.
+    device.handle(4.0, Input::EffectDone { id: effect, ok: Some(Json::Null), error: None, unreachable: false });
+    let out = device.handle(4.1, Input::Sync { object: "Customer/user:ana".into(), state: json!({ "name": "Bo" }), seq: Some(2) });
+    assert!(format!("{out:?}").contains("Bo"), "{out:?}");
+    assert_eq!(form(&device)["drafts"], json!({}));
+    // An error from the server shows for the whole form.
+    device.handle(5.0, ui("name", "onChange", json!("Cy")));
+    let (effect, ..) = call(&device.handle(5.1, ui("save", "onPress", Json::Null))).expect("sent");
+    let out = device.handle(6.0, Input::EffectDone { id: effect, ok: None, error: Some("The business is closed".into()), unreachable: false });
+    assert!(format!("{out:?}").contains("The business is closed") && format!("{out:?}").contains("form-error"), "{out:?}");
+    // Sent, then the app restarts before the answer: the draft is kept, and the form is not
+    // left waiting for an answer it can no longer hear. (The call itself stays in the outbox,
+    // and the new one goes after it.)
+    call(&device.handle(7.0, ui("save", "onPress", Json::Null))).expect("sent");
+    let (mut device, _) = boot_as(PROFILE, store, 8.0, false);
+    let out = device.handle(8.1, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    assert!(format!("{out:?}").contains("Cy") && !format!("{out:?}").contains("\"disabled\": Bool(true)"), "the draft, and a form ready to send: {out:?}");
+    let out = device.handle(8.2, ui("save", "onPress", Json::Null));
+    assert!(format!("{out:?}").contains("\"disabled\": Bool(true)"), "sending again: {out:?}");
+}
+
+#[test]
+fn a_persons_own_data_goes_back_only_into_their_own_objects() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("
+")).unwrap_or_default();
+    let customer = "@server @read(\"owner\") object Customer {
+  @pii(\"contact\", \"booking\") name: string = \"\"
+  @allow(\"owner\") save(name: string) { this.name = name }
+";
+    // A screen runs as the signed-in person: their own name back into their own record.
+    assert_eq!(msg(&format!("{customer}}}
+function App() {{
+  const me = Customer.get(caller.id)
+  return <Button id=\"s\" onPress={{() => me.save(me.name.trim())}}>Save</Button>
+}}
+")), "");
+    assert_eq!(msg(PROFILE), "", "through a form too");
+    // Into someone else's record, through a method, it is refused.
+    let e = msg(&format!("{customer}  @allow(\"owner\") copy(to: string) {{ Customer.get(to).save(this.name) }}
+}}
+"));
+    assert!(e.contains("may be about someone other than the owner"), "{e}");
+}
+
 #[test]
 fn tj_ui_fields_keep_their_label_and_show_errors_by_them() {
     let src = r#"import { Field, Notice } from "tj:ui"
-object Form {
+object Draft {
   error: string = "A slot lasts 5 to 480 minutes"
 }
 function App() {
-  const f = Form.get("main")
+  const f = Draft.get("main")
   return <Column>
     <Field label="Length (minutes)" error={f.error} id="minutes">
       <Input id="new-minutes" type="number" value={30} />

@@ -407,10 +407,31 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   - `null` while the entry is empty or not a real date (February 30).
   - Dates are in the viewer's zone, or in UTC with `zone="UTC"`.
   - Agents may type `2026-12-01 14:30` into one, and it is read as a person's entry is.
-- `import { Field, Notice } from "tj:ui"` gives two ready-made pieces:
+- `import { Field, Notice, Form, FormInput } from "tj:ui"` gives ready-made pieces:
   - `<Field label="Minutes" error={e} id="minutes">…</Field>`: a visible label over its
     control, with the error below in red (`minutes-error`);
-  - `<Notice text={t} kind="ok" | "error">`: good news in green, or an error in red.
+  - `<Notice text={t} kind="ok" | "error">`: good news in green, or an error in red;
+  - `Form.get("profile")`: a form's drafts and errors, with no object or setters to write.
+    `<FormInput form={f} name="name" label="Name" saved={me.name} />` shows the saved value
+    until the person types, and its error below (`type`, `zone` and `placeholder` as on
+    `Input`). `f.value("name", me.name)` reads it.
+  - `f.submit(() => { validName(...); return me.save(...) })` sends one at a time
+    (`f.busy()` is true meanwhile). When it works, the drafts go. When it fails, an error from
+    `check(ok, field, message)` shows at its field and any other in `f.error`. A server's
+    refusal has no field, so run the shared rules first, as here, to place each error.
+  - Drafts survive a restart and go at sign-out; a restart forgets that a form was waiting.
+
+```tsx
+const f = Form.get("profile")
+<Column>
+  <FormInput form={f} name="name" label="Name" saved={me.name} />
+  <Button id="save" disabled={f.busy()} onPress={() => f.submit(() => {
+    validName(f.value("name", me.name))
+    return me.save(f.value("name", me.name))
+  })}>Save</Button>
+  <Notice id="form-error" text={f.error} />
+</Column>
+```
 - Give lists a `key`: `{items.map(i => <Row key={i.id}>…</Row>)}`.
 - `{cond && <X/>}` renders nothing when `cond` is false or null. Bare strings and numbers
   inside `Column`, `Row` and `Scroll` become `Text`.
