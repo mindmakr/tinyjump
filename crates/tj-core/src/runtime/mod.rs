@@ -364,13 +364,11 @@ impl Runtime {
             Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
                 Err((status, why)) => self.reply_status(reply, status, why),
                 Ok(who) => {
-                    // Personal data reaches its owner only; everyone else, tools included, sees it masked.
+                    // Each field reaches the readers its rule names; tools see personal data masked.
                     let state = self.resolve_object(&object).and_then(|o| {
                         let mut s = self.object_state(&o)?;
-                        if !who.owns(&o.id) {
-                            // A person the rules admitted reads the lists the rule is for.
-                            self.mask(o.class, &mut s, matches!(who, Who::Remote { .. }));
-                        }
+                        let hidden = self.hidden(o.class, &o.id, &s, &who);
+                        self.hide(o.class, &mut s, &hidden);
                         Ok(s)
                     });
                     match state {

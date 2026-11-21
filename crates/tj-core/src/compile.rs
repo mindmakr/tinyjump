@@ -281,7 +281,7 @@ impl Compiler {
                 }
                 Item::Object(o) => {
                     if self.check_top_name(&o.name, o.span) {
-                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None, pii: Vec::new(), retain: None, hold: None });
+                        self.objects.push(ObjectDef { name: Rc::from(o.name.as_str()), fields: Vec::new(), init: 0, methods: IndexMap::new(), server: false, read: None, pii: Vec::new(), guards: Vec::new(), retain: None, hold: None });
                         self.add_global(&o.name, false, GKind::Object);
                     }
                 }
@@ -348,8 +348,9 @@ impl Compiler {
         self.end_fn()
     }
 
-    /// The words of an `@read` / `@allow` rule (see docs/access-control.md).
-    fn rule(&mut self, d: &Decorator) -> Option<Rc<[Rc<str>]>> {
+    /// The words of an `@read` / `@allow` rule (see docs/access-control.md). `"self"` is for
+    /// a field's rule.
+    fn rule(&mut self, d: &Decorator, field: bool) -> Option<Rc<[Rc<str>]>> {
         let mut words = Vec::new();
         for a in &d.args {
             let ExprKind::Str(w) = &a.kind else {
@@ -361,6 +362,10 @@ impl Compiler {
                 self.error(Diagnostic::new(format!("'{w}' is not a rule word or role"), a.span).hint("use \"anyone\", \"signedIn\", \"owner\" or a role name such as \"staff\" (\"system\" is reserved)"));
                 return None;
             }
+            if w == "self" && !field {
+                self.error(Diagnostic::new("\"self\" is for a field's @read", a.span).hint("on a field holding a person's id, `@read(\"staff\", \"self\") customer: string` shows it to staff and to that person"));
+                return None;
+            }
             words.push(Rc::from(w.as_str()));
         }
         if words.is_empty() {
@@ -368,6 +373,37 @@ impl Compiler {
             return None;
         }
         Some(words.into())
+    }
+
+    /// A field's `@read`: which of the readers the object's rule admits see the field.
+    fn field_rule(&mut self, d: &Decorator, f: &crate::syntax::ast::Field, o: &ObjectDecl, server: bool, read: Option<&[Rc<str>]>, pii: bool) -> Option<Rc<[Rc<str>]>> {
+        let rule = self.rule(d, true)?;
+        let Some(read) = read.filter(|_| server) else {
+            self.error(Diagnostic::new(format!("@read on a field narrows who reads {}, and nobody outside the server does", o.name), d.span).hint(format!("give {} @server and its own @read(...) first", o.name)));
+            return None;
+        };
+        #[cfg(feature = "check")]
+        self.check_field_rule(&rule, d, f, o, read, pii);
+        #[cfg(not(feature = "check"))]
+        let _ = (f, read, pii);
+        Some(rule)
+    }
+
+    /// Each word of a field's rule names a reader it can show the field to. Devices run apps
+    /// the CLI checked, and leave this out.
+    #[cfg(feature = "check")]
+    fn check_field_rule(&mut self, rule: &[Rc<str>], d: &Decorator, f: &crate::syntax::ast::Field, o: &ObjectDecl, read: &[Rc<str>], pii: bool) {
+        for (w, a) in rule.iter().zip(&d.args) {
+            let reaches = read.iter().any(|r| &**r == "anyone" || &**r == "signedIn" && &**w != "anyone" || r == w);
+            if &**w == "self" && !matches!(&f.ty, Some(TypeExpr::Named(n, _)) if n == "string") {
+                self.error(Diagnostic::new(format!("\"self\" is the person whose id {} holds, so it needs a `string`", f.name), a.span).hint(format!("declare it as `{}: string = \"\"`, set to caller.id", f.name)));
+            } else if &**w == "anyone" && pii {
+                self.error(Diagnostic::new(format!("{} is personal data and cannot be read by anyone", f.name), a.span).hint("name who may read it, e.g. @read(\"owner\", \"staff\")"));
+            } else if !reaches {
+                let who = if &**w == "self" { "the person it names".to_string() } else { format!("\"{w}\"") };
+                self.error(Diagnostic::new(format!("{who} cannot read {} at all, so this rule never shows them {}", o.name, f.name), a.span).hint(format!("add {} to {}'s @read, or leave it out here", if &**w == "self" { "\"signedIn\"" } else { w }, o.name)));
+            }
+        }
     }
 
     /// A declared type as a JSON shape for checking calls from outside. Aliases are followed a
@@ -431,7 +467,7 @@ impl Compiler {
         for d in &o.decorators {
             match (d.name.as_str(), d.args.is_empty()) {
                 ("server", true) => server = true,
-                ("read", _) if read.is_none() => read = self.rule(d),
+                ("read", _) if read.is_none() => read = self.rule(d, false),
                 ("retain", _) if retain.is_none() => retain = self.retain(d),
                 ("legalHold", _) if hold.is_none() => {
                     hold = d.args.first().and_then(duration_ms).filter(|ms| *ms > 0.0 && d.args.len() == 1);
@@ -449,28 +485,37 @@ impl Compiler {
         }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut fields = Vec::new();
-        let mut pii = Vec::new();
+        let (mut pii, mut guards) = (Vec::new(), Vec::new());
         for f in &o.fields {
             if OBJECT_RESERVED.contains(&f.name.as_str()) {
                 self.error(Diagnostic::new(format!("'{}' is reserved on objects", f.name), f.span).hint("`this.id`, `this.emit()` and `this.schedule()` are built in"));
             } else if !seen.insert(&f.name) {
                 self.error(Diagnostic::new(format!("'{}' is declared twice", f.name), f.span));
             }
-            for (i, d) in f.decorators.iter().enumerate() {
-                let by_after_pii = d.name == "by" && i == 1 && f.decorators[0].name == "pii";
-                if !(by_after_pii || d.name == "pii" && i == 0) {
-                    self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take @pii(category, purpose), and @by(field) after it for a list of several people's entries; other decorators go on methods"));
-                } else if by_after_pii {
-                    if let Some(by) = self.by(d, f, o) {
-                        if let Some(p) = pii.last_mut().filter(|p: &&mut Pii| *p.field == *f.name) {
-                            p.by = Some(by);
-                        }
-                    }
+            let is_pii = f.decorators.iter().any(|d| d.name == "pii");
+            let (mut names, mut by, mut rule, mut personal) = (HashSet::new(), None, None, None);
+            for d in &f.decorators {
+                if !names.insert(d.name.as_str()) || !matches!(d.name.as_str(), "pii" | "by" | "read") || d.name == "by" && !is_pii {
+                    self.error(Diagnostic::new(format!("unknown or repeated field decorator @{}", d.name), d.span).hint("fields take @pii(category, purpose), @by(field) with it for a list of several people's entries, and @read(...) for who sees the field; other decorators go on methods"));
+                } else if d.name == "by" {
+                    by = self.by(d, f, o);
+                } else if d.name == "read" {
+                    rule = self.field_rule(d, f, o, server, read.as_deref(), is_pii);
                 } else if !server {
                     self.error(Diagnostic::new("personal data lives in @server objects", d.span).hint(format!("add @server to {}: the server is where it can be exported and erased", o.name)));
-                } else if let Some(p) = self.pii(d, &f.name) {
-                    pii.push(p);
+                } else {
+                    personal = self.pii(d, &f.name);
                 }
+            }
+            if let Some(mut p) = personal {
+                // Personal data is its owner's to see, a `@by` list its readers', unless the
+                // field names its own readers.
+                let default = if by.is_some() { read.clone().unwrap_or_else(|| Rc::from([])) } else { Rc::from([Rc::from("owner")]) };
+                guards.push(Guard { field: p.field.clone(), rule: rule.take().unwrap_or(default), pii: true });
+                p.by = by;
+                pii.push(p);
+            } else if let Some(rule) = rule {
+                guards.push(Guard { field: Rc::from(f.name.as_str()), rule, pii: false });
             }
             fields.push(Rc::from(f.name.as_str()));
         }
@@ -517,7 +562,7 @@ impl Compiler {
                     },
                     "allow" if m.private => self.error(Diagnostic::new("private methods cannot be called remotely", d.span).hint("remove `private` or the @allow rule")),
                     "allow" if allow.is_none() => {
-                        allow = self.rule(d);
+                        allow = self.rule(d, false);
                         if read.is_none() {
                             self.error(Diagnostic::new(format!("{} can be called remotely but not read", o.name), d.span).hint(format!("add @read(...) to {}, e.g. @read(\"owner\") to keep it private to its user", o.name)));
                         }
@@ -545,6 +590,7 @@ impl Compiler {
         def.server = server;
         def.read = read;
         def.pii = pii;
+        def.guards = guards;
         def.retain = retain;
         def.hold = hold;
     }

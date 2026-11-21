@@ -28,6 +28,12 @@ pub fn report(source: &str) -> String {
             if server && read.is_none() {
                 warnings.push(format!("@server object {} has no @read rule: only server code can read it, and devices cannot hold replicas (right for private data)", o.name));
             }
+            for f in &o.fields {
+                if let Some(rule) = f.decorators.iter().find(|d| d.name == "read").map(words) {
+                    table.push_str(&format!("  .{}  read: {rule}
+", f.name));
+                }
+            }
             for m in &o.methods {
                 let name = &m.func.name;
                 let allow = m.decorators.iter().find(|d| d.name == "allow").map(words);

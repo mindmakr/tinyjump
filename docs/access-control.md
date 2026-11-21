@@ -143,11 +143,33 @@ Use `caller.id`.
 
 ### Fields, and what rules cannot express
 
-Reading is per object, not per field, and a read rule cannot depend on the object's
-data. A private chat room's member list, for example, cannot decide who reads the room.
-Keep private data in objects whose id is the reader (`@read("owner") Inbox/<user id>`),
-and copy into them from server code. Do not rely on unguessable ids as secrets: ids appear
-in URLs, streams and logs.
+A field of a `@server` object can have its own `@read`, which narrows who sees it among the
+readers the object's rule admits:
+
+```tsx
+@server @read("anyone") object Slot {
+  title: string = ""
+  @read("staff", "self") customer: string = ""
+  @read("staff") alarm: number = 0
+}
+```
+
+- Readers the field's rule does not name get its default value (`""`, `0`), in reads and
+  in change streams alike, so a replica that saw it before forgets it. Personal data shows
+  `•••` instead ([privacy.md](privacy.md)).
+- `"self"` is the person whose id the field holds (a `string`): here, whoever booked the
+  slot sees that it is theirs, and others see an empty field.
+- Each word must be a reader the object's rule admits, or the compiler says so: a field
+  cannot widen the object's rule.
+- The server sends each change once per set of hidden fields, shared by every reader who
+  has that set.
+- Tools see every field that is not personal data.
+
+The object's rule still decides who reads the object at all, and no rule can depend on
+another object's data: a private chat room's member list cannot decide who reads the room.
+Keep such data in objects whose id is the reader (`@read("owner") Inbox/<user id>`), and
+copy into them from server code. Do not rely on unguessable ids as secrets: ids appear in
+URLs, streams and logs.
 
 ### Refusals
 
@@ -156,8 +178,8 @@ in URLs, streams and logs.
   `403 not allowed`.
 - `tj dev` adds the reason to help development (`Cart.checkout needs owner or role
   staff`). `tj serve` never does, so it does not reveal what exists.
-- Fields marked `@pii` are masked (`•••`) for every reader but the object's owner, and for
-  every tool ([privacy.md](privacy.md)).
+- Fields marked `@pii` are masked (`•••`) for every reader but the object's owner (or the
+  readers the field's own `@read` names), and for every tool ([privacy.md](privacy.md)).
 - Each refusal is written to the audit log before the answer goes out: who (as a
   pseudonym), what was asked, the class and method, and the status. Tokens, arguments and
   object ids are never written (`docs/trust.md`, section 4). Runtime statistics count the
@@ -254,7 +276,6 @@ can come later, as a plugin.
 - Per-caller request rate limits beyond the stream and object caps.
 - An outbound allowlist for server-side `fetch`, against SSRF.
 - Signing in inside tinyjump, as a plugin.
-- Per-field read rules.
 
 ## Rollout in this repo
 

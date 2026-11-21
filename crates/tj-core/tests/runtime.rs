@@ -2471,6 +2471,88 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
     assert!(e.contains("reaches `this.last`"), "{e}");
 }
 
+const BOOKING: &str = r#"@server @read("anyone") object Slot {
+  title: string = "Cut"
+  @read("staff", "self") customer: string = ""
+  @read("staff") alarm: number = 0
+  @allow("signedIn") book() { this.customer = caller.id; this.alarm = 7 }
+}
+@server @read("owner", "staff") object Customer {
+  @pii("contact", "booking") @read("owner", "staff") name: string = ""
+  @pii("contact", "booking") note: string = ""
+  @allow("owner") save(name: string) { this.name = name; this.note = name }
+}
+"#;
+
+#[test]
+fn each_field_is_seen_by_the_readers_its_own_rule_names() {
+    let mut rt = server(BOOKING, false);
+    call_as(&mut rt, 1.0, "Slot/s1", "book", json!([]), who("user:ana", &[])).unwrap();
+    call_as(&mut rt, 1.0, "Customer/user:ana", "save", json!(["Ana"]), who("user:ana", &[])).unwrap();
+    let mut n = 0;
+    let mut get = |rt: &mut Runtime, object: &str, caller: Option<Caller>| {
+        n += 1;
+        let out = rt.handle(2.0, Input::Get { object: object.into(), reply: Some(n), caller });
+        out.into_iter().find_map(|o| if let Output::Reply { ok, .. } = o { ok } else { None }).unwrap()
+    };
+    // The public slot: who booked it is staff's and that person's to see; the alarm, staff's.
+    assert_eq!(get(&mut rt, "Slot/s1", who("", &[])), json!({ "title": "Cut", "customer": "", "alarm": 0 }), "hidden fields show their defaults");
+    assert_eq!(get(&mut rt, "Slot/s1", who("user:bo", &[])), json!({ "title": "Cut", "customer": "", "alarm": 0 }));
+    assert_eq!(get(&mut rt, "Slot/s1", who("user:ana", &[])), json!({ "title": "Cut", "customer": "user:ana", "alarm": 0 }));
+    assert_eq!(get(&mut rt, "Slot/s1", who("key:sam", &["staff"])), json!({ "title": "Cut", "customer": "user:ana", "alarm": 7 }));
+    // Staff see the customer's current name, as the field's rule says, and not the rest.
+    assert_eq!(get(&mut rt, "Customer/user:ana", who("key:sam", &["staff"])), json!({ "name": "Ana", "note": "•••" }));
+    assert_eq!(get(&mut rt, "Customer/user:ana", who("user:ana", &[])), json!({ "name": "Ana", "note": "Ana" }));
+    // Tools see what is not personal data.
+    assert_eq!(get(&mut rt, "Customer/user:ana", Some(Caller::trusted())), json!({ "name": "•••", "note": "•••" }));
+    assert_eq!(get(&mut rt, "Slot/s1", Some(Caller::trusted()))["alarm"], json!(7));
+
+    // A field naming a person is theirs to export and erase.
+    assert_eq!(rt.export_subject("user:ana").unwrap()["Slot/s1#customer"], json!("user:ana"));
+    let e = rt.erase_subject("user:ana", None).unwrap();
+    assert!(e.erased.contains(&"Slot/s1#customer".to_string()), "{:?}", e.erased);
+    assert_eq!(get(&mut rt, "Slot/s1", who("key:sam", &["staff"]))["customer"], json!(""));
+}
+
+#[test]
+fn a_fields_rule_is_checked_where_it_is_written() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| format!("{} | {}", d.message, d.hint.clone().unwrap_or_default())).collect::<Vec<_>>().join("
+")).unwrap_or_default();
+    assert_eq!(msg(BOOKING), "");
+    assert!(msg("object S {
+  @read(\"staff\") n: number = 0
+}
+").contains("nobody outside the server does"));
+    assert!(msg("@server object S {
+  @read(\"staff\") n: number = 0
+}
+").contains("nobody outside the server does"));
+    assert!(msg("@server @read(\"anyone\") object S {
+  @read(\"self\") n: number = 0
+}
+").contains("needs a `string`"));
+    assert!(msg("@server @read(\"owner\", \"staff\") object S {
+  @pii(\"contact\", \"b\") @read(\"anyone\") n: string = \"\"
+}
+").contains("cannot be read by anyone"));
+    assert!(msg("@server @read(\"owner\") object S {
+  @pii(\"contact\", \"b\") @read(\"owner\", \"staff\") n: string = \"\"
+}
+").contains("\"staff\" cannot read S at all"));
+    assert!(msg("@server @read(\"staff\") object S {
+  @read(\"self\") c: string = \"\"
+}
+").contains("the person it names cannot read S at all"));
+    assert!(msg("@server @read(\"self\") object S {
+  c: string = \"\"
+}
+").contains("is for a field's @read"));
+    assert!(msg("@server @read(\"anyone\") object S {
+  @read(\"staff\") @read(\"staff\") c: string = \"\"
+}
+").contains("unknown or repeated field decorator @read"));
+}
+
 #[test]
 fn a_class_stream_resumes_with_the_newest_changes_and_starts_over_for_a_new_user() {
     // Over the cap, catching up keeps the most recent changes, whatever the ids.

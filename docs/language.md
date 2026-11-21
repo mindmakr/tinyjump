@@ -68,7 +68,8 @@ object Cart {
 ```
 
 - `Cart.get(id)` returns the instance, creating it with the defaults if needed.
-  Ids are strings of 1–128 characters without `/`, and not `*`.
+  Ids are strings of 1–128 characters without `/`, and not `*`. A new object takes a new
+  id: `Slot.get(crypto.randomId())`, with no counter to keep.
 - `Cart.all()` lists every object of the class, in id order. Filter it like any list
   (`Slot.all().filter(s => s.open)`), so each fact is kept once and found when needed,
   not copied into a second object.
@@ -151,6 +152,19 @@ Without a rule, nothing can be read or called from outside the server:
   it remotely, including device replicas.
 - `@allow(...)` on a method says who may call it remotely.
 - `"owner"` is the caller whose id is the object's id, as in `Cart.get(caller.id)`.
+- `@read(...)` on a field of a `@server` object narrows who sees that field, among those
+  the object's rule admits; the others see its default value. `"self"` is the person whose
+  id the field holds. One object then keeps public and private facts together, and each
+  person finds their own entries with a filter:
+
+```tsx
+@server @read("anyone") object Slot {
+  title: string = ""
+  @read("staff", "self") customer: string = ""  // who booked it: staff and that customer
+  @allow("signedIn") book() { this.customer = caller.id }
+}
+const mine = Slot.all().filter(s => s.customer === caller.id)  // on the device, live
+```
 
 Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take identity from
 `caller.id`, never from arguments. In UI code on a device, `caller` is the signed-in user
@@ -171,7 +185,10 @@ Mark fields that hold personal data with a category and what they are for. Keep 
 }
 ```
 
-The owner reads the email; other readers and every tool see `•••`. Personal data cannot
+The owner reads the email; other readers and every tool see `•••`. A field's own `@read`
+names who else sees it: `@pii("contact", "booking") @read("owner", "staff") phone` shows
+staff the person's current phone, so nothing is copied and nothing goes stale. A field that
+names a person (`"self"`, above) is exported and erased with them. Personal data cannot
 reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's callers unless
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
 `@retain("90d")` erases objects of a class that long after their last change, and

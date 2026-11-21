@@ -5,6 +5,7 @@
 //! carries the whole state and its change number, and the stream stays in change order.
 
 use crate::stats::Stats;
+use tj_core::runtime::protocol::Caller;
 use std::collections::VecDeque;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -33,9 +34,9 @@ pub struct Mailbox {
     /// Only events about these objects are kept; `None`: every object (the admin's stream).
     /// Events about no object (`refused`, `reload`) are always kept.
     only: Option<Vec<String>>,
-    /// Who reads it: their own objects come with personal data, others masked. `None`: the
-    /// admin or an anonymous caller, who own nothing.
-    reader: Option<String>,
+    /// Who reads it, for the fields their rules let them see. `None`: the admin's stream,
+    /// which sees what tools see.
+    reader: Option<Caller>,
     stats: Option<Arc<Stats>>,
     queue: Mutex<Queue>,
     ready: Condvar,
@@ -52,21 +53,13 @@ impl Mailbox {
         Mailbox { only, reader: None, stats, queue: Mutex::new(Queue::default()), ready: Condvar::new() }
     }
 
-    pub fn read_by(mut self, reader: Option<String>) -> Mailbox {
+    pub fn read_by(mut self, reader: Option<Caller>) -> Mailbox {
         self.reader = reader;
         self
     }
 
-    /// Whether a caller the rules admitted reads it, by a person's token or a role key: they
-    /// see lists of several people's entries. Not admin automation, nor an anonymous caller.
-    pub fn is_person(&self) -> bool {
-        self.reader.as_deref().is_some_and(|r| !r.is_empty())
-    }
-
-    /// Whether this reader owns `object` (`Class/id`), and so sees its personal data.
-    pub fn owns(&self, object: &str) -> bool {
-        let id = object.split_once('/').map_or("", |(_, id)| id);
-        self.reader.as_deref().is_some_and(|r| tj_core::runtime::access::owns(r, id))
+    pub fn reader(&self) -> Option<&Caller> {
+        self.reader.as_ref()
     }
 
     /// Adds an event; false once the client has gone, so the sender can forget it.

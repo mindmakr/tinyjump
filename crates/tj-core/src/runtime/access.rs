@@ -5,6 +5,7 @@
 use super::protocol::Caller;
 use super::Runtime;
 use crate::vm::value::Value;
+use serde_json::Value as Json;
 use std::rc::Rc;
 
 /// The words a rule may use besides role names.
@@ -72,11 +73,17 @@ pub fn owns(caller_id: &str, object_id: &str) -> bool {
 
 /// Whether `rule` lets `who` act on the object with id `object_id`.
 fn allows(rule: &[Rc<str>], who: &Who, object_id: &str) -> bool {
+    allows_named(rule, who, object_id, "")
+}
+
+/// [`allows`], for a field's rule: `"self"` is the person whose id the field holds (`named`).
+fn allows_named(rule: &[Rc<str>], who: &Who, object_id: &str, named: &str) -> bool {
     let Who::Remote { id, roles } = who else { return true };
     rule.iter().any(|word| match &**word {
         "anyone" => true,
         "signedIn" => !id.is_empty(),
         "owner" => owns(id, object_id),
+        "self" => !id.is_empty() && **id == *named,
         role => roles.iter().any(|r| **r == *role),
     })
 }
@@ -116,6 +123,30 @@ impl Runtime {
         Ok((rule, id))
     }
 
+    /// The fields of `state`, an object of class `class` with id `id`, that `who` may not
+    /// see, as indexes into the class's guards: those whose rule does not admit a remote
+    /// reader, and personal data for tools (anyone else).
+    pub(crate) fn hidden(&self, class: u16, id: &str, state: &Json, who: &Who) -> Vec<usize> {
+        let guards = self.program.objects[class as usize].guards.iter().enumerate();
+        guards
+            .filter(|(_, g)| match who {
+                Who::Remote { .. } => !allows_named(&g.rule, who, id, state.get(&*g.field).and_then(Json::as_str).unwrap_or("")),
+                _ => g.pii,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// [`Runtime::hidden`] for `object` (`Class/id`) read by `caller` (`None`: a tool, such
+    /// as the admin's stream). Empty for anything else, which is shown whole.
+    pub fn hidden_from(&self, object: &str, state: &Json, caller: Option<&Caller>) -> Vec<usize> {
+        let who = caller.map_or(Who::System, |c| Who::from_caller(c, self.server));
+        match object.split_once('/').and_then(|(c, id)| Some((self.program.object(c)?, id))) {
+            Some((class, id)) => self.hidden(class, id, state, &who),
+            None => Vec::new(),
+        }
+    }
+
     /// Whether a remote caller may read `key` (for the server's change streams).
     pub fn may_read(&self, key: &str, caller: &Caller) -> Result<(), String> {
         match self.refusal(key, None, &Who::from_caller(caller, self.server)) {
@@ -147,6 +178,8 @@ mod tests {
         assert!(allows(&rule(&["owner"]), &ana, "user:ana") && !allows(&rule(&["owner"]), &ana, "user:bo"));
         assert!(!allows(&rule(&["owner"]), &anon, ""), "anonymous callers own nothing, even an empty id");
         assert!(allows(&rule(&["owner", "staff"]), &staff, "user:ana") && !allows(&rule(&["staff"]), &ana, "x"));
+        assert!(allows_named(&rule(&["self"]), &ana, "x", "user:ana") && !allows_named(&rule(&["self"]), &ana, "x", "user:bo"));
+        assert!(!allows_named(&rule(&["self"]), &anon, "x", ""), "anonymous callers are named by no field");
         assert!(allows(&rule(&[]), &Who::Local { id: Rc::from(""), roles: Rc::from([]) }, "x") && allows(&rule(&[]), &Who::System, "x"), "local and system code is not checked");
     }
 }

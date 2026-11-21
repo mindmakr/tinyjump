@@ -71,7 +71,15 @@ the goal; being in the market early, to gain momentum and contributors, is.
     - queries (`Class.all()`) and cancellable alarms;
     - personal data on shared objects (`@by`);
     - a clock redraw and `encodeURIComponent`.
-  - **Next:** round 2, with a new blind builder and two blind reviewers.
+  - **Round 2 is done.** The app took 417 lines (612 in round 1). The blind reviews scored
+    it 95 and 88; the 88 failed B12 because staff saw a copy of a customer's details taken
+    at booking, which went stale when the customer changed them.
+  - **Built from round 2, in the owner's order:**
+    - entries of `@by` lists can be filtered and moved without `reveal` (done);
+    - per-field read rules: a field's own `@read`, with `"self"` for the person a field
+      names, so staff read a customer's current details and nothing is copied (done);
+    - deleting objects;
+    - form binding in `tj:ui`, the largest piece of hand-written code left.
 
 ### The rest of the agreed order
 
