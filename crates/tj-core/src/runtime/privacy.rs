@@ -470,7 +470,8 @@ impl Runtime {
         let record = serde_json::json!({ "state": state, "seq": seq });
         self.store.save(key, &record.to_string())?;
         self.store.save("tj:seq", &seq.to_string())?;
-        self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Object(state), seq });
+        // Replicas hear of it as a deletion, like any erasure.
+        self.outputs.push(Output::Changed { object: key.to_string(), state: Json::Null, seq });
         Ok(())
     }
 

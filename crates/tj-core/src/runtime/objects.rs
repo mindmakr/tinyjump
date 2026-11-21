@@ -302,6 +302,13 @@ impl Runtime {
     /// A state numbered `seq` no newer than the replica's is stale (it was overtaken in
     /// flight) and is ignored.
     pub(crate) fn sync(&mut self, key: &str, state: &Json, seq: Option<u64>) -> Result<(), String> {
+        // A deletion of something this device never held (a class stream catching up): there
+        // is nothing to load, only a stored copy to forget, if any.
+        let replica = key.split_once('/').and_then(|(c, _)| self.program.object(c)).is_some_and(|c| self.program.objects[c as usize].server && !self.server);
+        if state.is_null() && replica && !self.is_loaded(key) {
+            let _ = self.store.remove(key);
+            return Ok(());
+        }
         let o = self.resolve_object(key)?;
         if !self.is_remote(&o) {
             return Err(format!("{key} is not a replica of a server object"));
@@ -323,7 +330,11 @@ impl Runtime {
             let inst = self.inst_mut(&o);
             (inst.state, inst.gone) = (fresh, true);
             self.touched.shift_remove(&(o.class, o.id.clone()));
-            return self.store.remove(key);
+            // A store that cannot remove keeps the blank instead, as at sign-out.
+            if self.store.remove(key).is_err() {
+                self.touch(&o);
+            }
+            return Ok(());
         };
         self.inst_mut(&o).gone = false;
         let inst = self.inst(&o);
@@ -731,7 +742,8 @@ impl Runtime {
             };
             let has_alarms = !inst.alarms.is_empty();
             let state_text = serde_json::to_string(&state).expect("JSON values serialize");
-            let state_changed = state_text != inst.state_text;
+            // Deleted or erased while already at its defaults is still news to replicas.
+            let state_changed = state_text != inst.state_text || gone;
             let remote = inst.remote;
             let mut record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone(), created: inst.created, changed: inst.changed };
             let mut text = serde_json::to_string(&record).expect("JSON values serialize");

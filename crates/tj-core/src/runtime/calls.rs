@@ -210,17 +210,22 @@ impl Runtime {
         // nobody signs in to keeps them.
         let someone_left = self.outbox.user.is_some();
         self.outbox.user = user;
-        if someone_left {
-            self.clear_device_objects();
-        }
         // `caller.id` changed: the UI is drawn again for the new user.
         self.ran_code = true;
+        // The calls they left are answered first, so what their code does with the answer (a
+        // form showing the error) is cleared with the rest. The message names no object id,
+        // which may be the person's.
         for p in dropped {
-            let why = format!("{}.{} was queued by another user and was not sent", p.object, p.method);
+            let class = p.object.split('/').next().unwrap_or_default();
+            let why = format!("{class}.{} was queued by another user and was not sent", p.method);
             match p.promise {
                 Some(promise) => self.resume(promise, None, Some(why)),
                 None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
             }
+        }
+        self.run_queued();
+        if someone_left {
+            self.clear_device_objects();
         }
         self.save_outbox();
         self.clear_replicas();

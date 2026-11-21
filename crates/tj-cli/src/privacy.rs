@@ -66,9 +66,18 @@ pub fn record(src: &str, program: &Program) -> String {
     }
     out.push_str("\n## Where it is let out\n\nPersonal data cannot leave its owner (network, plugins and AI models, events, errors, logs, other callers) except here, each with a stated purpose:\n\n");
     let facts = tj_core::facts(src);
-    if facts.reveals.is_empty() {
+    // Fields whose own @read shows them to readers besides their owner.
+    let shown: Vec<String> = program
+        .objects
+        .iter()
+        .flat_map(|o| o.guards.iter().filter(|g| g.pii).map(move |g| (o, g)))
+        .filter(|(_, g)| g.rule.iter().any(|w| &**w != "owner"))
+        .map(|(o, g)| format!("- `{}.{}`: read by {}, for {}\n", o.name, g.field, g.rule.join(", "), o.pii(&g.field).map_or(String::new(), |p| p.purposes.join(", "))))
+        .collect();
+    if facts.reveals.is_empty() && shown.is_empty() {
         out.push_str("- Nowhere.\n");
     }
+    out.extend(shown);
     for r in &facts.reveals {
         out.push_str(&format!("- `{}`: {}, for {}\n", place(src, r.at), r.fields.join(", "), r.purpose));
     }
@@ -137,6 +146,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_record_lists_fields_shown_to_other_readers() {
+        let src = "@server @read(\"owner\", \"staff\") object Customer {\n  @pii(\"contact\", \"booking\") @read(\"owner\", \"staff\") phone: string = \"\"\n}\n";
+        let r = record(src, &tj_core::compile(src).unwrap());
+        assert!(r.contains("- `Customer.phone`: read by owner, staff, for booking") && !r.contains("- Nowhere.\n"), "{r}");
+    }
 
     #[test]
     fn the_data_map_lists_every_personal_field() {
