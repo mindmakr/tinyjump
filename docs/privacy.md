@@ -88,9 +88,9 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
   who booked a slot), as `"Slot/s1#customer": "user:ana"`. Erase puts those fields back to
   their defaults.
 - **Erase** puts every such object back to its defaults, and drops its alarms and the
-  stored results of its calls. The blank state is saved with a new change number, so
-  replicas and devices receive the erasure like any other change, including devices that
-  reconnect later. It is refused (409) while a call is part way through one of the objects,
+  stored results of its calls. The blank is saved with a new change number, so replicas
+  and devices receive the erasure as a deletion (`this.delete()`), including devices that
+  reconnect later, and drop their copies. It is refused (409) while a call is part way through one of the objects,
   and when it cannot be saved, nothing is erased and it says so (503).
 - Erase also drops the alarms the person scheduled on other objects (a reminder on a
   shared board, say). Shared objects never held their id in readable form: a call made

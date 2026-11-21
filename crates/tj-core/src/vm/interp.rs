@@ -551,7 +551,7 @@ impl Runtime {
                 let caller_this = f.frames.last().and_then(|fr| fr.this.clone());
                 let own = caller_this.as_deref() == Some(&**o);
                 match name {
-                    "emit" | "schedule" | "unschedule" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
+                    "emit" | "schedule" | "unschedule" | "delete" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
                     "emit" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
@@ -564,6 +564,12 @@ impl Runtime {
                         f.stack.truncate(pos);
                         let handle = self.schedule_alarm(o, &args, &f.caller)?;
                         f.stack.push(handle);
+                        Ok(())
+                    }
+                    "delete" => {
+                        f.stack.truncate(pos);
+                        self.delete_object(o)?;
+                        f.stack.push(Value::Null);
                         Ok(())
                     }
                     "unschedule" => {

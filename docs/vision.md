@@ -78,7 +78,7 @@ the goal; being in the market early, to gain momentum and contributors, is.
     - entries of `@by` lists can be filtered and moved without `reveal` (done);
     - per-field read rules: a field's own `@read`, with `"self"` for the person a field
       names, so staff read a customer's current details and nothing is copied (done);
-    - deleting objects;
+    - deleting objects: `this.delete()`, sent to replicas as `null` (done);
     - form binding in `tj:ui`, the largest piece of hand-written code left.
 
 ### The rest of the agreed order

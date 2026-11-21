@@ -897,12 +897,12 @@ fn a_person_can_be_exported_and_erased() {
     assert_eq!(rt.erase_subject("user:ana", None).err().map(|e| e.0), Some(409));
     rt.handle(3.0, answered(effect, json!({ "status": 200, "headers": {}, "body": "" })));
 
-    // Erase: back to the defaults, alarms gone, and the blank state goes out as a change.
+    // Erase: back to the defaults, alarms gone, and replicas hear of it as a deletion.
     let e = rt.erase_subject("user:ana", None).unwrap();
     let (erased, out) = (e.erased, e.outputs);
     assert_eq!(erased, ["Account/user:ana"]);
     let change = out.iter().find_map(|o| if let Output::Changed { object, state, seq } = o { Some((object.clone(), state.clone(), *seq)) } else { None }).expect("replicas hear of it");
-    assert_eq!((change.0.as_str(), &change.1), ("Account/user:ana", &json!({ "email": "", "notes": "", "plan": "free" })));
+    assert_eq!((change.0.as_str(), &change.1), ("Account/user:ana", &Json::Null));
     let stored = store.0.borrow().data.get("Account/user:ana").cloned().unwrap();
     assert!(!stored.contains("ana@example.com") && !stored.contains("\"alarms\":[{"), "{stored}");
     assert_eq!(boot().export_subject("user:ana").unwrap()["Account/user:ana"]["email"], json!(""), "after a restart too");
@@ -2551,6 +2551,82 @@ fn a_fields_rule_is_checked_where_it_is_written() {
   @read(\"staff\") @read(\"staff\") c: string = \"\"
 }
 ").contains("unknown or repeated field decorator @read"));
+}
+
+const SHELF: &str = r#"@server @read("anyone") object Slot {
+  title: string = ""
+  ticks: number = 0
+  @allow("anyone") name(t: string) { this.title = t }
+  @allow("anyone") remove(): string { const t = this.title; this.delete(); return t }
+  @allow("anyone") later() { this.schedule(1000, "ring") }
+  ring() { this.title = "rang" }
+  @every("1s") tick() { this.ticks += 1 }
+}
+@server @read("anyone") object Desk {
+  @allow("anyone") titles(): string[] { return Slot.all().map(s => s.title) }
+  @allow("anyone") poke() { Slot.get("s1").delete() }
+}
+"#;
+
+#[test]
+fn a_deleted_object_leaves_its_class_its_replicas_and_its_timers() {
+    let store = Shared::default();
+    let (mut rt, _) = boot_as(SHELF, store.clone(), 0.0, true);
+    let anyone = || who("", &[]);
+    let titles = |rt: &mut Runtime, t: f64| call_as(rt, t, "Desk/d", "titles", json!([]), who("", &[])).unwrap();
+    call_as(&mut rt, 1.0, "Slot/s1", "name", json!(["A"]), anyone()).unwrap();
+    call_as(&mut rt, 1.0, "Slot/s2", "name", json!(["B"]), anyone()).unwrap();
+    call_as(&mut rt, 1.0, "Slot/s1", "later", json!([]), anyone()).unwrap();
+    // The method ends as written, and replicas are told with `null`.
+    let remove = |reply: u64| Input::Call { object: "Slot/s1".into(), method: "remove".into(), args: Vec::new(), reply: Some(reply), call: Some("c-1".into()), caller: who("", &[]) };
+    let out = rt.handle(2.0, remove(1));
+    assert_eq!(reply(&out), Ok(json!("A")));
+    assert!(out.iter().any(|o| matches!(o, Output::Changed { object, state: Json::Null, .. } if object == "Slot/s1")), "{out:?}");
+    assert_eq!(titles(&mut rt, 3.0), json!(["B"]));
+    // Its alarm and its timer went with it: neither brings it back.
+    rt.handle(5_000.0, Input::Tick);
+    assert_eq!(titles(&mut rt, 5_001.0), json!(["B"]));
+    // A retried call is answered once, from its record.
+    assert_eq!(reply(&rt.handle(5_002.0, remove(2))), Ok(json!("A")));
+    // A class stream resuming from before learns of the deletion.
+    let gone = |out: &[Output]| out.iter().any(|o| matches!(o, Output::Changed { object, state: Json::Null, .. } if object == "Slot/s1"));
+    assert!(gone(&rt.changed_since(&["Slot/*".into()], 0)));
+    // Still gone after a restart; written to again, it comes back.
+    let (mut rt, _) = boot_as(SHELF, store, 6_000.0, true);
+    assert_eq!(titles(&mut rt, 6_001.0), json!(["B"]));
+    call_as(&mut rt, 6_002.0, "Slot/s1", "name", json!(["C"]), anyone()).unwrap();
+    assert_eq!(titles(&mut rt, 6_003.0), json!(["C", "B"]));
+    // Only an object's own methods delete it.
+    let e = call_as(&mut rt, 6_004.0, "Desk/d", "poke", json!([]), anyone()).unwrap_err().1;
+    assert!(e.contains("own methods"), "{e}");
+
+    // The retention sweep leaves a deleted record alone, even with its call records.
+    let note = "@server @read(\"owner\") @retain(\"1d\") object Note {
+  text: string = \"\"
+  @allow(\"owner\") write(t: string) { this.text = t }
+  @allow(\"owner\") drop() { this.delete() }
+}
+";
+    let notes = Shared::default();
+    let (mut rt, _) = boot_as(note, notes.clone(), 0.0, true);
+    call_as(&mut rt, 1.0, "Note/user:ana", "write", json!(["hi"]), who("user:ana", &[])).unwrap();
+    rt.handle(2.0, Input::Call { object: "Note/user:ana".into(), method: "drop".into(), args: Vec::new(), reply: Some(1), call: Some("c-1".into()), caller: who("user:ana", &[]) });
+    let (mut rt, _) = boot_as(note, notes.clone(), 3.0, true);
+    for t in [3_700_000.0, 3_700_010.0, 3_700_020.0] {
+        rt.handle(t, Input::Tick);
+    }
+    let kept = notes.0.borrow().data.get("Note/user:ana").cloned().unwrap();
+    assert!(kept.contains("\"created\":0.0") && kept.contains("c-1"), "still deleted: {kept}");
+
+    // A device drops a deleted replica, and does not keep it for next time.
+    let src = format!("{SHELF}function App() {{\n  return <Column>{{Slot.all().map(s => <Text key={{s.id}}>{{s.title}}</Text>)}}</Column>\n}}\n");
+    let kept = Shared::default();
+    let (mut device, _) = boot_as(&src, kept.clone(), 0.0, false);
+    let out = device.handle(1.0, Input::Sync { object: "Slot/s9".into(), state: json!({ "title": "Beard" }), seq: Some(3) });
+    assert!(format!("{out:?}").contains("Beard"), "{out:?}");
+    device.handle(2.0, Input::Sync { object: "Slot/s9".into(), state: Json::Null, seq: Some(4) });
+    let (_, out) = boot_as(&src, kept, 3.0, false);
+    assert!(!format!("{out:?}").contains("Beard"), "a deleted replica is not kept: {out:?}");
 }
 
 #[test]

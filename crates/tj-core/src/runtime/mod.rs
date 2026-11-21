@@ -724,6 +724,8 @@ impl Runtime {
         while self.timers.peek().is_some_and(|Reverse(t)| t.at <= self.now) {
             let Some(Reverse(t)) = self.timers.pop() else { break };
             match t.kind {
+                // A deleted object's timers stop.
+                TimerKind::Every { obj, .. } if self.is_gone(&obj) => {}
                 TimerKind::Every { obj, method, interval } => {
                     // Skip missed beats instead of firing a burst after a pause.
                     let mut next = t.at + interval;
