@@ -1,0 +1,322 @@
+// Booking: a small business publishes appointment slots; customers book and cancel them
+// and get an in-app reminder before their appointment. Built from
+// milestones/m1-booking/spec.md.
+//
+//   cargo tj dev examples/booking/app.tj --as ana:staff
+
+import { exportData, erase } from "tj:privacy"
+import { Notice, Form, FormInput } from "tj:ui"
+
+const lawfulBasis = { booking: "contract" }
+
+type Reminder = { slot: string, title: string, at: number }
+
+// The rules for a slot, run by the publish form and by the server.
+function validSlot(title: string, start: number | null, minutes: number | null) {
+  const t = title === null ? "" : title.trim()
+  check(t !== "", "new-title", "Give the slot a title")
+  check(t.length <= 80, "new-title", "A title has at most 80 characters")
+  check(start !== null, "new-start", "Give a start as YYYY-MM-DD HH:MM (UTC)")
+  check(start > Date.now(), "new-start", "The start must be in the future")
+  check(minutes !== null && minutes >= 5 && minutes <= 480, "new-minutes", "A slot lasts 5 to 480 minutes")
+}
+
+function validProfile(name: string, phone: string) {
+  check(name !== null && name.trim() !== "", "profile-name", "Give your name")
+  check(name.trim().length <= 80, "profile-name", "A name has at most 80 characters")
+  check(phone !== null && phone.trim() !== "", "profile-phone", "Give your phone number")
+  check(phone.trim().length <= 30, "profile-phone", "A phone number has at most 30 characters")
+}
+
+function validReminder(minutes: number | null) {
+  check(minutes !== null && minutes >= 1 && minutes <= 1440, "reminder-minutes", "Remind 1 to 1440 minutes before")
+}
+
+function validCheckUrl(url: string) {
+  const u = url === null ? "" : url.trim()
+  check(u === "" || u.startsWith("https://") || u.startsWith("http://"), "check-url", "The address starts with https:// (or leave it empty)")
+}
+
+// The business's settings: only staff read and change them.
+@server @read("staff") object Settings {
+  checkUrl: string = ""
+  reminderMinutes: number = 60
+
+  @allow("staff") saveCheck(url: string) {
+    validCheckUrl(url)
+    this.checkUrl = url.trim()
+  }
+
+  @allow("staff") saveReminder(minutes: number) {
+    validReminder(minutes)
+    this.reminderMinutes = minutes
+  }
+}
+
+// A customer's profile and the reminders they have been sent. Only they and staff read it.
+@server @read("owner", "staff") @retain("1y") object Customer {
+  @pii("contact", "booking") @read("owner", "staff") name: string = ""
+  @pii("contact", "booking") @read("owner", "staff") phone: string = ""
+  reminders: Reminder[] = []
+
+  @allow("owner") save(name: string, phone: string) {
+    validProfile(name, phone)
+    this.name = name.trim()
+    this.phone = phone.trim()
+  }
+
+  // Server only: a slot's reminder alarm calls it.
+  remind(slot: string, title: string, at: number) {
+    if (this.reminders.some(r => r.slot === slot && r.at === at)) { return }
+    this.reminders.push({ slot, title, at })
+  }
+
+  @allow("owner") async myData(): any { return await exportData(caller.id) }
+
+  @allow("owner") async deleteAccount() {
+    // Erasure clears who booked each slot, but not the public `booked` flag, so cancel the
+    // future bookings first.
+    const now = Date.now()
+    for (const s of Slot.all()) {
+      if (s.customer === caller.id && s.start > now) { await s.release(caller.id) }
+    }
+    await erase(caller.id)
+  }
+}
+
+@server @read("anyone") object Slot {
+  title: string = ""
+  start: number = 0
+  minutes: number = 0
+  booked: boolean = false                       // public: everyone sees "booked"
+  @read("staff", "self") customer: string = ""  // who booked it: staff and that customer
+  @read("staff") alarm: number = 0              // the reminder's alarm
+
+  @allow("staff") publish(title: string, start: number, minutes: number) {
+    if (this.title !== "") { throw new Error("This slot already exists") }
+    validSlot(title, start, minutes)
+    this.title = title.trim()
+    this.start = start
+    this.minutes = minutes
+  }
+
+  @allow("staff") @exclusive remove() {
+    if (this.booked) { throw new Error("Cancel the booking before removing the slot") }
+    if (this.start <= Date.now()) { throw new Error("A past slot stays in the list") }
+    this.delete()
+  }
+
+  @allow("signedIn") @exclusive async book() {
+    this.mustBeOpen()
+    const me = Customer.get(caller.id)
+    if (me.name === "" || me.phone === "") { throw new Error("Save your name and phone before booking") }
+    const url = Settings.get("main").checkUrl
+    if (url !== "") {
+      const sep = url.includes("?") ? "&" : "?"
+      let status = 0
+      try {
+        const res = await fetch(`${url}${sep}slot=${encodeURIComponent(this.id)}`)
+        status = res.status
+      } catch (e) {
+        throw new Error("The business could not confirm this booking; try again")
+      }
+      if (status !== 200) { throw new Error("The business did not accept this booking") }
+      this.mustBeOpen()
+    }
+    this.booked = true
+    this.customer = caller.id
+    const before = Settings.get("main").reminderMinutes * 60000
+    this.alarm = this.schedule(Math.max(10, this.start - before - Date.now()), "remind")
+  }
+
+  @allow("signedIn") @exclusive cancel() {
+    if (!this.booked) { throw new Error("This slot is not booked") }
+    if (!caller.roles.includes("staff") && this.customer !== caller.id) { throw new Error("You can only cancel your own booking") }
+    if (this.start <= Date.now()) { throw new Error("This booking is final: its start has passed") }
+    this.clear()
+  }
+
+  // Server only: a customer deleting their account.
+  @exclusive release(person: string) {
+    if (this.customer === person && this.start > Date.now()) { this.clear() }
+  }
+
+  private mustBeOpen() {
+    if (this.title === "") { throw new Error("There is no such slot") }
+    if (this.start <= Date.now()) { throw new Error("This slot has passed") }
+    if (this.booked) { throw new Error("Sorry, this slot was just taken") }
+  }
+
+  private clear() {
+    if (this.alarm !== 0) { this.unschedule(this.alarm) }
+    this.alarm = 0
+    this.booked = false
+    this.customer = ""
+  }
+
+  private remind() {
+    this.alarm = 0
+    if (this.customer === "") { return }
+    Customer.get(this.customer).remind(this.id, this.title, this.start)
+  }
+}
+
+// This screen's own state: what "my data" showed.
+object Screen {
+  myData: string = ""
+
+  async showMyData() {
+    const data = await Customer.get(caller.id).myData()
+    // The flow check refuses to keep the export on this device without reveal.
+    this.myData = JSON.stringify(reveal(data, "booking"), null, 2)
+  }
+
+  async deleteAccount() {
+    await Customer.get(caller.id).deleteAccount()
+    this.myData = ""
+  }
+}
+
+function stateOf(s: Slot): string {
+  if (s.start <= Date.now()) { return "past" }
+  return s.booked ? "booked" : "open"
+}
+
+function SlotRow({ s, staff, customer, busy, onBook, onCancel, onRemove }) {
+  const state = stateOf(s)
+  const who = staff && s.customer !== "" ? Customer.get(s.customer) : null
+  return <Row id={`slot-${s.id}`} gap={8} padding={8} align="center" border="1px #d0d0d0" radius={6}>
+    <Column grow={1} gap={2}>
+      <Text weight="bold">{s.title}</Text>
+      <Row gap={6}>
+        <Time value={s.start} zone="UTC" style="iso" />
+        <Text>{s.minutes} min</Text>
+      </Row>
+      <Text id={`state-${s.id}`} color={state === "open" ? "#1b5e20" : "#444444"}>{state}</Text>
+      {who !== null && <Text id={`customer-${s.id}`}>{who.name} · {who.phone}</Text>}
+    </Column>
+    {customer && state === "open" && <Button id={`book-${s.id}`} disabled={busy} onPress={onBook}>Book</Button>}
+    {state === "booked" && (staff || s.customer === caller.id) && <Button id={`cancel-${s.id}`} onPress={onCancel}>Cancel</Button>}
+    {staff && state === "open" && <Button id={`remove-${s.id}`} onPress={onRemove}>Remove</Button>}
+  </Row>
+}
+
+function PublishForm() {
+  const f = Form.get("publish")
+  const title = f.value("new-title", "")
+  const start = f.value("new-start", null)
+  const minutes = f.value("new-minutes", null)
+  return <Column gap={8}>
+    <Text size={18} weight="bold">Publish a slot</Text>
+    <FormInput form={f} name="new-title" label="Title" saved="" placeholder="Haircut" />
+    <FormInput form={f} name="new-start" label="Start (UTC)" type="datetime" zone="UTC" saved={null} />
+    <FormInput form={f} name="new-minutes" label="Minutes" type="number" saved={null} />
+    <Button id="publish" disabled={f.busy()} onPress={() => f.submit(() => {
+      validSlot(title, start, minutes)
+      return Slot.get(crypto.randomId()).publish(title.trim(), start, minutes)
+    })}>Publish</Button>
+    <Notice id="publish-error" text={f.error} kind="error" />
+  </Column>
+}
+
+function StaffSettings() {
+  const settings = Settings.get("main")
+  const c = Form.get("check")
+  const r = Form.get("reminder")
+  return <Column gap={8}>
+    <Text size={18} weight="bold">Settings</Text>
+    <FormInput form={c} name="check-url" label="Check address" saved={settings.checkUrl} placeholder="https://example.com/check" />
+    <Button id="save-check" disabled={c.busy()} onPress={() => c.submit(() => {
+      const url = c.value("check-url", settings.checkUrl)
+      validCheckUrl(url)
+      return settings.saveCheck(url)
+    })}>Save check address</Button>
+    <Notice id="check-error" text={c.error} kind="error" />
+    <FormInput form={r} name="reminder-minutes" label="Remind minutes before" type="number" saved={settings.reminderMinutes} />
+    <Button id="save-reminder" disabled={r.busy()} onPress={() => r.submit(() => {
+      const minutes = r.value("reminder-minutes", settings.reminderMinutes)
+      validReminder(minutes)
+      return settings.saveReminder(minutes)
+    })}>Save reminder</Button>
+    <Notice id="reminder-error" text={r.error} kind="error" />
+  </Column>
+}
+
+function Profile({ me }) {
+  const f = Form.get("profile")
+  return <Column gap={8}>
+    <Text size={18} weight="bold">Your profile</Text>
+    <FormInput form={f} name="profile-name" label="Name" saved={me.name} />
+    <FormInput form={f} name="profile-phone" label="Phone" saved={me.phone} />
+    <Button id="save-profile" disabled={f.busy()} onPress={() => f.submit(() => {
+      const name = f.value("profile-name", me.name)
+      const phone = f.value("profile-phone", me.phone)
+      validProfile(name, phone)
+      return me.save(name, phone)
+    })}>Save profile</Button>
+    <Notice id="profile-error" text={f.error} kind="error" />
+  </Column>
+}
+
+function App() {
+  const signedIn = caller.id !== ""
+  const staff = caller.roles.includes("staff")
+  const customer = signedIn && !staff
+  const slots = Slot.all().filter(s => s.title !== "").sort((a, b) => a.start - b.start)
+  const book = Form.get("book")
+  const screen = Screen.get("main")
+
+  return <Scroll padding={16} gap={16}>
+    <Text size={24} weight="bold">Bookings</Text>
+    {!signedIn && <Text id="signin-prompt">Sign in to book a slot.</Text>}
+    {staff && <PublishForm />}
+    {staff && <StaffSettings />}
+
+    <Text size={18} weight="bold">Slots</Text>
+    <Column id="slots" gap={8}>
+      {slots.map(s => <SlotRow key={s.id} s={s} staff={staff} customer={customer} busy={book.busy()}
+        onBook={() => book.submit(() => s.book())}
+        onCancel={() => book.submit(() => s.cancel())}
+        onRemove={() => book.submit(() => s.remove())} />)}
+      {slots.length === 0 && <Text>No slots yet.</Text>}
+    </Column>
+    <Notice id="book-error" text={book.error} kind="error" />
+
+    {customer && <CustomerPanel screen={screen} />}
+  </Scroll>
+}
+
+function CustomerPanel({ screen }) {
+  const me = Customer.get(caller.id)
+  const mine = Slot.all().filter(s => s.customer === caller.id).sort((a, b) => a.start - b.start)
+  return <Column gap={16}>
+    <Text size={18} weight="bold">My bookings</Text>
+    <Column id="my-bookings" gap={6}>
+      {mine.map(s => <Row key={s.id} id={`mine-${s.id}`} gap={8}>
+        <Text weight="bold">{s.title}</Text>
+        <Time value={s.start} zone="UTC" style="iso" />
+        <Text>{stateOf(s)}</Text>
+      </Row>)}
+      {mine.length === 0 && <Text>No bookings.</Text>}
+    </Column>
+
+    <Text size={18} weight="bold">Reminders</Text>
+    <Column id="reminders" gap={6}>
+      {me.reminders.map(r => <Row key={`${r.slot}-${r.at}`} id={`reminder-${r.slot}`} gap={4}>
+        <Text weight="bold">{r.title}</Text>
+        <Text>at</Text>
+        <Time value={r.at} show="time" zone="UTC" style="iso" />
+      </Row>)}
+      {me.reminders.length === 0 && <Text>No reminders.</Text>}
+    </Column>
+
+    <Profile me={me} />
+
+    <Text size={18} weight="bold">Your data</Text>
+    <Row gap={8}>
+      <Button id="my-data" onPress={() => screen.showMyData()}>Show my data</Button>
+      <Button id="delete-account" onPress={() => screen.deleteAccount()}>Delete my account</Button>
+    </Row>
+    <Text id="my-data-view">{screen.myData}</Text>
+  </Column>
+}
