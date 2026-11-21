@@ -42,18 +42,19 @@ public final class TinyJump {
         return tj
     }
 
-    /// The signed-in user's token for the server and their id. Call it right after `start` and
-    /// whenever the token is refreshed. A new user id drops the server calls the previous user
-    /// queued and the replicas they saw (docs/access-control.md).
-    public func setToken(_ token: String?, userId: String?) {
-        if sync.setToken(token, user: userId) {
-            send(["type": "identity", "user": userId.map { $0 as Any } ?? NSNull()])
+    /// The signed-in user's token for the server, their id and their roles as the server reports
+    /// them (`GET /api/whoami`; the roles only choose what the UI shows). Call it right after
+    /// `start` and whenever the token is refreshed. A new user id or new roles drop the server
+    /// calls the previous identity queued and the replicas it saw (docs/access-control.md).
+    public func setToken(_ token: String?, userId: String?, roles: [String]) {
+        if sync.setToken(token, user: userId, roles: roles) {
+            send(["type": "identity", "user": userId.map { $0 as Any } ?? NSNull(), "roles": roles])
         }
     }
 
     /// Forgets the token, the replicas and every queued server call.
     public func signOut() {
-        setToken(nil, userId: nil)
+        setToken(nil, userId: nil, roles: [])
     }
 
     /// Called on the main thread when the server answers 401: refresh the token, then setToken.

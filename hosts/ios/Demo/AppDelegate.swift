@@ -1,7 +1,9 @@
 import UIKit
 
 /// Runs one of the repo's example apps. Launch arguments: `-example <name>` (default todo),
-/// `-dir rtl|ltr` (overriding the language's direction) and `-server <url>` for `@server` objects. Debug builds serve automation on port 4701.
+/// `-dir rtl|ltr` (overriding the language's direction), `-server <url>` for `@server` objects and
+/// `-key <api key>` from `tj key` (the demo signs in with it, as an app would with its own sign-in).
+/// Debug builds serve automation on port 4701.
 @main
 final class AppDelegate: UIResponder, UIApplicationDelegate {
     var window: UIWindow?
@@ -33,7 +35,27 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
         #if DEBUG
         app?.enableAutomation(port: 4701)
         #endif
+        if let server = defaults.string(forKey: "server"), let key = defaults.string(forKey: "key") {
+            signIn(server: server, key: key)
+        }
         return true
+    }
+
+    /// Asks the server who the key belongs to (`GET /api/whoami`), then hands it to the runtime.
+    private func signIn(server: String, key: String) {
+        guard let url = URL(string: server.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + "/api/whoami") else { return }
+        var req = URLRequest(url: url)
+        req.setValue("Bearer " + key, forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data = data,
+                  let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let me = body["ok"] as? [String: Any],
+                  let id = me["id"] as? String, let roles = me["roles"] as? [String] else {
+                NSLog("tinyjump-demo: sign-in failed")
+                return
+            }
+            DispatchQueue.main.async { self.app?.setToken(key, userId: id, roles: roles) }
+        }.resume()
     }
 
     /// The example's files as one source: app.tj first, then its other .tj files, each after a

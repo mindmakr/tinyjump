@@ -11,6 +11,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -95,15 +97,18 @@ public final class TinyJump {
     }
 
     /**
-     * The signed-in user's token for the server and their id. Call it right after
-     * {@link #start} and whenever the token is refreshed. A new user id drops the server calls
-     * the previous user queued and the replicas they saw (docs/access-control.md).
+     * The signed-in user's token for the server, their id and their roles as the server reports
+     * them ({@code GET /api/whoami}; the roles only choose what the UI shows). Call it right
+     * after {@link #start} and whenever the token is refreshed. A new user id or new roles drop
+     * the server calls the previous identity queued and the replicas it saw
+     * (docs/access-control.md).
      */
-    public void setToken(String token, String userId) {
+    public void setToken(String token, String userId, List<String> roles) {
         assertMain();
-        if (sync.setToken(token, userId)) {
+        List<String> held = roles == null ? Collections.<String>emptyList() : new ArrayList<>(roles);
+        if (sync.setToken(token, userId, held)) {
             try {
-                send(input("identity").put("user", userId == null ? JSONObject.NULL : userId));
+                send(input("identity").put("user", userId == null ? JSONObject.NULL : userId).put("roles", new JSONArray(held)));
             } catch (JSONException e) {
                 throw new IllegalStateException(e);
             }
@@ -112,7 +117,7 @@ public final class TinyJump {
 
     /** Forgets the token, the replicas and every queued server call. */
     public void signOut() {
-        setToken(null, null);
+        setToken(null, null, null);
     }
 
     /** Runs on the main thread when the server answers 401: refresh the token, then setToken. */
