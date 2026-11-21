@@ -247,6 +247,9 @@ pub struct ObjectDef {
     pub read: Option<Rc<[Rc<str>]>>,
     /// `@pii(category, purpose, ...)` fields (docs/privacy.md).
     pub pii: Vec<Pii>,
+    /// Fields some readers the object's rule admits may not see: those with their own
+    /// `@read`, and personal data.
+    pub guards: Vec<Guard>,
     /// `@retain(duration, "created" | "changed")`: objects are erased this long after they
     /// were created or last changed.
     pub retain: Option<Retain>,
@@ -272,6 +275,25 @@ pub struct Pii {
     /// `@by("customer", "at")`: the field holds several people's entries, each belonging to
     /// the person its `customer` names; `at` is the entry's own time, for `@retain`.
     pub by: Option<(Rc<str>, Option<Rc<str>>)>,
+}
+
+/// Who sees one field of an object (docs/access-control.md).
+#[derive(Debug, Clone)]
+pub struct Guard {
+    pub field: Rc<str>,
+    /// The field's `@read`, or for personal data without one `"owner"` (a `@by` list: the
+    /// object's rule). `"self"`: the person whose id the field holds.
+    pub rule: Rc<[Rc<str>]>,
+    /// Personal data: masked (`•••`) where hidden, and for every tool. Other hidden fields
+    /// show their default value; tools see them.
+    pub pii: bool,
+}
+
+impl Guard {
+    /// Whether the field names the person who may see it (`"self"`): export and erasure find it.
+    pub fn names_a_person(&self) -> bool {
+        self.rule.iter().any(|w| &**w == "self")
+    }
 }
 
 /// Personal-data categories, after GDPR articles 9 and 10 and the Saudi PDPL.

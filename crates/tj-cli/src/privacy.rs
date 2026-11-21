@@ -15,17 +15,20 @@ pub fn report(program: &Program) -> String {
         for p in &o.pii {
             let special = if SPECIAL_CATEGORIES.contains(&&*p.category) { "  special category" } else { "" };
             let by = p.by.as_ref().map_or_else(String::new, |(who, _)| format!("  each entry is the person its `{who}` names"));
-            out.push_str(&format!("  {}  {}{special}  for {}{by}\n", p.field, p.category, p.purposes.join(", ")));
+            let seen = o.guards.iter().find(|g| g.field == p.field).map_or_else(String::new, |g| g.rule.join(", "));
+            out.push_str(&format!("  {}  {}{special}  for {}{by}  seen by: {seen}\n", p.field, p.category, p.purposes.join(", ")));
         }
         out.push_str(&format!("  kept: {}\n", kept(o)));
+    }
+    for o in &program.objects {
+        for g in o.guards.iter().filter(|g| g.names_a_person()) {
+            out.push_str(&format!("{}.{}  names a person (seen by: {}): exported and erased with them\n", o.name, g.field, g.rule.join(", ")));
+        }
     }
     if out.is_empty() {
         return "no personal data: mark fields with @pii(category, purpose)\n".into();
     }
-    out.push_str("The owner sees these fields; other readers and every tool see •••.\n");
-    if program.objects.iter().any(|o| o.pii.iter().any(|p| p.by.is_some())) {
-        out.push_str("Lists of several people's entries are seen by the readers their rule names; every tool sees •••.\n");
-    }
+    out.push_str("Each field is seen by the readers named (\"owner\": the person whose id is the object's; \"self\": the person the field names); everyone else sees ••• (a field naming a person: its default), and every tool sees •••.\n");
     out.push_str("Every compile checks where these values flow (docs/privacy.md); each reveal(value, purpose) lets one path through.\n");
     out
 }
@@ -80,7 +83,7 @@ pub fn record(src: &str, program: &Program) -> String {
     for o in program.objects.iter().filter(|o| o.belongs_to_a_person() || !o.pii.is_empty()) {
         out.push_str(&format!("- **{}**: {}\n", o.name, kept(o)));
     }
-    out.push_str("\n## Security measures the runtime provides\n\n- Access rules on every object and method (`tj check --access`), refusals audited.\n- Personal fields masked for every reader but their owner, and for every tool.\n- A tamper-evident audit log of calls, reads of personal data, refusals and admin requests, with people as pseudonyms.\n- With `TJ_KEY_FILE`: encryption at rest, and a key per person-owned object, destroyed on erasure so backups cannot be read. Lists of several people's entries are sealed under the store's key: erasure removes the entries from the live data, and backups keep them until they expire.\n- Exports and erasures on request (`tj privacy`, `tj:privacy`), audited.\n- Whether encryption is on for a given server is in its startup line: ____\n");
+    out.push_str("\n## Security measures the runtime provides\n\n- Access rules on every object and method (`tj check --access`), refusals audited.\n- Personal fields shown only to the readers each field names (by default its owner), and masked for everyone else and for every tool.\n- A tamper-evident audit log of calls, reads of personal data, refusals and admin requests, with people as pseudonyms.\n- With `TJ_KEY_FILE`: encryption at rest, and a key per person-owned object, destroyed on erasure so backups cannot be read. Lists of several people's entries are sealed under the store's key: erasure removes the entries from the live data, and backups keep them until they expire.\n- Exports and erasures on request (`tj privacy`, `tj:privacy`), audited.\n- Whether encryption is on for a given server is in its startup line: ____\n");
     out
 }
 
@@ -140,7 +143,7 @@ mod tests {
         let src = "@server @read(\"owner\", \"support\") object Account {\n  @pii(\"contact\", \"account\", \"billing\") email: string = \"\"\n  @pii(\"health\", \"care\") notes: string = \"\"\n  plan: string = \"free\"\n}\n";
         let r = report(&tj_core::compile(src).unwrap());
         assert!(r.contains("Account  (id: the person's id; read: owner, support)"), "{r}");
-        assert!(r.contains("  email  contact  for account, billing\n") && r.contains("  notes  health  special category  for care\n") && !r.contains("plan"), "{r}");
+        assert!(r.contains("  email  contact  for account, billing  seen by: owner\n") && r.contains("  notes  health  special category  for care  seen by: owner\n") && !r.contains("plan"), "{r}");
         assert!(report(&tj_core::compile("object A { n: number = 0 }").unwrap()).starts_with("no personal data"));
     }
 

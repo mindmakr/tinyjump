@@ -33,28 +33,36 @@ type SharedList = (u16, Rc<str>, Rc<str>, Option<Rc<str>>);
 /// Entries found in one object's list: the object, the field, the entries.
 #[cfg(feature = "server")]
 type Entries = (Rc<crate::vm::value::ObjRef>, Rc<str>, Vec<Json>);
+/// A field naming a person (`"self"`): the object, the field.
+#[cfg(feature = "server")]
+type Named = (Rc<crate::vm::value::ObjRef>, Rc<str>);
 
 impl Runtime {
-    /// Masks the personal-data fields of `state`, an object of class `class`.
-    /// Masks the personal fields of `state`. `reader`: a person the object's `@read` rule
-    /// admitted, who sees the lists of several people's entries (`@by`), as reading them is
-    /// what the rule is for; tools see everything masked.
-    pub(crate) fn mask(&self, class: u16, state: &mut Json, reader: bool) {
-        for p in self.program.objects[class as usize].pii.iter().filter(|p| !(reader && p.by.is_some())) {
-            if let Some(v) = state.get_mut(&*p.field) {
-                *v = Json::from(MASK);
+    /// Hides the fields of `state`, an object of class `class`, that [`Runtime::hidden`]
+    /// found: personal data shows `•••`, anything else its default value, so a replica that
+    /// saw it before forgets it.
+    pub(crate) fn hide(&mut self, class: u16, state: &mut Json, hidden: &[usize]) {
+        let guards = &self.program.objects[class as usize].guards;
+        let defaults = if hidden.iter().any(|&i| !guards[i].pii) { self.defaults(class).ok() } else { None };
+        for &i in hidden {
+            let g = &self.program.objects[class as usize].guards[i];
+            if let Some(v) = state.get_mut(&*g.field) {
+                *v = match &defaults {
+                    Some(d) if !g.pii => d.borrow().get(&*g.field).and_then(|d| d.to_json().ok()).unwrap_or(Json::Null),
+                    _ => Json::from(MASK),
+                };
             }
         }
     }
 
-    /// The state of `object` as someone who does not own it sees it (`reader`: a person its
-    /// rule admitted, see [`Runtime::mask`]), or `None` when its class holds no personal
-    /// data. For a server's change streams.
-    pub fn masked(&self, object: &str, state: &Json, reader: bool) -> Option<Json> {
-        let class = self.personal_class(object)?;
-        let mut masked = state.clone();
-        self.mask(class, &mut masked, reader);
-        Some(masked)
+    /// `state` of `object` (`Class/id`) without the fields `hidden` names (from
+    /// [`Runtime::hidden_from`]). For a server's change streams.
+    pub fn without(&mut self, object: &str, state: &Json, hidden: &[usize]) -> Json {
+        let mut state = state.clone();
+        if let Some(class) = object.split_once('/').and_then(|(c, _)| self.program.object(c)) {
+            self.hide(class, &mut state, hidden);
+        }
+        state
     }
 
     /// Whether objects like `object` (`Class/id`) hold personal data.
@@ -136,6 +144,9 @@ impl Runtime {
         for (o, field, entries) in self.entries_of(subject, None)? {
             out.insert(format!("{}#{field}", o.key()), Json::Array(entries));
         }
+        for (o, field) in self.take_named(subject, false)? {
+            out.insert(format!("{}#{field}", o.key()), Json::from(subject));
+        }
         Ok(Json::Object(out))
     }
 
@@ -150,6 +161,34 @@ impl Runtime {
             }
         }
         out
+    }
+
+    /// Fields that name `subject` (`@read(..., "self")`), with their objects. `clear` puts
+    /// each back to its default.
+    fn take_named(&mut self, subject: &str, clear: bool) -> Result<Vec<Named>, String> {
+        let mut found = Vec::new();
+        for class in 0..self.program.objects.len() as u16 {
+            let fields: Vec<Rc<str>> = self.program.objects[class as usize].guards.iter().filter(|g| g.names_a_person()).map(|g| g.field.clone()).collect();
+            if fields.is_empty() {
+                continue;
+            }
+            for id in self.class_ids(class) {
+                let o = self.instance(class, &id).map_err(|e| e.message())?;
+                for field in &fields {
+                    let state = self.inst(&o).state.clone();
+                    if !matches!(state.borrow().get(&**field), Some(Value::Str(s)) if &**s == subject) {
+                        continue;
+                    }
+                    if clear {
+                        let blank = self.defaults(class).map_err(|e| e.message())?.borrow().get(&**field).cloned().unwrap_or(Value::Null);
+                        state.borrow_mut().insert(field.clone(), blank);
+                        self.touch(&o);
+                    }
+                    found.push((o.clone(), field.clone()));
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Entries of `@by` lists that belong to `subject` (or, with `older`, any person's entry
@@ -238,10 +277,15 @@ impl Runtime {
         for (o, field, _) in self.take_entries(subject, None, true).map_err(|e| (503, e))? {
             erased.push(format!("{}#{field}", o.key()));
         }
+        // So do the fields that name them: who booked a slot, say.
+        for (o, field) in self.take_named(subject, true).map_err(|e| (503, e))? {
+            erased.push(format!("{}#{field}", o.key()));
+        }
         self.drop_alarms_of(subject, &held);
         // First the stored copies' keys, so copies in backups cannot be read either; then the
         // blank, under a new key.
-        // Entries taken out of shared lists (`Class/id#field`) have no key of their own.
+        // Entries taken out of shared lists and fields naming them (`Class/id#field`) have no
+        // key of their own.
         for key in erased.iter().filter(|k| !k.contains('#')) {
             self.store.forget(key).map_err(|e| (503, format!("could not destroy the key of {key}: {e}; nothing was erased; try again")))?;
         }

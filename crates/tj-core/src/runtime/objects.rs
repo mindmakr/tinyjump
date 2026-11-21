@@ -619,7 +619,11 @@ impl Runtime {
     pub(crate) fn object_states(&self) -> Json {
         let state = |i: &Instance| {
             let mut s = Value::Rec(i.state.clone().into()).to_json().unwrap_or(Json::Null);
-            self.mask(i.handle.class, &mut s, false);
+            for g in self.program.objects[i.handle.class as usize].guards.iter().filter(|g| g.pii) {
+                if let Some(v) = s.get_mut(&*g.field) {
+                    *v = Json::from(super::privacy::MASK);
+                }
+            }
             s
         };
         let mut list: Vec<(String, Json)> = self.instances.values().map(|i| (i.handle.key(), state(i))).collect();

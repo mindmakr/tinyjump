@@ -66,6 +66,12 @@ type Booker = { customer: string, name: string, at: number }
 - **Everyone else who may read the object** (`@read` roles, `anyone`) sees `•••` in its
   place, in `get` and in change streams. A support desk with `@read("support")` sees the
   plan, not the email.
+- **Readers the field names**: a field's own `@read` says who sees it, as it is, for its
+  purpose. `@pii("contact", "booking") @read("owner", "staff") phone` shows staff the
+  customer's current phone, so a booking points to the customer instead of copying their
+  details (a copy goes stale when they change them). Each word must be a reader the
+  object's rule admits, and `"anyone"` is refused on personal data. `tj check --privacy`
+  prints who sees each field.
 - **Every tool** sees `•••`: `/_tj/inspect`, `tj review`, the MCP tools, and admin reads.
 - Server code, the object's own methods and other objects' methods, sees the values. What
   it does with them is the app's code.
@@ -77,7 +83,10 @@ TJ_ADMIN_KEY=... tj privacy export user:ana --target https://shop.example.com
 TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
 ```
 
-- **Export** returns the state of every object whose id is the person's, unmasked.
+- **Export** returns the state of every object whose id is the person's, unmasked, their
+  entries in shared lists, and every field that names them (`@read(..., "self")`, such as
+  who booked a slot), as `"Slot/s1#customer": "user:ana"`. Erase puts those fields back to
+  their defaults.
 - **Erase** puts every such object back to its defaults, and drops its alarms and the
   stored results of its calls. The blank state is saved with a new change number, so
   replicas and devices receive the erasure like any other change, including devices that

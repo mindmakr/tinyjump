@@ -129,10 +129,7 @@ impl Engine {
     /// so a client that reconnects resumes where it left off instead of refetching.
     /// Also returns the listed objects the caller may not read, for the audit log.
     pub fn subscribe(&self, objects: Vec<String>, since: u64, caller: Option<Caller>) -> Result<(Arc<Mailbox>, Vec<String>), Failure> {
-        let reader = match &caller {
-            Some(Caller::Remote { id, .. }) => Some(id.clone()),
-            _ => None,
-        };
+        let reader = caller.clone().filter(|c| matches!(c, Caller::Remote { .. }));
         // Only what the caller may read goes into the mailbox, so no change to anything else
         // can reach it. Objects refused are named, so the device stops asking for them.
         let readable = match &caller {
@@ -226,7 +223,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
     let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new() };
-    d.outputs(&rt, boot_out);
+    d.outputs(&mut rt, boot_out);
     loop {
         let msg = match rt.next_wake() {
             Some(at) => rx.recv_timeout(Duration::from_millis((at - now_ms()).max(0.0) as u64)),
@@ -305,8 +302,8 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 // change once, in order.
                 for o in rt.changed_since(&objects, since) {
                     if let Output::Changed { object, state, seq } = o {
-                        let state = if events.owns(&object) { None } else { rt.masked(&object, &state, events.is_person()) }.unwrap_or(state);
-                        events.push(changed_event(&object, &state, seq));
+                        let hidden = rt.hidden_from(&object, &state, events.reader());
+                        events.push(changed_event(&object, &rt.without(&object, &state, &hidden), seq));
                     }
                 }
                 d.subscribers.push(events);
@@ -329,7 +326,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Err(RecvTimeoutError::Timeout) => rt.handle(now_ms(), Input::Tick),
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        d.outputs(&rt, out);
+        d.outputs(&mut rt, out);
         privacy_effects(&mut rt, &mut d);
     }
 }
@@ -386,7 +383,7 @@ fn privacy_effect(rt: &mut Runtime, d: &mut Dispatch, effect: u32, method: &str,
 }
 
 impl Dispatch {
-    fn outputs(&mut self, rt: &Runtime, out: Vec<Output>) {
+    fn outputs(&mut self, rt: &mut Runtime, out: Vec<Output>) {
         for o in out {
             match o {
                 Output::Reply { reply, ok, error, status } => {
@@ -423,24 +420,21 @@ impl Dispatch {
                     self.broadcast(Event::new(object, merge, text));
                 }
                 Output::Changed { object, state, seq } => {
-                    let full = changed_event(&object, &state, seq);
-                    match (rt.masked(&object, &state, true), rt.masked(&object, &state, false)) {
-                        // Personal data goes to its owner; lists of several people's also to
-                        // the people the rules let read them; tools see it masked.
-                        (Some(for_readers), Some(for_tools)) => {
-                            let (for_readers, for_tools) = (changed_event(&object, &for_readers, seq), changed_event(&object, &for_tools, seq));
-                            self.subscribers.retain(|s| {
-                                s.push(if s.owns(&object) {
-                                    full.clone()
-                                } else if s.is_person() {
-                                    for_readers.clone()
-                                } else {
-                                    for_tools.clone()
-                                })
-                            });
-                        }
-                        _ => self.broadcast(full),
-                    }
+                    // Each reader gets the fields their rules let them see: one event for
+                    // each set of hidden fields, shared by every reader who has it.
+                    let mut events: Vec<(Vec<usize>, Event)> = Vec::new();
+                    self.subscribers.retain(|s| {
+                        let hidden = rt.hidden_from(&object, &state, s.reader());
+                        let e = match events.iter().find(|(h, _)| *h == hidden) {
+                            Some((_, e)) => e.clone(),
+                            None => {
+                                let e = changed_event(&object, &rt.without(&object, &state, &hidden), seq);
+                                events.push((hidden, e.clone()));
+                                e
+                            }
+                        };
+                        s.push(e)
+                    });
                 }
                 Output::Log { level, message } => eprintln!("[app] {level}: {message}"),
                 Output::Erased { object, reason, forget } => {
@@ -724,6 +718,34 @@ mod tests {
         assert!(read(&staff).contains("\"Ana\""), "staff read the list");
         let masked = read(&tool);
         assert!(masked.contains("entries") && !masked.contains("Ana"), "{masked}");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn a_class_stream_shows_who_booked_only_to_staff_and_to_that_person() {
+        let data = std::env::temp_dir().join(format!("tj-engine-fields-{}", std::process::id()));
+        let source = "@server @read(\"anyone\") object Slot {
+  @read(\"staff\", \"self\") customer: string = \"\"
+  @allow(\"signedIn\") book() { this.customer = caller.id }
+}
+".to_string();
+        let audit = Audit::start(&data).expect("audit log").0;
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit).expect("boots");
+        let person = |id: &str, roles: &[&str]| Some(Caller::Remote { id: id.into(), roles: roles.iter().map(|r| r.to_string()).collect() });
+        let stream = |caller| engine.subscribe(vec!["Slot/*".into()], 0, caller).expect("anyone may read slots").0;
+        let (ana, bo, staff) = (stream(person("user:ana", &[])), stream(person("user:bo", &[])), stream(person("key:sam", &["staff"])));
+        engine.request(Input::Call { object: "Slot/s1".into(), method: "book".into(), args: Vec::new(), reply: None, call: None, caller: person("user:ana", &[]) }).expect("booked");
+        let read = |m: &Mailbox| {
+            let (mut text, start) = (String::new(), std::time::Instant::now());
+            while !text.contains("customer") && start.elapsed() < Duration::from_secs(2) {
+                text.extend(m.take(Duration::from_millis(200)).into_iter().map(|e| e.text));
+            }
+            text
+        };
+        assert!(read(&ana).contains("user:ana"), "the person who booked sees it is theirs");
+        assert!(read(&staff).contains("user:ana"), "staff see who booked");
+        let other = read(&bo);
+        assert!(other.contains("\"customer\":\"\"") && !other.contains("user:ana"), "{other}");
         let _ = std::fs::remove_dir_all(&data);
     }
 
