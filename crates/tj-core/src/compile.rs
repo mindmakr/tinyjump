@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// Names an object instance provides itself; fields and methods may not use them.
-const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule", "unschedule"];
+const OBJECT_RESERVED: &[&str] = &["id", "emit", "schedule", "unschedule", "delete"];
 const MAX_ERRORS: usize = 20;
 
 /// What the checks know about an app's personal data, for reports: `tj check --privacy
@@ -488,7 +488,7 @@ impl Compiler {
         let (mut pii, mut guards) = (Vec::new(), Vec::new());
         for f in &o.fields {
             if OBJECT_RESERVED.contains(&f.name.as_str()) {
-                self.error(Diagnostic::new(format!("'{}' is reserved on objects", f.name), f.span).hint("`this.id`, `this.emit()` and `this.schedule()` are built in"));
+                self.error(Diagnostic::new(format!("'{}' is reserved on objects", f.name), f.span).hint("`this.id`, `this.emit()`, `this.schedule()` and `this.delete()` are built in"));
             } else if !seen.insert(&f.name) {
                 self.error(Diagnostic::new(format!("'{}' is declared twice", f.name), f.span));
             }

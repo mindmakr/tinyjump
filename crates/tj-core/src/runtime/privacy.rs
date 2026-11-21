@@ -418,7 +418,8 @@ impl Runtime {
         } else {
             let Some(text) = self.store.load(key)? else { return Ok(()) };
             let mut stored: Stored = serde_json::from_str(&text).map_err(|e| format!("unreadable stored state: {e}"))?;
-            let blank = stored.alarms.is_empty() && stored.calls.is_empty() && Json::Object(stored.state.clone()) == defaults;
+            // A deleted record may keep the records of its calls, and is blank all the same.
+            let blank = stored.alarms.is_empty() && Json::Object(stored.state.clone()) == defaults;
             if !blank && (stored.created <= 0.0 || stored.changed <= 0.0) {
                 // A record from before times were kept: its clock starts now.
                 stored.created = self.now;

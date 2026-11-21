@@ -1053,7 +1053,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Ty::Obj(class) => {
-                if matches!(name, "emit" | "schedule" | "unschedule") {
+                if matches!(name, "emit" | "schedule" | "unschedule" | "delete") {
                     for a in args {
                         self.expr(a, None);
                     }

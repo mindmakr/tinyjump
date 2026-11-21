@@ -40,8 +40,11 @@ pub(crate) struct Instance {
     /// When it was created and last changed (epoch ms), for `@retain` and `@legalHold`.
     pub(crate) created: f64,
     pub(crate) changed: f64,
-    /// Just erased: saving the blank does not start its clock; the next change does.
+    /// Just erased or deleted: saving the blank does not start its clock; the next change
+    /// does.
     pub(crate) cleared: bool,
+    /// A replica the server said was deleted: not in `Class.all()` until it comes back.
+    gone: bool,
 }
 
 /// A call made with an id: who made it and with what, so a repeat is recognised, and its
@@ -165,9 +168,9 @@ impl Runtime {
             dated = stored.created > 0.0 && stored.changed > 0.0;
             if dated {
                 (created, changed) = (stored.created, stored.changed);
-            } else if alarms.is_empty() && calls.is_empty() && Value::Rec(self.defaults(class)?.into()).to_json().ok() == Some(Json::Object(stored.state.clone())) {
-                // An erased record: no clock until it holds something again, and reading it
-                // writes nothing.
+            } else if alarms.is_empty() && Value::Rec(self.defaults(class)?.into()).to_json().ok() == Some(Json::Object(stored.state.clone())) {
+                // An erased or deleted record: no clock until it holds something again, and
+                // reading it writes nothing. A deleted one may keep the records of its calls.
                 (created, changed, dated) = (0.0, 0.0, true);
             }
         }
@@ -189,7 +192,7 @@ impl Runtime {
             }
         }
         let state_text = Value::Rec(state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
-        self.instances.insert(key.clone(), Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text, created, changed, cleared: false });
+        self.instances.insert(key.clone(), Instance { handle: handle.clone(), remote, state, alarms, seq, calls, saved, state_text, created, changed, cleared: false, gone: false });
         if !dated && !remote && self.server {
             // Saved with the times from now on, so retention never counts from zero.
             self.touched.insert(key);
@@ -303,7 +306,9 @@ impl Runtime {
         if !self.is_remote(&o) {
             return Err(format!("{key} is not a replica of a server object"));
         }
-        let Json::Object(fields) = state else { return Err(format!("state for {key} must be a record")) };
+        if !matches!(state, Json::Object(_) | Json::Null) {
+            return Err(format!("state for {key} must be a record, or null for a deleted object"));
+        }
         if let Some(seq) = seq {
             let inst = self.inst_mut(&o);
             if seq <= inst.seq {
@@ -311,6 +316,16 @@ impl Runtime {
             }
             inst.seq = seq;
         }
+        self.ran_code = true;
+        let Json::Object(fields) = state else {
+            // Deleted on the server: the device forgets its copy.
+            let fresh = self.defaults(o.class).map_err(|e| e.message())?;
+            let inst = self.inst_mut(&o);
+            (inst.state, inst.gone) = (fresh, true);
+            self.touched.shift_remove(&(o.class, o.id.clone()));
+            return self.store.remove(key);
+        };
+        self.inst_mut(&o).gone = false;
         let inst = self.inst(&o);
         let mut s = inst.state.borrow_mut();
         for (k, v) in fields {
@@ -320,7 +335,6 @@ impl Runtime {
         }
         drop(s);
         self.touch(&o);
-        self.ran_code = true;
         Ok(())
     }
 
@@ -555,7 +569,8 @@ impl Runtime {
             let Ok(o) = self.resolve_object(key) else { continue };
             let seq = self.inst(&o).seq;
             if seq > since {
-                if let Ok(state) = self.object_state(&o) {
+                let state = if self.is_gone(&o) { Ok(Json::Null) } else { self.object_state(&o) };
+                if let Ok(state) = state {
                     out.push((seq, Output::Changed { object: o.key(), state, seq }));
                 }
             }
@@ -598,21 +613,48 @@ impl Runtime {
             }
             // A replica the server never sent (seq 0) is not a member: one left blank by a
             // change of user, or asked for by id and not there.
-            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote && i.seq > 0).map(|i| i.handle.clone()).collect();
+            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote && i.seq > 0 && !i.gone).map(|i| i.handle.clone()).collect();
             list.sort_by(|a, b| a.id.cmp(&b.id));
             return Ok(list);
         }
-        let defaults = Value::Rec(self.defaults(class)?.into()).to_json().map_err(Exc::msg)?;
         let mut list = Vec::new();
         for id in self.class_ids(class) {
             let o = self.instance(class, &id)?;
-            // An erased object is a blank with nothing in it: not a member any more.
-            let blank = { let i = self.inst(&o); i.alarms.is_empty() && i.calls.is_empty() && i.created == 0.0 && Value::Rec(i.state.clone().into()).to_json().ok().as_ref() == Some(&defaults) };
-            if !blank {
+            if !self.is_gone(&o) {
                 list.push(o);
             }
         }
         Ok(list)
+    }
+
+    /// Whether `o` was deleted or erased and holds nothing since: its defaults, no alarms, no
+    /// clock. It is no member of its class, and streams send it as `null`.
+    pub(crate) fn is_gone(&mut self, o: &ObjRef) -> bool {
+        let i = self.inst(o);
+        if i.created != 0.0 || !i.alarms.is_empty() {
+            return false;
+        }
+        let state = Value::Rec(i.state.clone().into()).to_json().ok();
+        self.defaults(o.class).ok().and_then(|d| Value::Rec(d.into()).to_json().ok()) == state
+    }
+
+    /// `this.delete()`: the object goes back to its defaults with no alarms and no clock, as if
+    /// it never was. Its call records stay, so a retried call is still answered once.
+    pub(crate) fn delete_object(&mut self, o: &ObjRef) -> Result<(), Exc> {
+        let fresh = self.defaults(o.class)?;
+        self.blank(o, fresh);
+        Ok(())
+    }
+
+    /// Gives `o` the state `state`, no alarms and no clock; the next change starts the clock.
+    fn blank(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) {
+        let inst = self.inst_mut(o);
+        inst.state = state;
+        inst.alarms.clear();
+        inst.created = 0.0;
+        inst.changed = 0.0;
+        inst.cleared = true;
+        self.touched.insert((o.class, o.id.clone()));
     }
 
     /// Every loaded object, for tools: personal data is always masked here.
@@ -635,15 +677,9 @@ impl Runtime {
     /// save puts all of it back (see `revert`).
     #[cfg(feature = "server")]
     pub(crate) fn reset(&mut self, o: &ObjRef, state: Rc<RefCell<Record>>) {
-        let inst = self.inst_mut(o);
-        inst.state = state;
-        inst.calls.clear();
-        inst.alarms.clear();
+        self.inst_mut(o).calls.clear();
         // No clock until it holds something again, so a person who comes back starts afresh.
-        inst.created = 0.0;
-        inst.changed = 0.0;
-        inst.cleared = true;
-        self.touched.insert((o.class, o.id.clone()));
+        self.blank(o, state);
     }
 
     /// Whether `o` holds nothing: default state, no alarms, no call records.
@@ -678,6 +714,11 @@ impl Runtime {
             }
         }
         for key in touched {
+            // Deleted or erased, and still blank: sent as `null`. Written to since: alive.
+            let gone = match self.instances.get(&key).filter(|i| i.cleared).map(|i| i.handle.clone()) {
+                Some(o) => self.is_gone(&o),
+                None => false,
+            };
             let Some(inst) = self.instances.get(&key) else { continue };
             let object = inst.handle.key();
             let state = match Value::Rec(inst.state.clone().into()).to_json() {
@@ -703,7 +744,7 @@ impl Runtime {
                 self.change_seq += 1;
                 seq_changed = true;
                 record.seq = self.change_seq;
-                if !inst.cleared {
+                if !gone {
                     record.changed = self.now;
                     if record.created <= 0.0 {
                         record.created = self.now;
@@ -731,7 +772,8 @@ impl Runtime {
             // an object without alarms at boot.
             index_changed |= !has_alarms && self.alarm_index.remove(&object);
             if state_changed {
-                self.outputs.push(Output::Changed { object, state: Json::Object(record.state), seq: record.seq });
+                let state = if gone { Json::Null } else { Json::Object(record.state) };
+                self.outputs.push(Output::Changed { object, state, seq: record.seq });
             }
         }
         if failed {

@@ -87,8 +87,12 @@ object Cart {
   changes a copy (`room.messages.slice()`, `[...room.messages]`).
 - `@pii(category, purpose) @by("customer", "at")` marks a list holding several people's
   entries, each belonging to the person its `customer` field names (docs/privacy.md).
-- `this.id` is the instance id. `id`, `emit`, `schedule` and `unschedule` are reserved
-  names.
+- `this.id` is the instance id. `id`, `emit`, `schedule`, `unschedule` and `delete` are
+  reserved names.
+- `this.delete()`, in the object's own methods, deletes it: it goes back to its defaults
+  with no alarms or timers, `Class.all()` leaves it out, and devices drop their copies.
+  The method still runs to its end, and a retried call is still answered once. Writing to
+  it again (`Slot.get(id).open(...)`) brings it back as new.
 - `this.schedule(ms, "method", ...args)` calls the named method of this object after `ms`
   milliseconds (at least 10), with the arguments given. It survives restarts and runs once.
   - It returns a handle (a number): keep it in a field.
