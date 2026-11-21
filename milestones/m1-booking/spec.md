@@ -36,7 +36,8 @@ title, start, length and state ("open", "booked" or "past").
   the list `slots` as open, for everyone, without reloading.
 - **B2. Bad input is refused, not stored.** When the title is empty, the start is not a
   valid future time, or the length is outside 5 to 480, pressing `publish` stores nothing
-  and shows the reason in `publish-error`.
+  and shows the reason in `publish-error`, or under the field at fault
+  (`new-title-error`, `new-start-error`, `new-minutes-error`).
 - **B3. Remove an open slot.** Given an open slot, when staff press `remove-<slot id>`, then
   it disappears for everyone. A booked slot has no remove button until its booking is
   cancelled. A past slot that was never booked has no remove button either: it stays
