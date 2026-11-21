@@ -776,11 +776,18 @@ impl Checker {
             let d = Diagnostic::new(format!("{} reaches `{place}`, which is not marked as personal data", self.describe(&t)), span)
                 .hint(format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)));
             self.report(d);
-        } else if t.other {
+        } else if t.other && !self.entries_kept_as_entries(class, field, &t) {
             let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
                 .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
             self.report(d);
         }
+    }
+
+    /// Entries of `@by` lists put back into a `@by` list (filtered, moved): each entry still
+    /// names its person, so whose object they were read through does not matter.
+    fn entries_kept_as_entries(&self, class: &Rc<str>, field: &str, t: &Taint) -> bool {
+        let shared = |c: &Rc<str>, f: &str| self.classes.get(c).is_some_and(|c| c.shared.contains(f));
+        shared(class, field) && t.fields.iter().all(|(c, f)| shared(c, f))
     }
 
     /// Writing into this object's field held only for purposes that rest on consent (collecting

@@ -205,7 +205,10 @@ time field as a `number` when the object has `@retain`. `@read("anyone")` is not
 on these objects, and an object holds either one person's data (its id is theirs) or
 shared lists, not both. Personal data revealed and copied onto another server object must
 go into a list like this one; the compiler refuses other copies. Objects that live only on
-the device may hold it, as they are cleared when the person signs out.
+the device may hold it, as they are cleared when the person signs out. Entries are taken
+out or moved like any array, with no `reveal`, as each still names its person:
+`this.entries = this.entries.filter(e => e.customer !== id)`, or
+`Waiting.get("w").entries.push(entry)` into another `@by` list.
 
 ## Plugins
 
