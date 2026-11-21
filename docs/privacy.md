@@ -184,7 +184,13 @@ through the code and refuses each path where they would leave their owner:
 - fields that are not marked `@pii`, and module-level variables, which every caller shares;
 - the return value of a method someone other than the owner may call; and, for a method
   only the owner may call, data that may be about someone else (read through
-  `Account.get(otherId)` rather than `this` or `Account.get(caller.id)`).
+  `Account.get(otherId)` rather than `this` or `Account.get(caller.id)`);
+- a person's data written into an object that may not be theirs, such as
+  `Account.get(otherId).save(this.email)`.
+
+A screen runs as the signed-in person, and the server methods it calls run as them too, so
+in UI code `Account.get(caller.id)` is their own: a form may send their name back to their
+own record without `reveal`.
 
 When a path is intended, say why: `reveal(value, "purpose")` returns the value, and the
 purpose must be one the field declares. A value made from fields with different purposes

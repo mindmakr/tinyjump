@@ -79,7 +79,10 @@ the goal; being in the market early, to gain momentum and contributors, is.
     - per-field read rules: a field's own `@read`, with `"self"` for the person a field
       names, so staff read a customer's current details and nothing is copied (done);
     - deleting objects: `this.delete()`, sent to replicas as `null` (done);
-    - form binding in `tj:ui`, the largest piece of hand-written code left.
+    - form binding in `tj:ui` (`Form`, `FormInput`), the largest piece of hand-written
+      code left, and a flow-check fix it needed: a screen may send a person's own data back
+      to their own record (done).
+  - **Next:** round 3, a new blind build, to measure what is still hand-written.
 
 ### The rest of the agreed order
 

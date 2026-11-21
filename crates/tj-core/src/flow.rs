@@ -345,7 +345,9 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
         c.memo.clear();
         for (decl, this, endpoint) in &entries {
             let args = vec![clean(); decl.params.len()];
-            c.call(decl, args, this.clone(), *endpoint, None);
+            // Functions are screens and helpers: a screen runs as the signed-in person, and
+            // the server methods it calls run as them too.
+            c.call(decl, args, this.clone(), *endpoint, *endpoint == Endpoint::OwnerOnly || this.is_none(), None);
         }
     }
     c.errors.sort_by_key(|d| d.span.start);
@@ -428,9 +430,11 @@ impl Checker {
     /// Runs a function with these argument values; its return taint. A function written
     /// inside another (`captured`) sees that one's variables, and what it puts into them is
     /// written back.
-    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, captured: Option<&mut HashMap<String, Val>>) -> Taint {
+    /// Follows a call. `owner_only`: the caller owns what `X.get(caller.id)` gives, as in a
+    /// method only the owner may call, a screen, and what those call on the caller's objects.
+    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, owner_only: bool, captured: Option<&mut HashMap<String, Val>>) -> Taint {
         let arg_sig: Vec<String> = args.iter().map(|a| self.flatten(a).sig()).collect();
-        let key = format!("{:p}|{}|{:?}|{}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
+        let key = format!("{:p}|{}|{:?}|{}|{owner_only}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
         // A container passed in may be written into: run again for each call, so every
         // container that is given personal data gets it.
         let pure = captured.is_none() && !args.iter().any(|a| matches!(a, Val::Cell(_)));
@@ -451,7 +455,6 @@ impl Checker {
             None => self.needs_of.get(&Rc::as_ptr(f)).cloned().unwrap_or_default(),
         };
         self.needs.push(needs);
-        let owner_only = endpoint == Endpoint::OwnerOnly;
         let mut fr = Frame { vars: captured.as_deref().cloned().unwrap_or_default(), this, owner_only, endpoint, ret: Taint::default() };
         for (i, p) in f.params.iter().enumerate() {
             let mut v = args.get(i).cloned().unwrap_or_else(clean);
@@ -709,7 +712,7 @@ impl Checker {
                 // Run it once as written (event handlers, callbacks stored for later).
                 let args = vec![clean(); f.params.len()];
                 let this = fr.this.clone();
-                self.call(f, args, this, Endpoint::Internal, Some(&mut fr.vars));
+                self.call(f, args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
                 Val::Func(f.clone())
             }
             ExprKind::Await(x) => self.expr(x, fr),
@@ -752,6 +755,7 @@ impl Checker {
     }
 
     /// `v` written into `field` of an object: its own (`this`), or another through a handle.
+    /// `own`: the object is the caller's, so the caller's own data may go in.
     fn write_field(&mut self, class: &Rc<str>, own: bool, field: &str, v: &Val, span: crate::syntax::Span) {
         let t = self.flatten(v);
         if !t.revealed.is_empty() {
@@ -776,7 +780,7 @@ impl Checker {
             let d = Diagnostic::new(format!("{} reaches `{place}`, which is not marked as personal data", self.describe(&t)), span)
                 .hint(format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)));
             self.report(d);
-        } else if t.other && !self.entries_kept_as_entries(class, field, &t) {
+        } else if (t.other || !own) && !self.entries_kept_as_entries(class, field, &t) {
             let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
                 .hint("read it through this object, or through X.get(caller.id); if copying someone else's data is intended, reveal it with its purpose");
             self.report(d);
@@ -811,8 +815,8 @@ impl Checker {
         let (base, field) = Self::root(target);
         match &base.kind {
             ExprKind::This => {
-                if let (Some(field), Some((class, _))) = (field, fr.this.clone()) {
-                    self.write_field(&class, true, field, &v, span);
+                if let (Some(field), Some((class, other))) = (field, fr.this.clone()) {
+                    self.write_field(&class, !other, field, &v, span);
                 }
             }
             // Another object's field, changed through a handle: `Room.get("lobby").messages.push(x)`.
@@ -896,7 +900,7 @@ impl Checker {
                 _ if self.functions.contains_key(name) => {
                     let f = self.functions[name].clone();
                     let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
-                    Val::Data(self.call(&f, vals, None, Endpoint::Internal, None))
+                    Val::Data(self.call(&f, vals, None, Endpoint::Internal, fr.owner_only, None))
                 }
                 // Error, String, Number, parseInt, parseFloat and anything else: what goes in
                 // comes out.
@@ -910,7 +914,7 @@ impl Checker {
                     // A function written inside this one: it sees, and changes, its variables.
                     Val::Func(f) => {
                         let this = fr.this.clone();
-                        Val::Data(self.call(&f, vals, this, Endpoint::Internal, Some(&mut fr.vars)))
+                        Val::Data(self.call(&f, vals, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars)))
                     }
                     _ => self.unknown_call(&vals, span),
                 }
@@ -984,7 +988,7 @@ impl Checker {
                         };
                         match target {
                             Some(decl) => {
-                                self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, None);
+                                self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, false, None);
                             }
                             None => self.report(Diagnostic::new("the privacy check cannot follow this alarm to its method", span).hint("name the method as a string, e.g. this.schedule(60000, \"remind\", ...)")),
                         }
@@ -999,7 +1003,8 @@ impl Checker {
             let method = self.classes.get(class).and_then(|c| c.methods.get(name)).map(|(d, _)| d.clone());
             if let Some(m) = method {
                 let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
-                return Val::Data(self.call(&m, vals, Some((class.clone(), *other)), Endpoint::Internal, None));
+                // The caller's own object stays theirs inside its methods.
+                return Val::Data(self.call(&m, vals, Some((class.clone(), *other)), Endpoint::Internal, fr.owner_only && !*other, None));
             }
         }
         // A list of objects keeps being one through filter, sort and slice; its elements are
@@ -1019,7 +1024,7 @@ impl Checker {
                     } else {
                         vec![elem.clone(), clean(), recv.clone()]
                     };
-                    let ret = self.call(f, cb_args, this, Endpoint::Internal, Some(&mut fr.vars));
+                    let ret = self.call(f, cb_args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
                     return match name {
                         "map" | "flatMap" | "reduce" => Val::Data(ret),
                         "some" | "every" | "findIndex" | "forEach" => clean(),
@@ -1061,7 +1066,7 @@ impl Checker {
                     vec![elem.clone(), clean(), elem]
                 };
                 let this = fr.this.clone();
-                let ret = self.call(&f, cb_args, this, Endpoint::Internal, Some(&mut fr.vars));
+                let ret = self.call(&f, cb_args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
                 return Val::Data(match name {
                     "map" | "flatMap" | "some" | "every" | "findIndex" => ret,
                     "reduce" => {
@@ -1148,7 +1153,7 @@ impl Checker {
             return;
         };
         let args = vec![clean(); decl.params.len()];
-        let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, None);
+        let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, false, None);
         // What the tool returns goes to the AI model.
         self.transfer(&Val::Data(ret.clone()), span, &Destination::Plugin("tj:ai".into()));
         if !ret.is_clean() {

@@ -13,6 +13,68 @@ export function Field(props: { label: string, error?: string | null, id?: string
   </Column>
 }
 
+/// The forms waiting for an answer in this run of the app. A restart forgets them, so no form
+/// is left waiting for a call it can no longer hear back from.
+let formsSending: string[] = []
+
+/// A form: what the person typed, its errors, and whether it is waiting for an answer
+/// (`Form.get("profile")`). Drafts stay on the device until sent, and go when the person
+/// signs out.
+export object Form {
+  drafts: Record<string, { v: any }> = {}
+  errors: Record<string, string> = {}
+  error: string = ""
+
+  /// What the input named `name` shows: what the person typed, or else `saved`.
+  value(name: string, saved: any): any {
+    const d = this.drafts[name]
+    return d === null ? saved : d.v
+  }
+
+  /// The person typed `v` into `name`: it is kept as a draft, and its error cleared.
+  set(name: string, v: any) {
+    this.drafts[name] = { v }
+    this.errors[name] = ""
+  }
+
+  /// Whether it is waiting for `submit`'s answer.
+  busy(): boolean {
+    return formsSending.includes(this.id)
+  }
+
+  /// Runs `action` (check, then call the server), one at a time. When it works, the drafts
+  /// go and inputs show the saved values; when it fails, an error from
+  /// `check(ok, field, message)` shows at its field, and any other at the form (`error`).
+  async submit(action: () => any) {
+    if (this.busy()) { return }
+    formsSending.push(this.id)
+    this.errors = {}
+    this.error = ""
+    try {
+      await action()
+      this.drafts = {}
+    } catch (e) {
+      if (e.field !== null && e.field !== "") {
+        this.errors[e.field] = e.message
+      } else {
+        this.error = e.message
+      }
+    }
+    formsSending = formsSending.filter(id => id !== this.id)
+  }
+}
+
+/// An input bound to a form field: its label, the saved value until the person types, and
+/// its error below. Its id is `name` unless given; the error's is `<id>-error`.
+export function FormInput(props: { form: Form, name: string, label: string, saved?: any, type?: "text" | "number" | "date" | "time" | "datetime", zone?: string, placeholder?: string, id?: string }) {
+  const f = props.form
+  const id = props.id === null ? props.name : props.id
+  return <Field label={props.label} error={f.errors[props.name]} id={id}>
+    <Input id={id} label={props.label} type={props.type} zone={props.zone} placeholder={props.placeholder}
+      value={f.value(props.name, props.saved)} onChange={(v) => f.set(props.name, v)} />
+  </Field>
+}
+
 /// A short message for the person: an error in red, or good news in green.
 export function Notice(props: { text?: string | null, kind?: "error" | "ok", id?: string }) {
   if (props.text === null || props.text === "") { return null }
