@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:,">
+  <title>tinyjump: a small runtime for apps that agents build</title>
+  <meta name="description" content="Open-source runtime: one TypeScript-shaped codebase for native web, Android and iOS screens and the backend behind them, built so AI coding agents can write, check, drive and measure apps.">
+  <style>
+    :root {
+      --bg: #f6f4ef; --fg: #16150f; --muted: #5f5b50; --line: #dcd7cb; --card: #fffdf8;
+      --accent: #c2410c; --code-bg: #1d1b16; --code-fg: #ece6d8;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #12110d; --fg: #ece6d8; --muted: #a39d8d; --line: #2c2a23; --card: #1a1914; --accent: #ff7a3d; --code-bg: #0b0a08; }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 ui-serif, Georgia, "Times New Roman", serif; }
+    a { color: inherit; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+    code { font: 0.86em ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; padding: 28px 0; border-bottom: 1px solid var(--line); gap: 12px; flex-wrap: wrap; }
+    .brand { font: 600 18px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace; letter-spacing: -0.02em; }
+    .brand span { color: var(--accent); }
+    nav a { margin-left: 20px; font: 14px ui-monospace, Menlo, Consolas, monospace; text-decoration: none; color: var(--muted); }
+    nav a:hover { color: var(--fg); }
+    .hero { padding: 64px 0 24px; display: grid; gap: 40px; grid-template-columns: 1fr 1fr; align-items: start; }
+    h1 { font-size: clamp(34px, 4.6vw, 54px); line-height: 1.05; letter-spacing: -0.03em; margin: 0 0 20px; font-weight: 600; }
+    .lede { font-size: 19px; color: var(--muted); margin: 0 0 28px; }
+    .cta { display: flex; gap: 12px; flex-wrap: wrap; font: 15px ui-monospace, Menlo, Consolas, monospace; }
+    .cta a { padding: 11px 16px; border: 1px solid var(--fg); text-decoration: none; }
+    .cta a.primary { background: var(--fg); color: var(--bg); }
+    pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 20px; overflow: auto; font: 13.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; border-radius: 4px; }
+    .k { color: #ff9e6b; } .s { color: #b8d68a; } .c { color: #9a9384; } .t { color: #8cc7e8; }
+    section { padding: 56px 0 8px; }
+    h2 { font-size: 30px; letter-spacing: -0.02em; margin: 0 0 18px; font-weight: 600; }
+    h3 { margin: 0 0 10px; font: 600 14px ui-monospace, Menlo, Consolas, monospace; text-transform: uppercase; letter-spacing: 0.06em; }
+    p { margin: 0 0 14px; }
+    .narrow { max-width: 46em; }
+    .muted { color: var(--muted); }
+    .three { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; }
+    .two { display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: start; }
+    .three ul, .two ul { padding-left: 18px; margin: 0; }
+    .hero > *, .two > *, .three > * { min-width: 0; }
+    li { margin-bottom: 8px; }
+    .decisions { border-top: 1px solid var(--line); }
+    .decision { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; padding: 18px 0; border-bottom: 1px solid var(--line); }
+    .decision b { font-weight: 600; }
+    .numbers { display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); }
+    .num { padding: 22px 24px 22px 0; border-bottom: 1px solid var(--line); }
+    .num b { display: block; font-size: 30px; letter-spacing: -0.02em; font-weight: 600; }
+    .num span { color: var(--muted); font-size: 15px; }
+    .status { width: 100%; border-collapse: collapse; font-size: 15px; }
+    .status td { padding: 12px 8px 12px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+    .status td:last-child { color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+    .status td.ok { color: var(--fg); }
+    .status td.ok::before { content: "● "; color: var(--accent); }
+    .log { padding-left: 18px; margin: 0; color: var(--muted); font-size: 16px; }
+    .log b { color: var(--fg); font-weight: 600; }
+    footer { margin-top: 72px; padding: 28px 0 48px; border-top: 1px solid var(--line); color: var(--muted); font-size: 15px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+    @media (max-width: 860px) { .hero, .two, .three, .decision { grid-template-columns: 1fr; } .numbers { grid-template-columns: 1fr 1fr; } nav a { margin-left: 0; margin-right: 16px; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">tiny<span>jump</span></div>
+      <nav>
+        <a href="demo/">demo</a>
+        <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">language</a>
+        <a href="https://github.com/mindmakr/tinyjump/tree/main/docs">docs</a>
+        <a href="https://github.com/mindmakr/tinyjump">github</a>
+      </nav>
+    </header>
+
+    <div class="hero">
+      <div>
+        <h1>Apps that AI agents can write, check and run.</h1>
+        <p class="lede">tinyjump is an open-source runtime. One TypeScript-shaped codebase gives you native screens on the web, Android and iOS, and the backend behind them. We built it so that a coding agent can write an app, check it, use it and measure it without gluing ten tools together.</p>
+        <div class="cta">
+          <a class="primary" href="demo/">Try the demo</a>
+          <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">The whole language, one page</a>
+        </div>
+      </div>
+<pre><span class="c">// cart.tj: lives on the server; every phone and browser
+// holds a live copy that updates in real time</span>
+<span class="k">export</span> <span class="k">@server</span> <span class="k">@read</span>(<span class="s">"anyone"</span>) <span class="k">object</span> <span class="t">Cart</span> {
+  lines: <span class="t">Line</span>[] = []
+  total: <span class="t">number</span> = 0
+
+  <span class="c">// callable over HTTP, from apps, and by agents</span>
+  <span class="k">@allow</span>(<span class="s">"anyone"</span>) add(sku: <span class="t">string</span>, name: <span class="t">string</span>) {
+    <span class="k">if</span> (!Shelf.get(<span class="s">"main"</span>).take(sku)) {
+      <span class="k">throw new</span> Error(<span class="s">`${sku} is out of stock`</span>)
+    }
+    <span class="k">this</span>.lines.push({ sku, qty: 1 })
+    <span class="c">// a durable timer: unclaimed stock returns
+    // to the shelf, even across restarts</span>
+    <span class="k">this</span>.schedule(HOLD_MS, <span class="s">"expire"</span>, Date.now())
+  }
+}</pre>
+    </div>
+
+    <section class="narrow">
+      <h2>Why we built it</h2>
+      <p>A typical app today is a web front end, two mobile apps, an API, a database, a realtime service, a queue, a sign-in service and a test setup. Each part has its own language, build and ways to fail. A coding agent can write any one of them well. The joins between them are where apps break, and where people spend their time.</p>
+      <p>tinyjump removes the joins. State lives in objects that save themselves. The same objects are the backend API and the source of every screen, and every screen updates when they change. The runtime draws real native widgets on each platform, checks access rules on the server, and lets tools inspect and drive everything. You write one language and use one tool.</p>
+    </section>
+
+    <section>
+      <h2>Who it is for</h2>
+      <div class="three">
+        <div>
+          <h3>Founders</h3>
+          <ul>
+            <li>Ship to the web, Android and iOS from one codebase, with a small team or with agents.</li>
+            <li>Offline use, realtime sync, access rules and audit trails are part of the runtime. They are not separate projects.</li>
+            <li>Open source (MIT or Apache-2.0). Run it on your own Linux server; your data stays yours.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Developers</h3>
+          <ul>
+            <li>Durable objects with timers, alarms and events. <code>@server</code> objects have live, offline-cached replicas on every device.</li>
+            <li>Calls made offline wait in a queue and run exactly once when the server is back.</li>
+            <li>Native Android Views and UIKit, laid out by one engine, with right-to-left support.</li>
+            <li>The core does no I/O, so runs are deterministic and can be tested without a device.</li>
+          </ul>
+        </div>
+        <div>
+          <h3>Agent-driven coders</h3>
+          <ul>
+            <li><code>tj docs</code> hands an agent the whole language in one call.</li>
+            <li><code>tj check</code> errors say how to fix them: <code>'txt' is not a field of Todo, did you mean 'text'?</code></li>
+            <li><code>tj mcp</code> lets an agent inspect, tap, type, screenshot and review a running app on any platform.</li>
+            <li><code>tj bench</code> and a size budget give numbers to optimise.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Decisions, and why</h2>
+      <div class="decisions">
+        <div class="decision"><b>TypeScript-shaped, not a new syntax</b><span class="muted">Agents already write TypeScript. We changed rules, not syntax: one way to do each thing, and every unsupported feature has an error that says what to write instead.</span></div>
+        <div class="decision"><b>Objects instead of a database plus an ORM</b><span class="muted">State, timers and events sit in one place. Each change is saved and numbered, so devices resume where they left off after a lost connection.</span></div>
+        <div class="decision"><b>The core does no I/O</b><span class="muted">Hosts do the I/O. The same core runs in browsers, phones and servers, and any run can be replayed exactly in a test.</span></div>
+        <div class="decision"><b>Native widgets, not a web view</b><span class="muted">Real Android Views and UIKit controls, placed by one layout engine in the core, so a screen looks the same everywhere and can be tested anywhere.</span></div>
+        <div class="decision"><b>Closed by default</b><span class="muted">Nothing can be read or called from outside without a rule next to the code: <code>@read</code>, <code>@allow</code>, <code>caller</code>. An independent security review shaped the design before we built it.</span></div>
+        <div class="decision"><b>Plugins speak MCP</b><span class="muted">Existing MCP servers (databases, payments, search) work as plugins from day one, each in its own process, with secrets kept on the server. The first plugin is an AI model, and agents built on it act only within the rights of the person they act for.</span></div>
+        <div class="decision"><b>Small, and measured</b><span class="muted">A size and speed budget fails any change that makes a build bigger or an app slower, unless the budget is raised on purpose, with the reason written down.</span></div>
+      </div>
+    </section>
+
+    <section class="narrow">
+      <h2>How it is built</h2>
+      <p>One owner sets the direction in a written vision that every change is checked against. AI agents build tinyjump step by step: each step comes with its tests, is measured against a size and speed budget, and is run live before it merges.</p>
+      <p>Other agents review the design and the work independently, without the builder's reasoning in front of them. That review corrected the trust design before any of it was built, and it keeps going: every correction is written down in the docs with its reason, so you can see what was planned, what was found and what was done instead.</p>
+    </section>
+
+    <section>
+      <h2>Measured, not claimed</h2>
+      <div class="numbers">
+        <div class="num"><b>700 KB</b><span>web runtime, compiler included (266 KB compressed)</span></div>
+        <div class="num"><b>~1 MB</b><span>native library per Android CPU type (690 KB on 32-bit ARM)</span></div>
+        <div class="num"><b>&lt;0.2 ms</b><span>to boot each example app on a laptop (<code>tj bench</code>)</span></div>
+        <div class="num"><b>130</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
+        <div class="num"><b>Android 5</b><span>and up, iOS 13 and up, and 2019-era browsers</span></div>
+        <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM</span></div>
+      </div>
+    </section>
+
+    <section class="narrow">
+      <h2>Starting fresh</h2>
+      <p>tinyjump has no package ecosystem yet. That is a cost, and also an advantage: there is no legacy to carry, and every library can be small, typed, tested and covered by the access rules.</p>
+      <p>Today, apps reach existing services through MCP plugins and <code>fetch</code>, device plugins wrap native code such as maps and cameras, and agents write small modules on demand. Next comes a registry of libraries that agents port, each checked against the original's tests. Teams with existing systems can run tinyjump next to them and move one piece at a time.</p>
+    </section>
+
+    <section class="two">
+      <div>
+        <h2>Where it runs</h2>
+        <table class="status"><tr><td>Web (WASM + DOM)</td><td class="ok">working</td></tr>
+<tr><td>Android (Views, minSdk 21; arm64, armv7, x86, x86_64)</td><td class="ok">working</td></tr>
+<tr><td>iOS (UIKit, iOS 13+)</td><td class="ok">working: built and driven on the iOS Simulator in CI</td></tr>
+<tr><td>macOS</td><td class="next">runtime and CLI tested on macOS CI; AppKit host after iOS</td></tr>
+<tr><td>Linux (server/CLI, static: x86_64, aarch64, armv7)</td><td class="ok">working</td></tr>
+<tr><td>Linux desktop UI</td><td class="next">after mobile</td></tr>
+<tr><td>Microcontrollers</td><td class="next">out of scope for now</td></tr></table>
+      </div>
+      <div>
+        <h2>Where it is heading</h2>
+        <ul>
+          <li>Checking where personal data flows, retention, and per-person keys so an erasure reaches backups too.</li>
+          <li>Compliance packs for the EU, Saudi Arabia, the wider MENA region and the US, which others can extend.</li>
+          <li>Servers that talk to each other, and webhooks.</li>
+          <li>More native components (navigation, long lists, forms), translations, and one-command app builds.</li>
+          <li>GPU graphics and 3D, as an optional module.</li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="two">
+      <div>
+        <h2>Latest</h2>
+        <ul class="log">
+          <li><b>Personal data, marked and masked.</b> <code>@pii("contact", "account")</code> marks a field with its category and purpose. Its owner reads it; other readers and every tool, agents included, see <code>•••</code>. <code>tj privacy export</code> and <code>erase</code> act on everything held about one person, erasures reach their devices like any other change, and the audit log forgets them. <code>tj check --privacy</code> prints the data map. Still to come, and said so in the docs: checking where personal data flows in code, retention, and backups.</li>
+          <li><b>Encrypted at rest, and secrets for apps.</b> Set <code>TJ_KEY_FILE</code> and every stored object is sealed with AES-256-GCM under its own key; file names reveal nothing, and keys change without re-encrypting. Apps get <code>crypto.randomId()</code>, <code>crypto.hmac()</code> and <code>crypto.timingSafeEqual()</code>, backed by secure random bytes from every host. A server reachable from other machines refuses credentials over plain HTTP. On the way we fixed an older flaw: a record that could not be read made its object start empty, and its next save overwrote it. Now the call fails instead.</li>
+          <li><b>An audit log that shows tampering.</b> Every API call, refusal, admin request, timer, alarm, agent tool and plugin call is written down: who, what, the outcome and the time taken, never values. Each line is chained to the one before with a keyed hash, and signed checkpoints can be copied off the machine. <code>tj audit verify</code> finds a changed, removed or reordered line, and with that copy, a history rewritten by someone holding the key. People appear as random tokens, so forgetting someone does not mean editing the log.</li>
+          <li><b>One call at a time, where it matters.</b> Mark a method <code>@exclusive</code> and an object runs one such call at a time, like an actor, even across <code>await</code>. Three payments of 60 from a balance of 100, sent at once: one goes through instead of all three. Calls that would wait for each other fail at once instead of hanging, and an agent's tools never wait for the agent.</li>
+          <li><b>Runtime statistics.</b> Calls, errors, refusals and work for every method on every platform, latency on servers, <code>tj stats</code>, and <code>/_tj/metrics</code> for Prometheus and Grafana.</li>
+          <li><b>Saves that reach the disk.</b> A crash leaves the old record or the new one, and a save that fails fails the call, so nobody is told a change happened when it did not.</li>
+          <li><b>Agents that follow the rules.</b> <code>tj:agent</code> turns an app's methods into tools, and every tool call is checked as the person who asked. The shop assistant can add tea for a shopper, but only restocks for staff.</li>
+          <li><b>Sign-in.</b> Tokens from any OpenID Connect provider (Google, Microsoft, Auth0, Keycloak), API keys for agents and scripts.</li>
+          <li><b>Plugins and an AI assistant.</b> Plugins are MCP servers in their own processes; <code>tj:ai</code> calls Claude with the key kept on the server.</li>
+          <li><b>Access control.</b> Closed by default, with one-time stream tickets, audit lines and per-caller limits.</li>
+          <li><b>Apps in several files.</b> <code>import { Cart } from "./cart"</code>, with errors that say which import to add.</li>
+          <li><b>Calls that survive outages.</b> Offline calls queue and run exactly once; replicas resume their change stream.</li>
+          <li><b>Right-to-left and one layout engine</b> for Arabic, Urdu and Hebrew on every platform.</li>
+        </ul>
+      </div>
+      <div>
+        <h2>Run it</h2>
+<pre>git clone https://github.com/mindmakr/tinyjump
+cd tinyjump
+rustup target add wasm32-unknown-unknown
+cargo web
+cargo tj dev examples/durable-cart/app.tj \
+  --plugin ai=fake:examples/durable-cart/fake-ai.json
+<span class="c"># open http://127.0.0.1:4700 in two browsers</span>
+
+curl -X POST localhost:4700/api/Cart/demo/add \
+  -H 'content-type: application/json' -d '["tea", "curl"]'</pre>
+      </div>
+    </section>
+
+    <footer>
+      <span>Created by Asif Raja · <a href="https://github.com/mindmakr">mindmakr</a></span>
+      <span>MIT or Apache-2.0 · early, and moving fast</span>
+    </footer>
+  </div>
+</body>
+</html>

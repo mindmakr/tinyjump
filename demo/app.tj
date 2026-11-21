@@ -1,0 +1,68 @@
+// A todo list with a live clock. Shows durable objects, timers, events and native UI.
+
+type Todo = { id: number, text: string, done: boolean }
+
+object Todos {
+  items: Todo[] = []
+  draft: string = ""
+  nextId: number = 1
+
+  setDraft(text: string) { this.draft = text }
+
+  add() {
+    const text = this.draft.trim()
+    if (text === "") { return }
+    this.items.push({ id: this.nextId, text, done: false })
+    this.nextId += 1
+    this.draft = ""
+    this.emit("added", { text })
+  }
+
+  toggle(id: number) {
+    const item = this.items.find(t => t.id === id)
+    if (item !== null) { item.done = !item.done }
+  }
+
+  clearDone() { this.items = this.items.filter(t => !t.done) }
+}
+
+object Clock {
+  now: number = Date.now()
+  @every("1s") tick() { this.now = Date.now() }
+}
+
+function time(ms: number): string {
+  const s = Math.floor(ms / 1000) % 86400
+  const two = (n: number) => String(n).padStart(2, "0")
+  return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}:${two(s % 60)} UTC`
+}
+
+function TodoRow({ todo, onToggle }) {
+  return <Row gap={8} padding={4}>
+    <Toggle id={`todo-${todo.id}`} value={todo.done} onChange={onToggle}>{todo.text}</Toggle>
+  </Row>
+}
+
+function App() {
+  const todos = Todos.get("main")
+  const clock = Clock.get("main")
+  const left = todos.items.filter(t => !t.done).length
+
+  return <Column padding={24} gap={12}>
+    <Row justify="between">
+      <Text size={24} weight="bold">Todos</Text>
+      <Text id="clock" color="#666">{time(clock.now)}</Text>
+    </Row>
+    <Row gap={8}>
+      <Input id="draft" grow={1} value={todos.draft} placeholder="What needs doing?"
+        onChange={(t) => todos.setDraft(t)} onSubmit={() => todos.add()} />
+      <Button id="add" onPress={() => todos.add()} disabled={todos.draft.trim() === ""}>Add</Button>
+    </Row>
+    {todos.items.map(t => <TodoRow key={t.id} todo={t} onToggle={() => todos.toggle(t.id)} />)}
+    {todos.items.length === 0 && <Text color="#999">Nothing yet. Add one above.</Text>}
+    <Row justify="between">
+      <Text id="left" color="#666">{left} left</Text>
+      <Button id="clear" onPress={() => todos.clearDone()} disabled={left === todos.items.length}>Clear done</Button>
+    </Row>
+  </Column>
+}
