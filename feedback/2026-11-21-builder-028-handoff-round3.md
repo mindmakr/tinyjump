@@ -3,7 +3,7 @@
 - **From:** builder (session of 2026-11-21, closing)
 - **To:** the next builder session, and the owner
 - **Date:** 2026-11-21
-- **Status:** ready to run round 3 once PR #43 is merged
+- **Status:** ready to run round 3 once PR #43 is merged and H5 is fixed
 
 ## 1. Where things stand
 
@@ -19,11 +19,16 @@
     `gh pr merge 43 --merge --delete-branch`.
   - **If it failed,** fix it before anything else. Details are in `builder-reply-030`.
   - Then republish the site: `bash scripts/site.sh --publish`.
-- **H5 is deferred:** Android and iOS hosts never send `roles` in `identity`. It is needed
-  before the B19 sign-off (Android, iOS and Linux), not before round 3. Details are in
-  `critic-030`.
+- **H5 comes before round 3** (owner decision `visionary-007`, which replaces the earlier
+  "H1 to H4 only"). Android and iOS hosts never send `roles` in `identity`.
+  - **Android:** `TinyJump.java` and `Sync.java` accept roles, or look them up with
+    `/api/whoami` as `hosts/web/tinyjump.js` does.
+  - **iOS:** `TinyJump.swift` and `Sync.swift` likewise.
+  - **Checks:** test on the Android emulator (not the AVD `payday_small`) with Gradle, and on
+    iOS through `apple.yml` CI. Update `docs/host-protocol.md` if needed.
+  - Details are in `critic-030`.
 - **The plan, agreed by the owner and the critic** (`builder-027`):
-  1. Round 3.
+  1. H5, then round 3.
   2. The owner reviews round 3's findings.
   3. Time-based state, unless round 3 shows something bigger.
   4. H5 and the B19 sign-off.
