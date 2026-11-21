@@ -16,6 +16,9 @@ export function Field(props: { label: string, error?: string | null, id?: string
 /// The forms waiting for an answer in this run of the app. A restart forgets them, so no form
 /// is left waiting for a call it can no longer hear back from.
 let formsSending: string[] = []
+/// The fields each form shows (`form/field`), so an error for one it does not show goes to
+/// the form's own `error` instead of nowhere.
+let formsShown: string[] = []
 
 /// A form: what the person typed, its errors, and whether it is waiting for an answer
 /// (`Form.get("profile")`). Drafts stay on the device until sent, and go when the person
@@ -44,7 +47,8 @@ export object Form {
 
   /// Runs `action` (check, then call the server), one at a time. When it works, the drafts
   /// go and inputs show the saved values; when it fails, an error from
-  /// `check(ok, field, message)` shows at its field, and any other at the form (`error`).
+  /// `check(ok, field, message)` shows at its field when the form shows that field (a
+  /// `FormInput`), and any other at the form (`error`).
   async submit(action: () => any) {
     if (this.busy()) { return }
     formsSending.push(this.id)
@@ -54,7 +58,7 @@ export object Form {
       await action()
       this.drafts = {}
     } catch (e) {
-      if (e.field !== null && e.field !== "") {
+      if (e.field !== null && formsShown.includes(`${this.id}/${e.field}`)) {
         this.errors[e.field] = e.message
       } else {
         this.error = e.message
@@ -69,6 +73,8 @@ export object Form {
 export function FormInput(props: { form: Form, name: string, label: string, saved?: any, type?: "text" | "number" | "date" | "time" | "datetime", zone?: string, placeholder?: string, id?: string }) {
   const f = props.form
   const id = props.id === null ? props.name : props.id
+  const shown = `${f.id}/${props.name}`
+  if (!formsShown.includes(shown)) { formsShown.push(shown) }
   return <Field label={props.label} error={f.errors[props.name]} id={id}>
     <Input id={id} label={props.label} type={props.type} zone={props.zone} placeholder={props.placeholder}
       value={f.value(props.name, props.saved)} onChange={(v) => f.set(props.name, v)} />

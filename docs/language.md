@@ -170,6 +170,10 @@ Without a rule, nothing can be read or called from outside the server:
 const mine = Slot.all().filter(s => s.customer === caller.id)  // on the device, live
 ```
 
+  Let `customer` alone say whether a slot is booked (`s.customer !== ""`), so erasing the
+  customer reopens it. Readers who are not shown the field see `""`: look the customer up
+  only when there is one, `s.customer !== "" ? Customer.get(s.customer) : null`.
+
 Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take identity from
 `caller.id`, never from arguments. In UI code on a device, `caller` is the signed-in user
 (`{ id: "", roles: [] }` before sign-in), and the screen is drawn again when that changes. Use
@@ -191,7 +195,10 @@ Mark fields that hold personal data with a category and what they are for. Keep 
 
 The owner reads the email; other readers and every tool see `•••`. A field's own `@read`
 names who else sees it: `@pii("contact", "booking") @read("owner", "staff") phone` shows
-staff the person's current phone, so nothing is copied and nothing goes stale. A field that
+staff the person's current phone, so nothing is copied and nothing goes stale. Its readers
+include `"owner"`, as the object is the person's. A purpose that rests on consent cannot add
+readers this way, since they would keep seeing it after consent is withdrawn: use `reveal` in
+a method with `@needs("consent:...")`. A field that
 names a person (`"self"`, above) is exported and erased with them. Personal data cannot
 reach `fetch`, plugins, `emit`, errors, logs, other fields or other people's callers unless
 the code says why: `reveal(this.email, "account")`, with a purpose the field declares.
@@ -417,7 +424,8 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
     `Input`). `f.value("name", me.name)` reads it.
   - `f.submit(() => { validName(...); return me.save(...) })` sends one at a time
     (`f.busy()` is true meanwhile). When it works, the drafts go. When it fails, an error from
-    `check(ok, field, message)` shows at its field and any other in `f.error`. A server's
+    `check(ok, field, message)` shows at its field if the form shows that field (a
+    `FormInput`), and any other in `f.error`. A server's
     refusal has no field, so run the shared rules first, as here, to place each error.
   - Drafts survive a restart and go at sign-out; a restart forgets that a form was waiting.
 

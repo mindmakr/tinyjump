@@ -79,6 +79,8 @@ enum Val {
     Handles { class: Rc<str> },
     /// An array or record: the taint of everything put in it, shared by its aliases.
     Cell(Rc<RefCell<Taint>>),
+    /// A component's props, each kept apart (`props.form` stays a handle).
+    Props(Rc<Vec<(String, Val)>>),
     Func(Rc<FnDecl>),
 }
 
@@ -265,8 +267,26 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     }
     let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new() };
     c.consent_purposes = crate::lawful_basis::declared(files).unwrap_or_default().into_iter().filter(|(_, b)| b == "consent").map(|(p, _)| p).collect();
-    let user: Vec<&Program> = files.iter().filter(|(name, _)| !name.starts_with("tj:")).map(|(_, p)| *p).collect();
-    for (name, p) in files.iter().filter(|(name, _)| name.starts_with("tj:")) {
+    // Readers a field's own @read adds see it whenever they look, consent or not: data held
+    // for a purpose that rests on consent is shown to others only through `reveal`, in a
+    // method that checks the consent.
+    for (_, p) in files {
+        for item in &p.items {
+            let Item::Object(o) = item else { continue };
+            for f in &o.fields {
+                let (Some(pii), Some(read)) = (f.decorators.iter().find(|d| d.name == "pii"), f.decorators.iter().find(|d| d.name == "read")) else { continue };
+                let others = words(read).iter().any(|w| w != "owner");
+                if let Some(purpose) = words(pii).iter().skip(1).find(|p| others && c.consent_purposes.contains(*p)) {
+                    c.errors.push(Diagnostic::new(format!("{}.{} is held for {purpose}, which rests on consent, so readers besides its owner cannot be given it for good", o.name, f.name), read.span).hint(format!("keep @read(\"owner\") here, and let it out with reveal(value, \"{purpose}\") in a method with @needs(\"consent:{purpose}\")")));
+                }
+            }
+        }
+    }
+    // Built-in modules that reach the host (`plugin`, `invoke`) are recipients; the others
+    // (tj:ui, tj:consent) are tinyjump code like the app's, and followed the same way.
+    let host = |name: &str| crate::modules::BUILT_IN.iter().any(|(n, src)| *n == name && (src.contains("plugin(") || src.contains("invoke(")));
+    let user: Vec<&Program> = files.iter().filter(|(name, _)| !host(name)).map(|(_, p)| *p).collect();
+    for (name, p) in files.iter().filter(|(name, _)| host(name)) {
         for item in &p.items {
             if let Item::Function(f) = item {
                 c.plugin_fns.insert(f.name.clone(), name.to_string());
@@ -376,6 +396,11 @@ impl Checker {
             Val::Func(_) => Taint::default(),
             Val::Handle { class, other } => self.whole(class, *other),
             Val::Handles { class } => self.whole(class, true),
+            Val::Props(props) => {
+                let mut t = Taint::default();
+                props.iter().for_each(|(_, v)| t.join(&self.flatten(v)));
+                t
+            }
         }
     }
 
@@ -437,7 +462,7 @@ impl Checker {
         let key = format!("{:p}|{}|{:?}|{}|{owner_only}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
         // A container passed in may be written into: run again for each call, so every
         // container that is given personal data gets it.
-        let pure = captured.is_none() && !args.iter().any(|a| matches!(a, Val::Cell(_)));
+        let pure = captured.is_none() && !args.iter().any(|a| matches!(a, Val::Cell(_) | Val::Props(_)));
         if pure {
             if let Some(t) = self.memo.get(&key) {
                 return t.clone();
@@ -489,6 +514,17 @@ impl Checker {
                 let merged = self.merge(fr.vars.get(n), v);
                 fr.vars.insert(n.clone(), merged);
             }
+            Pattern::Record(fields, _) if matches!(v, Val::Props(_)) => {
+                let Val::Props(props) = &v else { return };
+                for (key, pat, default) in fields {
+                    let mut given = props.iter().find(|(k, _)| k == key).map_or_else(clean, |(_, v)| v.clone());
+                    if let Some(d) = default {
+                        let dv = self.expr(d, fr);
+                        given = self.merge(Some(&given), dv);
+                    }
+                    self.bind(pat, given, fr);
+                }
+            }
             _ => {
                 let t = self.flatten(&v);
                 let mut names = Vec::new();
@@ -510,6 +546,13 @@ impl Checker {
                 let t = self.flatten(&new);
                 c.borrow_mut().join(&t);
                 Val::Cell(c.clone())
+            }
+            // Props stay apart, each merged with its own earlier value.
+            Some(Val::Props(a)) if matches!(&new, Val::Props(_)) => {
+                let Val::Props(b) = &new else { return new };
+                let mut merged: Vec<(String, Val)> = b.iter().map(|(k, v)| (k.clone(), self.merge(a.iter().find(|(o, _)| o == k).map(|(_, v)| v), v.clone()))).collect();
+                merged.extend(a.iter().filter(|(k, _)| !b.iter().any(|(n, _)| n == k)).cloned());
+                Val::Props(Rc::new(merged))
             }
             Some(old) => {
                 let t = self.flatten(&new);
@@ -663,6 +706,7 @@ impl Checker {
                 }
                 let v = self.expr(obj, fr);
                 match v {
+                    Val::Props(props) => props.iter().find(|(k, _)| k == name).map_or_else(clean, |(_, v)| v.clone()),
                     Val::Handle { class, other } => {
                         let personal = self.classes.get(&class).is_some_and(|c| c.pii.contains_key(name.as_str()));
                         if !personal {
@@ -724,17 +768,26 @@ impl Checker {
     }
 
     fn jsx(&mut self, el: &JsxElement, fr: &mut Frame) {
-        for (_, v) in &el.attrs {
-            self.expr(v, fr);
+        let mut props = Vec::new();
+        for (name, v) in &el.attrs {
+            let v = self.expr(v, fr);
+            props.push((name.clone(), v));
         }
+        let mut children = Taint::default();
         for c in &el.children {
             match c {
                 JsxChild::Expr(e) => {
-                    self.expr(e, fr);
+                    let v = self.expr(e, fr);
+                    children.join(&self.flatten(&v));
                 }
                 JsxChild::Element(el) => self.jsx(el, fr),
                 JsxChild::Text(_) => {}
             }
+        }
+        // A component is a function: follow it with the props it is given.
+        if let Some(f) = self.functions.get(&el.tag).cloned() {
+            props.push(("children".into(), Val::Data(children)));
+            self.call(&f, vec![Val::Props(Rc::new(props))], None, Endpoint::Internal, fr.owner_only, None);
         }
     }
 

@@ -393,6 +393,11 @@ impl Compiler {
     /// the CLI checked, and leave this out.
     #[cfg(feature = "check")]
     fn check_field_rule(&mut self, rule: &[Rc<str>], d: &Decorator, f: &crate::syntax::ast::Field, o: &ObjectDecl, read: &[Rc<str>], pii: bool) {
+        // One person's data lives in their own object, and they see it: without "owner", the
+        // object is not theirs, and export and erasure would not find it.
+        if pii && !f.decorators.iter().any(|d| d.name == "by") && !rule.iter().any(|w| &**w == "owner") {
+            self.error(Diagnostic::new(format!("{} is one person's data, so its readers include \"owner\"", f.name), d.span).hint("@read(\"owner\", ...) in an object whose id is the person's; for several people's entries in one object, use a @by list"));
+        }
         for (w, a) in rule.iter().zip(&d.args) {
             let reaches = read.iter().any(|r| &**r == "anyone" || &**r == "signedIn" && &**w != "anyone" || r == w);
             if &**w == "self" && !matches!(&f.ty, Some(TypeExpr::Named(n, _)) if n == "string") {

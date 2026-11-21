@@ -70,8 +70,10 @@ type Booker = { customer: string, name: string, at: number }
   purpose. `@pii("contact", "booking") @read("owner", "staff") phone` shows staff the
   customer's current phone, so a booking points to the customer instead of copying their
   details (a copy goes stale when they change them). Each word must be a reader the
-  object's rule admits, and `"anyone"` is refused on personal data. `tj check --privacy`
-  prints who sees each field.
+  object's rule admits, and `"anyone"` is refused on personal data. The readers include
+  `"owner"`, and a purpose that rests on consent cannot add readers (use `reveal` where the
+  consent is checked). `tj check --privacy` prints who sees each field, and `--record` lists
+  them where the data is let out.
 - **Every tool** sees `•••`: `/_tj/inspect`, `tj review`, the MCP tools, and admin reads.
 - Server code, the object's own methods and other objects' methods, sees the values. What
   it does with them is the app's code.
