@@ -108,8 +108,9 @@ starts_left add draft
 xcrun simctl terminate "$udid" "$bundle"
 
 echo "== chat: @server objects against tj serve"
-rm -rf "$out/chat-data"
-"$tj" serve examples/chat/app.tj --data "$out/chat-data" &
+rm -rf "$out/chat-data" "$out/chat-keys"
+key=$("$tj" key sam --keys "$out/chat-keys" --role staff | tail -n 1)
+TJ_KEYS="$out/chat-keys" "$tj" serve examples/chat/app.tj --data "$out/chat-data" &
 server=$!
 trap 'kill $server 2>/dev/null || true' EXIT
 xcrun simctl launch "$udid" "$bundle" -example chat -server http://127.0.0.1:4700
@@ -125,10 +126,11 @@ curl -sf "$api/_tj/screenshot" -o "$out/chat.png"
 starts_left draft send
 xcrun simctl terminate "$udid" "$bundle"
 
-echo "== chat, right to left"
-xcrun simctl launch "$udid" "$bundle" -example chat -server http://127.0.0.1:4700 -dir rtl
+echo "== chat, right to left, signed in: the host passes the server's roles to the UI"
+xcrun simctl launch "$udid" "$bundle" -example chat -server http://127.0.0.1:4700 -dir rtl -key "$key"
 wait_up
 expect "$api/_tj/inspect" 'hi phone'
+expect "$api/_tj/inspect" 'Signed in as key:sam (staff)'
 curl -sf "$api/_tj/screenshot" -o "$out/chat-rtl.png"
 "$tj" review --target "$api"
 starts_left send draft

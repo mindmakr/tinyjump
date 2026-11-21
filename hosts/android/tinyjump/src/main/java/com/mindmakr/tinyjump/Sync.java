@@ -37,8 +37,9 @@ final class Sync {
     private volatile boolean stopped;
     /** Sent as `Authorization: Bearer` (docs/access-control.md); null when signed out. */
     private volatile String token;
-    /** The signed-in user's id. Main thread only. */
+    /** The signed-in user's id and roles. Main thread only. */
     private String user;
+    private List<String> roles = Collections.emptyList();
     /** Told when the server answers 401, so the embedding app can refresh the token. */
     volatile Runnable onTokenExpired;
 
@@ -71,13 +72,14 @@ final class Sync {
     }
 
     /**
-     * Sets the token; returns true if the user changed, in which case replicas start over
-     * (the runtime drops what the previous user queued, and resubscribes).
+     * Sets the token; returns true if the user or their roles changed, in which case replicas
+     * start over (the runtime drops what the previous user queued, and resubscribes).
      */
-    boolean setToken(String newToken, String newUser) {
+    boolean setToken(String newToken, String newUser, List<String> newRoles) {
         token = newToken;
-        boolean changed = newUser == null ? user != null : !newUser.equals(user);
+        boolean changed = (newUser == null ? user != null : !newUser.equals(user)) || !newRoles.equals(roles);
         user = newUser;
+        roles = newRoles;
         if (changed) {
             replicas.clear();
             generation++;

@@ -3,19 +3,26 @@ package com.mindmakr.tinyjump.demo;
 import android.app.Activity;
 import android.content.pm.ApplicationInfo;
 import android.os.Bundle;
+import android.util.Log;
 import android.view.View;
 import android.widget.FrameLayout;
 import com.mindmakr.tinyjump.TinyJump;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 
 /**
  * Runs one of the repo's example apps. Launch extras: {@code example} (default "todo"),
- * {@code dir} ("rtl" or "ltr", overriding the locale) and {@code server} (a `tj serve`/`tj dev` URL for @server objects, e.g. http://10.0.2.2:4700).
+ * {@code dir} ("rtl" or "ltr", overriding the locale), {@code server} (a `tj serve`/`tj dev` URL for @server objects, e.g. http://10.0.2.2:4700)
+ * and {@code key} (an API key from `tj key`: the demo signs in with it, as an app would with its own sign-in).
  * Debug builds serve automation on port 4701.
  */
 public final class MainActivity extends Activity {
@@ -34,8 +41,34 @@ public final class MainActivity extends Activity {
         setContentView(root);
         String example = getIntent().getStringExtra("example");
         String source = source(example == null ? "todo" : example);
-        app = TinyJump.start(this, root, source, getIntent().getStringExtra("server"));
+        String server = getIntent().getStringExtra("server");
+        app = TinyJump.start(this, root, source, server);
         if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) app.enableAutomation(AUTOMATION_PORT);
+        String key = getIntent().getStringExtra("key");
+        if (server != null && key != null) signIn(server, key);
+    }
+
+    /** Asks the server who the key belongs to (`GET /api/whoami`), then hands it to the runtime. */
+    private void signIn(String server, String key) {
+        new Thread(() -> {
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL(server.replaceAll("/+$", "") + "/api/whoami").openConnection();
+                c.setRequestProperty("Authorization", "Bearer " + key);
+                JSONObject me;
+                try (InputStream in = c.getInputStream()) {
+                    me = new JSONObject(read(in)).getJSONObject("ok");
+                } finally {
+                    c.disconnect();
+                }
+                String id = me.getString("id");
+                List<String> roles = new ArrayList<>();
+                JSONArray r = me.getJSONArray("roles");
+                for (int i = 0; i < r.length(); i++) roles.add(r.getString(i));
+                runOnUiThread(() -> { if (app != null) app.setToken(key, id, roles); });
+            } catch (IOException | JSONException e) {
+                Log.w("tinyjump-demo", "sign-in failed: " + e);
+            }
+        }).start();
     }
 
     @Override
@@ -80,12 +113,16 @@ public final class MainActivity extends Activity {
 
     private String asset(String name) {
         try (InputStream in = getAssets().open(name)) {
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] buf = new byte[8192];
-            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
-            return out.toString("UTF-8");
+            return read(in);
         } catch (IOException e) {
             throw new IllegalStateException("missing asset " + name, e);
         }
+    }
+
+    private static String read(InputStream in) throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);
+        return out.toString("UTF-8");
     }
 }

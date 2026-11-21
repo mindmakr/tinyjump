@@ -18,6 +18,7 @@ final class Sync: NSObject, URLSessionDataDelegate {
     /// Sent as `Authorization: Bearer` (docs/access-control.md); nil when signed out.
     private var token: String?
     private var user: String?
+    private var roles: [String] = []
     /// Called when the server answers 401, so the embedding app can refresh the token.
     var onTokenExpired: (() -> Void)?
 
@@ -104,12 +105,13 @@ final class Sync: NSObject, URLSessionDataDelegate {
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 
-    /// Sets the token; returns true if the user changed, in which case replicas start over (the
-    /// runtime drops what the previous user queued, and resubscribes).
-    func setToken(_ newToken: String?, user newUser: String?) -> Bool {
+    /// Sets the token; returns true if the user or their roles changed, in which case replicas
+    /// start over (the runtime drops what the previous user queued, and resubscribes).
+    func setToken(_ newToken: String?, user newUser: String?, roles newRoles: [String]) -> Bool {
         token = newToken
-        let changed = newUser != user
+        let changed = newUser != user || newRoles != roles
         user = newUser
+        roles = newRoles
         if changed {
             replicas = [:]
             cursor = 0

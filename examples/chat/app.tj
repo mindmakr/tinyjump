@@ -51,6 +51,7 @@ function App() {
 
   return <Column padding={24} gap={12}>
     <Text size={24} weight="bold">Lobby</Text>
+    {caller.id !== "" && <Text id="signed-in" color="#999">{caller.roles.length > 0 ? `Signed in as ${caller.id} (${caller.roles.join(", ")})` : `Signed in as ${caller.id}`}</Text>}
     <Input id="name" value={me.name} placeholder="Your name" onChange={(t) => me.setName(t)} />
     <Scroll height={280} gap={6}>
       {room.messages.map((m, i) => <Row key={i} gap={8}>
