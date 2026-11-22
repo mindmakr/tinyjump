@@ -13,9 +13,8 @@ fn words(d: &Decorator) -> String {
 /// Parameter names that suggest identity is being taken from the caller's arguments.
 const IDENTITY_NAMES: &[&str] = &["author", "by", "user", "userId", "owner", "who"];
 
-/// The access table of a compiled app (`source` is its bundle).
-pub fn report(source: &str) -> String {
-    let mut table = String::new();
+/// Access warnings for likely mistakes (shared by `tj check --access` and `--manifest`).
+pub fn warnings(source: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     for f in modules::files(source) {
         let Ok(program) = parse_range(source, f.start, f.end) else { continue };
@@ -23,26 +22,12 @@ pub fn report(source: &str) -> String {
             let Item::Object(o) = item else { continue };
             let server = o.decorators.iter().any(|d| d.name == "server");
             let read = o.decorators.iter().find(|d| d.name == "read").map(words);
-            let where_ = if server { "@server object" } else { "object" };
-            table.push_str(&format!("{where_} {}  read: {}\n", o.name, read.as_deref().unwrap_or("not remote")));
             if server && read.is_none() {
                 warnings.push(format!("@server object {} has no @read rule: only server code can read it, and devices cannot hold replicas (right for private data)", o.name));
-            }
-            for f in &o.fields {
-                if let Some(rule) = f.decorators.iter().find(|d| d.name == "read").map(words) {
-                    table.push_str(&format!("  .{}  read: {rule}
-", f.name));
-                }
             }
             for m in &o.methods {
                 let name = &m.func.name;
                 let allow = m.decorators.iter().find(|d| d.name == "allow").map(words);
-                let call = match (&allow, m.private) {
-                    (_, true) => "private".to_string(),
-                    (Some(a), _) => a.clone(),
-                    (None, _) => "not remote".to_string(),
-                };
-                table.push_str(&format!("  {name}  call: {call}\n"));
                 if allow.as_deref().is_some_and(|a| a.split(", ").any(|w| w == "anyone")) {
                     for p in &m.func.params {
                         if let Pattern::Ident(param, _) = &p.pattern {
@@ -55,10 +40,41 @@ pub fn report(source: &str) -> String {
             }
         }
     }
+    warnings
+}
+
+/// The access table of a compiled app (`source` is its bundle).
+pub fn report(source: &str) -> String {
+    let mut table = String::new();
+    for f in modules::files(source) {
+        let Ok(program) = parse_range(source, f.start, f.end) else { continue };
+        for item in &program.items {
+            let Item::Object(o) = item else { continue };
+            let server = o.decorators.iter().any(|d| d.name == "server");
+            let read = o.decorators.iter().find(|d| d.name == "read").map(words);
+            let where_ = if server { "@server object" } else { "object" };
+            table.push_str(&format!("{where_} {}  read: {}\n", o.name, read.as_deref().unwrap_or("not remote")));
+            for f in &o.fields {
+                if let Some(rule) = f.decorators.iter().find(|d| d.name == "read").map(words) {
+                    table.push_str(&format!("  .{}  read: {rule}\n", f.name));
+                }
+            }
+            for m in &o.methods {
+                let name = &m.func.name;
+                let allow = m.decorators.iter().find(|d| d.name == "allow").map(words);
+                let call = match (&allow, m.private) {
+                    (_, true) => "private".to_string(),
+                    (Some(a), _) => a.clone(),
+                    (None, _) => "not remote".to_string(),
+                };
+                table.push_str(&format!("  {name}  call: {call}\n"));
+            }
+        }
+    }
     if table.is_empty() {
         table.push_str("no objects\n");
     }
-    for w in warnings {
+    for w in warnings(source) {
         table.push_str(&format!("warning: {w}\n"));
     }
     table

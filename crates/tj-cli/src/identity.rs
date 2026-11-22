@@ -10,6 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::auth::OpsScope;
 use crate::bytes::{hex, random};
 use tj_core::runtime::protocol::Caller;
 
@@ -22,7 +23,7 @@ const LEEWAY_S: u64 = 60;
 /// A token naming an unknown key refetches the provider's keys, at most this often.
 const REFETCH_EVERY: Duration = Duration::from_secs(60);
 const MAX_DOCUMENT: u64 = 1 << 20;
-const KEY_PREFIX: &str = "tjk_";
+pub const KEY_PREFIX: &str = "tjk_";
 const RELOAD_EVERY: Duration = Duration::from_secs(30);
 /// Words that rules use, which no credential may claim as a role.
 const NOT_ROLES: &[&str] = &["system", "anyone", "signedIn", "owner"];
@@ -31,6 +32,7 @@ const NOT_ROLES: &[&str] = &["system", "anyone", "signedIn", "owner"];
 struct Key {
     name: String,
     roles: Vec<String>,
+    ops: Option<OpsScope>,
     sha256: String,
 }
 
@@ -172,7 +174,7 @@ pub fn sha256_hex(text: &str) -> String {
 
 
 fn clean_roles(roles: Vec<String>) -> Vec<String> {
-    roles.into_iter().filter(|r| !NOT_ROLES.contains(&r.as_str())).collect()
+    roles.into_iter().filter(|r| !NOT_ROLES.contains(&r.as_str()) && !r.starts_with("ops:")).collect()
 }
 
 fn read_keys(path: &Path) -> Result<Vec<Key>, String> {
@@ -182,7 +184,12 @@ fn read_keys(path: &Path) -> Result<Vec<Key>, String> {
     for k in list.as_array().ok_or(format!("keys file {} must be a JSON array", path.display()))? {
         let field = |f: &str| k[f].as_str().map(str::to_string).ok_or(format!("a key in {} has no \"{f}\"", path.display()));
         let roles = k["roles"].as_array().map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()).unwrap_or_default();
-        keys.push(Key { name: field("name")?, roles: clean_roles(roles), sha256: field("sha256")?.to_lowercase() });
+        let ops = match k.get("ops") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(s)) => Some(OpsScope::parse(s).map_err(|e| format!("in {}: {e}", path.display()))?),
+            Some(_) => return Err(format!("in {}: \"ops\" must be \"observe\", \"test\" or \"maintain\"", path.display())),
+        };
+        keys.push(Key { name: field("name")?, roles: clean_roles(roles), ops, sha256: field("sha256")?.to_lowercase() });
     }
     Ok(keys)
 }
@@ -212,6 +219,21 @@ impl Identity {
             _ => None,
         };
         Ok(Identity { oidc, keys, dev_as })
+    }
+
+    #[cfg(test)]
+    pub fn anonymous() -> Identity {
+        Identity { oidc: None, keys: None, dev_as: None }
+    }
+
+    #[cfg(test)]
+    pub fn from_key_file(path: &Path) -> Result<Identity, String> {
+        let keys = read_keys(path)?;
+        Ok(Identity { oidc: None, keys: Some(Mutex::new(KeyFile { path: path.to_path_buf(), keys, loaded: Some(Instant::now()) })), dev_as: None })
+    }
+
+    pub fn has_keys(&self) -> bool {
+        self.keys.is_some()
     }
 
     pub fn describe(&self) -> String {
@@ -250,7 +272,14 @@ impl Identity {
         }
     }
 
-    fn api_key(&self, key: &str) -> Option<Verified> {
+    /// Looks up a `tjk_...` API key in `TJ_KEYS` and returns its name and operational scope
+    /// (`Ok(None)` when the key is valid but has no `--ops` scope; `Err(401)` when unknown).
+    pub fn verify_ops_key(&self, key: &str) -> Result<Option<(String, OpsScope)>, (u16, String)> {
+        let k = self.lookup_key(key).ok_or((401, "unknown or revoked API key".into()))?;
+        Ok(k.ops.map(|scope| (k.name, scope)))
+    }
+
+    fn lookup_key(&self, key: &str) -> Option<Key> {
         let mut file = self.keys.as_ref()?.lock().ok()?;
         if file.loaded.map_or(true, |t| t.elapsed() >= RELOAD_EVERY) {
             match read_keys(&file.path) {
@@ -260,8 +289,12 @@ impl Identity {
             file.loaded = Some(Instant::now());
         }
         let hash = sha256_hex(key);
-        let k = file.keys.iter().find(|k| k.sha256 == hash)?;
-        Some(Verified { caller: Caller::Remote { id: format!("key:{}", k.name), roles: k.roles.clone() }, expires: None })
+        file.keys.iter().find(|k| k.sha256 == hash).cloned()
+    }
+
+    fn api_key(&self, key: &str) -> Option<Verified> {
+        let k = self.lookup_key(key)?;
+        Some(Verified { caller: Caller::Remote { id: format!("key:{}", k.name), roles: k.roles }, expires: None })
     }
 }
 
@@ -275,8 +308,9 @@ fn parse_as(spec: &str) -> Result<Caller, String> {
     Ok(Caller::Remote { id: format!("dev:{name}"), roles })
 }
 
-/// `tj key new <name> --role r --keys file`: makes a key, prints it once, stores its hash.
-pub fn new_key(name: &str, roles: &[String], file: &Path) -> Result<String, String> {
+/// `tj key <name> --keys file [--role r]... [--ops observe|test|maintain]`: makes a key,
+/// prints it once, stores its hash.
+pub fn new_key(name: &str, roles: &[String], ops: Option<OpsScope>, file: &Path) -> Result<String, String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(format!("a key name is letters, digits, - and _, got {name:?}"));
     }
@@ -288,7 +322,11 @@ pub fn new_key(name: &str, roles: &[String], file: &Path) -> Result<String, Stri
         return Err(format!("{} already has a key named {name}; remove its line to revoke it first", file.display()));
     }
     let key = format!("{KEY_PREFIX}{}", hex(&random::<32>()?));
-    list.push(json!({ "name": name, "roles": clean_roles(roles.to_vec()), "sha256": sha256_hex(&key) }));
+    let mut entry = json!({ "name": name, "roles": clean_roles(roles.to_vec()), "sha256": sha256_hex(&key) });
+    if let Some(scope) = ops {
+        entry["ops"] = json!(scope.as_str());
+    }
+    list.push(entry);
     let text = serde_json::to_string_pretty(&list).expect("JSON serializes");
     std::fs::write(file, text + "\n").map_err(|e| format!("cannot write {}: {e}", file.display()))?;
     Ok(key)
@@ -310,13 +348,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tj-keys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
         let file = dir.join("keys.json");
-        let key = new_key("sync", &["staff".into(), "system".into()], &file).expect("made");
+        let key = new_key("sync", &["staff".into(), "system".into(), "ops:maintain".into()], None, &file).expect("made");
         assert!(key.starts_with("tjk_") && key.len() == 68);
         assert!(!std::fs::read_to_string(&file).unwrap().contains(&key), "only the hash is stored");
-        assert!(new_key("sync", &[], &file).is_err(), "names are unique");
+        assert!(new_key("sync", &[], None, &file).is_err(), "names are unique");
+        let ops_key = new_key("critic", &[], Some(OpsScope::Observe), &file).expect("ops key");
 
         let id = Identity { oidc: None, keys: Some(Mutex::new(KeyFile { path: file.clone(), keys: read_keys(&file).unwrap(), loaded: Some(Instant::now()) })), dev_as: None };
-        assert_eq!(remote(id.verify(Some(&format!("Bearer {key}"))).ok().unwrap()), ("key:sync".into(), vec!["staff".into()]), "system cannot be granted");
+        assert_eq!(remote(id.verify(Some(&format!("Bearer {key}"))).ok().unwrap()), ("key:sync".into(), vec!["staff".into()]), "system and ops:* cannot be granted as roles");
+        assert_eq!(id.verify_ops_key(&key).unwrap(), None, "plain API key has no ops scope");
+        assert_eq!(id.verify_ops_key(&ops_key).unwrap(), Some(("critic".into(), OpsScope::Observe)));
         assert_eq!(id.verify(Some("Bearer tjk_nope")).err().unwrap().0, 401);
         assert_eq!(id.verify(Some("Bearer eyJhbGciOi")).err().unwrap().0, 401, "a bad credential never becomes anonymous");
         assert_eq!(remote(id.verify(None).ok().unwrap()), (String::new(), vec![]));

@@ -4,6 +4,7 @@
 use crate::audit::{Actor, Audit, Entry};
 use crate::identity::sha256_hex;
 use crate::mailbox::{Event, Mailbox};
+use crate::manifest::Manifest;
 use crate::plugins::Plugins;
 use crate::stats::Stats;
 use serde_json::{json, Value as Json};
@@ -51,6 +52,8 @@ enum Msg {
 pub struct Engine {
     tx: Sender<Msg>,
     stats: Arc<Stats>,
+    manifest: Arc<Mutex<Manifest>>,
+    max_objects: usize,
 }
 
 pub fn now_ms() -> f64 {
@@ -59,8 +62,9 @@ pub fn now_ms() -> f64 {
 
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
-fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runtime, Vec<Output>), String> {
+fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<(Runtime, Vec<Output>, Manifest, usize), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
+    let manifest = Manifest::build(source, &program, configured_plugins);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
     let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
     let (store, _) = crate::sealed::open_store(data, &personal)?;
@@ -70,7 +74,7 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool) -> Result<(Runti
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
-    Ok((rt, out))
+    Ok((rt, out, manifest, max_objects))
 }
 
 impl Engine {
@@ -81,21 +85,36 @@ impl Engine {
         let back = tx.clone();
         let stats = Arc::new(Stats::default());
         let measured = stats.clone();
+        let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
+        let shared_slot: Arc<Mutex<Option<Arc<Mutex<Manifest>>>>> = Arc::new(Mutex::new(None));
+        let shared_ref = shared_slot.clone();
         thread::Builder::new()
             .name("tj-runtime".into())
-            .spawn(move || match boot(&source, &data, render, explain) {
-                Ok((rt, out)) => {
-                    let _ = ready_tx.send(Ok(()));
-                    audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                    run(rt, out, rx, back, data, render, explain, plugins, measured, audit);
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
+            .spawn(move || {
+                let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
+                match boot(&source, &data, render, explain, &refs) {
+                    Ok((rt, out, manifest, max_objects)) => {
+                        let shared = Arc::new(Mutex::new(manifest));
+                        if let Ok(mut r) = shared_ref.lock() {
+                            *r = Some(shared.clone());
+                        }
+                        let _ = ready_tx.send(Ok(max_objects));
+                        audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared);
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;
-        ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
-        Ok(Engine { tx, stats })
+        let max_objects = ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
+        let manifest = shared_slot
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
+        Ok(Engine { tx, stats, manifest, max_objects })
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -176,6 +195,14 @@ impl Engine {
         &self.stats
     }
 
+    /// The app's canonical manifest enriched with live health counters and active leases.
+    pub fn manifest(&self, dev: bool, audit_dropped: u64, leases: Vec<Json>) -> Result<Json, Failure> {
+        let core = self.core_stats()?;
+        let health = self.stats.health(&core, dev, self.max_objects, audit_dropped, leases.len());
+        let manifest = self.manifest.lock().map_err(|_| (500, "manifest unavailable".to_string()))?;
+        Ok(manifest.with_live(health, Json::Array(leases)))
+    }
+
     /// Re-boots with new source. Objects keep their stored state.
     pub fn reload(&self, source: String) {
         let _ = self.tx.send(Msg::Reload(source));
@@ -225,9 +252,10 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<Vec<Str
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit) {
+fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, manifest: Arc<Mutex<Manifest>>) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
     let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new() };
     d.outputs(&mut rt, boot_out);
@@ -316,20 +344,26 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                 d.subscribers.push(events);
                 continue;
             }
-            Ok(Msg::Reload(source)) => match boot(&source, &data, render, explain) {
-                Ok((new_rt, out)) => {
-                    rt = new_rt;
-                    d.audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                    // Requests waiting on the old runtime get a "restarted" error.
-                    d.replies.clear();
-                    eprintln!("[tj] reloaded");
-                    out
+            Ok(Msg::Reload(source)) => {
+                let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
+                match boot(&source, &data, render, explain, &refs) {
+                    Ok((new_rt, out, new_manifest, _)) => {
+                        rt = new_rt;
+                        if let Ok(mut m) = manifest.lock() {
+                            *m = new_manifest;
+                        }
+                        d.audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
+                        // Requests waiting on the old runtime get a "restarted" error.
+                        d.replies.clear();
+                        eprintln!("[tj] reloaded");
+                        out
+                    }
+                    Err(e) => {
+                        eprintln!("[tj] reload failed, keeping the running version:\n{e}");
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    eprintln!("[tj] reload failed, keeping the running version:\n{e}");
-                    continue;
-                }
-            },
+            }
             Err(RecvTimeoutError::Timeout) => rt.handle(now_ms(), Input::Tick),
             Err(RecvTimeoutError::Disconnected) => return,
         };

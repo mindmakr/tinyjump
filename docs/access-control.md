@@ -65,10 +65,25 @@ never share one:
 - A credential that is present but invalid or expired gets `401`, so clients know to refresh
   it; it never falls back to anonymous.
 - `system` is reserved: no credential can produce the id `system` or the role `system`.
-  Rule words (`anyone`, `signedIn`, `owner`) cannot be role names either.
+  Rule words (`anyone`, `signedIn`, `owner`) and `ops:*` cannot be role names either.
 
-The admin key (`TJ_ADMIN_KEY`) guards the automation endpoints only (`/_tj/*`). Automation
-is trusted and bypasses the rules, because it exists to test and drive the app.
+**Operational keys (`--ops`)** guard `/_tj/*` with least privilege instead of sharing one
+admin key. Make them in the same `TJ_KEYS` file with `tj key <name> --keys keys.json --ops <scope>`:
+
+- **`observe`** (critics, monitors, dashboards): `GET /_tj/manifest`, `/_tj/metrics`,
+  `/_tj/inspect` (`@pii` masked), `/_tj/leases` and acquiring/releasing own `observe`
+  leases. Zero writes and zero privacy access.
+- **`test`** (testers): everything in `observe`, plus `POST /_tj/input` **only** on `tj dev`
+  (refused with `403` on a live `tj serve` store), plus own `observe`/`test` leases.
+- **`maintain`** (maintainers, operators): everything, including `POST /_tj/input`,
+  `POST /_tj/privacy` (`export` and `erase`), unfiltered `/api/events`, and force-releasing
+  any lease.
+
+Each operational key is audited under its own name (`ops:<name>`), can be revoked by
+removing its line from `TJ_KEYS`, and works on `tj serve` even when `TJ_ADMIN_KEY` is unset.
+CLI tools (`tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`) send `TJ_OPS_KEY`
+when set, falling back to `TJ_ADMIN_KEY`. The legacy admin key (`TJ_ADMIN_KEY`) remains
+supported as full `maintain` access (`who: "admin"`).
 
 **`tj dev`** accepts the same credentials. It also takes `--as <name>:<role,role>`, an
 identity applied to requests that carry none, so you can try an app as a given user. Its id
@@ -209,7 +224,7 @@ method and a hash of the arguments.
 | `GET /api/{Class}/{id}` | object `@read` |
 | `GET /api/events?object=…` | `@read` for the listed objects: those refused are named in a `refused` event, left out, and written to the audit log as a refusal. `Class/*` streams the whole class, catching up with the 1000 objects changed most recently; an `"owner"` rule grants it to nobody, as no one owns every object. A malformed `object=` is `400`. Without any `object=`, a stream of every object needs the admin key |
 | Device server calls (outbox) | the same as the first row; devices send their token |
-| `/_tj/*` | the admin key; trusted, rules bypassed |
+| `/_tj/*` | scoped `--ops` key in `TJ_KEYS` (`observe` / `test` / `maintain`) or `TJ_ADMIN_KEY`; audited as `ops:<name>` or `admin` |
 
 - **The rules live in the core.** They are compiled into the program and checked by the
   core runtime, so every host and every path uses the same code.
@@ -265,13 +280,19 @@ can come later, as a plugin.
 
 ## Tooling
 
+- `tj check --manifest [--json] app.tj` prints the canonical app contract: code hash,
+  files, objects, field types, `@read`/`@allow` rules, `@pii`/retention/holds, methods,
+  plugins, outbound transfers and access warnings. Live servers serve the same contract
+  plus aggregate health counters and active work leases at `GET /_tj/manifest`.
 - `tj check --access app.tj` prints every object with its read rule and every method with
   its call rule, marking server-only ones. It warns about:
   - `@server` objects without `@read` (devices cannot hold replicas of them);
   - `@allow("anyone")` methods that take a parameter named like an identity (`author`,
     `by`, `user`).
-- `tj key` makes API keys (above).
-- `tj mcp` and `tj review` keep using the admin key.
+- `tj key` makes API keys and scoped `--ops` keys (above).
+- `tj lease list|acquire|release` manages operational work leases on `/_tj/leases`.
+- `tj mcp`, `tj review`, `tj stats`, `tj lease` and `tj privacy` send `TJ_OPS_KEY` when
+  set, or `TJ_ADMIN_KEY`.
 
 ## Later
 

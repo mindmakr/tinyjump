@@ -39,6 +39,7 @@ fn tools() -> Json {
     let none = json!({ "type": "object", "properties": {} });
     json!([
         { "name": "language", "description": "The tinyjump language reference: everything that differs from TypeScript and React, the UI components and the built-ins. Load it before writing or changing app code.", "inputSchema": none },
+        { "name": "manifest", "description": "The app's canonical contract (code hash, files, objects, fields, access rules, personal data, plugins, warnings) plus live server health and active work leases.", "inputSchema": none },
         { "name": "inspect", "description": "The app's screen as an outline ([node] kind \"text\" #id @x,y wxh on:events), plus object state and work counters.", "inputSchema": none },
         { "name": "act", "description": "Fire a UI event like a person would: press a button, type into an input, flip a toggle.",
           "inputSchema": { "type": "object", "required": ["target", "event"], "properties": {
@@ -102,6 +103,7 @@ impl Client {
         let text = |s: String| Ok(json!([{ "type": "text", "text": s }]));
         match name {
             "language" => text(crate::LANGUAGE.to_string()),
+            "manifest" => text(serde_json::to_string_pretty(&self.manifest()?).unwrap_or_default()),
             "inspect" => {
                 let s = self.inspect()?;
                 let objects = serde_json::to_string_pretty(&s["objects"]).unwrap_or_default();
@@ -171,6 +173,10 @@ impl Client {
         self.result(self.request("GET", "/_tj/inspect").call())
     }
 
+    fn manifest(&self) -> Result<Json, String> {
+        self.result(self.request("GET", "/_tj/manifest").call())
+    }
+
     fn input(&self, input: &Json) -> Result<Json, String> {
         self.result(self.request("POST", "/_tj/input").set("Content-Type", "application/json").send_string(&input.to_string()))
     }
@@ -205,7 +211,7 @@ mod tests {
         let init = c.handle("initialize", &json!({ "protocolVersion": "2025-06-18" })).unwrap();
         assert_eq!(init["capabilities"]["tools"], json!({}));
         let names: Vec<String> = c.handle("tools/list", &json!({})).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["language", "inspect", "act", "call", "get", "screenshot", "review", "input"]);
+        assert_eq!(names, ["language", "manifest", "inspect", "act", "call", "get", "screenshot", "review", "input"]);
         // The language reference works without an app: agents load it before writing code.
         let docs = c.handle("tools/call", &json!({ "name": "language", "arguments": {} })).unwrap();
         assert!(docs["content"][0]["text"].as_str().unwrap().starts_with("# The tinyjump language"));
