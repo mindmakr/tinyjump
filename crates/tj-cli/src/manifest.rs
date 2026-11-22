@@ -10,11 +10,11 @@ use crate::access;
 use crate::identity::sha256_hex;
 use crate::privacy;
 use serde_json::{json, Map, Value as Json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tj_core::modules;
 use tj_core::syntax::ast::{Decorator, ExprKind, Item, TypeExpr};
 use tj_core::syntax::parse_range;
-use tj_core::vm::program::{ObjectDef, Program, SPECIAL_CATEGORIES};
+use tj_core::vm::program::{ArgTy, ObjectDef, Program, SPECIAL_CATEGORIES};
 
 #[derive(Clone)]
 pub struct Manifest {
@@ -35,6 +35,7 @@ impl Manifest {
         let mut ast_objects: HashMap<String, AstObject> = HashMap::new();
         let mut imported_plugins: BTreeSet<String> = BTreeSet::new();
 
+        let canon_types = canonical_field_types(source);
         for f in modules::files(source) {
             let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
             for imp in &parsed.imports {
@@ -44,7 +45,11 @@ impl Manifest {
             }
             for item in &parsed.items {
                 let Item::Object(o) = item else { continue };
-                let field_types = o.fields.iter().filter_map(|fl| fl.ty.as_ref().map(|t| (fl.name.clone(), format_type(t)))).collect();
+                let field_types = o
+                    .fields
+                    .iter()
+                    .filter_map(|fl| canon_types.get(&(o.name.clone(), fl.name.clone())).map(|t| (fl.name.clone(), t.clone())))
+                    .collect();
                 let mut method_needs = HashMap::new();
                 for m in &o.methods {
                     let needs = decorator_strings(&m.decorators, "needs");
@@ -283,7 +288,7 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
             let params: Vec<Json> = m
                 .params
                 .iter()
-                .map(|(p, opt, ty)| json!({ "name": &**p, "optional": opt, "type": ty.describe() }))
+                .map(|(p, opt, ty)| json!({ "name": &**p, "optional": opt, "type": ty.describe(), "schema": arg_ty_to_json(ty) }))
                 .collect();
             obj.insert("params".into(), json!(params));
             Json::Object(obj)
@@ -309,28 +314,151 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
     Json::Object(obj)
 }
 
+/// Resolves local `type Foo = ...` aliases, infers literal default field types (`qty = 0`),
+/// and canonicalizes unions and record field order so `Manifest` and `compat::Snapshot`
+/// always emit identical field type strings.
+pub fn canonical_field_types(source: &str) -> HashMap<(String, String), String> {
+    let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
+    let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
+    for f in modules::files(source) {
+        let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
+        for item in &parsed.items {
+            match item {
+                Item::TypeAlias { name, generics, ty, .. } if generics.is_empty() => {
+                    aliases.insert(name.clone(), ty.clone());
+                }
+                Item::Object(o) => {
+                    for fl in &o.fields {
+                        if let Some(ty) = &fl.ty {
+                            raw_fields.push((o.name.clone(), fl.name.clone(), ty.clone()));
+                        } else if let Some(init) = &fl.init {
+                            let inferred = match &init.kind {
+                                ExprKind::Num(_) => Some("number"),
+                                ExprKind::Str(_) | ExprKind::Template(_) => Some("string"),
+                                ExprKind::Bool(_) => Some("boolean"),
+                                _ => None,
+                            };
+                            if let Some(t) = inferred {
+                                raw_fields.push((o.name.clone(), fl.name.clone(), TypeExpr::Named(t.into(), Vec::new())));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    raw_fields
+        .into_iter()
+        .map(|(o, f, ty)| ((o, f), canon_type(&ty, &aliases, &mut HashSet::new())))
+        .collect()
+}
+
+fn canon_type(ty: &TypeExpr, aliases: &HashMap<String, TypeExpr>, seen: &mut HashSet<String>) -> String {
+    match ty {
+        TypeExpr::Named(n, args) if args.is_empty() => {
+            if let Some(target) = aliases.get(n) {
+                if seen.insert(n.clone()) {
+                    let s = canon_type(target, aliases, seen);
+                    seen.remove(n);
+                    return s;
+                }
+            }
+            n.clone()
+        }
+        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(|a| canon_type(a, aliases, seen)).collect::<Vec<_>>().join(", ")),
+        TypeExpr::Array(inner) => format!("{}[]", canon_type(inner, aliases, seen)),
+        TypeExpr::Union(ts) => {
+            let mut parts: Vec<String> = ts.iter().map(|t| canon_type(t, aliases, seen)).collect();
+            parts.sort();
+            parts.dedup();
+            parts.join(" | ")
+        }
+        TypeExpr::Record(fs) => {
+            let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
+            for (k, opt, t) in fs {
+                sorted.insert(k.as_str(), format!("{k}{}: {}", if *opt { "?" } else { "" }, canon_type(t, aliases, seen)));
+            }
+            format!("{{ {} }}", sorted.into_values().collect::<Vec<_>>().join(", "))
+        }
+        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(|p| canon_type(p, aliases, seen)).collect::<Vec<_>>().join(", "), canon_type(r, aliases, seen)),
+        TypeExpr::StrLit(s) => format!("{s:?}"),
+        TypeExpr::NumLit(n) => n.to_string(),
+    }
+}
+
+pub fn arg_ty_to_json(ty: &ArgTy) -> Json {
+    match ty {
+        ArgTy::Any => json!("any"),
+        ArgTy::Num => json!("number"),
+        ArgTy::Str => json!("string"),
+        ArgTy::Bool => json!("boolean"),
+        ArgTy::Null => json!("null"),
+        ArgTy::StrLit(s) => json!({ "lit": &**s }),
+        ArgTy::NumLit(n) => json!({ "num": n }),
+        ArgTy::BoolLit(b) => json!({ "bool": b }),
+        ArgTy::Arr(inner) => json!({ "arr": arg_ty_to_json(inner) }),
+        ArgTy::Dict(inner) => json!({ "dict": arg_ty_to_json(inner) }),
+        ArgTy::Rec(fields) => json!({
+            "rec": fields.iter().map(|(k, opt, t)| json!({ "name": &**k, "optional": opt, "ty": arg_ty_to_json(t) })).collect::<Vec<_>>()
+        }),
+        ArgTy::Union(ts) => json!({ "union": ts.iter().map(arg_ty_to_json).collect::<Vec<_>>() }),
+    }
+}
+
+pub fn arg_ty_from_json(v: &Json) -> Option<ArgTy> {
+    if let Some(s) = v.as_str() {
+        return match s {
+            "any" => Some(ArgTy::Any),
+            "number" => Some(ArgTy::Num),
+            "string" => Some(ArgTy::Str),
+            "boolean" => Some(ArgTy::Bool),
+            "null" => Some(ArgTy::Null),
+            _ => None,
+        };
+    }
+    let obj = v.as_object()?;
+    if let Some(s) = obj.get("lit").and_then(Json::as_str) {
+        return Some(ArgTy::StrLit(s.into()));
+    }
+    if let Some(n) = obj.get("num").and_then(Json::as_f64) {
+        return Some(ArgTy::NumLit(n));
+    }
+    if let Some(b) = obj.get("bool").and_then(Json::as_bool) {
+        return Some(ArgTy::BoolLit(b));
+    }
+    if let Some(a) = obj.get("arr") {
+        return Some(ArgTy::Arr(Box::new(arg_ty_from_json(a)?)));
+    }
+    if let Some(d) = obj.get("dict") {
+        return Some(ArgTy::Dict(Box::new(arg_ty_from_json(d)?)));
+    }
+    if let Some(fields) = obj.get("rec").and_then(Json::as_array) {
+        let mut out = Vec::with_capacity(fields.len());
+        for f in fields {
+            let name = f["name"].as_str()?;
+            let opt = f["optional"].as_bool().unwrap_or(false);
+            let ty = arg_ty_from_json(&f["ty"])?;
+            out.push((name.into(), opt, ty));
+        }
+        return Some(ArgTy::Rec(out.into()));
+    }
+    if let Some(ts) = obj.get("union").and_then(Json::as_array) {
+        let mut out = Vec::with_capacity(ts.len());
+        for t in ts {
+            out.push(arg_ty_from_json(t)?);
+        }
+        return Some(ArgTy::Union(out));
+    }
+    None
+}
+
 fn decorator_strings(decorators: &[Decorator], name: &str) -> Vec<String> {
     decorators
         .iter()
         .filter(|d| d.name == name)
         .flat_map(|d| d.args.iter().filter_map(|a| if let ExprKind::Str(s) = &a.kind { Some(s.clone()) } else { None }))
         .collect()
-}
-
-fn format_type(ty: &TypeExpr) -> String {
-    match ty {
-        TypeExpr::Named(n, args) if args.is_empty() => n.clone(),
-        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(format_type).collect::<Vec<_>>().join(", ")),
-        TypeExpr::Array(inner) => format!("{}[]", format_type(inner)),
-        TypeExpr::Union(ts) => ts.iter().map(format_type).collect::<Vec<_>>().join(" | "),
-        TypeExpr::Record(fs) => {
-            let parts: Vec<String> = fs.iter().map(|(k, opt, t)| format!("{k}{}: {}", if *opt { "?" } else { "" }, format_type(t))).collect();
-            format!("{{ {} }}", parts.join(", "))
-        }
-        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(format_type).collect::<Vec<_>>().join(", "), format_type(r)),
-        TypeExpr::StrLit(s) => format!("{s:?}"),
-        TypeExpr::NumLit(n) => n.to_string(),
-    }
 }
 
 fn str_list(v: &Json) -> Option<String> {

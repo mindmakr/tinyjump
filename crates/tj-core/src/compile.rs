@@ -154,6 +154,7 @@ struct FnCtx {
     loops: Vec<LoopCtx>,
     try_depth: usize,
     is_main: bool,
+    is_invariant: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -166,8 +167,8 @@ enum Var {
 #[derive(Clone, Copy)]
 enum FnKind<'a> {
     Plain,
-    /// A method, with the consents it needs (`@needs`).
-    Method(&'a [String]),
+    /// A method, with the consents it needs (`@needs`) and whether it is an `@invariant`.
+    Method(&'a [String], bool),
 }
 
 struct Compiler {
@@ -599,7 +600,7 @@ impl Compiler {
             if invariant && (allow.is_some() || every.is_some() || exclusive || !needs.is_empty()) {
                 self.error(Diagnostic::new("@invariant methods cannot also have @allow, @every, @exclusive or @needs", m.func.span).hint("invariants run automatically before saving and must be pure synchronous checks"));
             }
-            let proto = self.function(&m.func, FnKind::Method(&needs));
+            let proto = self.function(&m.func, FnKind::Method(&needs, invariant));
             let params = m.func.params.iter().map(|p| {
                 let name = match &p.pattern {
                     Pattern::Ident(n, _) => Rc::from(n.as_str()),
@@ -725,6 +726,7 @@ impl Compiler {
             loops: Vec::new(),
             try_depth: 0,
             is_main,
+            is_invariant: false,
         });
     }
 
@@ -736,7 +738,8 @@ impl Compiler {
 
     fn function(&mut self, f: &FnDecl, kind: FnKind) -> u32 {
         self.begin_fn(&f.name, nested_names(f), false);
-        if let FnKind::Method(needs) = kind {
+        if let FnKind::Method(needs, invariant) = kind {
+            self.cur().is_invariant = invariant;
             let (this, _) = self.declare_local("this", false, f.span);
             // Checked before anything else runs, on every path into the method.
             for purpose in needs {
@@ -1370,6 +1373,9 @@ impl Compiler {
                 self.emit(Op::Closure(p), sp);
             }
             ExprKind::Await(x) => {
+                if self.fns.iter().any(|f| f.is_invariant) {
+                    self.error(Diagnostic::new("@invariant methods cannot use `await`", sp).hint("invariants must be pure synchronous checks before saving"));
+                }
                 self.expr(x);
                 self.emit(Op::Await, sp);
             }

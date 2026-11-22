@@ -418,10 +418,13 @@ impl Runtime {
                                     let ok = self.settle(f, None, Ok(Run::Await(p)), mark);
                                     if ok {
                                         self.reply(reply, Ok(Json::Null));
-                                    } else {
-                                        // Invariant failed before suspending; surface the error to the UI caller too.
+                                    } else if reply.is_some() {
+                                        // Invariant failed before suspending; replace the trailing Output::Error with Output::Reply.
                                         let msg = match self.outputs.last() {
-                                            Some(Output::Error { message, .. }) => message.clone(),
+                                            Some(Output::Error { .. }) => match self.outputs.pop() {
+                                                Some(Output::Error { message, .. }) => message,
+                                                _ => unreachable!(),
+                                            },
                                             _ => "invariant failed".into(),
                                         };
                                         self.reply_status(reply, 422, msg);

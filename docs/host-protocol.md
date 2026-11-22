@@ -216,12 +216,13 @@ Bearer <key>`:
   hot-reloaded on revocation). `observe` can read `/_tj/manifest`, `/_tj/metrics`,
   `/_tj/inspect` (`@pii` masked) and `/_tj/leases`; `test` adds `/_tj/input` on `tj dev`
   only (refused on live `tj serve`); `maintain` adds `/_tj/input`, `/_tj/privacy`,
-  unfiltered `/api/events` and force-releasing any lease.
+  `/_tj/reload`, `/_tj/rollback`, unfiltered `/api/events` and force-releasing any lease.
 - **Admin key (`TJ_ADMIN_KEY`, 24+ characters):** grants full `maintain` access (audited as
   `admin`). Without either `TJ_ADMIN_KEY` or `TJ_KEYS`, automation is off (`403`).
-- `tj review`, `tj stats`, `tj mcp`, `tj lease` and `tj privacy` send `TJ_OPS_KEY` when
-  set, falling back to `TJ_ADMIN_KEY`. `tj dev` and debug builds of the Android and iOS
-  hosts stay open when no key is sent, because they are for your own machine.
+- `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`, `tj reload` and `tj rollback`
+  send `TJ_OPS_KEY` when set, falling back to `TJ_ADMIN_KEY`. `tj dev` and debug builds of
+  the Android and iOS hosts stay open when no key is sent, because they are for your own
+  machine.
 
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
@@ -269,6 +270,14 @@ Two tools build on this:
   is observing, testing or maintaining the app (`holder`, `role`, `scope`, `exclusive`,
   `expiresAt`). Exclusive leases (`maintain`) reject collisions (`409`) and expire
   automatically.
+- **`POST /_tj/reload` & `POST /_tj/rollback`** (`maintain` scope; CLI: `tj reload`, `tj rollback`)
+  perform validated, zero-data-loss live upgrades on `tj serve`: compile the candidate bundle,
+  check `--compliance` and schema/rule compatibility (`409` on breaking changes unless
+  `allowBreaking: true`), shadow-boot on a copy-on-write overlay (`OverlayStore`) over the
+  live store without mutating disk, verify every stored object's `@invariant` (`422` on
+  violation) and replay any inline `smokeTraces`, briefly drain in-flight calls, swap cleanly
+  keeping SSE streams connected, and arm a health watch window (`watchSecs`, `errorThreshold`)
+  that automatically rolls back on uncaught errors or `503`s.
 - **`/_tj/metrics`** on `tj serve` (`observe` scope) serves the statistics as OpenMetrics
   text, for Prometheus and Grafana. It is cheaper than `inspect`, and its labels are class,
   method and effect names only, never object ids, which can identify people.

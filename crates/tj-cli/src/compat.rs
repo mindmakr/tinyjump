@@ -4,12 +4,9 @@
 //! cannot silently drop stored fields, break queued device calls or accidentally widen
 //! security rules.
 
-use crate::manifest::Manifest;
+use crate::manifest::{arg_ty_from_json, canonical_field_types, Manifest};
 use serde_json::{json, Value as Json};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use tj_core::modules;
-use tj_core::syntax::ast::{Item, TypeExpr};
-use tj_core::syntax::parse_range;
+use std::collections::HashMap;
 use tj_core::vm::program::{ArgTy, Program};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -64,6 +61,45 @@ impl Snapshot {
         let field_types = canonical_field_types(source);
         Snapshot { manifest, method_params, field_types }
     }
+
+    /// Builds a snapshot directly from a saved or live `/_tj/manifest` JSON document
+    /// (unwrapping an outer `{"ok": ...}` envelope if present).
+    pub fn from_manifest_json(raw: Json) -> Result<Snapshot, String> {
+        let manifest = match raw.get("ok") {
+            Some(inner) if inner.is_object() => inner.clone(),
+            _ => raw,
+        };
+        let objs = manifest
+            .get("objects")
+            .and_then(Json::as_array)
+            .ok_or("manifest JSON must have an \"objects\" array")?;
+        let mut method_params = HashMap::new();
+        let mut field_types = HashMap::new();
+        for o in objs {
+            let Some(oname) = o["name"].as_str() else { continue };
+            for f in o["fields"].as_array().into_iter().flatten() {
+                if let (Some(fname), Some(ty)) = (f["name"].as_str(), f["type"].as_str()) {
+                    field_types.insert((oname.to_string(), fname.to_string()), ty.to_string());
+                }
+            }
+            for m in o["methods"].as_array().into_iter().flatten() {
+                let Some(mname) = m["name"].as_str() else { continue };
+                let params: Vec<ParamSpec> = m["params"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| {
+                        let pname = p["name"].as_str().unwrap_or("argument").to_string();
+                        let opt = p["optional"].as_bool().unwrap_or(false);
+                        let ty = p.get("schema").and_then(arg_ty_from_json).unwrap_or(ArgTy::Any);
+                        (pname, opt, ty)
+                    })
+                    .collect();
+                method_params.insert((oname.to_string(), mname.to_string()), params);
+            }
+        }
+        Ok(Snapshot { manifest, method_params, field_types })
+    }
 }
 
 /// Compares `new` against `old` and returns all breaking changes and warnings.
@@ -103,7 +139,7 @@ pub fn check_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Finding> {
             });
         }
 
-        // 2. Object-level `@read` widening.
+        // 2. Object-level `@read` widening and `belongsToPerson` loss.
         if rule_widened(&o["read"], &n["read"]) {
             out.push(Finding {
                 severity: Severity::Breaking,
@@ -111,6 +147,15 @@ pub fn check_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Finding> {
                 subject: (*name).to_string(),
                 message: format!("@read on {name} widened from {} to {}", fmt_rule(&o["read"]), fmt_rule(&n["read"])),
                 hint: "keep @read the same or narrower, or pass --allow-breaking if exposing more readers is intentional".into(),
+            });
+        }
+        if o["belongsToPerson"].as_bool() == Some(true) && n["belongsToPerson"].as_bool() != Some(true) {
+            out.push(Finding {
+                severity: Severity::Breaking,
+                code: "person-ownership-lost",
+                subject: (*name).to_string(),
+                message: format!("object {name} no longer belongs to a person (`belongsToPerson` became false), dropping its records from `tj privacy` export and erase"),
+                hint: "keep an \"owner\" rule or @pii field on this object, or pass --allow-breaking if migrating records intentionally".into(),
             });
         }
 
@@ -401,68 +446,6 @@ fn arg_ty_compatible(old: &ArgTy, new: &ArgTy) -> bool {
     }
 }
 
-/// Resolves local `type Foo = ...` aliases and canonicalizes unions/record field ordering so
-/// benign refactors (`type Cents = number` <-> `number`, `A | B` <-> `B | A`) are not flagged.
-fn canonical_field_types(source: &str) -> HashMap<(String, String), String> {
-    let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
-    let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
-    for f in modules::files(source) {
-        let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
-        for item in &parsed.items {
-            match item {
-                Item::TypeAlias { name, generics, ty, .. } if generics.is_empty() => {
-                    aliases.insert(name.clone(), ty.clone());
-                }
-                Item::Object(o) => {
-                    for fl in &o.fields {
-                        if let Some(ty) = &fl.ty {
-                            raw_fields.push((o.name.clone(), fl.name.clone(), ty.clone()));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    raw_fields
-        .into_iter()
-        .map(|(o, f, ty)| ((o, f), canon_type(&ty, &aliases, &mut HashSet::new())))
-        .collect()
-}
-
-fn canon_type(ty: &TypeExpr, aliases: &HashMap<String, TypeExpr>, seen: &mut HashSet<String>) -> String {
-    match ty {
-        TypeExpr::Named(n, args) if args.is_empty() => {
-            if let Some(target) = aliases.get(n) {
-                if seen.insert(n.clone()) {
-                    let s = canon_type(target, aliases, seen);
-                    seen.remove(n);
-                    return s;
-                }
-            }
-            n.clone()
-        }
-        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(|a| canon_type(a, aliases, seen)).collect::<Vec<_>>().join(", ")),
-        TypeExpr::Array(inner) => format!("{}[]", canon_type(inner, aliases, seen)),
-        TypeExpr::Union(ts) => {
-            let mut parts: Vec<String> = ts.iter().map(|t| canon_type(t, aliases, seen)).collect();
-            parts.sort();
-            parts.dedup();
-            parts.join(" | ")
-        }
-        TypeExpr::Record(fs) => {
-            let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
-            for (k, opt, t) in fs {
-                sorted.insert(k.as_str(), format!("{k}{}: {}", if *opt { "?" } else { "" }, canon_type(t, aliases, seen)));
-            }
-            format!("{{ {} }}", sorted.into_values().collect::<Vec<_>>().join(", "))
-        }
-        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(|p| canon_type(p, aliases, seen)).collect::<Vec<_>>().join(", "), canon_type(r, aliases, seen)),
-        TypeExpr::StrLit(s) => format!("{s:?}"),
-        TypeExpr::NumLit(n) => n.to_string(),
-    }
-}
-
 /// Effective remote readers of a field: empty whenever the object itself is not remotely readable.
 fn effective_field_read<'a>(obj_read: &'a Json, field_read: &'a Json) -> Vec<&'a str> {
     let obj = str_set(Some(obj_read));
@@ -617,5 +600,54 @@ type Cents = number
         assert!(fld_read.message.contains("from owner to anyone"), "effective rule shown cleanly: {}", fld_read.message);
         let rename = f.iter().find(|x| x.code == "field-removed").unwrap();
         assert!(rename.hint.contains("Account.quantity"), "should suggest rename candidate: {}", rename.hint);
+    }
+
+    #[test]
+    fn infers_literal_field_types_catches_person_ownership_loss_and_compares_manifest_json() {
+        let old = r#"
+@server @read("owner", "staff") object Order {
+  qty = 0
+  @allow("owner") update(item: { qty: number }) { this.qty = item.qty }
+}
+"#;
+        let new = r#"
+@server @read("staff") object Order {
+  qty = "none"
+  @allow("staff") update(item: { qty: string }) {}
+}
+"#;
+        let f = diff(old, new);
+        let codes: Vec<&str> = f.iter().map(|x| x.code).collect();
+        assert!(codes.contains(&"field-type-changed"), "untyped literal default change must be caught: {codes:?}");
+        assert!(codes.contains(&"person-ownership-lost"), "dropping owner rule loses belongsToPerson: {codes:?}");
+        assert!(codes.contains(&"param-type-changed"), "{codes:?}");
+
+        // Comparing against a live `/_tj/manifest` JSON envelope matches `.tj` comparison losslessly.
+        let old_prog = tj_core::compile(old).unwrap();
+        let new_prog = tj_core::compile(new).unwrap();
+        let live_envelope = json!({ "ok": Manifest::build(old, &old_prog, &[]).json });
+        let old_snap = Snapshot::from_manifest_json(live_envelope).unwrap();
+        let new_snap = Snapshot::build(new, &new_prog);
+        let f_json = check_snapshots(&old_snap, &new_snap);
+        let codes_json: Vec<&str> = f_json.iter().map(|x| x.code).collect();
+        assert_eq!(codes, codes_json);
+
+        // C-037.5: comparing an unchanged app containing type aliases, unsorted unions
+        // (`string | null`), and unsorted record fields against its own `Manifest::build` JSON
+        // must produce zero findings.
+        let tricky = r#"
+type Cents = number
+@server @read("anyone") object Item {
+  price: Cents = 0
+  note: string | null = null
+  meta: { b: string, a: number } = { a: 0, b: "" }
+  @allow("anyone") ping() {}
+}
+"#;
+        let tp = tj_core::compile(tricky).unwrap();
+        let m_snap = Snapshot::from_manifest_json(Manifest::build(tricky, &tp, &[]).json).unwrap();
+        let s_snap = Snapshot::build(tricky, &tp);
+        let self_diff = check_snapshots(&m_snap, &s_snap);
+        assert!(self_diff.is_empty(), "unchanged app vs own manifest must have 0 findings: {}", report(&self_diff));
     }
 }

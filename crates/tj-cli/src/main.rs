@@ -58,6 +58,9 @@ USAGE:
   tj privacy export|erase <person id> [--target <url>]
                                  everything a running server holds about a person, or erase it
   tj lease list|acquire|release  view, acquire or release operational work leases on a running server
+  tj reload [<app.tj>] [--target <url>] [--trace <file.trace.jsonl>]... [--allow-breaking] [--watch-secs <n>] [--error-threshold <n>]
+                                 shadow-boot, validate invariants/smoke traces and live-reload a running server
+  tj rollback [--target <url>]   roll back a running server to its previous known-good bundle
   tj mcp    [--target <url>] [--record <trace.jsonl>]
                                  MCP server (stdio) so coding agents can inspect, drive, record and test an app
   tj plugin ai | fake <file.json>
@@ -220,6 +223,24 @@ fn main() -> ExitCode {
             }
         };
     }
+    if raw.get(1).map(String::as_str) == Some("reload") {
+        return match reload_cmd(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("rollback") {
+        return match rollback_cmd(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw.get(1).map(String::as_str) == Some("plugin") {
         let Some(name) = raw.get(2) else {
             eprintln!("error: tj plugin needs a name (ai, fake)\n\n{USAGE}");
@@ -332,10 +353,18 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 return Ok(());
             }
             if let Some(old_file) = against {
-                let old_src = read_source(old_file)?;
-                let old_name = old_file.display().to_string();
-                let old_prog = tj_core::compile(&old_src).map_err(|errs| errs.iter().map(|d| d.render(&old_name, &old_src)).collect::<Vec<_>>().join("\n\n"))?;
-                let findings = compat::check(&old_src, &old_prog, &src, &program);
+                let findings = if old_file.extension().and_then(|e| e.to_str()) == Some("json") {
+                    let raw = std::fs::read_to_string(old_file).map_err(|e| format!("cannot read {}: {e}", old_file.display()))?;
+                    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| format!("{} is not valid JSON: {e}", old_file.display()))?;
+                    let old_snap = compat::Snapshot::from_manifest_json(v)?;
+                    let new_snap = compat::Snapshot::build(&src, &program);
+                    compat::check_snapshots(&old_snap, &new_snap)
+                } else {
+                    let old_src = read_source(old_file)?;
+                    let old_name = old_file.display().to_string();
+                    let old_prog = tj_core::compile(&old_src).map_err(|errs| errs.iter().map(|d| d.render(&old_name, &old_src)).collect::<Vec<_>>().join("\n\n"))?;
+                    compat::check(&old_src, &old_prog, &src, &program)
+                };
                 if as_json {
                     let j = serde_json::json!({
                         "compatible": !compat::has_breaking(&findings),
@@ -441,11 +470,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // Checked before anything starts: a folder that mixes plain and sealed records, or a key
     // file that cannot be read, stops the server here.
     let (_, storage) = sealed::open_store(&data, &[])?;
-    if let Some(pack) = &args.compliance {
+    let compliance_gate = if let Some(pack) = &args.compliance {
         let pack = compliance::Pack::load(pack)?;
-        let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("
-
-"))?;
+        let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"))?;
         let key_file = std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
         let server = compliance::Server {
             encrypted: key_file.is_some(),
@@ -455,13 +482,15 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         };
         let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(&server)));
         if !ok {
-            return Err(format!("{report}
-not starting: some controls of the compliance pack are not met (above)"));
+            return Err(format!("{report}\nnot starting: some controls of the compliance pack are not met (above)"));
         }
         eprintln!("compliance: {} ({}): every checked control is met", pack.title, pack.names.join(" + "));
-    }
+        Some((pack, server))
+    } else {
+        None
+    };
     let (audit, audit_key) = audit::Audit::start(&data)?;
-    let engine = Engine::start(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone())?;
+    let engine = Engine::start_with_compliance(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone(), compliance_gate)?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     // The web app: always under `tj dev`, and under `tj serve` with --web.
@@ -488,7 +517,88 @@ not starting: some controls of the compliance pack are not met (above)"));
     if tls {
         eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", args.host, http::TLS_TERMINATED_ENV);
     }
-    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls))
+    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()))
+}
+
+fn reload_cmd(args: &[String]) -> Result<(), String> {
+    let usage = "usage: tj reload [<app.tj>] [--target <url>] [--trace <file.trace.jsonl>]... [--allow-breaking] [--watch-secs <n>] [--error-threshold <n>]";
+    let mut file: Option<PathBuf> = None;
+    let mut target = "http://127.0.0.1:4700".to_string();
+    let mut traces: Vec<PathBuf> = Vec::new();
+    let mut allow_breaking = false;
+    let mut watch_secs: Option<u64> = None;
+    let mut error_threshold: Option<u64> = None;
+    let mut it = args.iter().peekable();
+    if let Some(first) = it.next_if(|a| !a.starts_with("--")) {
+        file = Some(PathBuf::from(first));
+    }
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--target" => target = value()?.clone(),
+            "--trace" => traces.push(PathBuf::from(value()?)),
+            "--allow-breaking" => allow_breaking = true,
+            "--watch-secs" => watch_secs = Some(value()?.parse().map_err(|_| "--watch-secs must be a number")?),
+            "--error-threshold" => error_threshold = Some(value()?.parse().map_err(|_| "--error-threshold must be a number")?),
+            other => return Err(format!("unknown option {other}\n\n{usage}")),
+        }
+    }
+    let mut body = serde_json::Map::new();
+    if let Some(p) = &file {
+        body.insert("source".into(), serde_json::json!(read_source(p)?));
+    }
+    if allow_breaking {
+        body.insert("allowBreaking".into(), serde_json::json!(true));
+    }
+    if !traces.is_empty() {
+        let list: Vec<serde_json::Value> = traces
+            .iter()
+            .map(|p| std::fs::read_to_string(p).map(serde_json::Value::String).map_err(|e| format!("cannot read {}: {e}", p.display())))
+            .collect::<Result<_, _>>()?;
+        body.insert("smokeTraces".into(), serde_json::Value::Array(list));
+    }
+    if let Some(w) = watch_secs {
+        body.insert("watchSecs".into(), serde_json::json!(w));
+    }
+    if let Some(t) = error_threshold {
+        body.insert("errorThreshold".into(), serde_json::json!(t));
+    }
+    let ok = post_ops(&target, "/_tj/reload", serde_json::Value::Object(body))?;
+    println!("{}", serde_json::to_string_pretty(&ok).expect("JSON serializes"));
+    Ok(())
+}
+
+fn rollback_cmd(args: &[String]) -> Result<(), String> {
+    let usage = "usage: tj rollback [--target <url>]";
+    let mut target = "http://127.0.0.1:4700".to_string();
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--target" => target = it.next().ok_or("--target needs a value")?.clone(),
+            other => return Err(format!("unknown option {other}\n\n{usage}")),
+        }
+    }
+    let ok = post_ops(&target, "/_tj/rollback", serde_json::json!({}))?;
+    println!("{}", serde_json::to_string_pretty(&ok).expect("JSON serializes"));
+    Ok(())
+}
+
+fn post_ops(target: &str, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+    let base = target.trim_end_matches('/');
+    let mut req = ureq::post(&format!("{base}{path}")).set("Content-Type", "application/json");
+    if let Some(h) = auth::client_header() {
+        req = req.set("Authorization", &h);
+    }
+    let resp = req.send_string(&body.to_string());
+    let text = match resp {
+        Ok(r) | Err(ureq::Error::Status(_, r)) => r.into_string().map_err(|e| e.to_string())?,
+        Err(e) => return Err(format!("cannot reach {base}: {e}")),
+    };
+    let reply: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad reply from {base}: {e}"))?;
+    if let Some(e) = reply["error"].as_str() {
+        return Err(e.to_string());
+    }
+    Ok(reply["ok"].clone())
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.

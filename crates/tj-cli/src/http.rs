@@ -21,6 +21,8 @@
 //!   DELETE /_tj/leases/{id}           -> release own lease, or any lease with `maintain`
 //!   POST /_tj/input                   -> body: one protocol Input (`test` on dev; `maintain` on serve)
 //!   POST /_tj/privacy                 -> export or erase a person's data (`maintain`)
+//!   POST /_tj/reload                  -> shadow-boot, verify & swap live app bundle (`maintain`)
+//!   POST /_tj/rollback                -> roll back to the previous known-good bundle (`maintain`)
 //!   (`/_tj/*` needs a scoped `--ops` key in `TJ_KEYS` or `TJ_ADMIN_KEY` on `tj serve`; see auth.rs)
 //!
 //! The audit log (audit.rs) gets every API call, every refusal, and every operational request
@@ -33,7 +35,7 @@
 
 use crate::audit::{Actor, Audit, Entry};
 use crate::auth::{Automation, OpsAccess, OpsScope};
-use crate::engine::{CallFailure, Engine, Failure};
+use crate::engine::{CallFailure, Engine, Failure, ReloadRequest};
 use crate::bytes::{hex, random};
 use crate::identity::{sha256_hex, Identity};
 use crate::leases::Leases;
@@ -158,6 +160,8 @@ pub struct Front {
     pub identity: Identity,
     pub audit: Audit,
     pub leases: Leases,
+    /// Configured entry `.tj` file, reloaded when `POST /_tj/reload` omits `"source"`.
+    pub app_file: Option<PathBuf>,
     /// Refuse requests that carry credentials, as this server only speaks plain HTTP and
     /// nobody said a proxy in front of it terminates TLS (see [`credentials_need_tls`]).
     pub credentials_need_tls: bool,
@@ -171,7 +175,12 @@ impl Front {
     #[allow(clippy::too_many_arguments)]
     pub fn new(engine: Engine, web: Option<Arc<Web>>, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, leases: Leases, credentials_need_tls: bool) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, web, dev, automation, identity, audit, leases, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        Front { engine, web, dev, automation, identity, audit, leases, app_file: None, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+    }
+
+    pub fn with_app_file(mut self, path: PathBuf) -> Front {
+        self.app_file = Some(path);
+        self
     }
 }
 
@@ -481,6 +490,72 @@ fn handle(mut req: Request, front: &Front) {
                 engine.request(input)
             }))
         }
+        // Shadow-boot, compatibility-check and swap a new app bundle (`maintain` only).
+        (Method::Post, ["_tj", "reload"]) => {
+            asked = Some(("reload", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/reload").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| read_json(&mut req)).and_then(|j| {
+                if !(j.is_object() || j.is_null()) {
+                    return Err((400, "body must be a JSON object".into()));
+                }
+                let source = match j.get("source") {
+                    None | Some(Json::Null) => match &front.app_file {
+                        Some(p) => crate::app::read(p).map(|a| a.source).map_err(|e| (500, format!("cannot read {}: {e}", p.display())))?,
+                        None => return Err((400, "send {\"source\": \"<app bundle>\"}".into())),
+                    },
+                    Some(Json::String(s)) if !s.trim().is_empty() => s.clone(),
+                    Some(Json::String(_)) => return Err((400, "\"source\" cannot be empty".into())),
+                    Some(_) => return Err((400, "\"source\" must be a string".into())),
+                };
+                let allow_breaking = match j.get("allowBreaking") {
+                    None | Some(Json::Null) => false,
+                    Some(Json::Bool(b)) => *b,
+                    Some(_) => return Err((400, "\"allowBreaking\" must be true or false".into())),
+                };
+                let smoke_traces: Vec<String> = match j.get("smokeTraces") {
+                    None | Some(Json::Null) => Vec::new(),
+                    Some(Json::Array(arr)) => arr
+                        .iter()
+                        .map(|v| v.as_str().map(str::to_string).ok_or_else(|| (400, "smokeTraces entries must be JSONL strings".to_string())))
+                        .collect::<Result<_, _>>()?,
+                    Some(_) => return Err((400, "smokeTraces must be an array of JSONL strings".into())),
+                };
+                let watch_secs = match j.get("watchSecs") {
+                    None | Some(Json::Null) => 30,
+                    Some(v) => v.as_u64().ok_or_else(|| (400, "\"watchSecs\" must be a non-negative integer".to_string()))?,
+                };
+                let error_threshold = match j.get("errorThreshold") {
+                    None | Some(Json::Null) => 3,
+                    Some(v) => v.as_u64().ok_or_else(|| (400, "\"errorThreshold\" must be a non-negative integer".to_string()))?,
+                };
+                // Pre-compile on the HTTP thread so syntax/type errors fail fast (400) without stalling `tj-runtime`.
+                tj_core::compile(&source).map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", &source)).collect::<Vec<_>>().join("\n\n")))?;
+                let res = engine.safe_reload(ReloadRequest {
+                    source,
+                    allow_breaking,
+                    smoke_traces,
+                    watch_secs,
+                    error_threshold,
+                    actor: ops.actor(),
+                })?;
+                if let Some(dev) = &front.dev {
+                    dev.notify_reload();
+                }
+                Ok(res)
+            }))
+        }
+        // Roll back to the previous known-good bundle (`maintain` only).
+        (Method::Post, ["_tj", "rollback"]) => {
+            asked = Some(("rollback", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/rollback").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| read_json(&mut req).map(|_| ())).and_then(|()| {
+                let res = engine.rollback(ops.actor())?;
+                if let Some(dev) = &front.dev {
+                    dev.notify_reload();
+                }
+                Ok(res)
+            }))
+        }
         // A tab's answer to an agent's question (dev only; JSON only, so another site's form
         // cannot post one).
         (Method::Post, ["_tj", "answer", id]) if front.dev.is_some() => result_response(read_json(&mut req).and_then(|j| {
@@ -508,11 +583,19 @@ fn handle(mut req: Request, front: &Front) {
                 [""] | ["index.html"] => file(web.web_dir.join("index.html"), "text/html; charset=utf-8"),
                 ["tinyjump.js"] => file(web.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
                 ["tinyjump.wasm"] => file(web.wasm.clone(), "application/wasm"),
-                // The whole app as one bundle: the entry and the files it imports.
-                ["app.tj"] => match crate::app::read(&web.source) {
-                    Ok(app) => Response::from_data(app.source).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Cache-Control", "no-store")),
-                    Err(e) => json_response(404, &json!({ "error": e })),
-                },
+                // The whole app as one bundle: the entry and the files it imports (or the live
+                // reloaded bundle on `tj serve --web`).
+                ["app.tj"] => {
+                    let body = if front.dev.is_some() {
+                        crate::app::read(&web.source).map(|app| app.source)
+                    } else {
+                        Ok(engine.current_source())
+                    };
+                    match body {
+                        Ok(src) => Response::from_data(src).with_header(header("Content-Type", "text/plain; charset=utf-8")).with_header(header("Cache-Control", "no-store")),
+                        Err(e) => json_response(404, &json!({ "error": e })),
+                    }
+                }
                 _ => json_response(404, &json!({ "error": "not found" })),
             }
         }
@@ -771,6 +854,9 @@ fn sse(req: Request, events: &Mailbox, still_valid: impl Fn() -> bool) {
     let mut checked = Instant::now();
     while ok {
         let batch = events.take(SSE_KEEPALIVE);
+        if events.is_closed() {
+            break;
+        }
         if checked.elapsed() >= RECHECK_EVERY {
             checked = Instant::now();
             if !still_valid() {
@@ -972,6 +1058,202 @@ mod tests {
         assert!(entries.contains("\"kind\":\"lease\""), "{entries}");
         assert!(entries.contains("\"kind\":\"admin\"") && entries.contains("\"request\":\"stream\""), "{entries}");
         assert!(entries.contains("\"kind\":\"refused\"") && entries.contains("\"who\":\"ops:critic\"") && entries.contains("\"request\":\"stream\""), "{entries}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shadow_boot_reload_rollback_and_auto_rollback_work_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("tj-http-reload-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let keys_file = dir.join("keys.json");
+        let obs = crate::identity::new_key("critic", &[], Some(OpsScope::Observe), &keys_file).unwrap();
+        let mnt = crate::identity::new_key("maint", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
+        let mnt2 = crate::identity::new_key("maint2", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
+
+        let v1 = r#"
+@server @read("anyone") object Counter {
+  n: number = 0
+  @allow("anyone") set(v: number): number { this.n = v; return this.n }
+  @allow("anyone") version(): string { return "v1" }
+}
+"#
+        .to_string();
+
+        let (audit, _) = Audit::start(&data).unwrap();
+        let engine = Engine::start(v1.clone(), data.clone(), false, false, Arc::default(), audit.clone()).unwrap();
+        let identity = Identity::from_key_file(&keys_file).unwrap();
+        let front = Arc::new(Front::new(engine, None, None, Automation::Off, identity, audit, Leases::open(&data), false));
+
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let srv_front = front.clone();
+        thread::spawn(move || {
+            for req in server.incoming_requests() {
+                handle(req, &srv_front);
+            }
+        });
+
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+        let call = |method: &str, path: &str, token: Option<&str>, body: Option<Json>| -> (u16, Json) {
+            let mut req = agent.request(method, &format!("{base}{path}"));
+            if let Some(t) = token {
+                req = req.set("Authorization", &format!("Bearer {t}"));
+            }
+            let resp = match body {
+                Some(j) => req.set("Content-Type", "application/json").send_string(&j.to_string()),
+                None => req.call(),
+            };
+            let (status, r) = match resp {
+                Ok(r) => (r.status(), r),
+                Err(ureq::Error::Status(s, r)) => (s, r),
+                Err(e) => panic!("request {method} {path} failed: {e}"),
+            };
+            (status, serde_json::from_str(&r.into_string().unwrap()).unwrap())
+        };
+
+        // Store negative value in v1 so we can test shadow-boot @invariant rejection.
+        assert_eq!(call("POST", "/api/Counter/c1/set", None, Some(json!([-5]))).0, 200);
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v1" })));
+
+        // `ops:observe` is refused on reload/rollback; rollback before any reload returns 409.
+        assert_eq!(call("POST", "/_tj/reload", Some(&obs), Some(json!({ "source": v1 }))).0, 403);
+        assert_eq!(call("POST", "/_tj/rollback", Some(&obs), Some(json!({}))).0, 403);
+        assert_eq!(call("POST", "/_tj/rollback", Some(&mnt), Some(json!({}))).0, 409);
+
+        // Competing exclusive lease blocks reload (409).
+        let (st, lease) = call("POST", "/_tj/leases", Some(&mnt2), Some(json!({ "role": "maintain", "scope": "app" })));
+        assert_eq!(st, 200);
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1 }))).0, 409);
+        assert_eq!(call("DELETE", &format!("/_tj/leases/{}", lease["ok"]["id"].as_str().unwrap()), Some(&mnt2), None).0, 200);
+
+        // 1. Breaking upgrade (removing `n`) is refused with 409.
+        let breaking = r#"
+@server @read("anyone") object Counter {
+  count: number = 0
+  @allow("anyone") set(v: number): number { this.count = v; return this.count }
+  @allow("anyone") version(): string { return "bad" }
+}
+"#;
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": breaking }))).0, 409);
+
+        // 2. Shadow boot rejects an upgrade whose new `@invariant` is violated by stored `Counter/c1` (n = -5).
+        let bad_inv = r#"
+@server @read("anyone") object Counter {
+  n: number = 0
+  @invariant nonNeg(): boolean { return this.n >= 0 }
+  @allow("anyone") set(v: number): number { this.n = v; return this.n }
+  @allow("anyone") version(): string { return "inv" }
+}
+"#;
+        let (st, body) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": bad_inv })));
+        assert_eq!(st, 422, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("Counter/c1"), "{body}");
+        // Still running v1!
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v1" })));
+
+        // Fix Counter/c1 to 10 so invariant passes.
+        assert_eq!(call("POST", "/api/Counter/c1/set", None, Some(json!([10]))).0, 200);
+
+        // 3. Failing smoke trace rejects reload with 422 and NEVER mutates disk;
+        //    smoke traces cannot read server files via `"plugin"` `"file"` (C-037.1);
+        //    wrong-typed reload fields return 400 (C-037.10); rollback requires JSON CSRF barrier (C-037.8).
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": 123 }))).0, 400);
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "watchSecs": -1 }))).0, 400);
+        let file_read_smoke = "{\"do\": \"plugin\", \"name\": \"ai\", \"file\": \"keys.json\"}";
+        let (st, file_err) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "smokeTraces": [file_read_smoke] })));
+        assert_eq!(st, 422, "{file_err}");
+        assert!(file_err["error"].as_str().unwrap().contains("cannot read server files"), "{file_err}");
+        let bad_ct = agent.post(&format!("{base}/_tj/rollback")).set("Authorization", &format!("Bearer {mnt}")).set("Content-Type", "application/x-www-form-urlencoded").send_string("x=1");
+        assert!(matches!(bad_ct, Err(ureq::Error::Status(415, _))), "non-JSON rollback must be refused");
+
+        let v2 = r#"
+@server @read("anyone") object Counter {
+  n: number = 0
+  @invariant nonNeg(): boolean { return this.n >= 0 }
+  @allow("anyone") set(v: number): number { this.n = v; return this.n }
+  @allow("anyone") version(): string { return "v2" }
+}
+"#;
+        let bad_smoke = "{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"set\", \"args\": [999], \"as\": \"anon\"}\n{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"version\", \"as\": \"anon\", \"expect\": \"wrong\"}";
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2, "smokeTraces": [bad_smoke] }))).0, 422);
+        // Disk still holds n = 10, not 999!
+        assert_eq!(call("GET", "/api/Counter/c1", None, None), (200, json!({ "ok": { "n": 10 } })));
+
+        // C-037.4: tightening `@read("anyone")` -> `@read("staff")` closes existing anonymous SSE subscribers!
+        let (anon_sub, _) = front.engine.subscribe(vec!["Counter/c1".into()], 0, Some(Caller::Remote { id: String::new(), roles: Vec::new() })).unwrap();
+        assert!(!anon_sub.is_closed());
+        let tightened = r#"
+@server @read("staff") object Counter {
+  n: number = 0
+  @allow("staff") set(v: number): number { this.n = v; return this.n }
+  @allow("staff") version(): string { return "tight" }
+}
+"#;
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": tightened, "watchSecs": 0 }))).0, 200);
+        assert!(anon_sub.is_closed(), "anonymous SSE subscriber must be closed when @read tightens");
+        // Roll back to v1 before testing v2 + auto-rollback.
+        assert_eq!(call("POST", "/_tj/rollback", Some(&mnt), Some(json!({}))).0, 200);
+
+        // 4. Valid upgrade + passing smoke trace (mutating overlay to 777) swaps cleanly without touching disk!
+        let good_smoke = "{\"do\": \"get\", \"object\": \"Counter/c1\", \"as\": \"anon\", \"expect\": {\"n\": 10}}\n{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"set\", \"args\": [777], \"as\": \"anon\", \"expect\": 777}\n{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"version\", \"as\": \"anon\", \"expect\": \"v2\"}";
+        let (st, ok) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2, "smokeTraces": [good_smoke], "watchSecs": 30, "errorThreshold": 2 })));
+        assert_eq!(st, 200, "{ok}");
+        assert_eq!(ok["ok"]["smokeTracesPassed"], json!(1));
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v2" })));
+        assert_eq!(call("GET", "/api/Counter/c1", None, None), (200, json!({ "ok": { "n": 10 } })), "smoke trace overlay writes must never reach live disk");
+
+        // Live manifest reflects reload count & active watch window.
+        let (st, m) = call("GET", "/_tj/manifest", Some(&obs), None);
+        assert_eq!(st, 200);
+        assert_eq!(m["ok"]["health"]["reloads"], json!(2));
+        assert_eq!(m["ok"]["health"]["watching"], json!(true));
+
+        // 5. Manual rollback restores v1 cleanly.
+        let (st, rb) = call("POST", "/_tj/rollback", Some(&mnt), Some(json!({})));
+        assert_eq!(st, 200, "{rb}");
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v1" })));
+
+        // 6. Health-gated auto-rollback: deploy v3 with a buggy alarm; trigger 2 Output::Errors -> auto-rolls back to v1!
+        let v3_buggy = r#"
+@server @read("anyone") object Counter {
+  n: number = 0
+  @allow("anyone") set(v: number): number { this.n = v; return this.n }
+  @allow("anyone") version(): string { return "v3-buggy" }
+  @allow("anyone") armBug() { this.schedule(0, "crash") }
+  private crash() { throw "boom after reload" }
+}
+"#;
+        let (st, _) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v3_buggy, "watchSecs": 30, "errorThreshold": 2 })));
+        assert_eq!(st, 200);
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v3-buggy" })));
+        // Fire 2 crashing alarms via /api/Counter/c1/armBug + /_tj/input tick.
+        assert_eq!(call("POST", "/api/Counter/c1/armBug", None, Some(json!([]))).0, 200);
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
+        assert_eq!(call("POST", "/api/Counter/c1/armBug", None, Some(json!([]))).0, 200);
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
+        // Auto-rollback restored v1, AND a subsequent manual `POST /_tj/rollback` returns 409
+        // rather than re-promoting the broken `v3-buggy` bundle (P3B-2)!
+        assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v1" })));
+        assert_eq!(call("POST", "/_tj/rollback", Some(&mnt), Some(json!({}))).0, 409);
+        let (st, m_after) = call("GET", "/_tj/manifest", Some(&obs), None);
+        assert_eq!(st, 200);
+        assert_eq!(m_after["ok"]["health"]["autoRollbacks"], json!(1));
+        assert_eq!(m_after["ok"]["health"]["watching"], json!(false));
+
+        // Audit log recorded reload, rollback, and auto-rollback.
+        let entries: String = std::fs::read_dir(data.join("audit"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(entries.contains("\"request\":\"reload\""), "{entries}");
+        assert!(entries.contains("\"request\":\"rollback\""), "{entries}");
+        assert!(entries.contains("\"request\":\"auto-rollback\""), "{entries}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

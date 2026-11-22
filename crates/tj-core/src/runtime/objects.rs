@@ -555,23 +555,23 @@ impl Runtime {
 
     /// `this.unschedule(handleOrKey)`: cancels by handle (number), key (string), or method
     /// name (for unkeyed alarms). Returns false when none matched.
-    pub(crate) fn unschedule_alarm(&mut self, o: &Rc<ObjRef>, handle: &Value) -> Value {
+    pub(crate) fn unschedule_alarm(&mut self, o: &Rc<ObjRef>, handle: &Value) -> Result<Value, Exc> {
         if self.in_invariant {
-            return Value::Bool(false);
+            return Err(Exc::msg("@invariant methods cannot unschedule alarms"));
         }
         let inst = self.inst_mut(o);
         let before = inst.alarms.len();
         match handle {
             Value::Num(h) => inst.alarms.retain(|a| a.id as f64 != *h),
             Value::Str(k) => inst.alarms.retain(|a| !(a.key.as_deref() == Some(&**k) || (a.key.is_none() && a.method == **k))),
-            _ => return Value::Bool(false),
+            _ => return Ok(Value::Bool(false)),
         }
         let removed = inst.alarms.len() < before;
         if removed {
             // Its timer still fires, finds nothing and does nothing.
             self.touch(o);
         }
-        Value::Bool(removed)
+        Ok(Value::Bool(removed))
     }
 
     /// A handle no alarm had before, not even before a restart: at least the time in

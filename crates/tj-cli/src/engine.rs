@@ -2,13 +2,17 @@
 //! replies, HTTP effects (worker pool), realtime broadcasts, logs, timers and the audit log.
 
 use crate::audit::{Actor, Audit, Entry};
+use crate::compat::{self, Snapshot};
+use crate::compliance::{Pack, Server as ComplianceServer};
 use crate::identity::sha256_hex;
 use crate::mailbox::{Event, Mailbox};
 use crate::manifest::Manifest;
 use crate::plugins::Plugins;
 use crate::stats::Stats;
+use crate::store::OverlayStore;
+use crate::test_runner;
 use serde_json::{json, Value as Json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -20,8 +24,24 @@ use tj_core::{compile, Input, Options, Output, Runtime};
 const EFFECT_WORKERS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_SMOKE_TRACES: usize = 16;
+const MAX_WATCH_SECS: u64 = 3600;
 /// `1` lets `tj serve` fetch private, loopback and link-local addresses.
 pub const PRIVATE_FETCH_ENV: &str = "TJ_ALLOW_PRIVATE_FETCH";
+
+/// Compliance pack + server posture checked at startup and on every live reload.
+pub type ComplianceGate = (Pack, ComplianceServer);
+
+/// Options for a validated shadow-boot reload (`POST /_tj/reload`).
+pub struct ReloadRequest {
+    pub source: String,
+    pub allow_breaking: bool,
+    pub smoke_traces: Vec<String>,
+    pub watch_secs: u64,
+    pub error_threshold: u64,
+    pub actor: Actor,
+}
 
 /// A refused or failed request: its HTTP status and message.
 pub type Failure = (u16, String);
@@ -36,7 +56,8 @@ const MAX_OBJECTS: usize = 100_000;
 enum Msg {
     /// An input, who waits for its reply, and when it was sent (for latency).
     Input(Input, Option<Reply>, Instant),
-    EffectDone(u32, Result<Json, String>),
+    /// `(generation, effect_id, result)`: mismatched generations from a pre-reload runtime are dropped.
+    EffectDone(u64, u32, Result<Json, String>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
     /// Which of `objects` `caller` may read (for stream tickets).
@@ -45,7 +66,12 @@ enum Msg {
     Stats(Sender<Json>),
     /// Export (`erase: false`) or erase everything held about a person.
     Privacy { subject: String, erase: bool, done: Sender<Result<Json, Failure>> },
+    /// Fast file-watcher reload used by `tj dev`.
     Reload(String),
+    /// Shadow-booted, compatibility- and invariant-checked live reload (`POST /_tj/reload`).
+    SafeReload { req: ReloadRequest, done: Sender<Result<Json, Failure>> },
+    /// Roll back to the previous known-good bundle (`POST /_tj/rollback`).
+    Rollback { actor: Actor, done: Sender<Result<Json, Failure>> },
 }
 
 #[derive(Clone)]
@@ -53,6 +79,7 @@ pub struct Engine {
     tx: Sender<Msg>,
     stats: Arc<Stats>,
     manifest: Arc<Mutex<Manifest>>,
+    source: Arc<Mutex<String>>,
     max_objects: usize,
 }
 
@@ -62,9 +89,10 @@ pub fn now_ms() -> f64 {
 
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
-fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<(Runtime, Vec<Output>, Manifest, usize), String> {
+fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<(Runtime, Vec<Output>, Manifest, Snapshot, usize), String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let manifest = Manifest::build(source, &program, configured_plugins);
+    let snapshot = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
     let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
     let (store, _) = crate::sealed::open_store(data, &personal)?;
@@ -74,12 +102,18 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugi
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
-    Ok((rt, out, manifest, max_objects))
+    Ok((rt, out, manifest, snapshot, max_objects))
 }
 
 impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
+    #[cfg(test)]
     pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit) -> Result<Engine, String> {
+        Self::start_with_compliance(source, data, render, explain, plugins, audit, None)
+    }
+
+    /// Starts the runtime thread with an optional compliance pack enforced on every live reload.
+    pub fn start_with_compliance(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit, compliance: Option<ComplianceGate>) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
@@ -88,19 +122,21 @@ impl Engine {
         let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
         let shared_slot: Arc<Mutex<Option<Arc<Mutex<Manifest>>>>> = Arc::new(Mutex::new(None));
         let shared_ref = shared_slot.clone();
+        let live_source = Arc::new(Mutex::new(source.clone()));
+        let live_source_ref = live_source.clone();
         thread::Builder::new()
             .name("tj-runtime".into())
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs) {
-                    Ok((rt, out, manifest, max_objects)) => {
+                    Ok((rt, out, manifest, snap, max_objects)) => {
                         let shared = Arc::new(Mutex::new(manifest));
                         if let Ok(mut r) = shared_ref.lock() {
                             *r = Some(shared.clone());
                         }
                         let _ = ready_tx.send(Ok(max_objects));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -114,7 +150,7 @@ impl Engine {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
-        Ok(Engine { tx, stats, manifest, max_objects })
+        Ok(Engine { tx, stats, manifest, source: live_source, max_objects })
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -203,9 +239,30 @@ impl Engine {
         Ok(manifest.with_live(health, Json::Array(leases)))
     }
 
-    /// Re-boots with new source. Objects keep their stored state.
+    /// Re-boots with new source (`tj dev` file watcher). Objects keep their stored state.
     pub fn reload(&self, source: String) {
         let _ = self.tx.send(Msg::Reload(source));
+    }
+
+    /// Validated shadow-boot live reload (`POST /_tj/reload`): checks compatibility, boots on a
+    /// copy-on-write overlay, validates `@invariant`s and smoke traces, drains in-flight calls,
+    /// swaps cleanly and arms a health-gated auto-rollback watch window.
+    pub fn safe_reload(&self, req: ReloadRequest) -> Result<Json, Failure> {
+        let (done, r) = channel();
+        self.tx.send(Msg::SafeReload { req, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)?
+    }
+
+    /// Rolls back to the previous known-good app bundle (`POST /_tj/rollback`).
+    pub fn rollback(&self, actor: Actor) -> Result<Json, Failure> {
+        let (done, r) = channel();
+        self.tx.send(Msg::Rollback { actor, done }).map_err(|_| (503, "runtime stopped".to_string()))?;
+        Self::wait(&r)?
+    }
+
+    /// The currently running app bundle source (for `tj serve --web` `/app.tj`).
+    pub fn current_source(&self) -> String {
+        self.source.lock().map(|s| s.clone()).unwrap_or_default()
     }
 }
 
@@ -224,13 +281,106 @@ struct Dispatch {
     replies: HashMap<u64, Waiter>,
     next_reply: u64,
     subscribers: Vec<Arc<Mailbox>>,
-    effects: Sender<(u32, Effect)>,
+    effects: Sender<(u64, u32, Effect)>,
     stats: Arc<Stats>,
     audit: Audit,
     /// `tj:privacy` calls to carry out on the runtime thread.
     privacy: Vec<(u32, String, Json)>,
     /// People erased in this turn, forgotten by the audit log after its entries are written.
     forget_after: Vec<String>,
+    /// Uncaught `Output::Error` and `503` replies emitted in the current turn (for auto-rollback).
+    turn_errors: u64,
+    /// Monotonic runtime generation: incremented on every swap so stale `EffectDone`s are ignored.
+    generation: u64,
+}
+
+/// Post-reload health watch window: if uncaught errors or 503s reach `threshold` before `until`,
+/// the runtime automatically restores `prev_source`.
+struct WatchWindow {
+    until: Instant,
+    errors: u64,
+    threshold: u64,
+    prev_source: String,
+    prev_sha: String,
+}
+
+/// Validates `req.source` offline against `current_snap`, `compliance`, and a copy-on-write
+/// overlay over `data` (checking every stored object's `@invariant` and running `smoke_traces`).
+fn shadow_validate(
+    source: &str,
+    allow_breaking: bool,
+    smoke_traces: &[String],
+    current_snap: &Snapshot,
+    data: &Path,
+    explain: bool,
+    compliance: Option<&ComplianceGate>,
+) -> Result<(Vec<compat::Finding>, Snapshot), Failure> {
+    if smoke_traces.len() > MAX_SMOKE_TRACES {
+        return Err((400, format!("at most {MAX_SMOKE_TRACES} smoke traces per reload")));
+    }
+    let program = compile(source)
+        .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")))?;
+    if let Some((pack, server)) = compliance {
+        let (report, ok) = pack.report(&pack.evaluate(source, &program, Some(server)));
+        if !ok {
+            return Err((409, format!("compliance pack {} not met:\n{report}", pack.title)));
+        }
+    }
+    let new_snap = Snapshot::build(source, &program);
+    let findings = compat::check_snapshots(current_snap, &new_snap);
+    if !allow_breaking && compat::has_breaking(&findings) {
+        return Err((409, format!("breaking upgrade changes found; pass allowBreaking: true if intentional\n{}", compat::report(&findings))));
+    }
+    // Shadow boot against a copy-on-write overlay over the real data dir (never mutates disk).
+    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
+    let overlay = OverlayStore::new(base);
+    let seed = crate::bytes::random::<8>().map_err(|e| (500, e))?;
+    let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
+    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render: false, server: true, explain, max_objects };
+    let (mut shadow_rt, boot_out) = Runtime::boot(program, Box::new(overlay), opts).map_err(|e| (422, format!("shadow boot failed: {e}")))?;
+    let entropy = crate::bytes::hex(&crate::bytes::random::<32>().map_err(|e| (500, e))?);
+    let entropy_out = shadow_rt.handle(now_ms(), Input::Entropy { bytes: entropy });
+    for o in boot_out.into_iter().chain(entropy_out) {
+        if let Output::Error { message, .. } = o {
+            return Err((422, format!("shadow boot produced an error: {message}")));
+        }
+    }
+    shadow_rt.check_invariants().map_err(|e| (422, format!("shadow boot invariant check failed: {e}")))?;
+    for (idx, trace_text) in smoke_traces.iter().enumerate() {
+        let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
+        let overlay = OverlayStore::new(base);
+        let res = test_runner::run_trace_on_store(source, &format!("smoke-{}", idx + 1), trace_text, HashMap::new(), Box::new(overlay), now_ms());
+        if !res.passed() {
+            return Err((422, format!("shadow smoke trace #{} failed: {}", idx + 1, res.error.unwrap_or_default())));
+        }
+    }
+    Ok((findings, new_snap))
+}
+
+/// Briefly drains in-flight `d.replies` (up to `DRAIN_TIMEOUT`) while buffering arriving
+/// non-effect messages so no requests are dropped across a live reload or rollback.
+fn drain_inflight(rt: &mut Runtime, d: &mut Dispatch, rx: &Receiver<Msg>, pending: &mut VecDeque<Msg>) {
+    let deadline = Instant::now() + DRAIN_TIMEOUT;
+    while !d.replies.is_empty() {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else { break };
+        match rx.recv_timeout(rem) {
+            Ok(Msg::EffectDone(gen, id, result)) => {
+                if gen != d.generation {
+                    continue;
+                }
+                let (ok, error) = match result {
+                    Ok(v) => (Some(v), None),
+                    Err(e) => (None, Some(e)),
+                };
+                let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable: false });
+                d.outputs(rt, out);
+                privacy_effects(rt, d);
+            }
+            Ok(other) => pending.push_back(other),
+            Err(_) => break,
+        }
+    }
 }
 
 /// Who waits for a reply; for calls, the method and when the call was sent; for reads of
@@ -252,18 +402,43 @@ fn may_read(rt: &Runtime, objects: &[String], caller: &Caller) -> Result<Vec<Str
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<Msg>, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, manifest: Arc<Mutex<Manifest>>) {
+fn run(
+    mut rt: Runtime,
+    boot_out: Vec<Output>,
+    rx: Receiver<Msg>,
+    back: Sender<Msg>,
+    data: PathBuf,
+    render: bool,
+    explain: bool,
+    plugins: Arc<Plugins>,
+    stats: Arc<Stats>,
+    audit: Audit,
+    manifest: Arc<Mutex<Manifest>>,
+    live_source: Arc<Mutex<String>>,
+    mut current_source: String,
+    mut current_snap: Snapshot,
+    compliance: Option<ComplianceGate>,
+) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new() };
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new(), turn_errors: 0, generation: 1 };
+    let mut current_sha = sha256_hex(&current_source);
+    let mut previous: Option<(String, String)> = None;
+    let mut watch: Option<WatchWindow> = None;
+    let mut pending: VecDeque<Msg> = VecDeque::new();
     d.outputs(&mut rt, boot_out);
     loop {
-        let msg = match rt.next_wake() {
-            Some(at) => rx.recv_timeout(Duration::from_millis((at - now_ms()).max(0.0) as u64)),
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        let msg = if let Some(m) = pending.pop_front() {
+            Ok(m)
+        } else {
+            match rt.next_wake() {
+                Some(at) => rx.recv_timeout(Duration::from_millis((at - now_ms()).max(0.0) as u64)),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            }
         };
+        d.turn_errors = 0;
         let out = match msg {
             Ok(Msg::Input(mut input, reply, sent)) => {
                 if let Some(reply) = reply {
@@ -309,7 +484,10 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     }
                 }
             }
-            Ok(Msg::EffectDone(id, result)) => {
+            Ok(Msg::EffectDone(gen, id, result)) => {
+                if gen != d.generation {
+                    continue;
+                }
                 let (ok, error) = match result {
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
@@ -347,14 +525,24 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
             Ok(Msg::Reload(source)) => {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs) {
-                    Ok((new_rt, out, new_manifest, _)) => {
+                    Ok((new_rt, out, new_manifest, new_snap, _)) => {
+                        let new_sha = sha256_hex(&source);
+                        previous = Some((current_source, current_sha));
+                        current_source = source.clone();
+                        current_sha = new_sha.clone();
+                        current_snap = new_snap;
+                        if let Ok(mut s) = live_source.lock() {
+                            *s = source;
+                        }
                         rt = new_rt;
+                        d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
                             *m = new_manifest;
                         }
-                        d.audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        // Requests waiting on the old runtime get a "restarted" error.
-                        d.replies.clear();
+                        watch = None;
+                        d.stats.set_watch_until(0);
+                        d.stats.reloaded();
+                        d.audit.record(Entry::new("start").text("app", &new_sha));
                         eprintln!("[tj] reloaded");
                         out
                     }
@@ -364,11 +552,148 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     }
                 }
             }
+            Ok(Msg::SafeReload { req, done }) => {
+                let new_sha = sha256_hex(&req.source);
+                // Audit BEFORE shadow_validate decrypts live data or runs smoke traces (fail-closed).
+                if let Err(e) = d.audit.security(Entry::new("admin").who(req.actor).text("request", "reload").text("app", &new_sha)) {
+                    let _ = done.send(Err(e));
+                    continue;
+                }
+                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = done.send(Err(e));
+                        continue;
+                    }
+                };
+                drain_inflight(&mut rt, &mut d, &rx, &mut pending);
+                d.turn_errors = 0;
+                let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
+                match boot(&req.source, &data, render, explain, &refs) {
+                    Ok((new_rt, out, new_manifest, _, _)) => {
+                        let prev_source = std::mem::replace(&mut current_source, req.source.clone());
+                        let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
+                        previous = Some((prev_source.clone(), prev_sha.clone()));
+                        current_snap = new_snap;
+                        if let Ok(mut s) = live_source.lock() {
+                            *s = req.source;
+                        }
+                        rt = new_rt;
+                        d.on_swap(&rt);
+                        if let Ok(mut m) = manifest.lock() {
+                            *m = new_manifest;
+                        }
+                        d.stats.reloaded();
+                        let watch_secs = if req.error_threshold > 0 { req.watch_secs.min(MAX_WATCH_SECS) } else { 0 };
+                        if watch_secs > 0 {
+                            let until_ms = (now_ms() as u64).saturating_add(watch_secs * 1000);
+                            d.stats.set_watch_until(until_ms);
+                            watch = Some(WatchWindow {
+                                until: Instant::now() + Duration::from_secs(watch_secs),
+                                errors: 0,
+                                threshold: req.error_threshold,
+                                prev_source,
+                                prev_sha: prev_sha.clone(),
+                            });
+                        } else {
+                            watch = None;
+                            d.stats.set_watch_until(0);
+                        }
+                        let warnings: Vec<Json> = findings.iter().map(compat::Finding::json).collect();
+                        let _ = done.send(Ok(json!({
+                            "appSha256": new_sha,
+                            "previousSha256": prev_sha,
+                            "findings": warnings,
+                            "smokeTracesPassed": req.smoke_traces.len(),
+                            "watchSecs": watch_secs,
+                        })));
+                        out
+                    }
+                    Err(e) => {
+                        let _ = done.send(Err((503, format!("production swap boot failed; kept running version: {e}"))));
+                        continue;
+                    }
+                }
+            }
+            Ok(Msg::Rollback { actor, done }) => {
+                let Some((prev_source, prev_sha)) = previous.clone() else {
+                    let _ = done.send(Err((409, "no previous app version is available to roll back to".into())));
+                    continue;
+                };
+                if let Err(e) = d.audit.security(Entry::new("admin").who(actor).text("request", "rollback").text("app", &prev_sha)) {
+                    let _ = done.send(Err(e));
+                    continue;
+                }
+                drain_inflight(&mut rt, &mut d, &rx, &mut pending);
+                d.turn_errors = 0;
+                let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
+                match boot(&prev_source, &data, render, explain, &refs) {
+                    Ok((new_rt, out, new_manifest, new_snap, _)) => {
+                        let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
+                        current_source = prev_source.clone();
+                        previous = None;
+                        current_snap = new_snap;
+                        if let Ok(mut s) = live_source.lock() {
+                            *s = prev_source;
+                        }
+                        rt = new_rt;
+                        d.on_swap(&rt);
+                        if let Ok(mut m) = manifest.lock() {
+                            *m = new_manifest;
+                        }
+                        watch = None;
+                        d.stats.set_watch_until(0);
+                        let _ = done.send(Ok(json!({ "appSha256": prev_sha, "rolledBackFrom": rolled_from_sha })));
+                        out
+                    }
+                    Err(e) => {
+                        let _ = done.send(Err((503, format!("rollback boot failed: {e}"))));
+                        continue;
+                    }
+                }
+            }
             Err(RecvTimeoutError::Timeout) => rt.handle(now_ms(), Input::Tick),
             Err(RecvTimeoutError::Disconnected) => return,
         };
         d.outputs(&mut rt, out);
         privacy_effects(&mut rt, &mut d);
+
+        // Health-gated auto-rollback: if uncaught errors or 503s exceed the watch threshold
+        // during the post-reload watch window, restore the previous known-good bundle.
+        if let Some(w) = &mut watch {
+            if Instant::now() >= w.until {
+                watch = None;
+                d.stats.set_watch_until(0);
+            } else if d.turn_errors > 0 {
+                w.errors += d.turn_errors;
+                if w.errors >= w.threshold {
+                    let w = watch.take().expect("checked");
+                    d.stats.set_watch_until(0);
+                    let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
+                    match boot(&w.prev_source, &data, render, explain, &refs) {
+                        Ok((prev_rt, boot_out, prev_manifest, prev_snap, _)) => {
+                            current_source = w.prev_source.clone();
+                            current_sha = w.prev_sha.clone();
+                            previous = None;
+                            current_snap = prev_snap;
+                            if let Ok(mut s) = live_source.lock() {
+                                *s = w.prev_source;
+                            }
+                            rt = prev_rt;
+                            d.on_swap(&rt);
+                            if let Ok(mut m) = manifest.lock() {
+                                *m = prev_manifest;
+                            }
+                            d.stats.auto_rolled_back();
+                            d.audit.record(Entry::new("admin").who(Actor::System).text("request", "auto-rollback").text("app", &w.prev_sha));
+                            eprintln!("[tj] auto-rollback triggered ({} error(s) in watch window): restored {}", w.errors, &w.prev_sha[..w.prev_sha.len().min(12)]);
+                            d.outputs(&mut rt, boot_out);
+                        }
+                        Err(e) => eprintln!("[tj] auto-rollback boot failed: {e}"),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -424,10 +749,34 @@ fn privacy_effect(rt: &mut Runtime, d: &mut Dispatch, effect: u32, method: &str,
 }
 
 impl Dispatch {
+    /// Runs after every runtime swap: bumps `generation` so stale `EffectDone`s from the old
+    /// runtime are ignored, clears uncompleted replies/privacy effects, and closes any SSE
+    /// subscribers whose `@read` rules tightened under the new bundle.
+    fn on_swap(&mut self, rt: &Runtime) {
+        self.generation += 1;
+        self.replies.clear();
+        self.privacy.clear();
+        self.turn_errors = 0;
+        self.subscribers.retain(|s| {
+            let ok = match (s.reader(), s.objects()) {
+                (Some(caller), Some(objs)) => objs.iter().all(|o| rt.may_read(o, caller).is_ok()),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if !ok {
+                s.close();
+            }
+            ok
+        });
+    }
+
     fn outputs(&mut self, rt: &mut Runtime, out: Vec<Output>) {
         for o in out {
             match o {
                 Output::Reply { reply, ok, error, field, status } => {
+                    if status == Some(503) {
+                        self.turn_errors += 1;
+                    }
                     if let Some(w) = self.replies.remove(&reply) {
                         if let Some((name, sent)) = &w.timed {
                             self.stats.method(name, sent.elapsed(), error.is_none());
@@ -452,7 +801,7 @@ impl Dispatch {
                 // tj:privacy acts on the runtime, so it runs on this thread (see `privacy_effects`).
                 Output::Effect { id, effect: Effect::Plugin { plugin, method, args } } if plugin == "privacy" => self.privacy.push((id, method, args)),
                 Output::Effect { id, effect } => {
-                    let _ = self.effects.send((id, effect));
+                    let _ = self.effects.send((self.generation, id, effect));
                 }
                 Output::Emit { object, name, data } => {
                     let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
@@ -495,6 +844,7 @@ impl Dispatch {
                     self.audit.record(Entry::new(kind).who(Actor::id(caller.as_deref())).object(&object).text("method", &method).ok(ok).num("ms", ms));
                 }
                 Output::Error { message, trace } => {
+                    self.turn_errors += 1;
                     eprintln!("[app] error: {message}");
                     for t in trace {
                         eprintln!("    {t}");
@@ -520,8 +870,8 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool) -> Sender<(u32, Effect)> {
-    let (tx, rx) = channel::<(u32, Effect)>();
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool) -> Sender<(u64, u32, Effect)> {
+    let (tx, rx) = channel::<(u64, u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
     if !private_fetch {
@@ -534,7 +884,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
         let (rx, back, agent, plugins, stats, audit) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
-            let Ok((id, effect)) = job else { return };
+            let Ok((gen, id, effect)) = job else { return };
             let kind = match &effect {
                 Effect::Http { .. } => "http".to_string(),
                 Effect::Plugin { plugin, .. } => format!("plugin.{plugin}"),
@@ -551,7 +901,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
             if let Some((plugin, method)) = plugin_call {
                 audit.record(Entry::new("plugin").text("plugin", &plugin).text("method", &method).ok(result.is_ok()).num("ms", started.elapsed().as_millis() as u64));
             }
-            if back.send(Msg::EffectDone(id, result)).is_err() {
+            if back.send(Msg::EffectDone(gen, id, result)).is_err() {
                 return;
             }
         });

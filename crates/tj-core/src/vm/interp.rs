@@ -577,7 +577,7 @@ impl Runtime {
                     "unschedule" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
-                        let gone = self.unschedule_alarm(o, args.first().unwrap_or(&Value::Null));
+                        let gone = self.unschedule_alarm(o, args.first().unwrap_or(&Value::Null))?;
                         f.stack.push(gone);
                         Ok(())
                     }

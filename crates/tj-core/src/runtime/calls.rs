@@ -18,7 +18,7 @@ use super::access::Who;
 use super::objects::CallRecord;
 use super::protocol::{Effect, Output};
 use super::{By, Entry, Runtime, TimerKind};
-use crate::vm::value::{ObjRef, Value};
+use crate::vm::value::{Exc, ObjRef, Value};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 use std::collections::HashSet;
@@ -234,12 +234,15 @@ impl Runtime {
 
     /// `invoke(object, method, args)`: queues a call of an app method as the current caller,
     /// run once the calling fiber has suspended (so its promise has someone waiting on it).
-    pub(crate) fn invoke_as_caller(&mut self, object: String, method: String, args: Vec<Value>) -> u32 {
+    pub(crate) fn invoke_as_caller(&mut self, object: String, method: String, args: Vec<Value>) -> Result<u32, Exc> {
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot invoke other methods"));
+        }
         self.next_effect += 1;
         let promise = self.next_effect;
         let (who, chain) = (self.running_caller.clone(), self.running_chain);
         self.invocations.push_back(Invocation { promise, object, method, args, who, chain });
-        promise
+        Ok(promise)
     }
 
     /// Runs queued `invoke`s, each checked against the rules for its caller, exactly as a

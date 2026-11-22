@@ -3229,3 +3229,120 @@ fn schedule_checks_every_argument_and_tools_mask_self_person_fields() {
     assert_eq!(get_as(&mut rt, who("key:sam", &["staff"]))["customer"], json!("user:ana"));
     assert_eq!(get_as(&mut rt, who("user:bo", &[]))["customer"], json!("•••"));
 }
+
+#[test]
+fn invariant_purity_compile_checks_and_ui_reply_dedup() {
+    // P3A-R2: `@invariant` using `await` or omitting `return true` or returning non-boolean fails `compile()`.
+    let await_inv = r#"
+@server @read("anyone") object A {
+  n: number = 0
+  @invariant bad(): boolean { const _ = await fetch("https://example.com"); return true }
+}
+"#;
+    assert!(compile(await_inv).err().expect("await in invariant").iter().any(|d| d.message.contains("await")));
+
+    let missing_ret = r#"
+@server @read("anyone") object B {
+  n: number = 0
+  @invariant bad() { check(this.n >= 0, "n", "negative") }
+}
+"#;
+    assert!(compile(missing_ret).err().expect("missing return in invariant").iter().any(|d| d.message.contains("boolean")));
+
+    let wrong_ret = r#"
+@server @read("anyone") object C {
+  n: number = 0
+  @invariant bad(): string { return "ok" }
+}
+"#;
+    assert!(compile(wrong_ret).err().expect("wrong return type").iter().any(|d| d.message.contains("boolean")));
+
+    let bare_ret = r#"
+@server @read("anyone") object D {
+  n: number = 0
+  @invariant bad(): boolean { if (this.n < 0) { return } return true }
+}
+"#;
+    assert!(compile(bare_ret).err().expect("bare return in invariant").iter().any(|d| d.message.contains("boolean")));
+
+    let alias_ret = r#"
+type Valid = boolean
+@server @read("anyone") object E {
+  n: number = 0
+  @invariant ok(): Valid { return this.n >= 0 }
+}
+"#;
+    assert!(compile(alias_ret).is_ok(), "boolean type alias must be accepted on @invariant");
+
+    let nested_await = r#"
+@server @read("anyone") object F {
+  n: number = 0
+  @invariant bad(): boolean { const fn1 = () => await fetch("https://example.com"); return fn1 !== null }
+}
+"#;
+    assert!(compile(nested_await).err().expect("nested await in invariant").iter().any(|d| d.message.contains("await")));
+
+    // P3A-R1: `@invariant` cannot call `invoke(...)` (even via a plugin helper) or `this.unschedule(...)`.
+    let invoke_inv = r#"//# file: app.tj
+import { sneakInvoke } from "tj:sneak"
+@server @read("anyone") object Side {
+  hits: number = 0
+  @allow("anyone") bump() { this.hits += 1 }
+}
+@server @read("anyone") object Main {
+  n: number = 0
+  @invariant sneak(): boolean {
+    sneakInvoke()
+    return true
+  }
+  @allow("anyone") set(v: number) { this.n = v }
+}
+//# file: tj:sneak
+export function sneakInvoke() {
+  invoke("Side/s", "bump", [])
+}
+"#;
+    let mut rt = server(invoke_inv, false);
+    assert_eq!(call_as(&mut rt, 1.0, "Main/m", "set", json!([1]), who("", &[])).unwrap_err().0, Some(422));
+    assert_eq!(state(&mut rt, 2.0, "Side/s")["hits"], json!(0), "invoke inside @invariant must not run");
+
+    let unsched_inv = r#"
+@server @read("anyone") object Timer {
+  n: number = 0
+  armed: boolean = false
+  @invariant sneak(): boolean {
+    if (this.n > 0) { this.unschedule("ping") }
+    return true
+  }
+  @allow("anyone") arm() { this.schedule(1000, "ping"); this.armed = true }
+  @allow("anyone") bump() { this.n += 1 }
+  private ping() { this.armed = false }
+}
+"#;
+    let mut trt = server(unsched_inv, false);
+    call_as(&mut trt, 1.0, "Timer/t", "arm", json!([]), who("", &[])).unwrap();
+    assert_eq!(call_as(&mut trt, 2.0, "Timer/t", "bump", json!([]), who("", &[])).unwrap_err().0, Some(422));
+    trt.handle(2000.0, Input::Tick);
+    assert_eq!(state(&mut trt, 2001.0, "Timer/t")["armed"], json!(false), "alarm must still fire after blocked unschedule");
+
+    // P3A-R1: `Input::Ui` with `reply: Some(...)` failing `@invariant` before `await` emits
+    // only `Output::Reply` (422), never a duplicate `Output::Error`.
+    let ui_src = r#"
+object State {
+  n: number = 1
+  @invariant pos(): boolean { return this.n >= 0 }
+  async bad() {
+    this.n = -1
+    await fetch("https://example.com/x")
+  }
+}
+function App() {
+  const s = State.get("main")
+  return <Button id="go" onPress={() => s.bad()}>Go</Button>
+}
+"#;
+    let (mut dev, _) = boot_as(ui_src, Shared::default(), 0.0, false);
+    let out = dev.handle(1.0, Input::Ui { target: Target::Id { id: "go".into() }, event: "onPress".into(), value: Json::Null, reply: Some(42) });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 42, status: Some(422), .. })), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Error { .. })), "reply-bearing UI request must not emit duplicate Output::Error: {out:?}");
+}

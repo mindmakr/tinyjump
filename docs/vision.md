@@ -280,20 +280,25 @@ compliance without a rewrite). Proposed steps (`feedback/2026-11-20-critic-001-a
 and `feedback/2026-11-20-critic-003-two-way-case-and-refactoring.md`; not built yet, open
 for builder pushback and owner decision after the trust work):
 
-1. **Self-aware:** every app can state its own contract (`manifest`: object schemas,
-   access rules, personal-data map, plugins and code hash) and its live pulse (errors,
-   refusals, slow methods, queue depth and audit health).
-2. **Scoped operational roles:** observers/critics, testers, maintainers and human
-   operators use distinct, named credentials instead of one shared admin key. Critics
-   observe read-only with personal data masked; testers drive forked shadow state, never
-   live user records; leases show who is currently working on an app.
-3. **Self-protecting:** object invariants, per-turn VM step limits, per-object size caps,
-   outbound network rules and access/privacy checks fail closed before bad state reaches
-   the store.
-4. **Safe to evolve and keep fresh:** compile-time schema compatibility checks against the
-   deployed version, deterministic input-trace tests (`tj test`), shadow boot against
-   stored data with automatic rollback, and `tj retro` reports that flag dead code,
-   locale/layout regressions and budget drift.
+1. **Self-aware (built):** every app states its own contract (`tj check --manifest`,
+   `GET /_tj/manifest`, `tj mcp` `manifest`: object schemas, access rules, personal-data map,
+   plugins and code hash) and its live pulse (errors, refusals, slow methods, queue depth,
+   reload/rollback health and audit health).
+2. **Scoped operational roles (built):** observers/critics, testers, maintainers and human
+   operators use distinct, named credentials (`--ops observe|test|maintain` in `TJ_KEYS`,
+   audited as `ops:<name>`, isolated from `/api/*`) instead of one shared admin key. Critics
+   observe read-only with `@pii` and `"self"` person IDs masked; testers drive `tj dev` or
+   in-memory `tj test`, never live user records; leases (`/_tj/leases`) show and protect who
+   is currently working on an app.
+3. **Self-protecting (in progress):** object `@invariant`s with atomic turn rollback and
+   per-turn VM step limits (built), per-object size caps and per-caller/plugin rate caps
+   (next), plus outbound network rules and access/privacy checks fail closed before bad state
+   reaches the store.
+4. **Safe to evolve and keep fresh (in progress):** compile-time schema compatibility checks
+   against an older `.tj` file or live `/_tj/manifest` JSON (`tj check --against`),
+   deterministic input-trace tests (`tj test` + `tj mcp record_trace`), and shadow boot on a
+   copy-on-write overlay with live reload and health-gated automatic rollback (`POST /_tj/reload`,
+   `POST /_tj/rollback`, `tj reload`, `tj rollback`) are built; `tj retro` reports come next.
 
 ## For the next review and retro
 

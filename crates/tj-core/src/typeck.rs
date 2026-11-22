@@ -304,7 +304,28 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
                 let name: Rc<str> = Rc::from(o.name.as_str());
                 for m in &o.methods {
                     let saved = c.this_obj.replace(name.clone());
-                    c.function(&m.func, None);
+                    let is_inv = m.decorators.iter().any(|d| d.name == "invariant");
+                    let fn_ty = c.function(&m.func, None);
+                    if is_inv {
+                        let bad_ret = match &m.func.ret {
+                            Some(r) => {
+                                let resolved = c.resolve(r);
+                                c.deref(&resolved) != Ty::Bool
+                            }
+                            None => c.deref(&fn_ty.ret) != Ty::Bool && fn_ty.ret != Ty::Any,
+                        };
+                        if bad_ret || has_bare_return(&m.func.body) {
+                            c.errors.push(
+                                Diagnostic::new(format!("@invariant method {}.{} must return boolean", o.name, m.func.name), m.func.span)
+                                    .hint("declare `: boolean` and return true when valid (e.g. `@invariant ok(): boolean { return this.balance >= 0 }`)"),
+                            );
+                        } else if !always_exits(&m.func.body) {
+                            c.errors.push(
+                                Diagnostic::new(format!("@invariant method {}.{} may end without returning a boolean", o.name, m.func.name), m.func.span)
+                                    .hint("return true at the end of every non-throwing path (e.g. `return true` after `check(...)`)"),
+                            );
+                        }
+                    }
                     c.this_obj = saved;
                 }
             }
@@ -312,6 +333,26 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
         }
     }
     c.errors
+}
+
+fn always_exits(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Return(Some(_), _) | Stmt::Throw(_, _) => true,
+        Stmt::If { then, els: Some(els), .. } => always_exits(then) && always_exits(els),
+        Stmt::Try { body, handler, .. } => always_exits(body) && always_exits(handler),
+        Stmt::Block(b) => always_exits(b),
+        _ => false,
+    })
+}
+
+fn has_bare_return(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(|s| match s {
+        Stmt::Return(None, _) => true,
+        Stmt::If { then, els, .. } => has_bare_return(then) || els.as_deref().is_some_and(has_bare_return),
+        Stmt::While { body, .. } | Stmt::ForOf { body, .. } | Stmt::For { body, .. } | Stmt::Block(body) => has_bare_return(body),
+        Stmt::Try { body, handler, .. } => has_bare_return(body) || has_bare_return(handler),
+        _ => false,
+    })
 }
 
 impl<'a> Checker<'a> {
