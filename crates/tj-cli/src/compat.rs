@@ -1,12 +1,16 @@
 //! Upgrade compatibility checker (`tj check <new.tj> --against <old.tj>` and non-blocking
-//! reload notices in `tj dev`): compares two compiled apps' schemas, outbox method signatures,
-//! access rules and personal-data declarations so agentic refactorings cannot silently drop
-//! stored fields, break queued device calls or accidentally widen security rules.
+//! reload notices in `tj dev`): compares two compiled apps' schemas, outbox method signatures
+//! (structural `ArgTy`), access rules and personal-data declarations so agentic refactorings
+//! cannot silently drop stored fields, break queued device calls or accidentally widen
+//! security rules.
 
 use crate::manifest::Manifest;
 use serde_json::{json, Value as Json};
-use std::collections::HashMap;
-use tj_core::vm::program::Program;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use tj_core::modules;
+use tj_core::syntax::ast::{Item, TypeExpr};
+use tj_core::syntax::parse_range;
+use tj_core::vm::program::{ArgTy, Program};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -35,28 +39,54 @@ impl Finding {
     }
 }
 
-/// Compares `new` against `old` and returns all breaking changes and warnings.
-pub fn check(old_src: &str, old_prog: &Program, new_src: &str, new_prog: &Program) -> Vec<Finding> {
-    let old = Manifest::build(old_src, old_prog, &[]).json;
-    let new = Manifest::build(new_src, new_prog, &[]).json;
-    check_manifests(&old, &new)
+type ParamSpec = (String, bool, ArgTy);
+
+/// Precomputed snapshot of one app version so `tj dev` can cache the previous version without
+/// recompiling on every save.
+pub struct Snapshot {
+    pub manifest: Json,
+    /// `(Object, method)` -> compiled `(param_name, optional, ArgTy)` for structural outbox checks.
+    method_params: HashMap<(String, String), Vec<ParamSpec>>,
+    /// `(Object, field)` -> alias-resolved, canonicalized type string.
+    field_types: HashMap<(String, String), String>,
 }
 
-pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
+impl Snapshot {
+    pub fn build(source: &str, program: &Program) -> Snapshot {
+        let manifest = Manifest::build(source, program, &[]).json;
+        let mut method_params = HashMap::new();
+        for o in &program.objects {
+            for (mname, m) in &o.methods {
+                let params = m.params.iter().map(|(n, opt, ty)| (n.to_string(), *opt, ty.clone())).collect();
+                method_params.insert((o.name.to_string(), mname.to_string()), params);
+            }
+        }
+        let field_types = canonical_field_types(source);
+        Snapshot { manifest, method_params, field_types }
+    }
+}
+
+/// Compares `new` against `old` and returns all breaking changes and warnings.
+pub fn check(old_src: &str, old_prog: &Program, new_src: &str, new_prog: &Program) -> Vec<Finding> {
+    check_snapshots(&Snapshot::build(old_src, old_prog), &Snapshot::build(new_src, new_prog))
+}
+
+pub fn check_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
-    let old_objs = by_name(&old["objects"]);
-    let new_objs = by_name(&new["objects"]);
+    let old_objs = by_name(&old.manifest["objects"]);
+    let new_objs = by_name(&new.manifest["objects"]);
 
     for (name, o) in &old_objs {
         let Some(n) = new_objs.get(name) else {
-            // Only persistent objects with fields risk losing stored data.
-            if o["fields"].as_array().is_some_and(|f| !f.is_empty()) {
+            let has_fields = o["fields"].as_array().is_some_and(|f| !f.is_empty());
+            let has_remote_methods = o["methods"].as_array().is_some_and(|ms| ms.iter().any(|m| m["allow"].is_array()));
+            if has_fields || has_remote_methods {
                 out.push(Finding {
                     severity: Severity::Breaking,
                     code: "object-removed",
                     subject: (*name).to_string(),
-                    message: format!("object {name} was removed; existing stored {name}/* records will become unreachable"),
-                    hint: format!("keep `object {name}` until its stored data is migrated or pass --allow-breaking if intentional"),
+                    message: format!("object {name} was removed; existing stored {name}/* records or queued device calls will break"),
+                    hint: format!("keep `object {name}` until its stored data and device callers are migrated, or pass --allow-breaking"),
                 });
             }
             continue;
@@ -87,17 +117,19 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
         // 3. Retention / legalHold weakening.
         check_retention(name, o, n, &mut out);
 
-        // 4. Fields: removals (with rename hint), type changes, field `@read` widening, `@pii` removal/widening.
+        // 4. Fields: removals (deterministic rename hint), type changes, field `@read` widening, `@pii` / `@by` regressions.
         let old_fields = by_name(&o["fields"]);
         let new_fields = by_name(&n["fields"]);
-        let added_fields: Vec<(&str, &Json)> = new_fields.iter().filter(|(k, _)| !old_fields.contains_key(*k)).map(|(k, v)| (*k, *v)).collect();
+        let mut added_fields: Vec<(&str, &Json)> = new_fields.iter().filter(|(k, _)| !old_fields.contains_key(*k)).map(|(k, v)| (*k, *v)).collect();
+        added_fields.sort_by_key(|(k, _)| *k);
 
         for (fname, of) in &old_fields {
             let subj = format!("{name}.{fname}");
+            let old_ty = old.field_types.get(&((*name).to_string(), (*fname).to_string()));
             let Some(nf) = new_fields.get(fname) else {
                 let candidate = added_fields
                     .iter()
-                    .find(|(_, af)| of.get("type").is_some() && af.get("type") == of.get("type"))
+                    .find(|(ak, _)| old_ty.is_some() && new.field_types.get(&((*name).to_string(), (*ak).to_string())) == old_ty)
                     .map(|(k, _)| *k);
                 let hint = match candidate {
                     Some(c) => format!("did you rename {name}.{fname} to {name}.{c}? Keep `{fname}` (or migrate stored records) so existing values are not dropped"),
@@ -112,7 +144,8 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
                 });
                 continue;
             };
-            if let (Some(ot), Some(nt)) = (of["type"].as_str(), nf["type"].as_str()) {
+            let new_ty = new.field_types.get(&((*name).to_string(), (*fname).to_string()));
+            if let (Some(ot), Some(nt)) = (old_ty, new_ty) {
                 if ot != nt {
                     out.push(Finding {
                         severity: Severity::Breaking,
@@ -123,17 +156,19 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
                     });
                 }
             }
-            // Field-level `@read` widening (removing a field `@read` exposes it to all object readers!).
-            if field_read_widened(&o["read"], &of["read"], &n["read"], &nf["read"]) {
+            // Effective field `@read` is the intersection of object `@read` and field `@read`.
+            let eff_old = effective_field_read(&o["read"], &of["read"]);
+            let eff_new = effective_field_read(&n["read"], &nf["read"]);
+            if rule_words_widened(&eff_old, &eff_new) {
                 out.push(Finding {
                     severity: Severity::Breaking,
                     code: "field-read-widened",
                     subject: subj.clone(),
-                    message: format!("@read on {name}.{fname} widened from {} to {}", fmt_rule(&of["read"]), fmt_rule(&nf["read"])),
+                    message: format!("@read on {name}.{fname} widened from {} to {}", fmt_words(&eff_old), fmt_words(&eff_new)),
                     hint: "keep the field's @read rule the same or narrower, or pass --allow-breaking if intentional".into(),
                 });
             }
-            // `@pii` removal or purpose widening.
+            // `@pii`, `@by`, and special-category regressions.
             match (of["pii"].as_object(), nf["pii"].as_object()) {
                 (Some(_), None) => out.push(Finding {
                     severity: Severity::Breaking,
@@ -143,6 +178,24 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
                     hint: "keep @pii on personal data fields, or pass --allow-breaking if the field no longer holds personal data".into(),
                 }),
                 (Some(op), Some(np)) => {
+                    if op.get("by") != np.get("by") {
+                        out.push(Finding {
+                            severity: Severity::Breaking,
+                            code: "pii-by-changed",
+                            subject: subj.clone(),
+                            message: format!("@by metadata changed on {name}.{fname}; existing list entries will not match export, erasure or retention"),
+                            hint: "keep @by(\"person\", \"at\") unchanged for existing stored lists or migrate records first".into(),
+                        });
+                    }
+                    if op.get("special").and_then(Json::as_bool) == Some(true) && np.get("special").and_then(Json::as_bool) != Some(true) {
+                        out.push(Finding {
+                            severity: Severity::Breaking,
+                            code: "pii-special-downgraded",
+                            subject: subj.clone(),
+                            message: format!("{name}.{fname} changed from a special personal-data category to a non-special category"),
+                            hint: "verify the category classification; special categories carry stricter compliance controls".into(),
+                        });
+                    }
                     let old_p = str_set(op.get("purposes"));
                     let new_p = str_set(np.get("purposes"));
                     let added: Vec<&str> = new_p.iter().filter(|p| !old_p.contains(*p)).copied().collect();
@@ -160,7 +213,7 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
             }
         }
 
-        // 5. Methods: removed remote methods, parameter breaks (outbox compatibility), `@allow` widening.
+        // 5. Methods: removed remote methods, structural `ArgTy` parameter compatibility, `@allow` widening, `@needs` removal.
         let old_methods = by_name(&o["methods"]);
         let new_methods = by_name(&n["methods"]);
         for (mname, om) in &old_methods {
@@ -196,13 +249,27 @@ pub fn check_manifests(old: &Json, new: &Json) -> Vec<Finding> {
                     hint: "keep @allow the same or narrower, or pass --allow-breaking if intentional".into(),
                 });
             }
+            let old_needs = str_set(om.get("needs"));
+            let new_needs = str_set(nm.get("needs"));
+            let dropped_needs: Vec<&str> = old_needs.iter().filter(|x| !new_needs.contains(*x)).copied().collect();
+            if !dropped_needs.is_empty() {
+                out.push(Finding {
+                    severity: Severity::Breaking,
+                    code: "needs-removed",
+                    subject: subj.clone(),
+                    message: format!("@needs consent gate(s) removed from {name}.{mname}: {}", dropped_needs.join(", ")),
+                    hint: "keep @needs(\"consent:...\") unless consent is no longer required for this method".into(),
+                });
+            }
             if was_remote && nm["allow"].is_array() {
-                check_params(&subj, &om["params"], &nm["params"], &mut out);
+                let key = ((*name).to_string(), (*mname).to_string());
+                if let (Some(op), Some(np)) = (old.method_params.get(&key), new.method_params.get(&key)) {
+                    check_params(&subj, op, np, &mut out);
+                }
             }
         }
     }
 
-    // Also flag newly added objects that have no issues unless they have access warnings.
     out.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.subject.cmp(&b.subject)).then(a.code.cmp(b.code)));
     out
 }
@@ -225,6 +292,15 @@ fn check_retention(name: &str, o: &Json, n: &Json, out: &mut Vec<Finding>) {
         }),
         _ => {}
     }
+    if o["retain"]["from"].as_str() == Some("created") && n["retain"]["from"].as_str() == Some("changed") {
+        out.push(Finding {
+            severity: Severity::Breaking,
+            code: "retain-from-changed",
+            subject: name.into(),
+            message: format!("@retain on {name} changed from \"created\" to \"changed\" (extending retention on every edit)"),
+            hint: "keep @retain(..., \"created\") or pass --allow-breaking if changing retention policy intentionally".into(),
+        });
+    }
     match (o["legalHoldMs"].as_f64(), n["legalHoldMs"].as_f64()) {
         (Some(_), None) => out.push(Finding {
             severity: Severity::Breaking,
@@ -244,9 +320,7 @@ fn check_retention(name: &str, o: &Json, n: &Json, out: &mut Vec<Finding>) {
     }
 }
 
-fn check_params(subj: &str, old_params: &Json, new_params: &Json, out: &mut Vec<Finding>) {
-    let old = old_params.as_array().map(Vec::as_slice).unwrap_or(&[]);
-    let new = new_params.as_array().map(Vec::as_slice).unwrap_or(&[]);
+fn check_params(subj: &str, old: &[ParamSpec], new: &[ParamSpec], out: &mut Vec<Finding>) {
     if new.len() < old.len() {
         out.push(Finding {
             severity: Severity::Breaking,
@@ -256,22 +330,17 @@ fn check_params(subj: &str, old_params: &Json, new_params: &Json, out: &mut Vec<
             hint: "keep trailing parameters as optional (`unused?: any`) during rollout or pass --allow-breaking".into(),
         });
     }
-    for (i, np) in new.iter().enumerate() {
-        let pname = np["name"].as_str().unwrap_or("arg");
-        let n_opt = np["optional"].as_bool().unwrap_or(false);
-        let n_ty = np["type"].as_str().unwrap_or("anything");
+    for (i, (pname, n_opt, n_ty)) in new.iter().enumerate() {
         match old.get(i) {
             None if !n_opt => out.push(Finding {
                 severity: Severity::Breaking,
                 code: "param-required-added",
                 subject: subj.into(),
-                message: format!("{subj} added required parameter `{pname}` ({n_ty}); queued calls from older devices omit it"),
+                message: format!("{subj} added required parameter `{pname}` ({}); queued calls from older devices omit it", n_ty.describe()),
                 hint: format!("make `{pname}` optional (`{pname}?: ...` or give it a default value) so older callers keep working"),
             }),
-            Some(op) => {
-                let o_opt = op["optional"].as_bool().unwrap_or(false);
-                let o_ty = op["type"].as_str().unwrap_or("anything");
-                if o_opt && !n_opt {
+            Some((_, o_opt, o_ty)) => {
+                if *o_opt && !n_opt {
                     out.push(Finding {
                         severity: Severity::Breaking,
                         code: "param-made-required",
@@ -280,12 +349,12 @@ fn check_params(subj: &str, old_params: &Json, new_params: &Json, out: &mut Vec<
                         hint: format!("keep `{pname}` optional during rollout or pass --allow-breaking"),
                     });
                 }
-                if o_ty != n_ty && n_ty != "anything" {
+                if !arg_ty_compatible(o_ty, n_ty) {
                     out.push(Finding {
                         severity: Severity::Breaking,
                         code: "param-type-changed",
                         subject: subj.into(),
-                        message: format!("{subj} parameter `{pname}` changed type from {o_ty} to {n_ty}"),
+                        message: format!("{subj} parameter `{pname}` changed type incompatibly (old callers send {}, new expects {})", o_ty.describe(), n_ty.describe()),
                         hint: "accept a union of old and new types (or add a new method) so queued calls do not fail".into(),
                     });
                 }
@@ -295,10 +364,127 @@ fn check_params(subj: &str, old_params: &Json, new_params: &Json, out: &mut Vec<
     }
 }
 
-/// True if `new_rule` admits any caller that `old_rule` refused.
+/// True if every JSON value accepted by `old` is also accepted by `new` (contravariant parameter safety).
+fn arg_ty_compatible(old: &ArgTy, new: &ArgTy) -> bool {
+    if matches!(new, ArgTy::Any) {
+        return true;
+    }
+    if let ArgTy::Union(os) = old {
+        return os.iter().all(|o| arg_ty_compatible(o, new));
+    }
+    if let ArgTy::Union(ns) = new {
+        return ns.iter().any(|n| arg_ty_compatible(old, n));
+    }
+    match (old, new) {
+        (ArgTy::Num, ArgTy::Num)
+        | (ArgTy::Str, ArgTy::Str)
+        | (ArgTy::Bool, ArgTy::Bool)
+        | (ArgTy::Null, ArgTy::Null)
+        | (ArgTy::StrLit(_), ArgTy::Str)
+        | (ArgTy::NumLit(_), ArgTy::Num)
+        | (ArgTy::BoolLit(_), ArgTy::Bool) => true,
+        (ArgTy::StrLit(a), ArgTy::StrLit(b)) => a == b,
+        (ArgTy::NumLit(a), ArgTy::NumLit(b)) => a == b,
+        (ArgTy::BoolLit(a), ArgTy::BoolLit(b)) => a == b,
+        (ArgTy::Arr(o), ArgTy::Arr(n)) => arg_ty_compatible(o, n),
+        (ArgTy::Dict(o), ArgTy::Dict(n)) => arg_ty_compatible(o, n),
+        (ArgTy::Rec(of), ArgTy::Rec(nf)) => {
+            // Every field an old caller might send must be allowed by `new` with a compatible type,
+            // and `new` may not require any field that `old` did not require.
+            let old_fits = of.iter().all(|(k, o_opt, ot)| {
+                nf.iter().any(|(nk, n_opt, nt)| nk == k && (!*o_opt || *n_opt) && arg_ty_compatible(ot, nt))
+            });
+            let req_met = nf.iter().all(|(nk, n_opt, _)| *n_opt || of.iter().any(|(k, o_opt, _)| k == nk && !*o_opt));
+            old_fits && req_met
+        }
+        _ => false,
+    }
+}
+
+/// Resolves local `type Foo = ...` aliases and canonicalizes unions/record field ordering so
+/// benign refactors (`type Cents = number` <-> `number`, `A | B` <-> `B | A`) are not flagged.
+fn canonical_field_types(source: &str) -> HashMap<(String, String), String> {
+    let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
+    let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
+    for f in modules::files(source) {
+        let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
+        for item in &parsed.items {
+            match item {
+                Item::TypeAlias { name, generics, ty, .. } if generics.is_empty() => {
+                    aliases.insert(name.clone(), ty.clone());
+                }
+                Item::Object(o) => {
+                    for fl in &o.fields {
+                        if let Some(ty) = &fl.ty {
+                            raw_fields.push((o.name.clone(), fl.name.clone(), ty.clone()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    raw_fields
+        .into_iter()
+        .map(|(o, f, ty)| ((o, f), canon_type(&ty, &aliases, &mut HashSet::new())))
+        .collect()
+}
+
+fn canon_type(ty: &TypeExpr, aliases: &HashMap<String, TypeExpr>, seen: &mut HashSet<String>) -> String {
+    match ty {
+        TypeExpr::Named(n, args) if args.is_empty() => {
+            if let Some(target) = aliases.get(n) {
+                if seen.insert(n.clone()) {
+                    let s = canon_type(target, aliases, seen);
+                    seen.remove(n);
+                    return s;
+                }
+            }
+            n.clone()
+        }
+        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(|a| canon_type(a, aliases, seen)).collect::<Vec<_>>().join(", ")),
+        TypeExpr::Array(inner) => format!("{}[]", canon_type(inner, aliases, seen)),
+        TypeExpr::Union(ts) => {
+            let mut parts: Vec<String> = ts.iter().map(|t| canon_type(t, aliases, seen)).collect();
+            parts.sort();
+            parts.dedup();
+            parts.join(" | ")
+        }
+        TypeExpr::Record(fs) => {
+            let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
+            for (k, opt, t) in fs {
+                sorted.insert(k.as_str(), format!("{k}{}: {}", if *opt { "?" } else { "" }, canon_type(t, aliases, seen)));
+            }
+            format!("{{ {} }}", sorted.into_values().collect::<Vec<_>>().join(", "))
+        }
+        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(|p| canon_type(p, aliases, seen)).collect::<Vec<_>>().join(", "), canon_type(r, aliases, seen)),
+        TypeExpr::StrLit(s) => format!("{s:?}"),
+        TypeExpr::NumLit(n) => n.to_string(),
+    }
+}
+
+/// Effective remote readers of a field: empty whenever the object itself is not remotely readable.
+fn effective_field_read<'a>(obj_read: &'a Json, field_read: &'a Json) -> Vec<&'a str> {
+    let obj = str_set(Some(obj_read));
+    if obj.is_empty() || obj.iter().all(|w| *w == "none") {
+        return Vec::new();
+    }
+    let fld = str_set(Some(field_read));
+    if fld.is_empty() {
+        obj
+    } else if fld.iter().all(|w| *w == "none") {
+        Vec::new()
+    } else {
+        fld
+    }
+}
+
 fn rule_widened(old_rule: &Json, new_rule: &Json) -> bool {
-    let old = str_set(Some(old_rule));
-    let new = str_set(Some(new_rule));
+    rule_words_widened(&str_set(Some(old_rule)), &str_set(Some(new_rule)))
+}
+
+/// True if `new` admits any caller that `old` refused.
+fn rule_words_widened(old: &[&str], new: &[&str]) -> bool {
     if new.is_empty() || new.iter().all(|w| *w == "none") {
         return false;
     }
@@ -312,20 +498,12 @@ fn rule_widened(old_rule: &Json, new_rule: &Json) -> bool {
         return true;
     }
     if old.contains(&"signedIn") {
-        // Only "anyone" is wider than "signedIn", already handled above.
         return false;
     }
     if new.contains(&"signedIn") {
         return true;
     }
-    // Otherwise every word in `new` must have been in `old`.
     new.iter().any(|w| !old.contains(w))
-}
-
-fn field_read_widened(old_obj: &Json, old_field: &Json, new_obj: &Json, new_field: &Json) -> bool {
-    let eff_old = if old_field.is_array() { old_field } else { old_obj };
-    let eff_new = if new_field.is_array() { new_field } else { new_obj };
-    rule_widened(eff_old, eff_new)
 }
 
 fn by_name(list: &Json) -> HashMap<&str, &Json> {
@@ -341,7 +519,10 @@ fn str_set(v: Option<&Json>) -> Vec<&str> {
 }
 
 fn fmt_rule(v: &Json) -> String {
-    let words = str_set(Some(v));
+    fmt_words(&str_set(Some(v)))
+}
+
+fn fmt_words(words: &[&str]) -> String {
     if words.is_empty() { "not remote".into() } else { words.join(", ") }
 }
 
@@ -378,19 +559,28 @@ mod tests {
     }
 
     #[test]
-    fn additive_and_tightening_changes_are_compatible() {
+    fn additive_tightening_union_widening_and_alias_refactors_are_compatible() {
         let old = r#"
+type Cents = number
 @server @read("anyone") object Cart {
-  stock: number = 10
+  stock: Cents = 10
+  meta: { a: number, b: string } = { a: 0, b: "" }
   @allow("anyone") add(qty: number) { this.stock -= qty }
+}
+@server object Vault {
+  email: string = ""
 }
 "#;
         let new = r#"
 @server @read("signedIn") object Cart {
   stock: number = 10
+  meta: { b: string, a: number } = { a: 0, b: "" }
   note: string = ""
   @invariant nonNeg(): boolean { return this.stock >= 0 }
-  @allow("signedIn") add(qty: number, note?: string) { this.stock -= qty; if (note !== null) { this.note = note } }
+  @allow("signedIn") add(qty: number | string, note?: string) { if (note !== null) { this.note = note } }
+}
+@server object Vault {
+  @pii("contact", "account") email: string = ""
 }
 "#;
         let f = diff(old, new);
@@ -398,28 +588,33 @@ mod tests {
     }
 
     #[test]
-    fn catches_field_renames_type_changes_outbox_breaks_and_rule_widenings() {
+    fn catches_record_param_breaks_privacy_regressions_and_stateless_object_removal() {
         let old = r#"
-@server @read("owner") @retain("30d") @legalHold("365d") object Account {
-  @pii("contact", "account") email: string = ""
+@server @read("owner") @retain("30d", "created") @legalHold("365d") object Account {
+  @pii("health", "care") email: string = ""
   qty: number = 0
   @read("owner") secret: string = ""
-  @allow("owner") update(n: number) { this.qty = n }
+  @allow("owner") update(item: { price: number }) { this.qty = item.price }
+}
+@server @read("anyone") object Ping {
+  @allow("anyone") ok(): boolean { return true }
 }
 "#;
         let new = r#"
-@server @read("anyone") object Account {
-  email: string = ""
+@server @read("anyone") @retain("30d", "changed") object Account {
+  @pii("contact", "care") email: string = ""
   quantity: number = 0
   secret: string = ""
-  @allow("anyone") update(n: string, extra: number) { this.quantity = extra }
+  @allow("anyone") update(item: { price: string }, extra: number) { this.quantity = extra }
 }
 "#;
         let f = diff(old, new);
         let codes: Vec<&str> = f.iter().map(|x| x.code).collect();
-        for want in ["read-widened", "retain-removed", "legal-hold-removed", "pii-removed", "field-removed", "field-read-widened", "allow-widened", "param-type-changed", "param-required-added"] {
+        for want in ["read-widened", "retain-from-changed", "legal-hold-removed", "pii-special-downgraded", "field-removed", "field-read-widened", "allow-widened", "param-type-changed", "param-required-added", "object-removed"] {
             assert!(codes.contains(&want), "missing {want} in {codes:?}\n{}", report(&f));
         }
+        let fld_read = f.iter().find(|x| x.code == "field-read-widened").unwrap();
+        assert!(fld_read.message.contains("from owner to anyone"), "effective rule shown cleanly: {}", fld_read.message);
         let rename = f.iter().find(|x| x.code == "field-removed").unwrap();
         assert!(rename.hint.contains("Account.quantity"), "should suggest rename candidate: {}", rename.hint);
     }

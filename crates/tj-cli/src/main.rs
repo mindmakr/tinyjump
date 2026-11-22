@@ -317,10 +317,20 @@ fn read_source(file: &Path) -> Result<String, String> {
 
 #[allow(clippy::too_many_arguments)]
 fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>, allow_breaking: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+    if as_json && show_manifest && against.is_some() {
+        return Err("pass either --manifest --json or --against <old.tj> --json, not both".into());
+    }
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
         Ok(program) => {
+            if show_manifest && as_json {
+                let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+                let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+                let m = manifest::Manifest::build(&src, &program, &refs);
+                println!("{}", serde_json::to_string_pretty(&m.json).expect("JSON serializes"));
+                return Ok(());
+            }
             if let Some(old_file) = against {
                 let old_src = read_source(old_file)?;
                 let old_name = old_file.display().to_string();
@@ -332,21 +342,40 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                         "findings": findings.iter().map(compat::Finding::json).collect::<Vec<_>>(),
                     });
                     println!("{}", serde_json::to_string_pretty(&j).expect("JSON serializes"));
-                } else {
-                    println!("ok: {name}");
-                    print!("{}", compat::report(&findings));
+                    if !allow_breaking && compat::has_breaking(&findings) {
+                        return Err("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                    }
+                    return Ok(());
                 }
-                if !allow_breaking && compat::has_breaking(&findings) {
-                    return Err("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                println!("ok: {name}");
+                print!("{}", compat::report(&findings));
+                let mut failed: Option<String> = (!allow_breaking && compat::has_breaking(&findings)).then(|| "breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                if show_manifest {
+                    let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+                    let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+                    let m = manifest::Manifest::build(&src, &program, &refs);
+                    print!("{}", m.text());
                 }
-                return Ok(());
-            }
-            if show_manifest && as_json {
-                let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
-                let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-                let m = manifest::Manifest::build(&src, &program, &refs);
-                println!("{}", serde_json::to_string_pretty(&m.json).expect("JSON serializes"));
-                return Ok(());
+                if access {
+                    print!("{}", access::report(&src));
+                }
+                if privacy && record {
+                    print!("{}", privacy::record(&src, &program));
+                } else if privacy {
+                    print!("{}", privacy::report(&program));
+                }
+                if let Some(pack) = pack {
+                    let pack = compliance::Pack::load(pack)?;
+                    let (report, ok) = pack.report(&pack.evaluate(&src, &program, None));
+                    print!("{report}");
+                    if !ok {
+                        failed = Some("some controls are not met (above)".into());
+                    }
+                }
+                return match failed {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
             }
             println!("ok: {name}");
             if show_manifest {
@@ -481,7 +510,7 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
     let stamps = |files: &[PathBuf]| -> Vec<Option<SystemTime>> { files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect() };
     let spawned = thread::Builder::new().name("tj-watch".into()).spawn(move || {
         let initial = app::read(&file).ok();
-        let mut prev_src = initial.as_ref().map(|a| a.source.clone());
+        let mut prev_snap = initial.as_ref().and_then(|a| tj_core::compile(&a.source).ok().map(|p| compat::Snapshot::build(&a.source, &p)));
         let mut files = initial.map(|a| a.files).unwrap_or_else(|| vec![file.clone()]);
         let mut last = stamps(&files);
         loop {
@@ -493,16 +522,15 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
                 Ok(app) => {
                     match tj_core::compile(&app.source) {
                         Ok(new_prog) => {
+                            let new_snap = compat::Snapshot::build(&app.source, &new_prog);
                             // Non-blocking upgrade check during `tj dev` iteration (`R-003.1`).
-                            if let Some(old_src) = &prev_src {
-                                if let Ok(old_prog) = tj_core::compile(old_src) {
-                                    let findings = compat::check(old_src, &old_prog, &app.source, &new_prog);
-                                    if !findings.is_empty() {
-                                        eprint!("[tj] upgrade notice:\n{}", compat::report(&findings));
-                                    }
+                            if let Some(old_snap) = &prev_snap {
+                                let findings = compat::check_snapshots(old_snap, &new_snap);
+                                if !findings.is_empty() {
+                                    eprint!("[tj] upgrade notice:\n{}", compat::report(&findings));
                                 }
                             }
-                            prev_src = Some(app.source.clone());
+                            prev_snap = Some(new_snap);
                             engine.reload(app.source);
                         }
                         Err(errs) => eprintln!("{}", errs.iter().map(|d| d.render(&file.display().to_string(), &app.source)).collect::<Vec<_>>().join("\n\n")),

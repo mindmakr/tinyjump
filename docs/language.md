@@ -389,10 +389,12 @@ exclusive call at a time, in order, like an actor:
 
 ### Object invariants (`@invariant`) and atomic turns
 
-An object can declare synchronous `@invariant` methods (taking no parameters, returning a
-boolean). Before saving any modified object, the runtime runs its `@invariant` methods; if
-any returns `false` or throws, every object touched in that turn rolls back to its last
-saved state (alarms and events included) and the call fails with status `422`:
+An object can declare pure, synchronous `@invariant` methods (taking no parameters,
+returning a boolean, with no `@allow`, `@every`, `@exclusive` or `@needs`). At the end of
+every turn — and right before an `async` method suspends at `await` — the runtime checks
+`@invariant` on every modified object. If any returns `false`, throws, or tries to mutate
+state or run effects, every object touched in that turn rolls back to its last saved state
+(alarms, events and uncommitted effects included) and the call fails with status `422`:
 
 ```tsx
 @server @read("anyone") object Cart {
@@ -402,8 +404,14 @@ saved state (alarms and events included) and the call fails with status `422`:
 }
 ```
 
-Any uncaught `throw` or `check()` failure in a method also rolls back uncommitted mutations
-made during that turn, so failed calls never leave half-written state behind.
+- Any uncaught `throw` or `check()` failure also rolls back uncommitted mutations made
+  during that turn, so failed calls never leave half-written state behind.
+- Each `await` is a commit boundary: mutations made before `await` are checked and saved
+  when suspending; if a later segment throws, only mutations made after the `await` roll
+  back.
+- Statutory privacy erasure (`erase`) and `@retain` sweeps always succeed and are not
+  blocked by app `@invariant`s; write invariants on shared objects with `@by` or `"self"`
+  fields so erased/empty values stay valid.
 
 ## UI
 

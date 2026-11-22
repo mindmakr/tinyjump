@@ -596,8 +596,8 @@ impl Compiler {
                     other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object), @invariant (checked before saving) and @needs(\"consent:<purpose>\")")),
                 }
             }
-            if invariant && (allow.is_some() || every.is_some()) {
-                self.error(Diagnostic::new("@invariant methods cannot also have @allow or @every", m.func.span).hint("invariants run automatically before saving and are never called remotely or by timers"));
+            if invariant && (allow.is_some() || every.is_some() || exclusive || !needs.is_empty()) {
+                self.error(Diagnostic::new("@invariant methods cannot also have @allow, @every, @exclusive or @needs", m.func.span).hint("invariants run automatically before saving and must be pure synchronous checks"));
             }
             let proto = self.function(&m.func, FnKind::Method(&needs));
             let params = m.func.params.iter().map(|p| {

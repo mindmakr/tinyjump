@@ -67,6 +67,8 @@ pub(crate) struct CallRecord {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     field: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<u16>,
 }
 
 impl CallRecord {
@@ -74,7 +76,7 @@ impl CallRecord {
         let text = serde_json::to_string(args).expect("JSON values serialize");
         // FNV-1a: telling one call's arguments from another's, not hiding them.
         let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None, field: None }
+        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None, field: None, status: None }
     }
 
     fn expired(&self, now: f64) -> bool {
@@ -86,15 +88,20 @@ impl CallRecord {
         self.by == other.by && self.method == other.method && self.args == other.args
     }
 
-    pub(crate) fn with_result(mut self, r: &Result<Json, (String, Option<String>)>) -> CallRecord {
+    pub(crate) fn with_result(mut self, r: &Result<Json, (String, Option<String>)>, status: Option<u16>) -> CallRecord {
         match r {
             Ok(v) => self.ok = Some(v.clone()),
             Err((e, f)) => {
                 self.error = Some(e.clone());
                 self.field = f.clone();
+                self.status = status;
             }
         }
         self
+    }
+
+    pub(crate) fn status(&self) -> Option<u16> {
+        self.status
     }
 
     pub(crate) fn result(&self) -> Result<Json, (String, Option<String>)> {
@@ -416,7 +423,7 @@ impl Runtime {
         }
         let v = self.inst(o).state.borrow().get(name).cloned();
         match v {
-            Some(v) if this != Some(&**o) => Ok(v.read_only()),
+            Some(v) if this != Some(&**o) || self.in_invariant => Ok(v.read_only()),
             Some(v) => {
                 // Containers can be changed in place, so the object may need saving.
                 if matches!(v, Value::Arr(_) | Value::Rec(_)) {
@@ -481,6 +488,9 @@ impl Runtime {
     }
 
     pub(crate) fn set_obj_field(&mut self, this: Option<&ObjRef>, o: &Rc<ObjRef>, name: &str, v: Value) -> Result<(), Exc> {
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot modify object state"));
+        }
         if this != Some(&**o) {
             return Err(Exc::msg(format!("only {}'s own methods can change its fields; call one of its methods instead", o.class_name)));
         }
@@ -497,6 +507,9 @@ impl Runtime {
 
     /// `this.emit(name, data?)`
     pub(crate) fn emit_event(&mut self, o: &ObjRef, args: &[Value]) -> Result<(), Exc> {
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot emit events"));
+        }
         let Some(Value::Str(name)) = args.first() else {
             return Err(Exc::msg("emit(name, data) needs an event name"));
         };
@@ -511,6 +524,9 @@ impl Runtime {
     /// alarm with the same key on this object is replaced, and `this.unschedule("key")`
     /// cancels it without storing a handle field.
     pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<Value, Exc> {
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot schedule alarms"));
+        }
         let (key, delay, method, rest) = match (args.first(), args.get(1), args.get(2)) {
             (Some(Value::Str(k)), Some(Value::Num(delay)), Some(Value::Str(method))) => {
                 if k.is_empty() {
@@ -540,6 +556,9 @@ impl Runtime {
     /// `this.unschedule(handleOrKey)`: cancels by handle (number), key (string), or method
     /// name (for unkeyed alarms). Returns false when none matched.
     pub(crate) fn unschedule_alarm(&mut self, o: &Rc<ObjRef>, handle: &Value) -> Value {
+        if self.in_invariant {
+            return Value::Bool(false);
+        }
         let inst = self.inst_mut(o);
         let before = inst.alarms.len();
         match handle {
@@ -679,6 +698,9 @@ impl Runtime {
     /// `this.delete()`: the object goes back to its defaults with no alarms and no clock, as if
     /// it never was. Its call records stay, so a retried call is still answered once.
     pub(crate) fn delete_object(&mut self, o: &ObjRef) -> Result<(), Exc> {
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot delete objects"));
+        }
         let fresh = self.defaults(o.class)?;
         self.blank(o, fresh);
         Ok(())
@@ -727,7 +749,7 @@ impl Runtime {
         Ok(inst.alarms.is_empty() && inst.calls.is_empty() && &Value::Rec(inst.state.clone().into()).to_json()? == defaults)
     }
 
-    /// Checks every `@invariant` method on `o` synchronously.
+    /// Checks every `@invariant` method on `o` synchronously, forbidding mutations and I/O.
     fn check_object_invariants(&mut self, o: &Rc<ObjRef>) -> Result<(), String> {
         let invariants: Vec<(Rc<str>, usize)> = self.program.objects[o.class as usize]
             .methods
@@ -739,19 +761,55 @@ impl Runtime {
         if invariants.is_empty() {
             return Ok(());
         }
+        let prev = self.in_invariant;
+        self.in_invariant = true;
+        let out_mark = self.outputs.len();
+        let mut res = Ok(());
         for (name, idx) in invariants {
             let closure = self.methods[o.class as usize][idx].clone();
             let mut f = Fiber::default();
             f.stack.push(Value::Obj(o.clone()));
             if let Err(e) = self.push_frame(&mut f, closure, 0, 0, Some(o.clone())) {
-                return Err(format!("{}.{name} invariant failed: {}", o.class_name, e.message()));
+                res = Err(format!("{}.{name} invariant failed: {}", o.class_name, e.message()));
+                break;
             }
             match self.run_sync(f) {
                 Ok(Value::Bool(true)) => {}
-                Ok(Value::Bool(false)) => return Err(format!("{}.{name} invariant failed on {}", o.class_name, o.key())),
-                Ok(other) => return Err(format!("{}.{name} invariant must return true or false, got a {}", o.class_name, other.type_name())),
-                Err(fail) => return Err(format!("{}.{name} invariant failed on {}: {}", o.class_name, o.key(), fail.message)),
+                Ok(Value::Bool(false)) => {
+                    res = Err(format!("{}.{name} invariant failed on {}", o.class_name, o.key()));
+                    break;
+                }
+                Ok(other) => {
+                    res = Err(format!("{}.{name} invariant must return true or false, got a {}", o.class_name, other.type_name()));
+                    break;
+                }
+                Err(fail) => {
+                    res = Err(format!("{}.{name} invariant failed on {}: {}", o.class_name, o.key(), fail.message));
+                    break;
+                }
             }
+        }
+        self.in_invariant = prev;
+        if self.outputs.len() > out_mark {
+            self.outputs.truncate(out_mark);
+            if res.is_ok() {
+                res = Err(format!("{} @invariant cannot perform I/O or side effects", o.class_name));
+            }
+        }
+        res
+    }
+
+    /// Checks `@invariant` methods on every modified, owned, live object in `self.touched`.
+    pub(crate) fn check_touched_invariants(&mut self) -> Result<(), String> {
+        let keys: Vec<(u16, Rc<str>)> = self.touched.iter().cloned().collect();
+        for key in keys {
+            let Some((o, remote, cleared)) = self.instances.get(&key).map(|i| (i.handle.clone(), i.remote, i.cleared)) else {
+                continue;
+            };
+            if remote || (cleared && self.is_gone(&o)) {
+                continue;
+            }
+            self.check_object_invariants(&o)?;
         }
         Ok(())
     }
@@ -781,78 +839,51 @@ impl Runtime {
         Ok(checked)
     }
 
-    /// Keeps alarms already fired during this turn removed after a code rollback (throw or
-    /// `@invariant`), so a failing alarm never re-fires in a loop.
-    fn drop_consumed_alarms(&mut self) {
-        for (key, id) in std::mem::take(&mut self.consumed_alarms) {
-            if let Some(inst) = self.instances.get_mut(&key) {
+    /// Reverts every object touched in the current turn back to its last saved record, drops
+    /// uncommitted `emit` and `effect` outputs from indices `>= mark`, and persists any
+    /// consumed-alarm removal so a failing alarm never re-fires or resurrects.
+    pub(crate) fn rollback_turn(&mut self, mark: usize) {
+        let touched = std::mem::take(&mut self.touched);
+        let consumed = std::mem::take(&mut self.consumed_alarms);
+        for key in &touched {
+            self.revert(key, &consumed, false);
+        }
+        let mut had_consumed = false;
+        for (key, id) in &consumed {
+            if let Some(inst) = self.instances.get_mut(key) {
                 let before = inst.alarms.len();
-                inst.alarms.retain(|a| a.id != id);
+                inst.alarms.retain(|a| a.id != *id);
                 if inst.alarms.len() < before {
                     let handle = inst.handle.clone();
                     self.touch(&handle);
+                    had_consumed = true;
                 }
             }
         }
-    }
-
-    /// Reverts every object touched in the current turn back to its last saved record and
-    /// drops uncommitted `emit` events (called on uncaught errors and invariant failures).
-    pub(crate) fn revert_touched(&mut self) {
-        let touched = std::mem::take(&mut self.touched);
-        for key in &touched {
-            self.revert(key);
-        }
-        self.drop_consumed_alarms();
-        if !touched.is_empty() {
-            self.outputs.retain(|o| !matches!(o, Output::Emit { .. }));
+        // Only trim outputs emitted by THIS failed sub-turn (indices >= mark).
+        let mut i = 0;
+        self.outputs.retain(|o| {
+            let keep = i < mark || !matches!(o, Output::Emit { .. } | Output::Effect { .. });
+            i += 1;
+            keep
+        });
+        // Persist consumed-alarm removal right away so inst.saved drops the fired alarm before
+        // any later timer in the same tick runs.
+        if had_consumed {
+            self.flush_from(mark);
         }
     }
 
     /// Persists every object touched by the last input whose record changed. Whether every
     /// save worked.
     pub(crate) fn flush(&mut self) -> bool {
+        self.flush_from(0)
+    }
+
+    /// Like [`flush`], scoping any disk-save error reply rewrite to outputs at indices `>= mark`.
+    pub(crate) fn flush_from(&mut self, mark: usize) -> bool {
         let mut touched = std::mem::take(&mut self.touched);
-        // Check `@invariant` methods on every modified, owned, live object before any disk
-        // write. If any fails, roll back every touched object in this turn atomically.
-        let mut invariant_err: Option<String> = None;
-        for key in &touched {
-            let check = self.instances.get(key).filter(|i| !i.remote && !i.cleared).map(|i| i.handle.clone());
-            if let Some(o) = check {
-                if let Err(msg) = self.check_object_invariants(&o) {
-                    invariant_err = Some(msg);
-                    break;
-                }
-            }
-        }
-        if let Some(msg) = invariant_err {
-            for key in touched {
-                self.revert(&key);
-            }
-            // Any extra objects touched while running the invariant revert too.
-            for key in std::mem::take(&mut self.touched) {
-                self.revert(&key);
-            }
-            self.drop_consumed_alarms();
-            self.outputs.retain(|o| !matches!(o, Output::Emit { .. }));
-            let mut replied = false;
-            for o in &mut self.outputs {
-                if let Output::Reply { ok, error, field, status, .. } = o {
-                    if error.is_none() {
-                        *ok = None;
-                        *error = Some(msg.clone());
-                        *field = None;
-                        *status = Some(422);
-                        replied = true;
-                    }
-                }
-            }
-            if !replied {
-                self.outputs.push(Output::Error { message: msg, trace: Vec::new() });
-            }
-            return false;
-        }
-        self.consumed_alarms.clear();
+        let consumed = std::mem::take(&mut self.consumed_alarms);
         let mut index_changed = false;
         let mut seq_changed = false;
         let mut failed = false;
@@ -868,7 +899,7 @@ impl Runtime {
                 }
                 self.outputs.push(Output::Error { message: format!("could not save the alarm index: {e}"), trace: Vec::new() });
                 for key in std::mem::take(&mut touched) {
-                    self.revert(&key);
+                    self.revert(&key, &consumed, true);
                 }
                 failed = true;
             }
@@ -914,10 +945,10 @@ impl Runtime {
                 text = serde_json::to_string(&record).expect("JSON values serialize");
             }
             if let Err(e) = self.store.save(&object, &text) {
-                // The change did not happen: back to the last saved record, and the input's
+                // The change did not happen: back to the last saved record, and the turn's
                 // answers become errors below, so nobody is told it worked.
                 self.outputs.push(Output::Error { message: format!("{object}: could not save: {e}"), trace: Vec::new() });
-                self.revert(&key);
+                self.revert(&key, &consumed, true);
                 failed = true;
                 continue;
             }
@@ -938,7 +969,7 @@ impl Runtime {
             }
         }
         if failed {
-            for o in &mut self.outputs {
+            for o in self.outputs.iter_mut().skip(mark) {
                 if let Output::Reply { ok, error, field, status, .. } = o {
                     if error.is_none() {
                         *ok = None;
@@ -963,11 +994,11 @@ impl Runtime {
         !failed
     }
 
-    /// Puts an object's state, call records and alarms back to its last saved record, after a
-    /// failed save. An alarm scheduled by the failed call does not fire; one that fired in it
-    /// runs again, as its work was undone too. Timers left from the failed call find no alarm
-    /// with their id and do nothing.
-    fn revert(&mut self, key: &(u16, Rc<str>)) {
+    /// Puts an object's state, metadata, call records and alarms back to its last saved record.
+    /// Existing pending alarms already sit in `self.timers`, so only alarms popped during this
+    /// turn (`consumed`) are re-queued on a disk-save failure (`restore_consumed == true`),
+    /// avoiding duplicate heap growth.
+    fn revert(&mut self, key: &(u16, Rc<str>), consumed: &[((u16, Rc<str>), u64)], restore_consumed: bool) {
         let Some(inst) = self.instances.get(key) else { return };
         let (class, saved) = (inst.handle.class, inst.saved.clone());
         let fresh = match self.defaults(class) {
@@ -983,16 +1014,25 @@ impl Runtime {
                 }
             }
         }
-        let (calls, mut alarms) = stored.map(|s| (s.calls, s.alarms)).unwrap_or_default();
+        let (calls, mut alarms, created, changed) = stored
+            .map(|s| (s.calls, s.alarms, s.created, s.changed))
+            .unwrap_or_default();
         let Some(inst) = self.instances.get_mut(key) else { return };
         let restored = fresh.borrow().clone();
         *inst.state.borrow_mut() = restored;
         inst.calls = calls;
+        inst.created = created;
+        inst.changed = changed;
+        inst.cleared = false;
         inst.state_text = Value::Rec(inst.state.clone().into()).to_json().map(|j| j.to_string()).unwrap_or_default();
         let handle = inst.handle.clone();
-        for a in &mut alarms {
-            self.keep_alarm_id(a);
-            self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
+        if restore_consumed {
+            for a in &mut alarms {
+                self.keep_alarm_id(a);
+                if consumed.iter().any(|(k, id)| k == key && *id == a.id) {
+                    self.push_timer(a.at, TimerKind::Alarm { obj: handle.clone(), alarm: a.id });
+                }
+            }
         }
         if let Some(inst) = self.instances.get_mut(key) {
             inst.alarms = alarms;
