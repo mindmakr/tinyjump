@@ -86,3 +86,33 @@ export function Notice(props: { text?: string | null, kind?: "error" | "ok", id?
   if (props.text === null || props.text === "") { return null }
   return <Text id={props.id} color={props.kind === "ok" ? "#1b5e20" : "#b00020"}>{props.text}</Text>
 }
+
+/// Per-item actions in flight in this run of the app (`<actions.id>/<key>`). A restart
+/// forgets them, so no item is left waiting for a call it can no longer hear back from.
+let actionsPending: string[] = []
+
+/// Per-item actions (booking, cancelling, removing rows) that share one error notice:
+/// each key runs one at a time, while different keys queue together even offline.
+export object Actions {
+  error: string = ""
+
+  /// Whether `key` is waiting for its call to finish.
+  busy(key: string): boolean {
+    return actionsPending.includes(`${this.id}/${key}`)
+  }
+
+  /// Runs `action` for `key`, ignoring repeat presses on the same `key` while it is in
+  /// flight. Other keys keep working and queue in the outbox while offline.
+  async run(key: string, action: () => any) {
+    const tag = `${this.id}/${key}`
+    if (actionsPending.includes(tag)) { return }
+    actionsPending.push(tag)
+    this.error = ""
+    try {
+      await action()
+    } catch (e) {
+      this.error = e.message
+    }
+    actionsPending = actionsPending.filter(t => t !== tag)
+  }
+}

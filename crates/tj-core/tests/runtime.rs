@@ -2382,6 +2382,46 @@ fn server_check_preserves_field_across_rpc_and_idempotent_retries() {
 }
 
 #[test]
+fn actions_queue_multiple_items_offline_without_dropping_the_second() {
+    let src = r#"import { Actions, Notice } from "tj:ui"
+@server @read("anyone") object Slot {
+  @allow("signedIn") book() {}
+  @allow("signedIn") cancel() {}
+}
+function App() {
+  const a = Actions.get("slots")
+  return <Column>
+    <Button id="book-s2" disabled={a.busy("s2")} onPress={() => a.run("s2", () => Slot.get("s2").book())}>Book</Button>
+    <Button id="cancel-s1" disabled={a.busy("s1")} onPress={() => a.run("s1", () => Slot.get("s1").cancel())}>Cancel</Button>
+    <Notice id="book-error" text={a.error} kind="error" />
+  </Column>
+}
+"#;
+    let ui = |id: &str| Input::Ui { target: Target::Id { id: id.into() }, event: "onPress".into(), value: Json::Null, reply: None };
+    let calls = |out: &[Output]| -> Vec<(u32, String, String)> {
+        out.iter().filter_map(|o| if let Output::Effect { id, effect: Effect::Call { object, method, .. } } = o { Some((*id, object.clone(), method.clone())) } else { None }).collect()
+    };
+    let (mut device, _) = boot_as(src, Shared::default(), 0.0, false);
+    device.handle(0.5, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
+    // First action queues and stays waiting (offline).
+    let c1 = calls(&device.handle(1.0, ui("book-s2")));
+    assert_eq!(c1.len(), 1);
+    assert_eq!((c1[0].1.as_str(), c1[0].2.as_str()), ("Slot/s2", "book"));
+    // Repeat press on the same key is ignored while in flight.
+    assert!(calls(&device.handle(1.1, ui("book-s2"))).is_empty());
+    // A second action on another item still queues instead of being dropped!
+    let c2 = calls(&device.handle(1.2, ui("cancel-s1")));
+    assert_eq!(c2.len(), 1);
+    assert_eq!((c2[0].1.as_str(), c2[0].2.as_str()), ("Slot/s1", "cancel"));
+    // Both answers come back on reconnect: s2 conflicts (error shown), s1 succeeds.
+    let out = device.handle(2.0, Input::EffectDone { id: c1[0].0, ok: None, error: Some("Sorry, this slot was just taken".into()), field: None, unreachable: false });
+    assert!(format!("{out:?}").contains("Sorry, this slot was just taken") && format!("{out:?}").contains("book-error"), "{out:?}");
+    device.handle(2.1, Input::EffectDone { id: c2[0].0, ok: Some(Json::Null), error: None, field: None, unreachable: false });
+    // After finishing, both items are ready again.
+    assert_eq!(calls(&device.handle(3.0, ui("book-s2"))).len(), 1);
+}
+
+#[test]
 fn a_form_shows_every_error_and_forgets_the_last_person_at_sign_out() {
     let ui = |id: &str, event: &str, value: Json| Input::Ui { target: Target::Id { id: id.into() }, event: event.into(), value, reply: None };
     let form = |device: &Runtime| device.inspect()["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Form/profile").map(|o| o["state"].clone());
