@@ -149,4 +149,48 @@ expect http://127.0.0.1:4700/api/Cart/demo '"changedBy":"iPhone"'
 expect "$api/_tj/inspect" 'Last change by iPhone'
 curl -sf "$api/_tj/screenshot" -o "$out/cart.png"
 "$tj" review --target "$api"
+kill $server 2>/dev/null || true
+xcrun simctl terminate "$udid" "$bundle"
+
+echo "== booking: staff publishes a slot, customer saves profile and books (B19)"
+rm -rf "$out/booking-data" "$out/booking-keys"
+staff_key=$("$tj" key sam --keys "$out/booking-keys" --role staff | tail -n 1)
+cust_key=$("$tj" key ana --keys "$out/booking-keys" | tail -n 1)
+TJ_KEYS="$out/booking-keys" "$tj" serve examples/booking/app.tj --data "$out/booking-data" &
+server=$!
+xcrun simctl launch "$udid" "$bundle" -example booking -server http://127.0.0.1:4700 -key "$staff_key"
+wait_up
+expect "$api/_tj/inspect" 'Publish a slot'
+input '{"type":"ui","target":{"id":"new-title"},"event":"onChange","value":"Haircut"}'
+input '{"type":"ui","target":{"id":"new-start"},"event":"onChange","value":"2030-06-01 14:30"}'
+input '{"type":"ui","target":{"id":"new-minutes"},"event":"onChange","value":"30"}'
+input '{"type":"ui","target":{"id":"publish"},"event":"onPress"}'
+expect "$api/_tj/inspect" 'Haircut'
+curl -sf "$api/_tj/screenshot" -o "$out/booking-staff.png"
+"$tj" review --target "$api"
+xcrun simctl terminate "$udid" "$bundle"
+
+xcrun simctl launch "$udid" "$bundle" -example booking -server http://127.0.0.1:4700 -key "$cust_key"
+wait_up
+expect "$api/_tj/inspect" 'Haircut'
+input '{"type":"ui","target":{"id":"profile-name"},"event":"onChange","value":"Ana"}'
+input '{"type":"ui","target":{"id":"profile-phone"},"event":"onChange","value":"555-0100"}'
+input '{"type":"ui","target":{"id":"save-profile"},"event":"onPress"}'
+expect "$api/_tj/inspect" 'Ana'
+slot_id=$(curl -sf "$api/_tj/inspect" | python3 -c '
+import json, sys
+def walk(nodes):
+    for n in nodes:
+        i = n.get("props", {}).get("id", "")
+        if i.startswith("book-"):
+            print(i[5:])
+            sys.exit(0)
+        walk(n.get("children", []))
+walk(json.load(sys.stdin)["ok"]["tree"])
+sys.exit(1)
+')
+input "{\"type\":\"ui\",\"target\":{\"id\":\"book-$slot_id\"},\"event\":\"onPress\"}"
+expect "$api/_tj/inspect" "cancel-$slot_id"
+curl -sf "$api/_tj/screenshot" -o "$out/booking-customer.png"
+"$tj" review --target "$api"
 echo "iOS tests passed"
