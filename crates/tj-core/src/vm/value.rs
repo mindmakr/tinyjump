@@ -113,18 +113,38 @@ pub struct Exc(pub Value, pub ExcKind);
 /// forge an HTTP status or hide a VM crash.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExcKind {
-    /// Explicit user `throw`, `check(ok, field, msg)`, or effect/plugin error (400).
+    /// Explicit user `throw`, `check(ok, field, msg)`, caller-input error, or effect failure (400).
     #[default]
     User,
     /// Access/privacy refusal (`Exc::refused`, 403).
     Refused,
-    /// Internal VM/runtime fault (null deref, bad call, stack overflow, runaway: 500 on server).
+    /// Deadlock / conflict refusal (`Exc::conflict`, 409).
+    Conflict,
+    /// Transient capacity/lock/storage busy error (`Exc::busy`, 503).
+    Busy,
+    /// Internal VM/code defect (null deref, bad call, stack overflow, runaway: 500 on server).
     Fault,
 }
 
 impl Exc {
     pub fn msg(message: impl Into<String>) -> Exc {
+        Exc(error_record(&message.into()), ExcKind::User)
+    }
+
+    /// An internal VM/code defect (null dereference, non-function call, stack overflow),
+    /// answered with 500 on servers when uncaught.
+    pub fn fault(message: impl Into<String>) -> Exc {
         Exc(error_record(&message.into()), ExcKind::Fault)
+    }
+
+    /// A transient overload, lock-timeout, or store I/O error, answered with 503 when uncaught.
+    pub fn busy(message: impl Into<String>) -> Exc {
+        Exc(error_record(&message.into()), ExcKind::Busy)
+    }
+
+    /// A conflict (such as an `@exclusive` lock deadlock cycle), answered with 409 when uncaught.
+    pub fn conflict(message: impl Into<String>) -> Exc {
+        Exc(error_record(&message.into()), ExcKind::Conflict)
     }
 
     /// An error with an optional `field` (from `check(ok, field, message)` or effect failure).
@@ -150,12 +170,17 @@ impl Exc {
         Exc(error_record(&message.into()), ExcKind::Refused)
     }
 
-    /// The status a request fails with when nothing catches this error (see [`Exc::refused`]).
+    /// The status a request fails with when nothing catches this error (`403` / `409` / `503`).
     pub fn status(&self) -> Option<u16> {
-        (self.1 == ExcKind::Refused).then_some(403)
+        match self.1 {
+            ExcKind::Refused => Some(403),
+            ExcKind::Conflict => Some(409),
+            ExcKind::Busy => Some(503),
+            ExcKind::User | ExcKind::Fault => None,
+        }
     }
 
-    /// Whether this exception is an internal VM/runtime fault rather than a user `throw`/`check`.
+    /// Whether this exception is an internal VM/code defect rather than a user `throw`/`check`.
     pub fn is_fault(&self) -> bool {
         self.1 == ExcKind::Fault
     }

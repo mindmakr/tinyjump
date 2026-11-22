@@ -186,7 +186,7 @@ most once**, so each runs exactly once in effect:
 
 - **On the device,** the runtime keeps every server call in a durable outbox (store key
   `tj:outbox`) until it gets an answer. Each call has a unique id.
-- **When the server is unreachable** (network failure, `5xx`, `401` before token refresh,
+- **When the server is unreachable** (network failure, `502`/`503`/`504`, `401` before token refresh,
   or `429` rate-limit backoff), the host reports `unreachable: true`. The runtime
   then retries after 1, 2, 4… seconds, at most every 30 seconds, and at once when the host
   sends `online` (its change stream connected). The app's `await` waits and does not fail.

@@ -201,7 +201,8 @@ impl Runtime {
         match self.may_enter(&key, f.chain) {
             Ok(true) => Ok(None),
             Ok(false) => Ok(Some(key)),
-            Err((_, why)) => Err(Exc::msg(why)),
+            Err((409, why)) => Err(Exc::conflict(why)),
+            Err((_, why)) => Err(Exc::busy(why)),
         }
     }
 
@@ -268,7 +269,7 @@ impl Runtime {
                 let mut f = w.fiber;
                 let mark = self.outputs.len();
                 self.ran_code = true;
-                let r = self.unwind(&mut f, Exc::msg(why)).and_then(|()| self.run(&mut f));
+                let r = self.unwind(&mut f, Exc::busy(why)).and_then(|()| self.run(&mut f));
                 self.settle(f, w.reply, r, mark);
             } else {
                 self.refuse_start(w.reply, 503, why);

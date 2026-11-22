@@ -135,9 +135,15 @@ final class Sync {
             int status = c.getResponseCode();
             // A 401 is retried too, once the embedding app has refreshed the token.
             if (status == 401) tokenExpired();
-            if (status >= 500 || status == 401 || status == 429) throw new IOException("server answered " + status);
-            JSONObject reply = new JSONObject(body(c));
-            if (reply.has("error")) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
+            if (status >= 502 || status == 401 || status == 429) throw new IOException("server answered " + status);
+            final JSONObject reply;
+            try {
+                reply = new JSONObject(body(c));
+            } catch (org.json.JSONException e) {
+                throw new IOException("non-JSON server reply (" + status + ")", e);
+            }
+            if (reply.opt("error") instanceof String) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
+            if (status < 200 || status >= 300) throw new IOException("server answered " + status);
             return reply.opt("ok");
         } finally {
             c.disconnect();
