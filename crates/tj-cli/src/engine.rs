@@ -745,7 +745,7 @@ mod tests {
         assert!(read(&ana).contains("user:ana"), "the person who booked sees it is theirs");
         assert!(read(&staff).contains("user:ana"), "staff see who booked");
         let other = read(&bo);
-        assert!(other.contains("\"customer\":\"\"") && !other.contains("user:ana"), "{other}");
+        assert!(other.contains("\"customer\":\"•••\"") && !other.contains("user:ana"), "{other}");
         let _ = std::fs::remove_dir_all(&data);
     }
 

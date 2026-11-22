@@ -366,7 +366,15 @@ impl Compiler {
                 self.error(Diagnostic::new("\"self\" is for a field's @read", a.span).hint("on a field holding a person's id, `@read(\"staff\", \"self\") customer: string` shows it to staff and to that person"));
                 return None;
             }
+            if w == "none" && !field {
+                self.error(Diagnostic::new("\"none\" is for a field's @read", a.span).hint("to keep a whole object or method server-only, leave out @read or @allow"));
+                return None;
+            }
             words.push(Rc::from(w.as_str()));
+        }
+        if words.len() > 1 && words.iter().any(|w| &**w == "none") {
+            self.error(Diagnostic::new("\"none\" cannot be combined with other readers", d.span).hint("write @read(\"none\") on its own to keep a field server-only"));
+            return None;
         }
         if words.is_empty() {
             self.error(Diagnostic::new(format!("@{} needs at least one rule word", d.name), d.span).hint("e.g. @read(\"anyone\"); without a rule, nobody outside the server may"));
@@ -399,6 +407,9 @@ impl Compiler {
             self.error(Diagnostic::new(format!("{} is one person's data, so its readers include \"owner\"", f.name), d.span).hint("@read(\"owner\", ...) in an object whose id is the person's; for several people's entries in one object, use a @by list"));
         }
         for (w, a) in rule.iter().zip(&d.args) {
+            if &**w == "none" {
+                continue;
+            }
             let reaches = read.iter().any(|r| &**r == "anyone" || &**r == "signedIn" && &**w != "anyone" || r == w);
             if &**w == "self" && !matches!(&f.ty, Some(TypeExpr::Named(n, _)) if n == "string") {
                 self.error(Diagnostic::new(format!("\"self\" is the person whose id {} holds, so it needs a `string`", f.name), a.span).hint(format!("declare it as `{}: string = \"\"`, set to caller.id", f.name)));

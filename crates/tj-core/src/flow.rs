@@ -93,6 +93,8 @@ struct Class {
     pii: HashMap<Rc<str>, (String, Vec<String>)>,
     /// `@server`: kept on the server, where export and erasure reach it.
     server: bool,
+    /// Has `@read` or any `@allow` method: reachable from outside, not pure device screen state.
+    exposed: bool,
     /// `@pii` fields that are lists of several people's entries (`@by`).
     shared: HashSet<Rc<str>>,
     /// Method -> (declaration, `@allow` words).
@@ -112,6 +114,8 @@ struct Frame {
     vars: HashMap<String, Val>,
     this: Option<(Rc<str>, bool)>,
     owner_only: bool,
+    /// Running inside an `@server` method (where plain objects live on the server, shared).
+    on_server: bool,
     endpoint: Endpoint,
     ret: Taint,
 }
@@ -134,6 +138,9 @@ struct Checker {
     /// Revealed data written into fields that are not personal (a queue, a cache): read
     /// back from them, it is still followed.
     field_revealed: HashMap<Field, BTreeSet<Field>>,
+    /// Personal data held in a device-local screen object's field (cleared at sign-out):
+    /// allowed for display without `reveal`, and still followed to every sink.
+    field_taint: HashMap<Field, Taint>,
     /// Purposes whose lawful basis is consent (`const lawfulBasis`).
     consent_purposes: HashSet<String>,
     /// The consents each method checks first (`@needs`), by the method's declaration.
@@ -265,7 +272,7 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
         return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), field_taint: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new() };
     c.consent_purposes = crate::lawful_basis::declared(files).unwrap_or_default().into_iter().filter(|(_, b)| b == "consent").map(|(p, _)| p).collect();
     // Readers a field's own @read adds see it whenever they look, consent or not: data held
     // for a purpose that rests on consent is shown to others only through `reveal`, in a
@@ -319,12 +326,13 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
                         }
                     }
                     let server = o.decorators.iter().any(|d| d.name == "server");
+                    let exposed = o.decorators.iter().any(|d| d.name == "read") || o.methods.iter().any(|m| m.decorators.iter().any(|d| d.name == "allow"));
                     for m in &o.methods {
                         let needs: Vec<String> = m.decorators.iter().filter(|d| d.name == "needs").flat_map(words).filter_map(|w| w.strip_prefix("consent:").map(str::to_string)).collect();
                         c.needs_of.insert(Rc::as_ptr(&m.func), needs);
                     }
                     let methods = o.methods.iter().map(|m| (m.func.name.clone(), (m.func.clone(), m.decorators.iter().find(|d| d.name == "allow").map(words)))).collect();
-                    c.classes.insert(Rc::from(o.name.as_str()), Class { pii, server, shared, methods });
+                    c.classes.insert(Rc::from(o.name.as_str()), Class { pii, server, exposed, shared, methods });
                 }
                 Item::TypeAlias { .. } => {}
             }
@@ -332,7 +340,7 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
     }
     // Module-level values first, then every method as an entry point, then every function
     // (components included, whose event handlers run when people use the app).
-    let mut top = Frame { vars: HashMap::new(), this: None, owner_only: false, endpoint: Endpoint::Internal, ret: Taint::default() };
+    let mut top = Frame { vars: HashMap::new(), this: None, owner_only: false, on_server: false, endpoint: Endpoint::Internal, ret: Taint::default() };
     for p in &user {
         for item in &p.items {
             if let Item::Let(d) = item {
@@ -365,9 +373,11 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
         c.memo.clear();
         for (decl, this, endpoint) in &entries {
             let args = vec![clean(); decl.params.len()];
-            // Functions are screens and helpers: a screen runs as the signed-in person, and
-            // the server methods it calls run as them too.
-            c.call(decl, args, this.clone(), *endpoint, *endpoint == Endpoint::OwnerOnly || this.is_none(), None);
+            // Functions and pure device-local screen objects run as the signed-in person,
+            // and the server methods they call on `caller.id` run as them too.
+            let device_local = this.as_ref().is_some_and(|(class, _)| c.is_device_local(class));
+            let on_server = this.as_ref().is_some_and(|(class, _)| c.classes.get(class).is_some_and(|i| i.server));
+            c.call(decl, args, this.clone(), *endpoint, *endpoint == Endpoint::OwnerOnly || this.is_none() || device_local, on_server, None);
         }
     }
     c.errors.sort_by_key(|d| d.span.start);
@@ -375,6 +385,12 @@ fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
 }
 
 impl Checker {
+    /// A plain object with no `@server`, `@read` or `@allow`: device-local screen state,
+    /// cleared at sign-out and never reachable remotely.
+    fn is_device_local(&self, class: &Rc<str>) -> bool {
+        self.classes.get(class).is_some_and(|c| !c.server && !c.exposed)
+    }
+
     fn report(&mut self, d: Diagnostic) {
         if self.seen.insert((d.span.start, d.span.end, d.message.clone())) {
             self.errors.push(d);
@@ -457,9 +473,9 @@ impl Checker {
     /// written back.
     /// Follows a call. `owner_only`: the caller owns what `X.get(caller.id)` gives, as in a
     /// method only the owner may call, a screen, and what those call on the caller's objects.
-    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, owner_only: bool, captured: Option<&mut HashMap<String, Val>>) -> Taint {
+    fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, owner_only: bool, on_server: bool, captured: Option<&mut HashMap<String, Val>>) -> Taint {
         let arg_sig: Vec<String> = args.iter().map(|a| self.flatten(a).sig()).collect();
-        let key = format!("{:p}|{}|{:?}|{}|{owner_only}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
+        let key = format!("{:p}|{}|{:?}|{}|{owner_only}|{on_server}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);
         // A container passed in may be written into: run again for each call, so every
         // container that is given personal data gets it.
         let pure = captured.is_none() && !args.iter().any(|a| matches!(a, Val::Cell(_) | Val::Props(_)));
@@ -480,7 +496,7 @@ impl Checker {
             None => self.needs_of.get(&Rc::as_ptr(f)).cloned().unwrap_or_default(),
         };
         self.needs.push(needs);
-        let mut fr = Frame { vars: captured.as_deref().cloned().unwrap_or_default(), this, owner_only, endpoint, ret: Taint::default() };
+        let mut fr = Frame { vars: captured.as_deref().cloned().unwrap_or_default(), this, owner_only, on_server, endpoint, ret: Taint::default() };
         for (i, p) in f.params.iter().enumerate() {
             let mut v = args.get(i).cloned().unwrap_or_else(clean);
             if let Some(d) = &p.default {
@@ -710,9 +726,13 @@ impl Checker {
                     Val::Handle { class, other } => {
                         let personal = self.classes.get(&class).is_some_and(|c| c.pii.contains_key(name.as_str()));
                         if !personal {
-                            // Revealed data written here earlier (a queue of mail to send, say).
-                            let revealed = self.field_revealed.get(&(class.clone(), Rc::from(name.as_str()))).cloned().unwrap_or_default();
-                            return Val::Data(Taint { revealed, ..Taint::default() });
+                            // Revealed data or own data held in a device-local screen object.
+                            let key = (class.clone(), Rc::from(name.as_str()));
+                            let mut t = self.field_taint.get(&key).cloned().unwrap_or_default();
+                            if let Some(revealed) = self.field_revealed.get(&key) {
+                                t.revealed.extend(revealed.iter().cloned());
+                            }
+                            return Val::Data(t);
                         }
                         let from = if matches!(obj.kind, ExprKind::This) { format!("this.{name}") } else { format!("{class}.{name}") };
                         let fields = BTreeSet::from([(class.clone(), Rc::from(name.as_str()))]);
@@ -756,7 +776,7 @@ impl Checker {
                 // Run it once as written (event handlers, callbacks stored for later).
                 let args = vec![clean(); f.params.len()];
                 let this = fr.this.clone();
-                self.call(f, args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
+                self.call(f, args, this, Endpoint::Internal, fr.owner_only, fr.on_server, Some(&mut fr.vars));
                 Val::Func(f.clone())
             }
             ExprKind::Await(x) => self.expr(x, fr),
@@ -787,7 +807,7 @@ impl Checker {
         // A component is a function: follow it with the props it is given.
         if let Some(f) = self.functions.get(&el.tag).cloned() {
             props.push(("children".into(), Val::Data(children)));
-            self.call(&f, vec![Val::Props(Rc::new(props))], None, Endpoint::Internal, fr.owner_only, None);
+            self.call(&f, vec![Val::Props(Rc::new(props))], None, Endpoint::Internal, fr.owner_only, fr.on_server, None);
         }
     }
 
@@ -809,7 +829,7 @@ impl Checker {
 
     /// `v` written into `field` of an object: its own (`this`), or another through a handle.
     /// `own`: the object is the caller's, so the caller's own data may go in.
-    fn write_field(&mut self, class: &Rc<str>, own: bool, field: &str, v: &Val, span: crate::syntax::Span) {
+    fn write_field(&mut self, class: &Rc<str>, own: bool, field: &str, v: &Val, span: crate::syntax::Span, on_server: bool) {
         let t = self.flatten(v);
         if !t.revealed.is_empty() {
             self.field_revealed.entry((class.clone(), Rc::from(field))).or_default().extend(t.revealed.iter().cloned());
@@ -830,8 +850,18 @@ impl Checker {
         let place = if own { format!("this.{field}") } else { format!("{class}.{field}") };
         let personal = self.classes.get(class).is_some_and(|c| c.pii.contains_key(field));
         if !personal {
-            let d = Diagnostic::new(format!("{} reaches `{place}`, which is not marked as personal data", self.describe(&t)), span)
-                .hint(format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)));
+            // A device-local screen object is cleared at sign-out and unreachable remotely:
+            // on the device (`!on_server`), it may hold the signed-in person's own data (such
+            // as exportData(caller.id)) for display without `reveal`, while keeping its taint
+            // so any sink is still caught. From `@server` code, plain objects live on the
+            // server and are shared, so they are refused as usual.
+            if !on_server && self.is_device_local(class) && !t.other {
+                self.field_taint.entry((class.clone(), Rc::from(field))).or_default().join(&t);
+                return;
+            }
+            let is_server = self.classes.get(class).is_some_and(|c| c.server);
+            let hint = if is_server { format!("mark `{field}` with @pii(category, purpose), or {}", self.reveal_hint(&t)) } else { self.reveal_hint(&t) };
+            let d = Diagnostic::new(format!("{} reaches `{place}`, which is not marked as personal data", self.describe(&t)), span).hint(hint);
             self.report(d);
         } else if (t.other || !own) && !self.entries_kept_as_entries(class, field, &t) {
             let d = Diagnostic::new(format!("{} may be about someone other than the owner of the object it is written into (`{place}`)", self.describe(&t)), span)
@@ -869,18 +899,18 @@ impl Checker {
         match &base.kind {
             ExprKind::This => {
                 if let (Some(field), Some((class, other))) = (field, fr.this.clone()) {
-                    self.write_field(&class, !other, field, &v, span);
+                    self.write_field(&class, !other, field, &v, span, fr.on_server);
                 }
             }
             // Another object's field, changed through a handle: `Room.get("lobby").messages.push(x)`.
             ExprKind::Ident(n) if matches!(fr.vars.get(n), Some(Val::Handle { .. })) && field.is_some() => {
                 if let (Some(Val::Handle { class, other }), Some(field)) = (fr.vars.get(n).cloned(), field) {
-                    self.write_field(&class, !other, field, &v, span);
+                    self.write_field(&class, !other, field, &v, span, fr.on_server);
                 }
             }
             ExprKind::Call { .. } => {
                 if let (Val::Handle { class, other }, Some(field)) = (self.expr(base, fr), field) {
-                    self.write_field(&class, !other, field, &v, span);
+                    self.write_field(&class, !other, field, &v, span, fr.on_server);
                 }
             }
             ExprKind::Ident(n) if fr.vars.contains_key(n) => {
@@ -953,7 +983,7 @@ impl Checker {
                 _ if self.functions.contains_key(name) => {
                     let f = self.functions[name].clone();
                     let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
-                    Val::Data(self.call(&f, vals, None, Endpoint::Internal, fr.owner_only, None))
+                    Val::Data(self.call(&f, vals, None, Endpoint::Internal, fr.owner_only, fr.on_server, None))
                 }
                 // Error, String, Number, parseInt, parseFloat and anything else: what goes in
                 // comes out.
@@ -967,7 +997,7 @@ impl Checker {
                     // A function written inside this one: it sees, and changes, its variables.
                     Val::Func(f) => {
                         let this = fr.this.clone();
-                        Val::Data(self.call(&f, vals, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars)))
+                        Val::Data(self.call(&f, vals, this, Endpoint::Internal, fr.owner_only, fr.on_server, Some(&mut fr.vars)))
                     }
                     _ => self.unknown_call(&vals, span),
                 }
@@ -1041,7 +1071,7 @@ impl Checker {
                         };
                         match target {
                             Some(decl) => {
-                                self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, false, None);
+                                self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, false, fr.on_server, None);
                             }
                             None => self.report(Diagnostic::new("the privacy check cannot follow this alarm to its method", span).hint("name the method as a string, e.g. this.schedule(60000, \"remind\", ...)")),
                         }
@@ -1056,8 +1086,10 @@ impl Checker {
             let method = self.classes.get(class).and_then(|c| c.methods.get(name)).map(|(d, _)| d.clone());
             if let Some(m) = method {
                 let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();
-                // The caller's own object stays theirs inside its methods.
-                return Val::Data(self.call(&m, vals, Some((class.clone(), *other)), Endpoint::Internal, fr.owner_only && !*other, None));
+                // The caller's own object (and pure device-local screen objects) stay theirs.
+                let owner_only = if self.is_device_local(class) { fr.owner_only } else { fr.owner_only && !*other };
+                let on_server = fr.on_server || self.classes.get(class).is_some_and(|c| c.server);
+                return Val::Data(self.call(&m, vals, Some((class.clone(), *other)), Endpoint::Internal, owner_only, on_server, None));
             }
         }
         // A list of objects keeps being one through filter, sort and slice; its elements are
@@ -1077,7 +1109,7 @@ impl Checker {
                     } else {
                         vec![elem.clone(), clean(), recv.clone()]
                     };
-                    let ret = self.call(f, cb_args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
+                    let ret = self.call(f, cb_args, this, Endpoint::Internal, fr.owner_only, fr.on_server, Some(&mut fr.vars));
                     return match name {
                         "map" | "flatMap" | "reduce" => Val::Data(ret),
                         "some" | "every" | "findIndex" | "forEach" => clean(),
@@ -1119,7 +1151,7 @@ impl Checker {
                     vec![elem.clone(), clean(), elem]
                 };
                 let this = fr.this.clone();
-                let ret = self.call(&f, cb_args, this, Endpoint::Internal, fr.owner_only, Some(&mut fr.vars));
+                let ret = self.call(&f, cb_args, this, Endpoint::Internal, fr.owner_only, fr.on_server, Some(&mut fr.vars));
                 return Val::Data(match name {
                     "map" | "flatMap" | "some" | "every" | "findIndex" => ret,
                     "reduce" => {
@@ -1206,7 +1238,8 @@ impl Checker {
             return;
         };
         let args = vec![clean(); decl.params.len()];
-        let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, false, None);
+        let on_server = self.classes.get(&class).is_some_and(|c| c.server);
+        let ret = self.call(&decl, args, Some((class.clone(), false)), Endpoint::Internal, false, on_server, None);
         // What the tool returns goes to the AI model.
         self.transfer(&Val::Data(ret.clone()), span, &Destination::Plugin("tj:ai".into()));
         if !ret.is_clean() {

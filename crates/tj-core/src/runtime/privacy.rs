@@ -39,17 +39,21 @@ type Named = (Rc<crate::vm::value::ObjRef>, Rc<str>);
 
 impl Runtime {
     /// Hides the fields of `state`, an object of class `class`, that [`Runtime::hidden`]
-    /// found: personal data shows `•••`, anything else its default value, so a replica that
-    /// saw it before forgets it.
+    /// found: personal data shows `•••`, a field naming a person (`"self"`) shows `""` when
+    /// empty and `•••` when set (so others see it is taken without seeing whom), and any other
+    /// hidden field shows its default value.
     pub(crate) fn hide(&mut self, class: u16, state: &mut Json, hidden: &[usize]) {
         let guards = &self.program.objects[class as usize].guards;
-        let defaults = if hidden.iter().any(|&i| !guards[i].pii) { self.defaults(class).ok() } else { None };
+        let defaults = if hidden.iter().any(|&i| !guards[i].pii && !guards[i].names_a_person()) { self.defaults(class).ok() } else { None };
         for &i in hidden {
             let g = &self.program.objects[class as usize].guards[i];
             if let Some(v) = state.get_mut(&*g.field) {
-                *v = match &defaults {
-                    Some(d) if !g.pii => d.borrow().get(&*g.field).and_then(|d| d.to_json().ok()).unwrap_or(Json::Null),
-                    _ => Json::from(MASK),
+                *v = if g.pii {
+                    Json::from(MASK)
+                } else if g.names_a_person() {
+                    if v.as_str().is_some_and(|s| !s.is_empty()) { Json::from(MASK) } else { Json::from("") }
+                } else {
+                    defaults.as_ref().and_then(|d| d.borrow().get(&*g.field).and_then(|d| d.to_json().ok())).unwrap_or(Json::Null)
                 };
             }
         }
