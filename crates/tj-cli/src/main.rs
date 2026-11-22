@@ -17,6 +17,7 @@ mod manifest;
 mod plugin_server;
 mod plugins;
 mod privacy;
+mod registry;
 mod retro;
 mod stats;
 mod mcp;
@@ -41,13 +42,20 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj> [--manifest [--json]] [--against <old.tj> [--allow-breaking]] [--access] [--privacy] [--compliance <pack.json>]
+  tj check <app.tj> [--manifest [--json]] [--against <old.tj> [--allow-breaking]] [--access] [--privacy] [--compliance <pack.json>] [--min-trust community|verified|official]
                                  compile and report errors; --manifest prints the canonical app contract
                                  (hash, objects, rules, personal data, plugins, warnings; JSON with --json),
                                  --against compares schemas, outbox signatures and rules against an older app,
                                  --access prints who may read and call what, --privacy the personal data
                                  the app holds and for what (with --record: GDPR article 30 Markdown),
-                                 and --compliance checks the app against a compliance pack
+                                 --compliance checks the app against a compliance pack, and --min-trust
+                                 enforces locked registry package trust marks (`tj.lock`)
+  tj add <name> [--registry <url-or-dir>] [--dir <app-dir>] [--min-trust community|verified|official]
+                                 install a package from the registry into `.tj-packages/` and pin its
+                                 commit and SHA-256 in `tj.lock` after verifying declared permissions
+  tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]
+                                 validate a registry manifest (schema, license, typosquats, commit/hash pin,
+                                 static permission audit)
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
@@ -122,6 +130,7 @@ ENVIRONMENT (tj serve):
                   the audit log's key (made on first start; default: audit.key in the data
                   folder). Keep it apart from the data, and back it up
   TJ_AUDIT_DAYS   days of audit log kept (default 365)
+  TJ_REGISTRY     registry base URL or local directory for `tj add` (default: official index URL)
 ";
 
 struct Args {
@@ -149,6 +158,7 @@ struct Args {
     ops: Option<auth::OpsScope>,
     plugins: Vec<String>,
     checkpoints: Option<PathBuf>,
+    min_trust: Option<registry::Trust>,
 }
 
 impl Args {
@@ -161,7 +171,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -192,6 +202,7 @@ fn parse_args() -> Result<Args, String> {
             "--ops" => args.ops = Some(auth::OpsScope::parse(&value()?)?),
             "--plugin" => args.plugins.push(value()?),
             "--checkpoints" => args.checkpoints = Some(PathBuf::from(value()?)),
+            "--min-trust" => args.min_trust = Some(registry::Trust::parse(&value()?)?),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -264,6 +275,24 @@ fn main() -> ExitCode {
             }
         };
     }
+    if raw.get(1).map(String::as_str) == Some("add") {
+        return match registry::run_add(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("registry") {
+        return match registry::run_registry(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw.get(1).map(String::as_str) == Some("plugin") {
         let Some(name) = raw.get(2) else {
             eprintln!("error: tj plugin needs a name (ai, fake)\n\n{USAGE}");
@@ -289,7 +318,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.manifest, args.json, args.against.as_deref(), args.allow_breaking, args.access, args.privacy, args.record, args.compliance.as_deref())),
+        "check" => args.file().and_then(|f| check(f, args.manifest, args.json, args.against.as_deref(), args.allow_breaking, args.access, args.privacy, args.record, args.compliance.as_deref(), args.min_trust)),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -360,15 +389,19 @@ fn read_source(file: &Path) -> Result<String, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>, allow_breaking: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>, allow_breaking: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>, min_trust: Option<registry::Trust>) -> Result<(), String> {
     if as_json && show_manifest && against.is_some() {
         return Err("pass either --manifest --json or --against <old.tj> --json, not both".into());
     }
     let src = read_source(file)?;
     let name = file.display().to_string();
+    let app_dir = file.parent().unwrap_or(Path::new("."));
     match tj_core::compile(&src) {
         Ok(program) => {
             if show_manifest && as_json {
+                if min_trust.is_some() {
+                    registry::check_lockfile(app_dir, min_trust)?;
+                }
                 let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
                 let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
                 let m = manifest::Manifest::build(&src, &program, &refs);
@@ -402,7 +435,7 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 println!("ok: {name}");
                 print!("{}", compat::report(&findings));
                 let mut failed: Option<String> = (!allow_breaking && compat::has_breaking(&findings)).then(|| "breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
-                if let Err(e) = print_check_reports(file, &src, &program, show_manifest, access, privacy, record, pack) {
+                if let Err(e) = print_check_reports(file, app_dir, &src, &program, show_manifest, access, privacy, record, pack, min_trust) {
                     failed = Some(e);
                 }
                 return match failed {
@@ -411,14 +444,29 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 };
             }
             println!("ok: {name}");
-            print_check_reports(file, &src, &program, show_manifest, access, privacy, record, pack)
+            print_check_reports(file, app_dir, &src, &program, show_manifest, access, privacy, record, pack, min_trust)
         }
         Err(errs) => Err(errs.iter().map(|d| d.render(&name, &src)).collect::<Vec<_>>().join("\n\n")),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_check_reports(file: &Path, src: &str, program: &tj_core::vm::program::Program, show_manifest: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core::vm::program::Program, show_manifest: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>, min_trust: Option<registry::Trust>) -> Result<(), String> {
+    let mut failed: Option<String> = None;
+    match registry::check_lockfile(app_dir, min_trust) {
+        Ok((lines, warnings)) => {
+            if !lines.is_empty() {
+                println!("Packages ({}):", registry::LOCKFILE_NAME);
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            for w in warnings {
+                eprintln!("warning: {w}");
+            }
+        }
+        Err(e) => failed = Some(e),
+    }
     if show_manifest {
         let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
         let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
@@ -438,10 +486,13 @@ fn print_check_reports(file: &Path, src: &str, program: &tj_core::vm::program::P
         let (report, ok) = pack.report(&pack.evaluate(src, program, None));
         print!("{report}");
         if !ok {
-            return Err("some controls are not met (above)".into());
+            failed = Some("some controls are not met (above)".into());
         }
     }
-    Ok(())
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn store_rekey(args: &Args) -> Result<(), String> {

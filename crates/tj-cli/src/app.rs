@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 use tj_core::modules;
 
+#[derive(Debug)]
 pub struct App {
     /// The bundle; a one-file app is just its source.
     pub source: String,
@@ -16,14 +17,37 @@ pub fn read(entry: &Path) -> Result<App, String> {
     let entry_name = entry.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| format!("{} is not a file", entry.display()))?;
     let mut names = vec![entry_name];
     let mut sources = Vec::new();
+    let mut watched: Vec<PathBuf> = Vec::new();
+    let mut lock_watched = false;
     let mut i = 0;
     while i < names.len() {
-        let path = dir.join(&names[i]);
-        // Plugin modules (`tj:ai`) are not files: the compiler adds them.
-        if names[i].starts_with("tj:") {
+        // Built-in plugin modules (`tj:ai`) come from `tj-core`. Other `tj:<name>` imports
+        // resolve from `tj.lock` + `.tj-packages/<name>/plugin.tj` after SHA-256 verification.
+        if let Some(pkg_name) = names[i].strip_prefix("tj:") {
+            if !modules::BUILT_IN.iter().any(|(b, _)| *b == names[i]) {
+                if let Some((src, file)) = crate::registry::load_locked_module(dir, pkg_name)? {
+                    if let Ok(program) = tj_core::syntax::parse(&src) {
+                        for imp in program.imports {
+                            if let Ok(name) = modules::resolve(&names[i], &imp.from) {
+                                if !names.contains(&name) {
+                                    names.push(name);
+                                }
+                            }
+                        }
+                    }
+                    sources.push((names[i].clone(), src));
+                    watched.push(file);
+                    if !lock_watched {
+                        watched.push(dir.join(crate::registry::LOCKFILE_NAME));
+                        lock_watched = true;
+                    }
+                }
+            }
             i += 1;
             continue;
         }
+        let path = dir.join(&names[i]);
+        watched.push(path.clone());
         match std::fs::read_to_string(&path) {
             Ok(src) => {
                 // Unparsable files still go in: compiling the bundle reports their errors.
@@ -44,7 +68,7 @@ pub fn read(entry: &Path) -> Result<App, String> {
         }
         i += 1;
     }
-    Ok(App { source: modules::bundle(&sources), files: names.iter().filter(|n| !n.starts_with("tj:")).map(|n| dir.join(n)).collect() })
+    Ok(App { source: modules::bundle(&sources), files: watched })
 }
 
 #[cfg(test)]

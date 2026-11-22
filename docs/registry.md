@@ -160,12 +160,41 @@ enterprise needs:
 - **A page for package authors:** how to publish, what the review checks and how to earn
   Verified.
 
+## What is built vs planned
+
+**Built in `tj` (CLI & lockfile):**
+
+- `tj add <name> [--registry <url-or-dir>] [--dir <app-dir>] [--min-trust community|verified|official]`
+  fetches a manifest from a remote HTTPS registry (or a local/enterprise directory registry,
+  overridable via `TJ_REGISTRY`), enforces commit & SHA-256 pins, checks trust marks and
+  advisory `flagged` status, audits declared `permissions` against the AST (blocking
+  undeclared `fetch` hosts, aliased `fetch`/`plugin`/`invoke`, plain `http://`, undeclared
+  `plugin()` or built-in `tj:ai` usage, and undeclared `@pii` categories), prints the
+  app-store-style permission summary, installs into `.tj-packages/<name>/`, and pins the
+  package in `tj.lock`.
+- `app::read` automatically bundles locked `tj:<name>` packages into every host (`tj check`,
+  `tj test`, `tj dev`, `tj serve`, web/mobile) after verifying SHA-256 and permissions,
+  with **0 bytes added to `tj-core`**.
+- `tj check <app.tj> [--min-trust community|verified|official]` prints every locked package's
+  trust mark, warns on `flagged` versions, and fails closed on tampering, undeclared
+  permissions, or packages below `--min-trust`.
+- `tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]` runs the
+  step 1–3 manifest/license/typosquat/permission/compilation validator locally or in PR CI.
+- `tj retro <app.tj>` flags tampered, missing, or advisory-`flagged` locked packages as
+  `[fix]` (`supply-chain`).
+
+**Not yet created (awaiting owner go-ahead / later steps):**
+
+- The public external GitHub repository `mindmakr/tj-plugins` (index, request forms,
+  submission PR workflow, nightly re-scans, Sigstore/SLSA provenance, website).
+
 ## Order
 
-1. **The registry repository:** the index format, request forms and process documents,
-   with a first set of official entries (`tj:ai`, `tj:agent`, the GDPR pack).
-2. **The review pipeline, steps 1 to 3,** on submission pull requests only.
-3. **`tj add` with hash pinning, lock files and `--min-trust`.**
-4. **Sandboxed behaviour checks, signing and nightly re-scans.**
-5. **Bridges:** webhooks and outbound delivery first, then the OpenAPI generator.
-6. **The registry website, and the publisher programme.**
+1. **`tj add`, `tj.lock`, `--min-trust` and `tj registry check` (done):** local & HTTPS
+   registry client, hash pinning, static permission audit, typosquat & license validator.
+2. **The public registry repository (`mindmakr/tj-plugins`):** index, request forms,
+   official entries (`tj:ai`, `tj:agent`, GDPR pack), and PR submission pipeline running
+   `tj registry check`.
+3. **Sandboxed behaviour checks, signing (Sigstore/SLSA) and nightly re-scans.**
+4. **Bridges:** webhooks and outbound delivery first, then the OpenAPI generator.
+5. **The registry website, and the publisher programme.**

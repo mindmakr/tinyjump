@@ -164,7 +164,10 @@ library can be small, typed, tested and checked against its rules.
   - **`fetch`** reaches any web API.
   - **Device plugins** wrap native code (maps, charts, camera) on each platform.
   - **Agents write small modules** on demand.
-- **Long term: a tinyjump registry of libraries ported by agents.** Each port is checked
+- **Long term: a tinyjump registry of libraries ported by agents (`docs/registry.md`).**
+  The CLI client (`tj add`, `tj.lock`, `tj check --min-trust`, `tj registry check`) is built
+  with commit/SHA-256 pinning, trust marks, typosquat checks and static permission audits;
+  the public `mindmakr/tj-plugins` index repository comes next. Each port is checked
   against the original library's tests and kept within the size budget. An optional
   JavaScript-engine plugin, to run existing JavaScript libraries unchanged, comes only if
   real demand appears: it doubles the runtimes and weakens the guarantees.

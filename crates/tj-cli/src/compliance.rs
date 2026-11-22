@@ -87,6 +87,19 @@ impl Pack {
         Ok(pack)
     }
 
+    /// Validates a standalone compliance-pack JSON string (for registry verification).
+    /// Standalone registry packs cannot use relative `extends` paths.
+    pub fn validate_standalone(label: &str, text: &str) -> Result<Pack, String> {
+        let json: Json = serde_json::from_str(text).map_err(|e| format!("{label} is not JSON: {e}"))?;
+        let extends = strings(&json["extends"]).map_err(|e| format!("{label}: \"extends\" {e}"))?;
+        if !extends.is_empty() {
+            return Err(format!("{label}: standalone registry compliance packs cannot use \"extends\""));
+        }
+        let mut pack = Pack::default();
+        pack.merge_json(label, &json)?;
+        Ok(pack)
+    }
+
     /// Adds the pack at `path` after the packs it extends. `visiting` is the chain being
     /// loaded (a pack in it again is a cycle); `loaded` are packs already merged, which a
     /// second path to them (two packs extending the same base) skips.
@@ -101,13 +114,18 @@ impl Pack {
         visiting.push(at.clone());
         let text = std::fs::read_to_string(&at).map_err(|e| format!("cannot read the pack {}: {e}", path.display()))?;
         let json: Json = serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
-        let bad = |what: &str| format!("{}: {what}", path.display());
-        let name = json["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("needs a \"name\""))?;
-        for parent in strings(&json["extends"]).map_err(|e| bad(&format!("\"extends\" {e}")))? {
+        let label = path.display().to_string();
+        for parent in strings(&json["extends"]).map_err(|e| format!("{label}: \"extends\" {e}"))? {
             self.add(&at.parent().unwrap_or(Path::new(".")).join(parent), visiting, loaded)?;
         }
         visiting.pop();
         loaded.push(at.clone());
+        self.merge_json(&label, &json)
+    }
+
+    fn merge_json(&mut self, label: &str, json: &Json) -> Result<(), String> {
+        let bad = |what: &str| format!("{label}: {what}");
+        let name = json["name"].as_str().filter(|n| !n.is_empty()).ok_or_else(|| bad("needs a \"name\""))?;
         // Parents are added first, so the pack given last names the whole.
         self.title = json["title"].as_str().unwrap_or(name).to_string();
         self.names.push(name.to_string());

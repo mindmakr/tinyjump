@@ -4,7 +4,7 @@
 //!
 //! Every finding carries an action tag: `fix`, `optimize`, `prune`, or `rotate`.
 
-use crate::{access, app, audit, auth, bench, identity, review, sealed, test_runner};
+use crate::{access, app, audit, auth, bench, identity, registry, review, sealed, test_runner};
 use serde_json::{json, Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -215,6 +215,10 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
         data_checked = true;
     }
     check_keys_hygiene(&mut findings);
+
+    // 7. Locked registry packages (`tj.lock`) integrity & advisory check.
+    let app_dir = file.parent().unwrap_or(Path::new("."));
+    registry::retro_findings(app_dir, &mut findings);
 
     Ok(RetroReport { app: name, app_sha256, findings, bench: bench_json, live_checked, data_checked })
 }
