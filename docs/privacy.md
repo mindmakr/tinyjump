@@ -87,8 +87,8 @@ TJ_ADMIN_KEY=... tj privacy erase user:ana --target https://shop.example.com
 
 - **Export** returns the state of every object whose id is the person's, unmasked, their
   entries in shared lists, and every field that names them (`@read(..., "self")`, such as
-  who booked a slot), as `"Slot/s1#customer": "user:ana"`. Erase puts those fields back to
-  their defaults.
+  who booked a slot), as `"Slot/s1#customer": "user:ana"`. Hidden readers see `""` when the
+  field is empty and `"•••"` when set, and erase puts it back to `""` so the slot reopens.
 - **Erase** puts every such object back to its defaults, and drops its alarms and the
   stored results of its calls. The blank is saved with a new change number, so replicas
   and devices receive the erasure as a deletion (`this.delete()`), including devices that
@@ -124,7 +124,9 @@ import { exportData, erase } from "tj:privacy"
 - Audited as a `privacy` entry. The audit log forgets the person after the call's own
   entry is written, so that entry is anonymous too.
 - The flow check treats what `exportData` returns as all of the person's personal data:
-  it may go back to them, and nowhere else without `reveal`.
+  it may go back to them (including into a plain device-only screen object for display,
+  without `reveal`), and nowhere else (`fetch`, logs, plugins, server objects) without
+  `reveal`. `tj check --privacy --record` fills in `const lawfulBasis` when declared.
 
 ## Keeping data no longer than needed
 
