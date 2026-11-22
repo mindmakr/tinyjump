@@ -107,25 +107,33 @@ pub struct Elem {
 }
 
 /// A thrown value. Runtime errors are records `{ name: "Error", message }`, like `new Error(msg)`.
-pub struct Exc(pub Value, pub Refusal);
+pub struct Exc(pub Value, pub ExcKind);
 
-/// Whether an error refuses the request (`Exc::refused`): set only by the runtime, so app
-/// code cannot make a request fail with a status of its choosing.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Refusal(pub bool);
+/// Classifies how an exception originated: set only by the runtime, so app code cannot
+/// forge an HTTP status or hide a VM crash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ExcKind {
+    /// Explicit user `throw`, `check(ok, field, msg)`, or effect/plugin error (400).
+    #[default]
+    User,
+    /// Access/privacy refusal (`Exc::refused`, 403).
+    Refused,
+    /// Internal VM/runtime fault (null deref, bad call, stack overflow, runaway: 500 on server).
+    Fault,
+}
 
 impl Exc {
     pub fn msg(message: impl Into<String>) -> Exc {
-        Exc(error_record(&message.into()), Refusal(false))
+        Exc(error_record(&message.into()), ExcKind::Fault)
     }
 
-    /// An error with an optional `field` (from `check(ok, field, message)`).
+    /// An error with an optional `field` (from `check(ok, field, message)` or effect failure).
     pub fn with_field(message: impl Into<String>, field: Option<String>) -> Exc {
         let e = error_record(&message.into());
         if let (Some(field), Value::Rec(r)) = (field, &e) {
             r.borrow_mut().insert("field".into(), Value::Str(Rc::from(field.as_str())));
         }
-        Exc(e, Refusal(false))
+        Exc(e, ExcKind::User)
     }
 
     /// The `field` named by `check(ok, field, message)`, if any.
@@ -139,12 +147,17 @@ impl Exc {
 
     /// An error that refuses the request, answered with 403 when nothing catches it.
     pub fn refused(message: impl Into<String>) -> Exc {
-        Exc(error_record(&message.into()), Refusal(true))
+        Exc(error_record(&message.into()), ExcKind::Refused)
     }
 
     /// The status a request fails with when nothing catches this error (see [`Exc::refused`]).
     pub fn status(&self) -> Option<u16> {
-        self.1 .0.then_some(403)
+        (self.1 == ExcKind::Refused).then_some(403)
+    }
+
+    /// Whether this exception is an internal VM/runtime fault rather than a user `throw`/`check`.
+    pub fn is_fault(&self) -> bool {
+        self.1 == ExcKind::Fault
     }
 
     pub fn message(&self) -> String {

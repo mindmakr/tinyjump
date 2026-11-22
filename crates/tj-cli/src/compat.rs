@@ -213,6 +213,16 @@ pub fn check_snapshots(old: &Snapshot, new: &Snapshot) -> Vec<Finding> {
                     hint: "keep the field's @read rule the same or narrower, or pass --allow-breaking if intentional".into(),
                 });
             }
+            // Removing `"self"` (`namesPerson`) silently drops the field from GDPR export & erasure.
+            if of["namesPerson"].as_bool() == Some(true) && nf["namesPerson"].as_bool() != Some(true) {
+                out.push(Finding {
+                    severity: Severity::Breaking,
+                    code: "names-person-removed",
+                    subject: subj.clone(),
+                    message: format!("\"self\" was removed from @read on {name}.{fname}; records naming a person would no longer be exported or erased for them"),
+                    hint: "keep \"self\" in the field's @read rule, or pass --allow-breaking after migrating existing records".into(),
+                });
+            }
             // `@pii`, `@by`, and special-category regressions.
             match (of["pii"].as_object(), nf["pii"].as_object()) {
                 (Some(_), None) => out.push(Finding {
@@ -649,5 +659,21 @@ type Cents = number
         let s_snap = Snapshot::build(tricky, &tp);
         let self_diff = check_snapshots(&m_snap, &s_snap);
         assert!(self_diff.is_empty(), "unchanged app vs own manifest must have 0 findings: {}", report(&self_diff));
+
+        // T1-6: removing `"self"` (`namesPerson`) from `@read("staff", "self")` is a Breaking change.
+        let with_self = r#"
+@server @read("staff", "signedIn") object Slot {
+  @read("staff", "self") customer: string = ""
+  @allow("staff") assign(c: string) { this.customer = c }
+}
+"#;
+        let without_self = r#"
+@server @read("staff", "signedIn") object Slot {
+  @read("staff") customer: string = ""
+  @allow("staff") assign(c: string) { this.customer = c }
+}
+"#;
+        let self_rm = diff(with_self, without_self);
+        assert!(self_rm.iter().any(|x| x.code == "names-person-removed" && x.severity == Severity::Breaking), "{}", report(&self_rm));
     }
 }

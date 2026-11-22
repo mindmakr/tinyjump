@@ -65,6 +65,10 @@ pub struct Failure {
     pub status: Option<u16>,
     /// The field named by `check(ok, field, message)`, if any.
     pub field: Option<String>,
+    /// True when the failure came from an internal VM/runtime fault (null deref, bad call,
+    /// stack overflow, runaway step budget) rather than user `throw`/`check` or access refusal.
+    #[cfg(feature = "server")]
+    pub fault: bool,
 }
 
 impl Runtime {
@@ -473,7 +477,7 @@ impl Runtime {
                     }
                     Op::Throw => {
                         let v = pop!();
-                        throw!(Exc(v, crate::vm::value::Refusal(false)));
+                        throw!(Exc(v, crate::vm::value::ExcKind::User));
                     }
                     Op::TryBegin(t) => f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize }),
                     Op::TryEnd => {
@@ -497,7 +501,13 @@ impl Runtime {
                 f.stack.push(exc.0);
                 Ok(())
             }
-            None => Err(Failure { status: exc.status(), field: exc.field(), ..self.failure(f, exc.message()) }),
+            None => Err(Failure {
+                status: exc.status(),
+                field: exc.field(),
+                #[cfg(feature = "server")]
+                fault: exc.is_fault(),
+                ..self.failure(f, exc.message())
+            }),
         }
     }
 
@@ -521,7 +531,14 @@ impl Runtime {
                 format!("at {} ({at})", proto.name)
             })
             .collect();
-        Failure { message, trace, status: None, field: None }
+        Failure {
+            message,
+            trace,
+            status: None,
+            field: None,
+            #[cfg(feature = "server")]
+            fault: true,
+        }
     }
 
     fn call_value(&mut self, f: &mut Fiber, pos: usize) -> Result<(), Exc> {

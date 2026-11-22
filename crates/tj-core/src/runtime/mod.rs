@@ -704,10 +704,14 @@ impl Runtime {
                     Some(_) => self.count_refused_slot(f.stat),
                     None => self.count_error(f.stat),
                 }
-                let status = fail.status.unwrap_or(400);
-                match (reply, fail.status) {
+                #[cfg(feature = "server")]
+                let effective_status = if fail.status.is_none() && fail.fault && self.server { Some(500) } else { fail.status };
+                #[cfg(not(feature = "server"))]
+                let effective_status = fail.status;
+                let status = effective_status.unwrap_or(400);
+                match (reply, effective_status) {
                     // Through `refuse_start`, so a call run once (a device's) keeps the status
-                    // and no record of the refusal is kept for it.
+                    // and no record of the refusal or server fault is cached for it.
                     (Some(_), Some(status)) => self.refuse_start(reply, status, fail.message),
                     (Some(_), None) => self.reply(reply, Err((fail.message, fail.field))),
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),

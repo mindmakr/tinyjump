@@ -44,7 +44,7 @@ use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -178,6 +178,7 @@ pub struct Dev {
     tabs: Mutex<Vec<Arc<Mailbox>>>,
     asks: Mutex<HashMap<u64, Sender<Result<Json, String>>>>,
     next_ask: AtomicU64,
+    inline_reloaded: AtomicBool,
 }
 
 /// How long a browser tab has to answer an agent. An open tab answers in milliseconds; one
@@ -189,6 +190,10 @@ impl Dev {
         if let Ok(mut tabs) = self.tabs.lock() {
             tabs.retain(|s| s.push(Event::new(String::new(), None, "event: reload\ndata: {}\n\n".into())));
         }
+    }
+
+    pub fn set_inline_reloaded(&self, v: bool) {
+        self.inline_reloaded.store(v, Ordering::Relaxed);
     }
 
     /// Asks the newest open tab to `inspect` or take an `input`; `None` when no tab is open,
@@ -427,10 +432,16 @@ fn handle(mut req: Request, front: &Front) {
         return;
     }
     // Per-caller HTTP rate cap on `/api/*` (`TJ_RATE_LIMIT`, default 600/min on `tj serve`).
-    // Anonymous requests and IPs already flooding invalid tokens are limited before running
-    // JWT verification; valid credentials are verified once and reused below.
+    // Unfiltered `GET /api/events` uses ops/admin credentials and is exempt like `/_tj/*`.
+    // Anonymous callers and IPs flooding invalid non-`tjk_` tokens (OIDC JWTs) are limited
+    // before expensive JWT verification; `tjk_` API keys are a single SHA-256 and are verified
+    // first so valid keys behind a shared NAT/proxy are never blocked by `bad:{ip}`.
     let mut api_verified: Option<Result<crate::identity::Verified, Failure>> = None;
-    if segs.first() == Some(&"api") && front.rate.limit > 0 {
+    let unfiltered_ops_events = *req.method() == Method::Get
+        && segs.as_slice() == ["api", "events"]
+        && !req.url().contains("object=")
+        && !req.url().contains("ticket=");
+    if segs.first() == Some(&"api") && !unfiltered_ops_events && front.rate.limit > 0 {
         let respond_429 = |req: Request, retry_after: u64, who: Option<Actor>| {
             if let Some(who) = who {
                 front.audit.record(Entry::new("refused").who(who).text("request", "rate limit").num("status", 429));
@@ -448,9 +459,15 @@ fn handle(mut req: Request, front: &Front) {
             }
         } else {
             let bad_key = format!("bad:{}", client_ip(&req, front.trust_proxy));
-            if let Some(retry_after) = front.rate.is_exhausted(&bad_key, started) {
-                respond_429(req, retry_after, None);
-                return;
+            let is_api_key = authorization
+                .as_deref()
+                .and_then(|h| h.strip_prefix("Bearer ").map(str::trim))
+                .is_some_and(|t| t.starts_with(crate::identity::KEY_PREFIX));
+            if !is_api_key {
+                if let Some(retry_after) = front.rate.is_exhausted(&bad_key, started) {
+                    respond_429(req, retry_after, None);
+                    return;
+                }
             }
             let verified = front.identity.verify(authorization.as_deref());
             let (rate_key, actor) = match &verified {
@@ -629,9 +646,10 @@ fn handle(mut req: Request, front: &Front) {
                         return r;
                     }
                 }
-                // Automation is trusted (it already passed the scope check), so it says so explicitly.
-                if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
-                    *c = Some(Caller::trusted());
+                // Automation always runs as `Caller::trusted()` (never honour a body-supplied
+                // `caller` identity that could bypass `@pii` masking or impersonate a user).
+                if let Input::Call { caller, .. } | Input::Get { caller, .. } = &mut input {
+                    *caller = Some(Caller::trusted());
                 }
                 engine.request(input)
             }))
@@ -685,6 +703,7 @@ fn handle(mut req: Request, front: &Front) {
                     actor: ops.actor(),
                 })?;
                 if let Some(dev) = &front.dev {
+                    dev.set_inline_reloaded(true);
                     dev.notify_reload();
                 }
                 Ok(res)
@@ -697,6 +716,7 @@ fn handle(mut req: Request, front: &Front) {
             result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/rollback").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| read_json(&mut req).map(|_| ())).and_then(|()| {
                 let res = engine.rollback(ops.actor())?;
                 if let Some(dev) = &front.dev {
+                    dev.set_inline_reloaded(true);
                     dev.notify_reload();
                 }
                 Ok(res)
@@ -732,7 +752,7 @@ fn handle(mut req: Request, front: &Front) {
                 // The whole app as one bundle: the entry and the files it imports (or the live
                 // reloaded bundle on `tj serve --web`).
                 ["app.tj"] => {
-                    let body = if front.dev.is_some() {
+                    let body = if front.dev.as_ref().is_some_and(|d| !d.inline_reloaded.load(Ordering::Relaxed)) {
                         crate::app::read(&web.source).map(|app| app.source)
                     } else {
                         Ok(engine.current_source())
@@ -983,12 +1003,23 @@ fn release(front: &Front, slot: Option<&str>) {
 }
 
 /// Client IP address: behind a single trusted reverse proxy (`TJ_TRUST_PROXY=1`), uses the
-/// rightmost valid IP in `X-Forwarded-For` (the entry appended by the proxy, not an
-/// attacker-controlled leftmost value), falling back to the peer socket address.
+/// rightmost valid IP in the **last** `X-Forwarded-For` header (the entry appended by the proxy,
+/// not an attacker-controlled leftmost value or earlier duplicate header), falling back to peer IP.
 fn client_ip(req: &Request, trust_proxy: bool) -> String {
     if trust_proxy {
-        if let Some(ip) = header_value(req, "X-Forwarded-For")
-            .and_then(|v| v.rsplit(',').map(str::trim).find(|s| !s.is_empty()).and_then(|s| s.parse::<std::net::IpAddr>().ok()))
+        if let Some(ip) = req
+            .headers()
+            .iter()
+            .rev()
+            .find(|h| h.field.equiv("X-Forwarded-For"))
+            .and_then(|h| {
+                h.value
+                    .as_str()
+                    .rsplit(',')
+                    .map(str::trim)
+                    .find(|s| !s.is_empty())
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            })
         {
             return ip.to_string();
         }
@@ -1473,6 +1504,129 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(entries.matches("\"request\":\"rate limit\"").count(), 1, "expected exactly 1 deduplicated 429 audit entry: {entries}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn track1_holistic_security_privacy_and_autorollback_regressions() {
+        let dir = std::env::temp_dir().join(format!("tj-http-t1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let data = dir.join("data");
+        let keys_file = dir.join("keys.json");
+        let obs = crate::identity::new_key("obs", &[], Some(OpsScope::Observe), &keys_file).unwrap();
+        let tst = crate::identity::new_key("tst", &[], Some(OpsScope::Test), &keys_file).unwrap();
+        let mnt = crate::identity::new_key("mnt", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
+        let ana_key = crate::identity::new_key("ana", &[], None, &keys_file).unwrap();
+
+        let v1 = r#"
+@server @read("owner", "staff") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") setEmail(e: string): string { this.email = e; return "saved" }
+  @allow("anyone") ping(): string { return "v1" }
+}
+"#;
+        let (audit, _) = Audit::start(&data).unwrap();
+        let engine = Engine::start(v1.into(), data.clone(), false, false, Arc::default(), audit.clone()).unwrap();
+        let leases = Leases::open(&data);
+        let identity = Identity::from_key_file(&keys_file).unwrap();
+        let mut front = Front::new(engine, None, None, Automation::Off, identity, audit, leases, false).with_rate_limit(2);
+        front.trust_proxy = true;
+        let front = Arc::new(front);
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let f = front.clone();
+        thread::spawn(move || {
+            for req in server.incoming_requests() {
+                handle(req, &f);
+            }
+        });
+
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+        let base = format!("http://{addr}");
+        let call = |method: &str, path: &str, bearer: Option<&str>, body: Option<Json>| -> (u16, Json) {
+            let mut r = agent.request(method, &format!("{base}{path}"));
+            if let Some(k) = bearer {
+                r = r.set("Authorization", &format!("Bearer {k}"));
+            }
+            let resp = match body {
+                Some(b) => r.set("Content-Type", "application/json").send_string(&b.to_string()),
+                None => r.call(),
+            };
+            let (st, resp) = match resp {
+                Ok(r) => (r.status(), r),
+                Err(ureq::Error::Status(s, r)) => (s, r),
+                Err(e) => panic!("transport error: {e}"),
+            };
+            let text = resp.into_string().unwrap();
+            (st, serde_json::from_str(&text).unwrap_or(Json::String(text)))
+        };
+
+        // Seed sensitive PII for `key:ana`.
+        assert_eq!(call("POST", "/api/Account/key:ana/setEmail", Some(&ana_key), Some(json!(["secret@example.com"]))).0, 200);
+
+        // T1-1: `ops:observe` and `ops:test` MUST be refused (403) when asking for `exclusive: true`.
+        assert_eq!(call("POST", "/_tj/leases", Some(&obs), Some(json!({ "role": "observe", "scope": "app", "exclusive": true }))).0, 403);
+        assert_eq!(call("POST", "/_tj/leases", Some(&tst), Some(json!({ "role": "test", "scope": "app", "exclusive": true }))).0, 403);
+
+        // T1-2(A): `POST /_tj/input` ignores body-supplied `"caller"` so `@pii` stays masked `"•••"`.
+        let (st, got) = call("POST", "/_tj/input", Some(&mnt), Some(json!({
+            "type": "get",
+            "object": "Account/key:ana",
+            "caller": { "id": "key:ana", "roles": [] }
+        })));
+        assert_eq!(st, 200, "{got}");
+        assert_eq!(got["ok"]["email"], json!("•••"), "body-supplied caller must never unmask @pii: {got}");
+
+        // T1-2(B): `POST /_tj/reload` smoke traces block `"privacy"` steps, block person-id `"get"`,
+        // and redact mismatch payloads so raw `@pii` cannot leak in `422`.
+        let priv_smoke = "{\"do\": \"privacy\", \"action\": \"export\", \"subject\": \"key:ana\", \"expect\": \"\"}";
+        let (st, err) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "smokeTraces": [priv_smoke] })));
+        assert_eq!(st, 422);
+        assert!(!err.to_string().contains("secret@example.com"), "PII leaked in privacy smoke error: {err}");
+
+        let get_smoke = "{\"do\": \"get\", \"object\": \"Account/key:ana\", \"as\": \"key:ana\", \"expect\": {}}";
+        let (st, err) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "smokeTraces": [get_smoke] })));
+        assert_eq!(st, 422);
+        assert!(!err.to_string().contains("secret@example.com"), "PII leaked in get smoke error: {err}");
+
+        // T1-4: exhausting `bad:{ip}` with forged JWTs from an IP does NOT lock out a valid `tjk_` API key.
+        for _ in 0..3 {
+            let _ = call("POST", "/api/Account/key:ana/ping", Some("forged.jwt.token"), Some(json!([])));
+        }
+        assert_eq!(call("POST", "/api/Account/key:ana/ping", Some(&ana_key), Some(json!([]))), (200, json!({ "ok": "v1" })));
+
+        // T1-5: uncaught HTTP VM fault (`cannot read 'x' of null` -> 500) triggers auto-rollback during watch window!
+        let v2_crash = r#"
+@server @read("owner", "staff") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") setEmail(e: string): string { this.email = e; return "saved" }
+  @allow("anyone") ping(): string {
+    const x: any = null
+    return x.boom
+  }
+}
+"#;
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2_crash, "watchSecs": 30, "errorThreshold": 2 }))).0, 200);
+        // Trigger 2 HTTP 500 crashes from distinct anonymous XFF IPs (to stay under rate limit = 2).
+        for ip in ["198.51.100.1", "198.51.100.2"] {
+            let resp = agent
+                .post(&format!("{base}/api/Account/a/ping"))
+                .set("Content-Type", "application/json")
+                .set("X-Forwarded-For", ip)
+                .send_string("[]");
+            assert!(matches!(resp, Err(ureq::Error::Status(500, _))), "uncaught VM fault must return 500: {resp:?}");
+        }
+        // Auto-rollback restored v1 AND cleared stale method stats (T1-8)!
+        let resp = agent
+            .post(&format!("{base}/api/Account/a/ping"))
+            .set("Content-Type", "application/json")
+            .set("X-Forwarded-For", "198.51.100.3")
+            .send_string("[]")
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.into_string().unwrap(), "{\"ok\":\"v1\"}");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

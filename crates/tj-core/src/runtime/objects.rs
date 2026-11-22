@@ -897,7 +897,14 @@ impl Runtime {
             let record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone(), created: inst.created, changed: inst.changed };
             let len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
             let already_over = inst.saved.len() > self.max_object_bytes;
-            let shrinking = already_over && (len <= inst.saved.len() || state_len < inst.state_text.len());
+            // Allow shrinking an already-oversized record even if an `Idempotency-Key` `CallRecord`
+            // adds wrapper bytes, but never allow alarm bloat (`without_calls_len` must stay below `saved`).
+            let shrinking = already_over
+                && (len <= inst.saved.len()
+                    || (state_len < inst.state_text.len() && {
+                        let bare = Stored { state: record.state, alarms: record.alarms, seq: record.seq, calls: Vec::new(), created: record.created, changed: record.changed };
+                        serde_json::to_string(&bare).map(|s| s.len()).unwrap_or(len) < inst.saved.len()
+                    }));
             if len > self.max_object_bytes && !shrinking {
                 return Err(format!("{} exceeds the object size limit ({len} > {} bytes); prune old entries or split into separate objects", inst.handle.key(), self.max_object_bytes));
             }

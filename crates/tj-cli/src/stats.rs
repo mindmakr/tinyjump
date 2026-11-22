@@ -189,6 +189,14 @@ impl Stats {
         self.reloads.fetch_add(1, Relaxed);
     }
 
+    /// Clears per-method latency/failure counters on a live reload/rollback swap so `tj retro`
+    /// and `tj stats` reflect the currently running release instead of stale pre-reload errors.
+    pub fn reset_methods(&self) {
+        if let Ok(mut m) = self.methods.0.lock() {
+            m.clear();
+        }
+    }
+
     pub fn auto_rolled_back(&self) {
         self.auto_rollbacks.fetch_add(1, Relaxed);
     }

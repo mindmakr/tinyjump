@@ -75,7 +75,7 @@ pub fn load(entry: &Path, overrides: &[String]) -> Result<Plugins, String> {
                 return Err(format!("plugin {name} in {} needs a \"command\"", file.display()));
             }
             let max_calls_per_hour = match c.get("maxCallsPerHour") {
-                None | Some(Json::Null) => default_budget(name),
+                None | Some(Json::Null) => default_budget(name)?,
                 Some(v) => {
                     let raw = v.as_u64().ok_or_else(|| format!("plugin {name} \"maxCallsPerHour\" must be a non-negative integer"))?;
                     let n = usize::try_from(raw).map_err(|_| format!("plugin {name} \"maxCallsPerHour\" is too large"))?;
@@ -89,18 +89,32 @@ pub fn load(entry: &Path, overrides: &[String]) -> Result<Plugins, String> {
         let (name, spec) = o.split_once('=').ok_or(format!("--plugin takes name=fake:file.json, got {o}"))?;
         let fake = spec.strip_prefix("fake:").ok_or(format!("--plugin {name}= supports fake:<file.json>"))?;
         let path: PathBuf = fake.into();
-        let max_calls_per_hour = configs.get(name).and_then(|c| c.max_calls_per_hour).or_else(|| default_budget(name));
+        let max_calls_per_hour = match configs.get(name).and_then(|c| c.max_calls_per_hour) {
+            Some(n) => Some(n),
+            None => default_budget(name)?,
+        };
         configs.insert(name.to_string(), Config { command: vec!["tj".into(), "plugin".into(), "fake".into(), path.display().to_string()], env: Vec::new(), max_calls_per_hour });
     }
     let slots = configs.into_iter().map(|(n, config)| (n, Mutex::new(Slot { config, process: None, started: None, calls: VecDeque::new() }))).collect();
     Ok(Plugins { slots })
 }
 
-fn default_budget(name: &str) -> Option<usize> {
+fn parse_budget_env(var: &str, raw: &str) -> Result<Option<usize>, String> {
+    let n: usize = raw.trim().parse().map_err(|_| format!("{var} must be a non-negative integer, got {raw:?}"))?;
+    Ok((n > 0).then_some(n))
+}
+
+fn default_budget(name: &str) -> Result<Option<usize>, String> {
     let env_nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
-    let specific = (name == "ai").then(|| env_nonempty(AI_BUDGET_ENV)).flatten();
-    let fallback = env_nonempty(PLUGIN_BUDGET_ENV);
-    specific.or(fallback).and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0)
+    if name == "ai" {
+        if let Some(v) = env_nonempty(AI_BUDGET_ENV) {
+            return parse_budget_env(AI_BUDGET_ENV, &v);
+        }
+    }
+    if let Some(v) = env_nonempty(PLUGIN_BUDGET_ENV) {
+        return parse_budget_env(PLUGIN_BUDGET_ENV, &v);
+    }
+    Ok(None)
 }
 
 impl Plugins {
@@ -281,6 +295,10 @@ mod tests {
         assert_eq!(loaded.slots["ai"].lock().unwrap().config.max_calls_per_hour, Some(5));
         std::fs::write(dir.join("plugins.json"), r#"{ "ai": { "command": ["tj", "plugin", "ai"], "maxCallsPerHour": "five" } }"#).unwrap();
         assert!(load(&entry, &[]).is_err());
+        // T1-9: malformed env budget fails closed instead of silently disabling the cap.
+        assert!(parse_budget_env(AI_BUDGET_ENV, "100/hr").is_err());
+        assert_eq!(parse_budget_env(AI_BUDGET_ENV, "0").unwrap(), None);
+        assert_eq!(parse_budget_env(AI_BUDGET_ENV, "42").unwrap(), Some(42));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

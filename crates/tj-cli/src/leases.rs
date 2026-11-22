@@ -127,6 +127,9 @@ impl Leases {
         if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&ttl) {
             return Err((400, format!("lease ttlSecs must be between {MIN_TTL_SECS} and {MAX_TTL_SECS}")));
         }
+        if exclusive == Some(true) && role != OpsScope::Maintain {
+            return Err((403, "only maintain leases may be exclusive".into()));
+        }
         let exclusive = exclusive.unwrap_or(role == OpsScope::Maintain);
         let expires_at = now.saturating_add(ttl * 1000);
         let mut items = self.items.lock().map_err(|_| (500, "leases unavailable".to_string()))?;

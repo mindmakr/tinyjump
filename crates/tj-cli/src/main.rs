@@ -97,8 +97,8 @@ ENVIRONMENT (tj serve):
   TJ_ROLES_CLAIM  where tokens carry roles, e.g. realm_access.roles (none by default)
   TJ_KEYS         file of API key hashes (see `tj key`, including `--ops observe|test|maintain`)
   TJ_ADMIN_KEY    full-access admin key for /_tj/* (24+ chars); prefer scoped `--ops` keys in TJ_KEYS
-  TJ_OPS_KEY      client key sent by `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`
-                  (takes precedence over TJ_ADMIN_KEY when set)
+  TJ_OPS_KEY      client key sent by `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`,
+                  `tj reload`, `tj rollback` and `tj retro` (takes precedence over TJ_ADMIN_KEY)
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_MAX_OBJECT_BYTES
                   maximum serialized JSON bytes per stored object (default 262144; 0 disables;
@@ -539,6 +539,8 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     eprintln!("storage: {storage}\naudit log: {} (key: {audit_key})", data.join("audit").display());
     if tls {
         eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", args.host, http::TLS_TERMINATED_ENV);
+    } else if !dev_mode && std::env::var(http::TLS_TERMINATED_ENV).is_ok_and(|v| v == "1") && std::env::var("TJ_TRUST_PROXY").ok().as_deref() != Some("1") {
+        eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
     }
     http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()))
 }
@@ -660,6 +662,7 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
             }
             last = stamps(&files);
             // Browsers reload either way: they show compile errors in their overlay.
+            dev.set_inline_reloaded(false);
             dev.notify_reload();
         }
     });
