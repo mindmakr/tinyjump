@@ -82,7 +82,27 @@ the goal; being in the market early, to gain momentum and contributors, is.
     - form binding in `tj:ui` (`Form`, `FormInput`), the largest piece of hand-written
       code left, and a flow-check fix it needed: a screen may send a person's own data back
       to their own record (done).
-  - **Next:** round 3, a new blind build, to measure what is still hand-written.
+  - **Round 3 and B19 sign-off are done (2026-11-22):**
+    - The blind build took 322 lines (417 in round 2, 612 in round 1). Both blind reviews
+      passed every **must** behaviour and scored 96 (reviewer 5) and 97 (reviewer 6).
+    - **Built from round 3 (PR #48):**
+      - `@read("none")` for server-private fields, and presence masking on `"self"` fields
+        (`""` when empty, `"•••"` when set) so `tj privacy erase` reopens slots cleanly with
+        no duplicate flag;
+      - device-local screen objects may display `exportData(caller.id)` without `reveal`
+        (while keeping taint tracking to every sink), and `tj check --privacy --record` fills
+        in declared `const lawfulBasis`;
+      - server RPC errors preserve `check()`'s `field` across `Output::Reply`, retries, HTTP
+        and all three device hosts (web, Android, iOS);
+      - keyed alarms (`this.schedule("key", ms, "method", ...)` and `this.unschedule("key")`);
+      - `Actions` in `tj:ui` for per-item, offline-queueable actions (B18).
+    - **B19 platform sign-off (PR #49):** `examples/booking/app.tj` (283 lines using the new
+      engine primitives, zero `reveal` entries, clean `tj check --privacy --access --compliance`)
+      is verified end-to-end on Web, Android emulator (`tinyjump_api35`, `tj review` clean),
+      iOS Simulator (`scripts/ios-sim.sh` in `apple.yml`, `tj review` clean), and Linux
+      (`Ubuntu-24.04`, `tj serve --web` with `TJ_KEYS` and `tj privacy erase`).
+  - **Next:** owner's pick from the agreed order — Mobbin UI polish (`examples/booking` +
+    `tj:ui`), time-based state, or the living-app steps.
 
 ### The rest of the agreed order
 
