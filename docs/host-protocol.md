@@ -243,14 +243,38 @@ Every snapshot also carries `stats`, the runtime statistics:
   - Calls from requests, timers, alarms and `invoke` all count.
   - Methods that never ran are left out.
   - Unknown method names are never counted, so requests cannot grow the table.
-- `stats.objects["Cart"]` holds the number of objects loaded, and `stats.waiting["Cart"]`
-  the calls waiting for `@exclusive` objects of that class.
+- `stats.objects["Cart"]` holds the number of objects loaded, `stats.waiting["Cart"]` the
+  calls waiting for `@exclusive` objects of that class, and `stats.maxBytes["Cart"]` the
+  largest persisted JSON record size (in bytes) among loaded objects of that class.
 
-Two tools build on this:
+`tj serve` also enforces operational guardrails (all configurable via environment variables;
+`tj dev` keeps them permissive for local work):
+
+- **Per-object size cap (`TJ_MAX_OBJECT_BYTES`, default `262144` / 256 KB; `0` disables):**
+  checked atomically before flushing any touched object; growth past the cap rolls back the
+  turn and returns `413`, while shrinking or erasing an already-large object is always
+  allowed.
+- **Per-caller HTTP rate cap (`TJ_RATE_LIMIT`, default `600`/min on `tj serve`, `0` on
+  `tj dev`):** sliding 60-second window on `/api/*` keyed by verified caller id or IP
+  (respecting `TJ_TRUST_PROXY=1`); excess requests receive `429` with `Retry-After` and a
+  `refused` security audit entry.
+- **Outbound fetch host allowlist (`TJ_FETCH_ALLOW`):** comma-separated exact hosts
+  (`api.example.com`) or strict subdomains (`*.example.com`), enforced on both the initial
+  URL and DNS resolution (so redirects cannot escape the allowlist).
+- **Plugin call budget:** optional `"maxCallsPerHour"` per entry in `plugins.json`, falling
+  back to `TJ_AI_MAX_CALLS_HOUR` (for `tj:ai`) or `TJ_PLUGIN_MAX_CALLS_HOUR`.
+
+Three tools build on this:
 
 - **`tj review --target <url>`** checks the screen for overflow, overlapping siblings,
   touch targets under 44×44, unlabelled controls and text contrast below WCAG AA. It prints
   the metrics, and exits non-zero on errors, so CI can gate on it.
+- **`tj retro <app.tj> [--target <url>] [--data <dir>] [--json]`** runs a holistic health
+  and refactor report with `[fix]`, `[optimize]`, `[prune]` and `[rotate]` tags: access
+  warnings, unused private methods, a 6-viewport LTR/RTL Taffy layout sweep, benchmark
+  headroom against `scripts/budget.json`, live `/_tj/manifest` + `/_tj/inspect` telemetry
+  (errors, refusals, slow methods, `@exclusive` contention, objects nearing
+  `maxObjectBytes`, auto-rollbacks, dropped audit entries), and local audit/key hygiene.
 - On `tj serve`, `inspect` also has `server`: its own counters. They cover HTTP requests
   (count, errors, average and slowest time) and realtime (connected clients, events sent,
   average and worst fan-out lag from a change to its event being written, and states

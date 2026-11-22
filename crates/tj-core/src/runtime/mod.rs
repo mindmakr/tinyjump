@@ -46,12 +46,14 @@ pub struct Options {
     pub explain: bool,
     /// Remote requests may not load more objects than this at once (0: no limit).
     pub max_objects: usize,
+    /// Maximum serialized byte size of a single stored object record (0: no limit).
+    pub max_object_bytes: usize,
 }
 
 impl Options {
     /// A device or test runtime at time `now`.
     pub fn new(now: f64, seed: u64) -> Options {
-        Options { now, seed, render: true, server: false, explain: true, max_objects: 0 }
+        Options { now, seed, render: true, server: false, explain: true, max_objects: 0, max_object_bytes: 0 }
     }
 }
 
@@ -217,6 +219,8 @@ pub struct Runtime {
     pub(crate) server: bool,
     explain: bool,
     max_objects: usize,
+    #[cfg(feature = "server")]
+    max_object_bytes: usize,
     ran_code: bool,
     /// Set by `Date.now()`: a screen that read it is drawn again each minute.
     pub(crate) read_clock: bool,
@@ -299,6 +303,8 @@ impl Runtime {
             server: opts.server,
             explain: opts.explain,
             max_objects: opts.max_objects,
+            #[cfg(feature = "server")]
+            max_object_bytes: opts.max_object_bytes,
             ran_code: false,
             read_clock: false,
             clock: None,

@@ -3346,3 +3346,52 @@ function App() {
     assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 42, status: Some(422), .. })), "{out:?}");
     assert!(!out.iter().any(|o| matches!(o, Output::Error { .. })), "reply-bearing UI request must not emit duplicate Output::Error: {out:?}");
 }
+
+#[test]
+fn per_object_byte_cap_rejects_growth_atomically_allows_shrinking_and_reports_max_bytes() {
+    let src = r#"
+@server @read("anyone") object Log {
+  items: string[] = []
+  @allow("anyone") push(s: string): number { this.items.push(s); return this.items.length }
+  @allow("anyone") clear(): number { this.items = []; return 0 }
+}
+@server @read("anyone") object Peer {
+  note: string = ""
+  @allow("anyone") writeBoth(logId: string, big: string) {
+    this.note = "updated"
+    Log.get(logId).push(big)
+  }
+}
+"#;
+    let store = Shared::default();
+    let opts = Options { server: true, render: false, max_object_bytes: 120, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), opts).unwrap().0;
+
+    // Small write succeeds and shows up in `stats()["maxBytes"]`.
+    call_as(&mut rt, 1.0, "Log/l1", "push", json!(["hi"]), who("", &[])).unwrap();
+    let stats = rt.stats();
+    let max_b = stats["maxBytes"]["Log"].as_u64().expect("maxBytes.Log");
+    assert!(max_b > 0 && max_b <= 120, "maxBytes={max_b}");
+
+    // Oversized write via another object fails with 413 AND atomically rolls back BOTH objects!
+    let huge = "x".repeat(200);
+    let err = call_as(&mut rt, 2.0, "Peer/p1", "writeBoth", json!(["l1", huge]), who("", &[])).unwrap_err();
+    assert_eq!(err.0, Some(413), "{err:?}");
+    assert!(err.1.contains("limit"), "{err:?}");
+    assert_eq!(state(&mut rt, 3.0, "Peer/p1")["note"], json!(""), "Peer must be rolled back atomically");
+    assert_eq!(state(&mut rt, 4.0, "Log/l1")["items"], json!(["hi"]), "Log must remain at pre-call state");
+
+    // Pre-existing oversized record (e.g. cap lowered after deployment) can still be shrunk/cleared.
+    let big_opts = Options { server: true, render: false, max_object_bytes: 0, ..Options::new(10.0, 7) };
+    let mut rt_big = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), big_opts).unwrap().0;
+    call_as(&mut rt_big, 11.0, "Log/l1", "push", json!(["y".repeat(200)]), who("", &[])).unwrap();
+    drop(rt_big);
+
+    let tight_opts = Options { server: true, render: false, max_object_bytes: 120, ..Options::new(20.0, 7) };
+    let mut rt_tight = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), tight_opts).unwrap().0;
+    // Further growth is rejected (413)...
+    assert_eq!(call_as(&mut rt_tight, 21.0, "Log/l1", "push", json!(["more"]), who("", &[])).unwrap_err().0, Some(413));
+    // ...but shrinking/clearing succeeds!
+    assert_eq!(call_as(&mut rt_tight, 22.0, "Log/l1", "clear", json!([]), who("", &[])).unwrap(), json!(0));
+    assert_eq!(state(&mut rt_tight, 23.0, "Log/l1")["items"], json!([]));
+}

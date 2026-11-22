@@ -290,15 +290,19 @@ for builder pushback and owner decision after the trust work):
    observe read-only with `@pii` and `"self"` person IDs masked; testers drive `tj dev` or
    in-memory `tj test`, never live user records; leases (`/_tj/leases`) show and protect who
    is currently working on an app.
-3. **Self-protecting (in progress):** object `@invariant`s with atomic turn rollback and
-   per-turn VM step limits (built), per-object size caps and per-caller/plugin rate caps
-   (next), plus outbound network rules and access/privacy checks fail closed before bad state
-   reaches the store.
-4. **Safe to evolve and keep fresh (in progress):** compile-time schema compatibility checks
+3. **Self-protecting (built):** object `@invariant`s with atomic turn rollback, per-turn VM
+   step limits, per-object serialized byte caps (`TJ_MAX_OBJECT_BYTES`, `413` on growth
+   while always allowing shrinking/erasing), per-caller HTTP rate caps (`TJ_RATE_LIMIT`,
+   `429` + `Retry-After`), plugin/AI hourly call budgets (`maxCallsPerHour` /
+   `TJ_AI_MAX_CALLS_HOUR` / `TJ_PLUGIN_MAX_CALLS_HOUR`), outbound fetch host allowlists
+   (`TJ_FETCH_ALLOW`, enforced on redirects too), and access/privacy checks fail closed
+   before bad state reaches the store.
+4. **Safe to evolve and keep fresh (built):** compile-time schema compatibility checks
    against an older `.tj` file or live `/_tj/manifest` JSON (`tj check --against`),
-   deterministic input-trace tests (`tj test` + `tj mcp record_trace`), and shadow boot on a
-   copy-on-write overlay with live reload and health-gated automatic rollback (`POST /_tj/reload`,
-   `POST /_tj/rollback`, `tj reload`, `tj rollback`) are built; `tj retro` reports come next.
+   deterministic input-trace tests (`tj test` + `tj mcp record_trace`), shadow boot on a
+   copy-on-write overlay with live reload and health-gated automatic rollback
+   (`POST /_tj/reload`, `POST /_tj/rollback`, `tj reload`, `tj rollback`), and actionable
+   health & refactor reports (`tj retro`).
 
 ## For the next review and retro
 

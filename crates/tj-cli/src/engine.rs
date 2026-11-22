@@ -29,6 +29,11 @@ const MAX_SMOKE_TRACES: usize = 16;
 const MAX_WATCH_SECS: u64 = 3600;
 /// `1` lets `tj serve` fetch private, loopback and link-local addresses.
 pub const PRIVATE_FETCH_ENV: &str = "TJ_ALLOW_PRIVATE_FETCH";
+/// Optional comma-separated outbound fetch host allowlist (e.g. `api.stripe.com,*.example.com`).
+pub const FETCH_ALLOW_ENV: &str = "TJ_FETCH_ALLOW";
+/// Per-object serialized byte cap (`TJ_MAX_OBJECT_BYTES`, default 256 KB; 0 disables).
+pub const MAX_OBJECT_BYTES_ENV: &str = "TJ_MAX_OBJECT_BYTES";
+pub const DEFAULT_MAX_OBJECT_BYTES: usize = 256 * 1024;
 
 /// Compliance pack + server posture checked at startup and on every live reload.
 pub type ComplianceGate = (Pack, ComplianceServer);
@@ -81,28 +86,55 @@ pub struct Engine {
     manifest: Arc<Mutex<Manifest>>,
     source: Arc<Mutex<String>>,
     max_objects: usize,
+    max_object_bytes: usize,
+    fetch_allowlist: bool,
 }
 
 pub fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
+fn max_object_bytes_from_env() -> usize {
+    std::env::var(MAX_OBJECT_BYTES_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
+}
+
+pub(crate) fn parse_fetch_allow(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn fetch_allow_from_env() -> Vec<String> {
+    std::env::var(FETCH_ALLOW_ENV).ok().map(|s| parse_fetch_allow(&s)).unwrap_or_default()
+}
+
+struct Booted {
+    rt: Runtime,
+    out: Vec<Output>,
+    manifest: Manifest,
+    snap: Snapshot,
+    max_objects: usize,
+    max_object_bytes: usize,
+}
+
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
-fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<(Runtime, Vec<Output>, Manifest, Snapshot, usize), String> {
+fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<Booted, String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let manifest = Manifest::build(source, &program, configured_plugins);
-    let snapshot = Snapshot::build(source, &program);
+    let snap = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
     let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
     let (store, _) = crate::sealed::open_store(data, &personal)?;
     let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
-    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects };
+    let max_object_bytes = max_object_bytes_from_env();
+    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects, max_object_bytes };
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
-    Ok((rt, out, manifest, snapshot, max_objects))
+    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes })
 }
 
 impl Engine {
@@ -124,19 +156,21 @@ impl Engine {
         let shared_ref = shared_slot.clone();
         let live_source = Arc::new(Mutex::new(source.clone()));
         let live_source_ref = live_source.clone();
+        let fetch_allow = fetch_allow_from_env();
+        let fetch_allowlist = !fetch_allow.is_empty();
         thread::Builder::new()
             .name("tj-runtime".into())
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs) {
-                    Ok((rt, out, manifest, snap, max_objects)) => {
+                    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes }) => {
                         let shared = Arc::new(Mutex::new(manifest));
                         if let Ok(mut r) = shared_ref.lock() {
                             *r = Some(shared.clone());
                         }
-                        let _ = ready_tx.send(Ok(max_objects));
+                        let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -144,13 +178,13 @@ impl Engine {
                 }
             })
             .map_err(|e| e.to_string())?;
-        let max_objects = ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
+        let (max_objects, max_object_bytes) = ready_rx.recv().map_err(|_| "runtime thread died".to_string())??;
         let manifest = shared_slot
             .lock()
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
-        Ok(Engine { tx, stats, manifest, source: live_source, max_objects })
+        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist })
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -234,7 +268,7 @@ impl Engine {
     /// The app's canonical manifest enriched with live health counters and active leases.
     pub fn manifest(&self, dev: bool, audit_dropped: u64, leases: Vec<Json>) -> Result<Json, Failure> {
         let core = self.core_stats()?;
-        let health = self.stats.health(&core, dev, self.max_objects, audit_dropped, leases.len());
+        let health = self.stats.health(&core, dev, self.max_objects, self.max_object_bytes, self.fetch_allowlist, audit_dropped, leases.len());
         let manifest = self.manifest.lock().map_err(|_| (500, "manifest unavailable".to_string()))?;
         Ok(manifest.with_live(health, Json::Array(leases)))
     }
@@ -337,7 +371,8 @@ fn shadow_validate(
     let overlay = OverlayStore::new(base);
     let seed = crate::bytes::random::<8>().map_err(|e| (500, e))?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
-    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render: false, server: true, explain, max_objects };
+    let max_object_bytes = max_object_bytes_from_env();
+    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render: false, server: true, explain, max_objects, max_object_bytes };
     let (mut shadow_rt, boot_out) = Runtime::boot(program, Box::new(overlay), opts).map_err(|e| (422, format!("shadow boot failed: {e}")))?;
     let entropy = crate::bytes::hex(&crate::bytes::random::<32>().map_err(|e| (500, e))?);
     let entropy_out = shadow_rt.handle(now_ms(), Input::Entropy { bytes: entropy });
@@ -418,11 +453,12 @@ fn run(
     mut current_source: String,
     mut current_snap: Snapshot,
     compliance: Option<ComplianceGate>,
+    fetch_allow: Vec<String>,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
-    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
+    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch, Arc::new(fetch_allow));
     let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new(), turn_errors: 0, generation: 1 };
     let mut current_sha = sha256_hex(&current_source);
     let mut previous: Option<(String, String)> = None;
@@ -525,7 +561,7 @@ fn run(
             Ok(Msg::Reload(source)) => {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs) {
-                    Ok((new_rt, out, new_manifest, new_snap, _)) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let new_sha = sha256_hex(&source);
                         previous = Some((current_source, current_sha));
                         current_source = source.clone();
@@ -570,7 +606,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&req.source, &data, render, explain, &refs) {
-                    Ok((new_rt, out, new_manifest, _, _)) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, .. }) => {
                         let prev_source = std::mem::replace(&mut current_source, req.source.clone());
                         let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
                         previous = Some((prev_source.clone(), prev_sha.clone()));
@@ -628,7 +664,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&prev_source, &data, render, explain, &refs) {
-                    Ok((new_rt, out, new_manifest, new_snap, _)) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
                         current_source = prev_source.clone();
                         previous = None;
@@ -671,7 +707,7 @@ fn run(
                     d.stats.set_watch_until(0);
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                     match boot(&w.prev_source, &data, render, explain, &refs) {
-                        Ok((prev_rt, boot_out, prev_manifest, prev_snap, _)) => {
+                        Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, .. }) => {
                             current_source = w.prev_source.clone();
                             current_sha = w.prev_sha.clone();
                             previous = None;
@@ -870,18 +906,32 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool) -> Sender<(u64, u32, Effect)> {
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool, fetch_allow: Arc<Vec<String>>) -> Sender<(u64, u32, Effect)> {
     let (tx, rx) = channel::<(u64, u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
-    if !private_fetch {
-        // Checked where names become addresses, so redirects and names that point inside are
-        // caught too.
-        agent = agent.resolver(public_only);
+    if !private_fetch || !fetch_allow.is_empty() {
+        // Checked where names become addresses, so redirects and names that point inside or
+        // outside `TJ_FETCH_ALLOW` are caught too.
+        let allow = fetch_allow.clone();
+        agent = agent.resolver(move |netloc: &str| {
+            if !allow.is_empty() && !netloc_allowed(netloc, &allow) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"),
+                ));
+            }
+            if !private_fetch {
+                public_only(netloc)
+            } else {
+                use std::net::ToSocketAddrs;
+                Ok(netloc.to_socket_addrs()?.collect())
+            }
+        });
     }
     let agent = agent.build();
     for i in 0..EFFECT_WORKERS {
-        let (rx, back, agent, plugins, stats, audit) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone());
+        let (rx, back, agent, plugins, stats, audit, fetch_allow) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone(), fetch_allow.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
             let Ok((gen, id, effect)) = job else { return };
@@ -896,7 +946,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
                 _ => None,
             };
             let started = Instant::now();
-            let result = perform(&agent, &plugins, effect);
+            let result = perform(&agent, &plugins, &fetch_allow, effect);
             stats.effect(&kind, started.elapsed(), result.is_ok());
             if let Some((plugin, method)) = plugin_call {
                 audit.record(Entry::new("plugin").text("plugin", &plugin).text("method", &method).ok(result.is_ok()).num("ms", started.elapsed().as_millis() as u64));
@@ -910,6 +960,31 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
         }
     }
     tx
+}
+
+/// Checks whether a `host:port` netloc matches any entry in `TJ_FETCH_ALLOW`
+/// (`example.com` exact match, or `*.example.com` strict subdomain match).
+pub(crate) fn netloc_allowed(netloc: &str, allowed: &[String]) -> bool {
+    let host = if let Some(rest) = netloc.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        netloc.split(':').next().unwrap_or("")
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    allowed.iter().any(|p| match p.strip_prefix("*.") {
+        Some(suffix) => !suffix.is_empty() && host.len() > suffix.len() + 1 && host.ends_with(suffix) && host.as_bytes()[host.len() - suffix.len() - 1] == b'.',
+        None => host == *p,
+    })
+}
+
+fn url_host_allowed(url: &str, allowed: &[String]) -> bool {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or("");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
+    netloc_allowed(hostport, allowed)
 }
 
 /// The public addresses of `netloc` (`host:port`): a server's `fetch` must not reach this
@@ -941,7 +1016,7 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn perform(agent: &ureq::Agent, plugins: &Plugins, effect: Effect) -> Result<Json, String> {
+fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effect: Effect) -> Result<Json, String> {
     let (url, method, headers, body) = match effect {
         Effect::Http { url, method, headers, body } => (url, method, headers, body),
         Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args),
@@ -949,6 +1024,9 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, effect: Effect) -> Result<Jso
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("only http and https addresses can be fetched".into());
+    }
+    if !fetch_allow.is_empty() && !url_host_allowed(&url, fetch_allow) {
+        return Err(format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"));
     }
     let mut req = agent.request(&method, &url);
     if let Json::Object(h) = &headers {
@@ -1154,7 +1232,7 @@ mod tests {
         // The address may be private (a webhook with a token in it), and apps show errors.
         let agent = ureq::AgentBuilder::new().resolver(public_only).timeout(Duration::from_secs(2)).build();
         let url = "http://127.0.0.1:9/hook?token=secret123";
-        let e = perform(&agent, &Plugins::default(), Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        let e = perform(&agent, &Plugins::default(), &[], Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e.starts_with("the request failed") && !e.contains("secret123") && !e.contains("127.0.0.1"), "{e}");
     }
 
@@ -1232,5 +1310,40 @@ import { erase, exportData } from "tj:privacy"
         assert_eq!(core["methods"]["Room.post"]["calls"], json!(2), "{core}");
         assert!(engine.stats().openmetrics(&core).contains("tj_method_duration_seconds_count{class=\"Room\",method=\"post\"} 2"));
         let _ = std::fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn fetch_allowlist_matches_exact_and_strict_subdomains_and_blocks_disallowed() {
+        let allow = vec!["api.example.com".to_string(), "*.partner.org".to_string()];
+        // Exact host match (case-insensitive, with port or trailing dot).
+        assert!(netloc_allowed("api.example.com:443", &allow));
+        assert!(netloc_allowed("API.EXAMPLE.COM.:80", &allow));
+        assert!(!netloc_allowed("sub.api.example.com:443", &allow));
+        assert!(!netloc_allowed("evilapi.example.com:443", &allow));
+        // Strict wildcard subdomain match: bare apex and suffix-spoofing rejected.
+        assert!(netloc_allowed("hooks.partner.org:443", &allow));
+        assert!(netloc_allowed("a.b.partner.org:443", &allow));
+        assert!(!netloc_allowed("partner.org:443", &allow));
+        assert!(!netloc_allowed("evilpartner.org:443", &allow));
+        // URL parsing including userinfo stripping.
+        assert!(url_host_allowed("https://api.example.com/v1/ok?x=1", &allow));
+        assert!(url_host_allowed("https://user:pass@hooks.partner.org:8443/cb", &allow));
+        assert!(!url_host_allowed("https://evil.com/steal", &allow));
+        // `perform` refuses disallowed hosts without leaking the URL.
+        let agent = ureq::AgentBuilder::new().build();
+        let err = perform(
+            &agent,
+            &Plugins::default(),
+            &allow,
+            Effect::Http {
+                url: "https://secret-token.evil.com/hook?key=TOPSECRET".into(),
+                method: "GET".into(),
+                headers: Json::Null,
+                body: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains(FETCH_ALLOW_ENV), "{err}");
+        assert!(!err.contains("TOPSECRET") && !err.contains("evil.com"), "error must not leak URL: {err}");
     }
 }

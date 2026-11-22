@@ -34,7 +34,7 @@ pub(crate) struct Instance {
     /// Results of recent calls made with an id (see `calls.rs`), oldest first.
     pub(crate) calls: Vec<CallRecord>,
     /// The last persisted record, to skip unchanged writes.
-    saved: String,
+    pub(crate) saved: String,
     /// The state part of it: only a new state gets a change number and is broadcast.
     state_text: String,
     /// When it was created and last changed (epoch ms), for `@retain` and `@legalHold`.
@@ -891,6 +891,47 @@ impl Runtime {
         let mut index_changed = false;
         let mut seq_changed = false;
         let mut failed = false;
+        // Enforce per-object serialized byte cap BEFORE saving any object in this turn so
+        // multi-object turns stay atomic. Shrinking or erasing an already-large object is always allowed.
+        #[cfg(feature = "server")]
+        if self.max_object_bytes > 0 {
+            let mut oversized: Option<(String, usize)> = None;
+            for key in &touched {
+                let Some(inst) = self.instances.get(key) else { continue };
+                if inst.remote {
+                    continue;
+                }
+                let Ok(Json::Object(state)) = Value::Rec(inst.state.clone().into()).to_json() else { continue };
+                let record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone(), created: inst.created, changed: inst.changed };
+                let len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
+                if len > self.max_object_bytes && len > inst.saved.len() {
+                    oversized = Some((inst.handle.key(), len));
+                    break;
+                }
+            }
+            if let Some((object, len)) = oversized {
+                self.touched = touched;
+                self.consumed_alarms = consumed;
+                self.rollback_turn(mark);
+                let msg = format!("{object} exceeds the object size limit ({len} > {} bytes); prune old entries or split into separate objects", self.max_object_bytes);
+                let mut replied = false;
+                for o in self.outputs.iter_mut().skip(mark) {
+                    if let Output::Reply { ok, error, field, status, .. } = o {
+                        if error.is_none() {
+                            *ok = None;
+                            *error = Some(msg.clone());
+                            *field = None;
+                            *status = Some(413);
+                            replied = true;
+                        }
+                    }
+                }
+                if !replied {
+                    self.outputs.push(Output::Error { message: msg, trace: Vec::new() });
+                }
+                return false;
+            }
+        }
         // An object that now has alarms goes into the alarm index before it is saved, so a
         // restart always finds it. If the index cannot be saved, nothing is.
         let joining: Vec<String> = touched.iter().filter_map(|k| self.instances.get(k)).filter(|i| !i.alarms.is_empty()).map(|i| i.handle.key()).filter(|o| !self.alarm_index.contains(o)).collect();

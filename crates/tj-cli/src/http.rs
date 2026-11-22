@@ -41,7 +41,7 @@ use crate::identity::{sha256_hex, Identity};
 use crate::leases::Leases;
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -66,6 +66,54 @@ const RECHECK_EVERY: Duration = Duration::from_secs(60);
 const STREAMS_PER_CALLER: usize = 8;
 const TICKET_LIFETIME: Duration = Duration::from_secs(60);
 const MAX_TICKETS: usize = 1000;
+/// Per-caller HTTP `/api/*` rate limit (`TJ_RATE_LIMIT`, requests per minute; default 600 on
+/// `tj serve`, 0 / off on `tj dev`; 0 disables).
+pub const RATE_LIMIT_ENV: &str = "TJ_RATE_LIMIT";
+const DEFAULT_RATE_LIMIT: u32 = 600;
+const RATE_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RATE_KEYS: usize = 10_000;
+
+/// Sliding-window per-caller HTTP rate limiter with bounded memory.
+struct RateLimiter {
+    limit: u32,
+    buckets: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl RateLimiter {
+    fn new(limit: u32) -> RateLimiter {
+        RateLimiter { limit, buckets: Mutex::default() }
+    }
+
+    /// Returns `Ok(())` if allowed, or `Err(retry_after_secs)` if the caller exceeded `limit`.
+    fn check(&self, key: &str, now: Instant) -> Result<(), u64> {
+        if self.limit == 0 {
+            return Ok(());
+        }
+        let Ok(mut map) = self.buckets.lock() else { return Ok(()) };
+        if map.len() >= MAX_RATE_KEYS && !map.contains_key(key) {
+            map.retain(|_, q| {
+                while q.front().is_some_and(|&t| now.saturating_duration_since(t) >= RATE_WINDOW) {
+                    q.pop_front();
+                }
+                !q.is_empty()
+            });
+            if map.len() >= MAX_RATE_KEYS {
+                return Err(1);
+            }
+        }
+        let q = map.entry(key.to_string()).or_default();
+        while q.front().is_some_and(|&t| now.saturating_duration_since(t) >= RATE_WINDOW) {
+            q.pop_front();
+        }
+        if q.len() >= self.limit as usize {
+            let oldest = q.front().copied().unwrap_or(now);
+            let wait = RATE_WINDOW.saturating_sub(now.saturating_duration_since(oldest)).as_secs().max(1);
+            return Err(wait);
+        }
+        q.push_back(now);
+        Ok(())
+    }
+}
 
 type Body = Response<std::io::Cursor<Vec<u8>>>;
 
@@ -169,17 +217,26 @@ pub struct Front {
     pub trust_proxy: bool,
     streams: Mutex<HashMap<String, usize>>,
     tickets: Mutex<HashMap<String, Ticket>>,
+    rate: RateLimiter,
 }
 
 impl Front {
     #[allow(clippy::too_many_arguments)]
     pub fn new(engine: Engine, web: Option<Arc<Web>>, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, leases: Leases, credentials_need_tls: bool) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, web, dev, automation, identity, audit, leases, app_file: None, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        let default_rate = if dev.is_some() { 0 } else { DEFAULT_RATE_LIMIT };
+        let limit = std::env::var(RATE_LIMIT_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(default_rate);
+        Front { engine, web, dev, automation, identity, audit, leases, app_file: None, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default(), rate: RateLimiter::new(limit) }
     }
 
     pub fn with_app_file(mut self, path: PathBuf) -> Front {
         self.app_file = Some(path);
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_rate_limit(mut self, limit: u32) -> Front {
+        self.rate = RateLimiter::new(limit);
         self
     }
 }
@@ -322,20 +379,47 @@ fn handle(mut req: Request, front: &Front) {
         front.engine.stats().request(started.elapsed(), false);
         return;
     }
+    // Per-caller HTTP rate cap on `/api/*` (`TJ_RATE_LIMIT`, default 600/min on `tj serve`).
+    // Verify the credential at most once and reuse it below so OIDC JWTs are not checked twice.
+    let mut api_verified: Option<Result<crate::identity::Verified, Failure>> = None;
+    if segs.first() == Some(&"api") && front.rate.limit > 0 {
+        let verified = front.identity.verify(authorization.as_deref());
+        let rate_key = match &verified {
+            Ok(v) => match &v.caller {
+                Caller::Remote { id, .. } if !id.is_empty() => id.clone(),
+                _ => format!("ip:{}", client_ip(&req, front.trust_proxy)),
+            },
+            Err(_) => format!("ip:{}", client_ip(&req, front.trust_proxy)),
+        };
+        if let Err(retry_after) = front.rate.check(&rate_key, started) {
+            let who = match &verified {
+                Ok(v) => Actor::of(&v.caller),
+                Err(_) => Actor::Invalid,
+            };
+            let _ = front.audit.security(Entry::new("refused").who(who).text("request", "rate limit").num("status", 429));
+            let resp = json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
+                .with_header(header("Retry-After", &retry_after.to_string()));
+            let _ = req.respond(resp);
+            front.engine.stats().request(started.elapsed(), false);
+            return;
+        }
+        api_verified = Some(verified);
+    }
     let method = req.method().clone();
     let engine = &front.engine;
     let dev_mode = front.dev.is_some();
     let mut asked: Option<Asked> = None;
+    let mut take_verified = || api_verified.take().unwrap_or_else(|| front.identity.verify(authorization.as_deref()));
     let response = match (&method, segs.as_slice()) {
-        (Method::Get, ["api", "events"]) => return stream(req, front, authorization),
+        (Method::Get, ["api", "events"]) => return stream(req, front, authorization, api_verified),
         (Method::Post, ["api", "events", "ticket"]) => {
             asked = Some(("ticket", None, None));
-            result_response(ticket(&mut req, front, authorization.as_deref()))
+            result_response(ticket(&mut req, front, authorization.as_deref(), api_verified))
         }
         (Method::Get, ["api", class, id]) => {
             asked = Some(("get", Some(class), None));
             let object = format!("{class}/{id}");
-            result_response(front.identity.verify(authorization.as_deref()).and_then(|v| engine.request(Input::Get { object, reply: None, caller: Some(v.caller) })))
+            result_response(take_verified().and_then(|v| engine.request(Input::Get { object, reply: None, caller: Some(v.caller) })))
         }
         (Method::Post, ["api", class, id, name]) => {
             asked = Some(("call", Some(class), Some(name)));
@@ -350,7 +434,7 @@ fn handle(mut req: Request, front: &Front) {
             // The engine writes the call to the audit log as it answers it; refusals are
             // written below, as security events.
             call_response(r.map_err(|(s, m)| (s, m, None)).and_then(|args| {
-                let caller = front.identity.verify(authorization.as_deref()).map_err(|(s, m)| (s, m, None))?.caller;
+                let caller = take_verified().map_err(|(s, m)| (s, m, None))?.caller;
                 engine.request_with_field(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
             }))
         }
@@ -434,7 +518,7 @@ fn handle(mut req: Request, front: &Front) {
         // with it. Outside `/_tj/`, so a person's own key is enough.
         (Method::Get, ["api", "whoami"]) => result_response({
             asked = Some(("whoami", None, None));
-            front.identity.verify(authorization.as_deref())
+            take_verified()
         }.map(|v| match v.caller {
             Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some() }),
             Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some() }),
@@ -687,13 +771,13 @@ fn classes(objects: &[String]) -> String {
 
 /// `POST /api/events/ticket`: a one-time ticket for a stream of the listed objects, bound to
 /// the caller and those objects, stored only by its hash.
-fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Result<Json, Failure> {
+fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>, verified: Option<Result<crate::identity::Verified, Failure>>) -> Result<Json, Failure> {
     let body = read_json(req)?;
     let objects: Vec<String> = body["objects"].as_array().map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect()).unwrap_or_default();
     if objects.is_empty() {
         return Err((400, "list the objects to stream: {\"objects\": [\"Class/id\", ...]}".into()));
     }
-    let verified = front.identity.verify(authorization)?;
+    let verified = verified.unwrap_or_else(|| front.identity.verify(authorization))?;
     // The stream checks again when it opens, and names any it refuses.
     let readable = front.engine.may_read(objects.clone(), verified.caller.clone())?;
     if readable.len() < objects.len() {
@@ -729,7 +813,7 @@ struct Opened {
 }
 
 /// `GET /api/events`: checks who may stream what, caps streams per caller, then streams.
-fn stream(req: Request, front: &Front, authorization: Option<String>) {
+fn stream(req: Request, front: &Front, authorization: Option<String>, mut api_verified: Option<Result<crate::identity::Verified, Failure>>) {
     let mut ops_access: Option<OpsAccess> = None;
     let opened = (|| -> Result<Opened, Failure> {
         let since_header = header_value(&req, "Last-Event-ID");
@@ -752,7 +836,8 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
                     let auth = matches!(ops, OpsAccess::Scoped { .. }).then(|| authorization.clone()).flatten().map(StreamAuth::Ops);
                     (None, objects, auth)
                 } else {
-                    (Some(front.identity.verify(authorization.as_deref())?.caller), objects, authorization.clone().map(StreamAuth::User))
+                    let v = api_verified.take().unwrap_or_else(|| front.identity.verify(authorization.as_deref()))?;
+                    (Some(v.caller), objects, authorization.clone().map(StreamAuth::User))
                 }
             }
         };
@@ -1255,6 +1340,55 @@ mod tests {
         assert!(entries.contains("\"request\":\"rollback\""), "{entries}");
         assert!(entries.contains("\"request\":\"auto-rollback\""), "{entries}");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rate_limit_caps_api_calls_returns_retry_after_and_audits_429() {
+        let dir = std::env::temp_dir().join(format!("tj-http-rate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        let src = r#"
+@server @read("anyone") object Ping {
+  n: number = 0
+  @allow("anyone") hit(): number { this.n += 1; return this.n }
+}
+"#;
+        let (audit, _) = Audit::start(&data).unwrap();
+        let engine = Engine::start(src.into(), data.clone(), false, false, Arc::default(), audit.clone()).unwrap();
+        let leases = Leases::open(&data);
+        let front = Arc::new(Front::new(engine, None, None, Automation::Open, Identity::anonymous(), audit, leases, false).with_rate_limit(2));
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let f = front.clone();
+        thread::spawn(move || {
+            for req in server.incoming_requests() {
+                handle(req, &f);
+            }
+        });
+
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+        let url = format!("http://{addr}/api/Ping/p1/hit");
+        // First 2 requests succeed.
+        assert_eq!(agent.post(&url).set("Content-Type", "application/json").send_string("[]").unwrap().status(), 200);
+        assert_eq!(agent.post(&url).set("Content-Type", "application/json").send_string("[]").unwrap().status(), 200);
+        // 3rd request within the 60s window returns 429 with `Retry-After`.
+        match agent.post(&url).set("Content-Type", "application/json").send_string("[]") {
+            Err(ureq::Error::Status(429, resp)) => {
+                assert!(resp.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n >= 1));
+            }
+            other => panic!("expected 429, got {other:?}"),
+        }
+        // `/_tj/*` is exempt from the `/api/*` caller rate limit so operators can still inspect!
+        assert_eq!(agent.get(&format!("http://{addr}/_tj/manifest")).call().unwrap().status(), 200);
+
+        let entries: String = std::fs::read_dir(data.join("audit"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(entries.contains("\"request\":\"rate limit\"") && entries.contains("\"status\":429"), "{entries}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

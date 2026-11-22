@@ -82,10 +82,26 @@ impl Runtime {
             }
         }
         let mut loaded = vec![0u64; self.program.objects.len()];
-        for (class, _) in self.instances.keys() {
+        #[cfg(feature = "server")]
+        let mut max_bytes = vec![0usize; self.program.objects.len()];
+        for ((class, _), inst) in &self.instances {
             loaded[*class as usize] += 1;
+            #[cfg(feature = "server")]
+            {
+                max_bytes[*class as usize] = max_bytes[*class as usize].max(inst.saved.len());
+            }
+            #[cfg(not(feature = "server"))]
+            let _ = inst;
         }
         let objects: Map<String, Json> = self.program.objects.iter().zip(loaded).filter(|(_, n)| *n > 0).map(|(o, n)| (o.name.to_string(), json!(n))).collect();
-        json!({ "methods": methods, "objects": objects, "waiting": self.waiting_json() })
+        #[cfg(feature = "server")]
+        {
+            let bytes: Map<String, Json> = self.program.objects.iter().zip(max_bytes).filter(|(_, n)| *n > 0).map(|(o, n)| (o.name.to_string(), json!(n))).collect();
+            json!({ "methods": methods, "objects": objects, "maxBytes": bytes, "waiting": self.waiting_json() })
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            json!({ "methods": methods, "objects": objects, "waiting": self.waiting_json() })
+        }
     }
 }

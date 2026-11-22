@@ -273,7 +273,7 @@ impl Harness {
         self.nodes.borrow_mut().clear();
         self.frames.clear();
         let program: Program = compile(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
-        let opts = Options { now: self.now, seed: self.seed, render: self.render, server: self.server, explain: true, max_objects: 100_000 };
+        let opts = Options { now: self.now, seed: self.seed, render: self.render, server: self.server, explain: true, max_objects: 100_000, max_object_bytes: 0 };
         let (mut rt, mut out) = Runtime::boot(program, Box::new(self.store.clone()), opts).map_err(|e| format!("boot failed: {e}"))?;
         rt.set_measure(Box::new(TestMeasure(self.nodes.clone())));
         out.extend(rt.handle(self.now, Input::Entropy { bytes: DEFAULT_ENTROPY.into() }));
@@ -810,6 +810,20 @@ fn parse_duration_ms(s: &str) -> Result<f64, String> {
 pub fn run_trace(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>) -> TraceResult {
     let h = Harness::new(app_dir.to_path_buf(), source.to_string(), cli_plugins);
     execute_trace(h, name, trace_text)
+}
+
+/// Runs a single in-memory Taffy layout + `review::review` check for `source` at
+/// `(width, height, rtl)`, reusing `TestMeasure` and `attach_bounds` (used by `tj retro`).
+pub fn layout_findings(source: &str, width: f32, height: f32, rtl: bool) -> Result<Vec<review::Finding>, String> {
+    let mut h = Harness::new(PathBuf::from("."), source.to_string(), HashMap::new());
+    h.boot(false)?;
+    let out = h.rt.as_mut().expect("booted").handle(h.now, Input::Layout { width, height, rtl });
+    let mut replies = HashMap::new();
+    h.pump(out, &mut replies)?;
+    let mut snap = h.inspect_snapshot()?;
+    snap["viewport"] = json!({ "w": width, "h": height });
+    attach_bounds(&mut snap["tree"], &h.frames, 0.0, 0.0);
+    Ok(review::review(&snap))
 }
 
 /// Runs a smoke trace against a caller-supplied store (e.g. a copy-on-write `OverlayStore`

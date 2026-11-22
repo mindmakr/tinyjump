@@ -198,7 +198,8 @@ impl Stats {
     }
 
     /// Health summary for `GET /_tj/manifest` (aggregate counters only; zero user data).
-    pub fn health(&self, core: &Json, dev: bool, max_objects: usize, audit_dropped: u64, active_leases: usize) -> Json {
+    #[allow(clippy::too_many_arguments)]
+    pub fn health(&self, core: &Json, dev: bool, max_objects: usize, max_object_bytes: usize, fetch_allowlist: bool, audit_dropped: u64, active_leases: usize) -> Json {
         let empty = Map::new();
         let sum = |section: &str, field: Option<&str>| -> u64 {
             core[section]
@@ -211,6 +212,13 @@ impl Stats {
                 })
                 .sum()
         };
+        let largest_bytes = core["maxBytes"]
+            .as_object()
+            .unwrap_or(&empty)
+            .values()
+            .filter_map(Json::as_u64)
+            .max()
+            .unwrap_or(0);
         let now_ms = crate::engine::now_ms() as u64;
         let watching = self.watch_until_ms.load(Relaxed) > now_ms;
         json!({
@@ -218,6 +226,9 @@ impl Stats {
             "uptimeSecs": self.started.elapsed().as_secs(),
             "objectsLoaded": sum("objects", None),
             "maxObjects": max_objects,
+            "maxObjectBytes": max_object_bytes,
+            "largestObjectBytes": largest_bytes,
+            "fetchAllowlist": fetch_allowlist,
             "requests": self.requests.load(Relaxed),
             "requestErrors": self.errors.load(Relaxed),
             "methodErrors": sum("methods", Some("errors")),
