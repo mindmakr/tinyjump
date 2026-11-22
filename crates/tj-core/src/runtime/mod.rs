@@ -219,7 +219,7 @@ pub struct Runtime {
     #[cfg(feature = "server")]
     pub(crate) running_idempotency: Option<crate::vm::interp::IdempotencyCtx>,
     #[cfg(feature = "server")]
-    pub(crate) running_this: Option<Rc<str>>,
+    pub(crate) running_this: Option<Rc<ObjRef>>,
     next_chain: u64,
     /// `@exclusive` (see `exclusive.rs`): held objects and calls whose turn has come.
     locks: Vec<exclusive::Lock>,
@@ -571,8 +571,8 @@ impl Runtime {
             return Err(Exc::msg("crypto.idempotencyKey() must be called inside an @server object method"));
         };
         let res = (|| -> Result<String, Exc> {
-            let active_object = self.running_this.clone().unwrap_or_else(|| ctx.object.clone());
-            let label_key = (active_object.to_string(), label.to_string());
+            let active_object = self.running_this.as_ref().map(|o| o.key()).unwrap_or_else(|| ctx.object.to_string());
+            let label_key = (active_object.clone(), label.to_string());
             if ctx.used_labels.contains(&label_key) {
                 return Err(Exc::msg(format!(
                     "crypto.idempotencyKey({label:?}) was already called in this call; include a unique id in the label (e.g. crypto.idempotencyKey(\"{label}:\" + item.id))"
@@ -592,7 +592,7 @@ impl Runtime {
                     format!("turn:{}", crate::crypto::hex(&root))
                 }
             };
-            let parts: &[&[u8]] = &[b"tj-idem-v1", active_object.as_bytes(), ctx.method.as_bytes(), caller_tag.as_bytes(), call_scope.as_bytes(), label.as_bytes()];
+            let parts: &[&[u8]] = &[b"tj-idem-v1", ctx.object.as_bytes(), active_object.as_bytes(), ctx.method.as_bytes(), caller_tag.as_bytes(), call_scope.as_bytes(), label.as_bytes()];
             let mut framed = Vec::with_capacity(parts.iter().map(|p| 4 + p.len()).sum());
             for p in parts {
                 framed.extend_from_slice(&(p.len() as u32).to_be_bytes());

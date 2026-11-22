@@ -955,7 +955,7 @@ impl Runtime {
         #[cfg(feature = "server")]
         let multi = touched.len() > 1;
         #[cfg(feature = "server")]
-        let mut saved_before: Vec<((u16, Rc<str>), String, String)> = Vec::new();
+        let mut saved_before = Vec::new();
         // An object that now has alarms goes into the alarm index before it is saved, so a
         // restart always finds it. If the index cannot be saved, nothing is.
         let joining: Vec<String> = touched.iter().filter_map(|k| self.instances.get(k)).filter(|i| !i.alarms.is_empty()).map(|i| i.handle.key()).filter(|o| !self.alarm_index.contains(o)).collect();
@@ -1000,7 +1000,7 @@ impl Runtime {
                 continue;
             }
             #[cfg(feature = "server")]
-            let prev_saved = multi.then(|| inst.saved.clone());
+            let prev_saved = multi.then(|| (inst.saved.clone(), inst.seq));
             // Alarms and call records are bookkeeping; only a new state is a change to share.
             if state_changed && !remote {
                 // A new state of an object this runtime owns gets the next change number.
@@ -1032,8 +1032,8 @@ impl Runtime {
                 inst.cleared = false;
             }
             #[cfg(feature = "server")]
-            if let Some(prev) = prev_saved {
-                saved_before.push((key, object.clone(), prev));
+            if let Some((prev, prev_seq)) = prev_saved {
+                saved_before.push((key, object.clone(), prev, prev_seq));
             }
             // Objects joined the index above; leaving it can wait, as a stale entry only loads
             // an object without alarms at boot.
@@ -1046,7 +1046,7 @@ impl Runtime {
         if failed {
             #[cfg(feature = "server")]
             if !saved_before.is_empty() {
-                for (prev_key, prev_obj, prev_saved) in saved_before.into_iter().rev() {
+                for (prev_key, prev_obj, prev_saved, prev_seq) in saved_before.into_iter().rev() {
                     if prev_saved.is_empty() {
                         let _ = self.store.remove(&prev_obj);
                     } else {
@@ -1054,8 +1054,12 @@ impl Runtime {
                     }
                     if let Some(inst) = self.instances.get_mut(&prev_key) {
                         inst.saved = prev_saved;
+                        inst.seq = prev_seq;
                     }
                     self.revert(&prev_key, &consumed, true);
+                    if self.instances.get(&prev_key).is_some_and(|i| !i.alarms.is_empty()) {
+                        index_changed |= self.alarm_index.insert(prev_obj);
+                    }
                 }
                 let mut i = 0;
                 self.outputs.retain(|o| {

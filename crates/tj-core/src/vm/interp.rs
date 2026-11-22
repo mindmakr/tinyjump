@@ -581,7 +581,7 @@ impl Runtime {
                 #[cfg(feature = "server")]
                 let prev_this = std::mem::replace(
                     &mut self.running_this,
-                    f.frames.iter().rev().find_map(|fr| fr.this.as_ref().map(|o| Rc::from(o.key()))),
+                    f.frames.iter().rev().find_map(|fr| fr.this.clone()),
                 );
                 let r = (n.f)(self, &args);
                 #[cfg(feature = "server")]

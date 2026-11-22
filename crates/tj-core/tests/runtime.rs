@@ -3952,6 +3952,7 @@ export async function callInner(obj: string, m: string, args: any[]): any {
     assert!(!m_out.iter().any(|o| matches!(o, Output::Error { .. })), "reply.is_some() 503 must not also emit Output::Error: {m_out:?}");
     assert_eq!(state(&mut mrt, 3.0, "BoxObj/a")["v"], json!(0), "earlier saved object A must be reverted in memory");
     assert!(!multi_store.0.borrow().data.contains_key("BoxObj/a"), "earlier saved new object A must be removed from disk");
+    assert!(mrt.changed_since(&["BoxObj/a".into()], 0).is_empty(), "rolled-back object A must have seq restored so changed_since does not broadcast it");
     // reply.is_none() emits exactly ONE Output::Error (the specific save error, no duplicate).
     let m_noreply = mrt.handle(4.0, Input::Call { object: "BoxObj/a".into(), method: "touchTwoAndWait".into(), args: vec![], reply: None, call: None, caller: who("alice", &[]) });
     assert_eq!(m_noreply.iter().filter(|o| matches!(o, Output::Error { .. })).count(), 1, "reply.is_none() must emit exactly 1 Output::Error: {m_noreply:?}");
@@ -3977,11 +3978,17 @@ export async function callInner(obj: string, m: string, args: any[]): any {
     let keys1 = c_out1.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap_or_else(|| panic!("expected two keys, got {c_out1:?}"));
     assert_eq!(keys1.len(), 2);
     assert_ne!(keys1[0], keys1[1], "distinct objects on same fiber must derive distinct keys");
-    // Crash & replay same call_id on fresh runtime sharing `tj:secret` -> identical keys!
+    // Crash & replay same entry object + call_id on fresh runtime sharing `tj:secret` -> identical keys!
     let mut crt2 = Runtime::boot(compile(cross_src).unwrap(), Box::new(cross_store.0.borrow().clone()), Options { server: true, render: false, ..Options::new(3.0, 9) }).unwrap().0;
-    let c_out2 = crt2.handle(4.0, Input::Call { object: "Cart/c2".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let c_out2 = crt2.handle(4.0, Input::Call { object: "Cart/c1".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
     let keys2 = c_out2.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap();
-    assert_eq!(keys1, keys2, "cross-object keys must be crash-deterministic");
+    assert_eq!(keys1, keys2, "same entry object + call_id must derive identical cross-object keys");
+    // IK-8: DIFFERENT entry object `Cart/c2` with the SAME `call_id: "co-1"` calling the SAME
+    // `Item/sku-1.reserve()` must derive DIFFERENT keys (no cross-entry-object collision)!
+    let c_out_other = crt2.handle(4.5, Input::Call { object: "Cart/c2".into(), method: "checkout".into(), args: vec![], reply: Some(2), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys_other = c_out_other.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap();
+    assert_ne!(keys1[0], keys_other[0], "Cart/c1 and Cart/c2 with same call_id must not collide on shared Item/sku-1");
+    assert_ne!(keys1[1], keys_other[1], "Cart/c1 and Cart/c2 with same call_id must not collide on shared Item/sku-2");
     // Same object + same label twice in one fiber STILL fails fast!
     let c_dup = crt.handle(5.0, Input::Call { object: "Cart/c1".into(), method: "dupSameItem".into(), args: vec![], reply: Some(2), call: Some("co-2".into()), caller: who("alice", &[]) });
     assert!(c_dup.iter().any(|o| matches!(o, Output::Reply { reply: 2, error: Some(e), .. } if e.contains("already called in this call"))), "{c_dup:?}");
