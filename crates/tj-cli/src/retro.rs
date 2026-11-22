@@ -134,10 +134,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// Runs static, layout, benchmark/budget, optional live-server, and optional data-dir checks.
 pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result<RetroReport, String> {
     let name = file.display().to_string();
-    let source = app::read(file)?.source;
+    let app_dir = file.parent().unwrap_or(Path::new("."));
+    let mut findings = Vec::new();
+    // Audit locked registry packages first so tampered/missing imports still yield structured
+    // `[fix]` (`supply-chain`) findings even if `app::read` refuses to bundle them.
+    registry::retro_findings(app_dir, &mut findings);
+    let source = match app::read(file) {
+        Ok(a) => a.source,
+        Err(_) if !findings.is_empty() => {
+            return Ok(RetroReport { app: name, app_sha256: String::new(), findings, bench: None, live_checked: false, data_checked: false });
+        }
+        Err(e) => return Err(e),
+    };
     let program = tj_core::compile(&source).map_err(|errs| errs.iter().map(|d| d.render(&name, &source)).collect::<Vec<_>>().join("\n\n"))?;
     let app_sha256 = identity::sha256_hex(&source);
-    let mut findings = Vec::new();
 
     // 1. Access & privacy warnings (`fix`).
     for w in access::warnings(&source) {
@@ -215,10 +225,6 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
         data_checked = true;
     }
     check_keys_hygiene(&mut findings);
-
-    // 7. Locked registry packages (`tj.lock`) integrity & advisory check.
-    let app_dir = file.parent().unwrap_or(Path::new("."));
-    registry::retro_findings(app_dir, &mut findings);
 
     Ok(RetroReport { app: name, app_sha256, findings, bench: bench_json, live_checked, data_checked })
 }

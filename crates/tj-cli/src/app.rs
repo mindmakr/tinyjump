@@ -28,6 +28,9 @@ pub fn read(entry: &Path) -> Result<App, String> {
                 if let Some((src, file)) = crate::registry::load_locked_module(dir, pkg_name)? {
                     if let Ok(program) = tj_core::syntax::parse(&src) {
                         for imp in program.imports {
+                            if !imp.from.starts_with("tj:") {
+                                return Err(format!("locked package `{}` cannot import local file {:?}", names[i], imp.from));
+                            }
                             if let Ok(name) = modules::resolve(&names[i], &imp.from) {
                                 if !names.contains(&name) {
                                     names.push(name);

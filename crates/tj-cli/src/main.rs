@@ -96,6 +96,8 @@ OPTIONS:
                   run plugin <name> as a scripted fake (tests, demos without keys)
   --compliance <pack.json>
                   `serve`: refuse to start while a control of the pack is not met
+  --min-trust <community|verified|official>
+                  `check` / `serve` / `add`: refuse locked packages below this trust mark or flagged
   --web           `serve`: also serve the web app, with a sign-in bar for API keys
   --as <name:role,role>
                   `dev` only: requests without credentials act as this user (dev:<name>)
@@ -399,8 +401,9 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
     match tj_core::compile(&src) {
         Ok(program) => {
             if show_manifest && as_json {
-                if min_trust.is_some() {
-                    registry::check_lockfile(app_dir, min_trust)?;
+                let (_, warnings) = registry::check_lockfile(app_dir, min_trust)?;
+                for w in warnings {
+                    eprintln!("warning: {w}");
                 }
                 let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
                 let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
@@ -422,26 +425,35 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                     compat::check(&old_src, &old_prog, &src, &program)
                 };
                 if as_json {
+                    let mut failures = Vec::new();
+                    match registry::check_lockfile(app_dir, min_trust) {
+                        Ok((_, warnings)) => {
+                            for w in warnings {
+                                eprintln!("warning: {w}");
+                            }
+                        }
+                        Err(e) => failures.push(e),
+                    }
                     let j = serde_json::json!({
                         "compatible": !compat::has_breaking(&findings),
                         "findings": findings.iter().map(compat::Finding::json).collect::<Vec<_>>(),
                     });
                     println!("{}", serde_json::to_string_pretty(&j).expect("JSON serializes"));
                     if !allow_breaking && compat::has_breaking(&findings) {
-                        return Err("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                        failures.push("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
                     }
-                    return Ok(());
+                    return if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) };
                 }
                 println!("ok: {name}");
                 print!("{}", compat::report(&findings));
-                let mut failed: Option<String> = (!allow_breaking && compat::has_breaking(&findings)).then(|| "breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
-                if let Err(e) = print_check_reports(file, app_dir, &src, &program, show_manifest, access, privacy, record, pack, min_trust) {
-                    failed = Some(e);
+                let mut failures = Vec::new();
+                if !allow_breaking && compat::has_breaking(&findings) {
+                    failures.push("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
                 }
-                return match failed {
-                    Some(e) => Err(e),
-                    None => Ok(()),
-                };
+                if let Err(e) = print_check_reports(file, app_dir, &src, &program, show_manifest, access, privacy, record, pack, min_trust) {
+                    failures.push(e);
+                }
+                return if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) };
             }
             println!("ok: {name}");
             print_check_reports(file, app_dir, &src, &program, show_manifest, access, privacy, record, pack, min_trust)
@@ -452,7 +464,7 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
 
 #[allow(clippy::too_many_arguments)]
 fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core::vm::program::Program, show_manifest: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>, min_trust: Option<registry::Trust>) -> Result<(), String> {
-    let mut failed: Option<String> = None;
+    let mut failures = Vec::new();
     match registry::check_lockfile(app_dir, min_trust) {
         Ok((lines, warnings)) => {
             if !lines.is_empty() {
@@ -465,7 +477,7 @@ fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core
                 eprintln!("warning: {w}");
             }
         }
-        Err(e) => failed = Some(e),
+        Err(e) => failures.push(e),
     }
     if show_manifest {
         let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
@@ -486,13 +498,10 @@ fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core
         let (report, ok) = pack.report(&pack.evaluate(src, program, None));
         print!("{report}");
         if !ok {
-            failed = Some("some controls are not met (above)".into());
+            failures.push("some controls are not met (above)".into());
         }
     }
-    match failed {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) }
 }
 
 fn store_rekey(args: &Args) -> Result<(), String> {
@@ -530,6 +539,11 @@ fn workspace_dir() -> PathBuf {
 
 fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let file = args.file()?;
+    let app_dir = file.parent().unwrap_or(Path::new("."));
+    let (_, lock_warnings) = registry::check_lockfile(app_dir, args.min_trust)?;
+    for w in lock_warnings {
+        eprintln!("warning: {w}");
+    }
     let source = read_source(file)?;
     let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
     let loopback = http::is_loopback(&args.host);
