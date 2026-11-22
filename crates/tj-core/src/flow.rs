@@ -952,6 +952,10 @@ impl Checker {
                 "fetch" | "plugin" | "invoke" => {
                     let to = match name.as_str() {
                         "fetch" => Some(args.first().map_or(Destination::Unknown, destination)),
+                        "plugin" => Some(match args.first().map(|a| &a.kind) {
+                            Some(ExprKind::Str(p)) => Destination::Plugin(format!("tj:{p}")),
+                            _ => Destination::Unknown,
+                        }),
                         _ => None,
                     };
                     for a in args {

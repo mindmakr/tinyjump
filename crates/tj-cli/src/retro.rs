@@ -4,7 +4,7 @@
 //!
 //! Every finding carries an action tag: `fix`, `optimize`, `prune`, or `rotate`.
 
-use crate::{access, app, audit, auth, bench, identity, review, sealed, test_runner};
+use crate::{access, app, audit, auth, bench, identity, registry, review, sealed, test_runner};
 use serde_json::{json, Map, Value as Json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
@@ -134,10 +134,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
 /// Runs static, layout, benchmark/budget, optional live-server, and optional data-dir checks.
 pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result<RetroReport, String> {
     let name = file.display().to_string();
-    let source = app::read(file)?.source;
+    let app_dir = file.parent().unwrap_or(Path::new("."));
+    let mut findings = Vec::new();
+    // Audit locked registry packages first so tampered/missing imports still yield structured
+    // `[fix]` (`supply-chain`) findings even if `app::read` refuses to bundle them.
+    registry::retro_findings(app_dir, &mut findings);
+    let source = match app::read(file) {
+        Ok(a) => a.source,
+        Err(_) if !findings.is_empty() => {
+            return Ok(RetroReport { app: name, app_sha256: String::new(), findings, bench: None, live_checked: false, data_checked: false });
+        }
+        Err(e) => return Err(e),
+    };
     let program = tj_core::compile(&source).map_err(|errs| errs.iter().map(|d| d.render(&name, &source)).collect::<Vec<_>>().join("\n\n"))?;
     let app_sha256 = identity::sha256_hex(&source);
-    let mut findings = Vec::new();
 
     // 1. Access & privacy warnings (`fix`).
     for w in access::warnings(&source) {
