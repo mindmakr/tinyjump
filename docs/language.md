@@ -387,6 +387,24 @@ exclusive call at a time, in order, like an actor:
   catch. Timers and alarms wait as long as needed, and `@every` beats that pile up run
   once.
 
+### Object invariants (`@invariant`) and atomic turns
+
+An object can declare synchronous `@invariant` methods (taking no parameters, returning a
+boolean). Before saving any modified object, the runtime runs its `@invariant` methods; if
+any returns `false` or throws, every object touched in that turn rolls back to its last
+saved state (alarms and events included) and the call fails with status `422`:
+
+```tsx
+@server @read("anyone") object Cart {
+  stock: number = 10
+  @invariant valid(): boolean { return this.stock >= 0 }
+  @allow("anyone") take(n: number) { this.stock -= n }
+}
+```
+
+Any uncaught `throw` or `check()` failure in a method also rolls back uncommitted mutations
+made during that turn, so failed calls never leave half-written state behind.
+
 ## UI
 
 Components are functions that return JSX. Props arrive as one record, with nested

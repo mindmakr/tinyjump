@@ -575,6 +575,7 @@ impl Runtime {
         let inst = self.instances.get_mut(&(o.class, o.id.clone()))?;
         let i = inst.alarms.iter().position(|a| a.id == id)?;
         let a = inst.alarms.remove(i);
+        self.consumed_alarms.push(((o.class, o.id.clone()), id));
         self.touch(o);
         Some(a)
     }
@@ -726,10 +727,132 @@ impl Runtime {
         Ok(inst.alarms.is_empty() && inst.calls.is_empty() && &Value::Rec(inst.state.clone().into()).to_json()? == defaults)
     }
 
+    /// Checks every `@invariant` method on `o` synchronously.
+    fn check_object_invariants(&mut self, o: &Rc<ObjRef>) -> Result<(), String> {
+        let invariants: Vec<(Rc<str>, usize)> = self.program.objects[o.class as usize]
+            .methods
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| m.invariant)
+            .map(|(i, (name, _))| (name.clone(), i))
+            .collect();
+        if invariants.is_empty() {
+            return Ok(());
+        }
+        for (name, idx) in invariants {
+            let closure = self.methods[o.class as usize][idx].clone();
+            let mut f = Fiber::default();
+            f.stack.push(Value::Obj(o.clone()));
+            if let Err(e) = self.push_frame(&mut f, closure, 0, 0, Some(o.clone())) {
+                return Err(format!("{}.{name} invariant failed: {}", o.class_name, e.message()));
+            }
+            match self.run_sync(f) {
+                Ok(Value::Bool(true)) => {}
+                Ok(Value::Bool(false)) => return Err(format!("{}.{name} invariant failed on {}", o.class_name, o.key())),
+                Ok(other) => return Err(format!("{}.{name} invariant must return true or false, got a {}", o.class_name, other.type_name())),
+                Err(fail) => return Err(format!("{}.{name} invariant failed on {}: {}", o.class_name, o.key(), fail.message)),
+            }
+        }
+        Ok(())
+    }
+
+    /// Loads every stored object of classes that declare `@invariant` and checks all of them.
+    /// Used by shadow-boot upgrades before promoting a new app version.
+    #[cfg(feature = "server")]
+    pub fn check_invariants(&mut self) -> Result<usize, String> {
+        let classes: Vec<u16> = self
+            .program
+            .objects
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.methods.values().any(|m| m.invariant))
+            .map(|(i, _)| i as u16)
+            .collect();
+        let mut checked = 0;
+        for c in classes {
+            for id in self.class_ids(c) {
+                let o = self.instance(c, &id).map_err(|e| e.message())?;
+                if !self.is_gone(&o) {
+                    self.check_object_invariants(&o)?;
+                    checked += 1;
+                }
+            }
+        }
+        Ok(checked)
+    }
+
+    /// Keeps alarms already fired during this turn removed after a code rollback (throw or
+    /// `@invariant`), so a failing alarm never re-fires in a loop.
+    fn drop_consumed_alarms(&mut self) {
+        for (key, id) in std::mem::take(&mut self.consumed_alarms) {
+            if let Some(inst) = self.instances.get_mut(&key) {
+                let before = inst.alarms.len();
+                inst.alarms.retain(|a| a.id != id);
+                if inst.alarms.len() < before {
+                    let handle = inst.handle.clone();
+                    self.touch(&handle);
+                }
+            }
+        }
+    }
+
+    /// Reverts every object touched in the current turn back to its last saved record and
+    /// drops uncommitted `emit` events (called on uncaught errors and invariant failures).
+    pub(crate) fn revert_touched(&mut self) {
+        let touched = std::mem::take(&mut self.touched);
+        for key in &touched {
+            self.revert(key);
+        }
+        self.drop_consumed_alarms();
+        if !touched.is_empty() {
+            self.outputs.retain(|o| !matches!(o, Output::Emit { .. }));
+        }
+    }
+
     /// Persists every object touched by the last input whose record changed. Whether every
     /// save worked.
     pub(crate) fn flush(&mut self) -> bool {
         let mut touched = std::mem::take(&mut self.touched);
+        // Check `@invariant` methods on every modified, owned, live object before any disk
+        // write. If any fails, roll back every touched object in this turn atomically.
+        let mut invariant_err: Option<String> = None;
+        for key in &touched {
+            let check = self.instances.get(key).filter(|i| !i.remote && !i.cleared).map(|i| i.handle.clone());
+            if let Some(o) = check {
+                if let Err(msg) = self.check_object_invariants(&o) {
+                    invariant_err = Some(msg);
+                    break;
+                }
+            }
+        }
+        if let Some(msg) = invariant_err {
+            for key in touched {
+                self.revert(&key);
+            }
+            // Any extra objects touched while running the invariant revert too.
+            for key in std::mem::take(&mut self.touched) {
+                self.revert(&key);
+            }
+            self.drop_consumed_alarms();
+            self.outputs.retain(|o| !matches!(o, Output::Emit { .. }));
+            let mut replied = false;
+            for o in &mut self.outputs {
+                if let Output::Reply { ok, error, field, status, .. } = o {
+                    if error.is_none() {
+                        *ok = None;
+                        *error = Some(msg.clone());
+                        *field = None;
+                        *status = Some(422);
+                        replied = true;
+                    }
+                }
+            }
+            if !replied {
+                self.outputs.push(Output::Error { message: msg, trace: Vec::new() });
+            }
+            return false;
+        }
+        self.consumed_alarms.clear();
         let mut index_changed = false;
         let mut seq_changed = false;
         let mut failed = false;

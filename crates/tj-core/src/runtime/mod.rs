@@ -238,6 +238,9 @@ pub struct Runtime {
     erasures: std::collections::BTreeMap<String, f64>,
     /// The secret behind `caller_tag`, once read or made.
     secret: Option<Rc<str>>,
+    /// Alarms already fired and consumed during the current turn: kept removed even if the
+    /// alarm handler throws or fails an `@invariant`, so a failing alarm never re-fires forever.
+    pub(crate) consumed_alarms: Vec<((u16, Rc<str>), u64)>,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
     stats: stats::Table,
@@ -307,6 +310,7 @@ impl Runtime {
             #[cfg(feature = "server")]
             erasures: std::collections::BTreeMap::new(),
             secret: None,
+            consumed_alarms: Vec::new(),
             outputs: Vec::new(),
             metrics: Metrics::default(),
             stats: stats::table(&program),
@@ -453,7 +457,9 @@ impl Runtime {
         if std::mem::take(&mut self.ran_code) && self.render {
             self.render_app();
         }
-        self.flush();
+        if !self.flush() && std::mem::take(&mut self.ran_code) && self.render {
+            self.render_app();
+        }
         self.drain()
     }
 
@@ -627,6 +633,9 @@ impl Runtime {
             Err(fail) => {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
+                // Atomic turns: an uncaught error rolls back every object mutated in this turn
+                // before recording the error reply (so idempotency call records stay clean).
+                self.revert_touched();
                 match fail.status {
                     Some(_) => self.count_refused_slot(f.stat),
                     None => self.count_error(f.stat),
@@ -721,6 +730,9 @@ impl Runtime {
     }
 
     fn fire_timers(&mut self) {
+        if !self.touched.is_empty() {
+            self.flush();
+        }
         while self.timers.peek().is_some_and(|Reverse(t)| t.at <= self.now) {
             let Some(Reverse(t)) = self.timers.pop() else { break };
             match t.kind {
@@ -734,6 +746,9 @@ impl Runtime {
                     }
                     self.push_timer(next, TimerKind::Every { obj: obj.clone(), method: method.clone(), interval });
                     self.invoke(obj, &method, Vec::new(), false, None, Entry { who: Who::System, chain: 0, by: By::Timer });
+                    if !self.touched.is_empty() {
+                        self.flush();
+                    }
                 }
                 TimerKind::Alarm { obj, alarm } => {
                     if let Some(a) = self.take_alarm(&obj, alarm) {
@@ -741,6 +756,9 @@ impl Runtime {
                         // An alarm runs as whoever scheduled it, so rules on data still hold.
                         let who = a.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
                         self.invoke(obj, &a.method, args, false, None, Entry { who, chain: 0, by: By::Alarm });
+                        if !self.touched.is_empty() {
+                            self.flush();
+                        }
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),

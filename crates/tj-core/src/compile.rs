@@ -565,6 +565,7 @@ impl Compiler {
             let mut every = None;
             let mut allow = None;
             let mut exclusive = false;
+            let mut invariant = false;
             let mut needs: Vec<String> = Vec::new();
             for d in &m.decorators {
                 match d.name.as_str() {
@@ -585,8 +586,18 @@ impl Compiler {
                     }
                     "exclusive" if !exclusive && d.args.is_empty() => exclusive = true,
                     "exclusive" if !exclusive => self.error(Diagnostic::new("@exclusive takes no arguments", d.span).hint("write @exclusive on its own")),
-                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object) and @needs(\"consent:<purpose>\")")),
+                    "invariant" if !invariant && d.args.is_empty() => {
+                        if !m.func.params.is_empty() {
+                            self.error(Diagnostic::new("@invariant methods take no parameters", m.func.span).hint("write `@invariant check(): boolean { return ... }`"));
+                        }
+                        invariant = true;
+                    }
+                    "invariant" if !invariant => self.error(Diagnostic::new("@invariant takes no arguments", d.span).hint("write @invariant on its own")),
+                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object), @invariant (checked before saving) and @needs(\"consent:<purpose>\")")),
                 }
+            }
+            if invariant && (allow.is_some() || every.is_some()) {
+                self.error(Diagnostic::new("@invariant methods cannot also have @allow or @every", m.func.span).hint("invariants run automatically before saving and are never called remotely or by timers"));
             }
             let proto = self.function(&m.func, FnKind::Method(&needs));
             let params = m.func.params.iter().map(|p| {
@@ -597,7 +608,7 @@ impl Compiler {
                 (name, p.optional || p.default.is_some(), p.ty.as_ref().map_or(ArgTy::Any, |t| self.arg_ty(t, 0)))
             });
             let params = params.collect();
-            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive, params });
+            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive, invariant, params });
         }
         let def = &mut self.objects[class];
         def.fields = fields;

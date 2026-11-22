@@ -941,9 +941,8 @@ fn a_runaway_call_on_a_server_fails_and_the_server_carries_on() {
     let steps = rt.stats()["methods"]["Spin.forever"]["steps"].as_u64().unwrap();
     assert!((20_000_000..20_000_100).contains(&steps), "{steps}");
     assert_eq!(call_as(&mut rt, 2.0, "Spin/s", "ok", json!([]), who("", &[])), Ok(json!("alive")));
-    // Like any thrown error, it keeps the changes made before it failed (see
-    // feedback/2026-11-20-builder-005-failed-calls-keep-changes.md).
-    assert!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap() > 0);
+    // Failed calls roll back uncommitted mutations atomically (atomic turns).
+    assert_eq!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap(), 0);
 }
 
 /// The account object the flow tests build on.
@@ -2995,4 +2994,71 @@ fn a_screen_that_shows_the_time_is_drawn_again_each_minute() {
 fn encode_uri_component_works_as_in_javascript() {
     let mut rt = boot("object U {\n  enc(s: string): string { return encodeURIComponent(s) }\n}\n");
     assert_eq!(call(&mut rt, 1.0, "U/u", "enc", json!(["a b&c/é?x=1-_.!~*'()"])).unwrap(), json!("a%20b%26c%2F%C3%A9%3Fx%3D1-_.!~*'()"));
+}
+
+#[test]
+fn invariants_roll_back_bad_mutations_and_failed_calls_are_atomic() {
+    // Compile errors with fix hints for invalid @invariant usage.
+    assert!(compile("object A { @invariant bad(x: number): boolean { return x > 0 } }").is_err());
+    assert!(compile("@server @read(\"anyone\") object A { @invariant @allow(\"anyone\") ok(): boolean { return true } }").is_err());
+    assert!(compile("object A { @invariant(\"x\") ok(): boolean { return true } }").is_err());
+
+    let src = r#"
+@server @read("anyone") object Account {
+  balance: number = 100
+  log: string[] = []
+  @invariant nonNegative(): boolean { return this.balance >= 0 }
+  @allow("anyone") deposit(n: number) { this.balance += n }
+  @allow("anyone") withdraw(n: number) {
+    this.balance -= n
+    this.emit("withdrew", { n })
+    this.schedule("fee", 5000, "chargeFee")
+  }
+  @allow("anyone") transferTo(other: string, n: number) {
+    Account.get(other).deposit(n)
+    this.balance -= n
+  }
+  @allow("anyone") mutateThenThrow(n: number) {
+    this.balance += n
+    this.schedule("fee", 5000, "chargeFee")
+    this.emit("mutated", { n })
+    throw new Error("boom")
+  }
+  private chargeFee() { this.log.push("fee") }
+}
+"#;
+    let mut rt = server(src, false);
+    let anon = || who("", &[]);
+
+    // Valid mutation passes the invariant and saves.
+    assert!(call_as(&mut rt, 1.0, "Account/a", "deposit", json!([50]), anon()).is_ok());
+    assert_eq!(state(&mut rt, 2.0, "Account/a")["balance"], json!(150));
+
+    // Breaking @invariant rolls back state, alarms and emits, and returns status 422.
+    let out = rt.handle(3.0, Input::Call { object: "Account/a".into(), method: "withdraw".into(), args: vec![json!(200)], reply: Some(1), call: None, caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { error: Some(e), status: Some(422), .. } if e.contains("Account.nonNegative"))), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "withdrew")), "no phantom emit: {out:?}");
+    assert_eq!(state(&mut rt, 4.0, "Account/a")["balance"], json!(150), "balance rolled back");
+    rt.handle(10_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 11_000.0, "Account/a")["log"], json!([]), "scheduled alarm rolled back too");
+
+    // Multi-object mutation rolls back BOTH objects if any touched object breaks its invariant.
+    let err = call_as(&mut rt, 12.0, "Account/a", "transferTo", json!(["b", 500]), anon()).unwrap_err();
+    assert_eq!(err.0, Some(422));
+    assert_eq!(state(&mut rt, 13.0, "Account/a")["balance"], json!(150));
+    assert_eq!(state(&mut rt, 14.0, "Account/b")["balance"], json!(100), "receiver deposit rolled back atomically");
+
+    // Uncaught throw rolls back state, alarms and emits atomically, while idempotency still caches the error.
+    let out = rt.handle(15.0, Input::Call { object: "Account/a".into(), method: "mutateThenThrow".into(), args: vec![json!(25)], reply: Some(2), call: Some("k1".into()), caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { error: Some(e), .. } if e.contains("boom"))), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "mutated")), "{out:?}");
+    assert_eq!(state(&mut rt, 16.0, "Account/a")["balance"], json!(150), "thrown call rolled back balance");
+    rt.handle(25_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 26_000.0, "Account/a")["log"], json!([]), "thrown call rolled back alarm");
+    // Replaying the idempotent key returns the cached error without mutating.
+    let replay = rt.handle(27.0, Input::Call { object: "Account/a".into(), method: "mutateThenThrow".into(), args: vec![json!(25)], reply: Some(3), call: Some("k1".into()), caller: anon() });
+    assert!(replay.iter().any(|o| matches!(o, Output::Reply { error: Some(e), .. } if e.contains("boom"))), "{replay:?}");
+
+    // `check_invariants()` verifies all stored objects cleanly.
+    assert_eq!(rt.check_invariants().unwrap(), 2);
 }

@@ -141,6 +141,9 @@ pub struct MethodDef {
     pub allow: Option<Rc<[Rc<str>]>>,
     /// `@exclusive`: one exclusive call at a time per object (see `runtime/exclusive.rs`).
     pub exclusive: bool,
+    /// `@invariant`: synchronous boolean check run before saving modified objects; returning
+    /// `false` or throwing rolls the turn's changes back and fails the call.
+    pub invariant: bool,
     /// Its parameters: name, whether it may be left out, and type. A call from outside (the
     /// HTTP API, another device) is checked against them before the method runs.
     pub params: Vec<(Rc<str>, bool, ArgTy)>,
