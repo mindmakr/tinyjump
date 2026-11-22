@@ -350,27 +350,8 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 println!("ok: {name}");
                 print!("{}", compat::report(&findings));
                 let mut failed: Option<String> = (!allow_breaking && compat::has_breaking(&findings)).then(|| "breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
-                if show_manifest {
-                    let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
-                    let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-                    let m = manifest::Manifest::build(&src, &program, &refs);
-                    print!("{}", m.text());
-                }
-                if access {
-                    print!("{}", access::report(&src));
-                }
-                if privacy && record {
-                    print!("{}", privacy::record(&src, &program));
-                } else if privacy {
-                    print!("{}", privacy::report(&program));
-                }
-                if let Some(pack) = pack {
-                    let pack = compliance::Pack::load(pack)?;
-                    let (report, ok) = pack.report(&pack.evaluate(&src, &program, None));
-                    print!("{report}");
-                    if !ok {
-                        failed = Some("some controls are not met (above)".into());
-                    }
+                if let Err(e) = print_check_reports(file, &src, &program, show_manifest, access, privacy, record, pack) {
+                    failed = Some(e);
                 }
                 return match failed {
                     Some(e) => Err(e),
@@ -378,32 +359,37 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 };
             }
             println!("ok: {name}");
-            if show_manifest {
-                let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
-                let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-                let m = manifest::Manifest::build(&src, &program, &refs);
-                print!("{}", m.text());
-            }
-            if access {
-                print!("{}", access::report(&src));
-            }
-            if privacy && record {
-                print!("{}", privacy::record(&src, &program));
-            } else if privacy {
-                print!("{}", privacy::report(&program));
-            }
-            if let Some(pack) = pack {
-                let pack = compliance::Pack::load(pack)?;
-                let (report, ok) = pack.report(&pack.evaluate(&src, &program, None));
-                print!("{report}");
-                if !ok {
-                    return Err("some controls are not met (above)".into());
-                }
-            }
-            Ok(())
+            print_check_reports(file, &src, &program, show_manifest, access, privacy, record, pack)
         }
         Err(errs) => Err(errs.iter().map(|d| d.render(&name, &src)).collect::<Vec<_>>().join("\n\n")),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_check_reports(file: &Path, src: &str, program: &tj_core::vm::program::Program, show_manifest: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+    if show_manifest {
+        let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+        let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+        let m = manifest::Manifest::build(src, program, &refs);
+        print!("{}", m.text());
+    }
+    if access {
+        print!("{}", access::report(src));
+    }
+    if privacy && record {
+        print!("{}", privacy::record(src, program));
+    } else if privacy {
+        print!("{}", privacy::report(program));
+    }
+    if let Some(pack) = pack {
+        let pack = compliance::Pack::load(pack)?;
+        let (report, ok) = pack.report(&pack.evaluate(src, program, None));
+        print!("{report}");
+        if !ok {
+            return Err("some controls are not met (above)".into());
+        }
+    }
+    Ok(())
 }
 
 fn store_rekey(args: &Args) -> Result<(), String> {

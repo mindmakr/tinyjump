@@ -13,7 +13,9 @@
 use crate::auth::OpsScope;
 use crate::bytes::{hex, random};
 use crate::engine::{now_ms, Failure};
+use crate::store::{private_dir, private_file, sync_dir};
 use serde_json::{json, Value as Json};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -179,17 +181,41 @@ impl Leases {
         Ok(removed)
     }
 
-    /// Best-effort persistence to `<data>/leases.json`, atomic via a temp file + rename.
+    /// Fails with `409` if another holder currently holds an active exclusive lease
+    /// overlapping `scope`. Unleased callers and the lease holder itself proceed.
+    pub fn check_exclusive(&self, holder: &str, scope: &str) -> Result<(), Failure> {
+        self.check_exclusive_at(now_ms() as u64, holder, scope)
+    }
+
+    fn check_exclusive_at(&self, now: u64, holder: &str, scope: &str) -> Result<(), Failure> {
+        let mut items = self.items.lock().map_err(|_| (500, "leases unavailable".to_string()))?;
+        items.retain(|l| l.expires_at > now);
+        if let Some(other) = items.iter().find(|l| l.exclusive && l.holder != holder && scopes_overlap(&l.scope, scope)) {
+            let left = other.expires_at.saturating_sub(now) / 1000;
+            return Err((409, format!("scope {:?} is leased exclusively by {} (role {}, id {}, {}s left); wait or release that lease first", other.scope, other.holder, other.role.as_str(), other.id, left)));
+        }
+        Ok(())
+    }
+
+    /// Best-effort persistence to `<data>/leases.json`, atomic via a private temp file + rename.
     fn save(&self, items: &[Lease]) {
         let Some(file) = &self.file else { return };
         if let Some(parent) = file.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = private_dir(parent);
         }
         let body = serde_json::to_string_pretty(&items.iter().map(Lease::json).collect::<Vec<_>>()).unwrap_or_default() + "\n";
         let tmp = file.with_extension("json.tmp");
-        if std::fs::write(&tmp, body).is_ok() {
-            let _ = std::fs::rename(&tmp, file);
-        }
+        let write = || -> std::io::Result<()> {
+            let mut f = private_file().write(true).create(true).truncate(true).open(&tmp)?;
+            f.write_all(body.as_bytes())?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, file)?;
+            if let Some(parent) = file.parent() {
+                sync_dir(parent)?;
+            }
+            Ok(())
+        };
+        let _ = write();
     }
 }
 
@@ -308,6 +334,12 @@ mod tests {
         let conflict_app = leases.acquire_at(t0, "ops:maint-2".into(), OpsScope::Maintain, "app".into(), None, Some(60), String::new()).unwrap_err();
         assert_eq!(conflict_app.0, 409);
 
+        // `check_exclusive_at` blocks competing holders on overlapping scopes, allows self & non-overlapping scopes.
+        assert_eq!(leases.check_exclusive_at(t0, "ops:maint-2", "Slot").unwrap_err().0, 409);
+        assert_eq!(leases.check_exclusive_at(t0, "ops:maint-2", "app").unwrap_err().0, 409);
+        assert!(leases.check_exclusive_at(t0, "ops:maint-2", "Settings").is_ok());
+        assert!(leases.check_exclusive_at(t0, "ops:maint-1", "Slot").is_ok());
+
         // Same holder renewing extends the same lease id instead of conflicting.
         let renewed = leases.acquire_at(t0 + 10_000, "ops:maint-1".into(), OpsScope::Maintain, "Slot".into(), None, Some(120), "still upgrading".into()).unwrap();
         assert_eq!(renewed.id, m1.id);
@@ -318,8 +350,11 @@ mod tests {
         assert!(leases.release_at(t0 + 10_000, &l1.id, "ops:critic-1", false).is_ok());
         assert!(leases.release_at(t0 + 10_000, &m1.id, "ops:maint-2", true).is_ok());
 
-        // Remaining lease expires cleanly once its TTL passes.
+        // Remaining lease expires cleanly once its TTL passes; an expired exclusive lease never blocks.
         assert_eq!(leases.list_at(t0 + 61_000).len(), 0);
+        let _ = leases.acquire_at(t0 + 70_000, "ops:maint-1".into(), OpsScope::Maintain, "app".into(), None, Some(10), String::new()).unwrap();
+        assert_eq!(leases.check_exclusive_at(t0 + 75_000, "ops:maint-2", "app").unwrap_err().0, 409);
+        assert!(leases.check_exclusive_at(t0 + 81_000, "ops:maint-2", "app").is_ok());
     }
 
     #[test]

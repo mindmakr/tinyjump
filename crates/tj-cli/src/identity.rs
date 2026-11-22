@@ -183,13 +183,17 @@ fn read_keys(path: &Path) -> Result<Vec<Key>, String> {
     let mut keys = Vec::new();
     for k in list.as_array().ok_or(format!("keys file {} must be a JSON array", path.display()))? {
         let field = |f: &str| k[f].as_str().map(str::to_string).ok_or(format!("a key in {} has no \"{f}\"", path.display()));
-        let roles = k["roles"].as_array().map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        let name = field("name")?;
+        let raw_roles: Vec<String> = k["roles"].as_array().map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()).unwrap_or_default();
         let ops = match k.get("ops") {
             None | Some(Json::Null) => None,
             Some(Json::String(s)) => Some(OpsScope::parse(s).map_err(|e| format!("in {}: {e}", path.display()))?),
             Some(_) => return Err(format!("in {}: \"ops\" must be \"observe\", \"test\" or \"maintain\"", path.display())),
         };
-        keys.push(Key { name: field("name")?, roles: clean_roles(roles), ops, sha256: field("sha256")?.to_lowercase() });
+        if ops.is_some() && !raw_roles.is_empty() {
+            return Err(format!("in {}: key {name:?} cannot combine \"ops\" with app \"roles\"; create a separate app user key", path.display()));
+        }
+        keys.push(Key { name, roles: clean_roles(raw_roles), ops, sha256: field("sha256")?.to_lowercase() });
     }
     Ok(keys)
 }
@@ -264,7 +268,7 @@ impl Identity {
             return Err((401, "send credentials as `Authorization: Bearer <credential>`".into()));
         };
         if credential.starts_with(KEY_PREFIX) {
-            return self.api_key(credential).ok_or((401, "unknown or revoked API key".into()));
+            return self.api_key(credential);
         }
         match &self.oidc {
             Some(o) => o.verify(credential).map_err(|e| (401, e)),
@@ -292,9 +296,12 @@ impl Identity {
         file.keys.iter().find(|k| k.sha256 == hash).cloned()
     }
 
-    fn api_key(&self, key: &str) -> Option<Verified> {
-        let k = self.lookup_key(key)?;
-        Some(Verified { caller: Caller::Remote { id: format!("key:{}", k.name), roles: k.roles }, expires: None })
+    fn api_key(&self, key: &str) -> Result<Verified, (u16, String)> {
+        let k = self.lookup_key(key).ok_or((401, "unknown or revoked API key".into()))?;
+        if k.ops.is_some() {
+            return Err((403, "this is an operational --ops key for /_tj/*, not an app user key".into()));
+        }
+        Ok(Verified { caller: Caller::Remote { id: format!("key:{}", k.name), roles: k.roles }, expires: None })
     }
 }
 
@@ -313,6 +320,9 @@ fn parse_as(spec: &str) -> Result<Caller, String> {
 pub fn new_key(name: &str, roles: &[String], ops: Option<OpsScope>, file: &Path) -> Result<String, String> {
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         return Err(format!("a key name is letters, digits, - and _, got {name:?}"));
+    }
+    if ops.is_some() && !roles.is_empty() {
+        return Err("an --ops key cannot also carry --role; create a separate app user key for /api/*".into());
     }
     let mut list: Vec<Json> = match std::fs::read_to_string(file) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{} is not a JSON array: {e}", file.display()))?,
@@ -353,11 +363,20 @@ mod tests {
         assert!(!std::fs::read_to_string(&file).unwrap().contains(&key), "only the hash is stored");
         assert!(new_key("sync", &[], None, &file).is_err(), "names are unique");
         let ops_key = new_key("critic", &[], Some(OpsScope::Observe), &file).expect("ops key");
+        assert!(new_key("mixed", &["staff".into()], Some(OpsScope::Observe), &file).is_err(), "cannot combine --ops with --role");
 
         let id = Identity { oidc: None, keys: Some(Mutex::new(KeyFile { path: file.clone(), keys: read_keys(&file).unwrap(), loaded: Some(Instant::now()) })), dev_as: None };
         assert_eq!(remote(id.verify(Some(&format!("Bearer {key}"))).ok().unwrap()), ("key:sync".into(), vec!["staff".into()]), "system and ops:* cannot be granted as roles");
         assert_eq!(id.verify_ops_key(&key).unwrap(), None, "plain API key has no ops scope");
         assert_eq!(id.verify_ops_key(&ops_key).unwrap(), Some(("critic".into(), OpsScope::Observe)));
+        // Operational --ops keys must never authenticate as signedIn app users on /api/*.
+        let ops_refused = id.verify(Some(&format!("Bearer {ops_key}"))).err().unwrap();
+        assert_eq!(ops_refused.0, 403);
+        assert!(ops_refused.1.contains("--ops"), "{}", ops_refused.1);
+        // Hand-edited keys.json combining ops + roles is refused on load.
+        let bad_file = dir.join("bad_keys.json");
+        std::fs::write(&bad_file, r#"[{"name":"bad","roles":["staff"],"ops":"observe","sha256":"00"}]"#).unwrap();
+        assert!(read_keys(&bad_file).is_err());
         assert_eq!(id.verify(Some("Bearer tjk_nope")).err().unwrap().0, 401);
         assert_eq!(id.verify(Some("Bearer eyJhbGciOi")).err().unwrap().0, 401, "a bad credential never becomes anonymous");
         assert_eq!(remote(id.verify(None).ok().unwrap()), (String::new(), vec![]));
