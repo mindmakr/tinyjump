@@ -56,7 +56,8 @@ const MAX_OBJECTS: usize = 100_000;
 enum Msg {
     /// An input, who waits for its reply, and when it was sent (for latency).
     Input(Input, Option<Reply>, Instant),
-    EffectDone(u32, Result<Json, String>),
+    /// `(generation, effect_id, result)`: mismatched generations from a pre-reload runtime are dropped.
+    EffectDone(u64, u32, Result<Json, String>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
     /// Which of `objects` `caller` may read (for stream tickets).
@@ -280,7 +281,7 @@ struct Dispatch {
     replies: HashMap<u64, Waiter>,
     next_reply: u64,
     subscribers: Vec<Arc<Mailbox>>,
-    effects: Sender<(u32, Effect)>,
+    effects: Sender<(u64, u32, Effect)>,
     stats: Arc<Stats>,
     audit: Audit,
     /// `tj:privacy` calls to carry out on the runtime thread.
@@ -289,6 +290,8 @@ struct Dispatch {
     forget_after: Vec<String>,
     /// Uncaught `Output::Error` and `503` replies emitted in the current turn (for auto-rollback).
     turn_errors: u64,
+    /// Monotonic runtime generation: incremented on every swap so stale `EffectDone`s are ignored.
+    generation: u64,
 }
 
 /// Post-reload health watch window: if uncaught errors or 503s reach `threshold` before `until`,
@@ -304,26 +307,28 @@ struct WatchWindow {
 /// Validates `req.source` offline against `current_snap`, `compliance`, and a copy-on-write
 /// overlay over `data` (checking every stored object's `@invariant` and running `smoke_traces`).
 fn shadow_validate(
-    req: &ReloadRequest,
+    source: &str,
+    allow_breaking: bool,
+    smoke_traces: &[String],
     current_snap: &Snapshot,
     data: &Path,
     explain: bool,
     compliance: Option<&ComplianceGate>,
 ) -> Result<(Vec<compat::Finding>, Snapshot), Failure> {
-    if req.smoke_traces.len() > MAX_SMOKE_TRACES {
+    if smoke_traces.len() > MAX_SMOKE_TRACES {
         return Err((400, format!("at most {MAX_SMOKE_TRACES} smoke traces per reload")));
     }
-    let program = compile(&req.source)
-        .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", &req.source)).collect::<Vec<_>>().join("\n\n")))?;
+    let program = compile(source)
+        .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")))?;
     if let Some((pack, server)) = compliance {
-        let (report, ok) = pack.report(&pack.evaluate(&req.source, &program, Some(server)));
+        let (report, ok) = pack.report(&pack.evaluate(source, &program, Some(server)));
         if !ok {
             return Err((409, format!("compliance pack {} not met:\n{report}", pack.title)));
         }
     }
-    let new_snap = Snapshot::build(&req.source, &program);
+    let new_snap = Snapshot::build(source, &program);
     let findings = compat::check_snapshots(current_snap, &new_snap);
-    if !req.allow_breaking && compat::has_breaking(&findings) {
+    if !allow_breaking && compat::has_breaking(&findings) {
         return Err((409, format!("breaking upgrade changes found; pass allowBreaking: true if intentional\n{}", compat::report(&findings))));
     }
     // Shadow boot against a copy-on-write overlay over the real data dir (never mutates disk).
@@ -342,10 +347,10 @@ fn shadow_validate(
         }
     }
     shadow_rt.check_invariants().map_err(|e| (422, format!("shadow boot invariant check failed: {e}")))?;
-    for (idx, trace_text) in req.smoke_traces.iter().enumerate() {
+    for (idx, trace_text) in smoke_traces.iter().enumerate() {
         let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
         let overlay = OverlayStore::new(base);
-        let res = test_runner::run_trace_on_store(data, &req.source, &format!("smoke-{}", idx + 1), trace_text, HashMap::new(), Box::new(overlay));
+        let res = test_runner::run_trace_on_store(source, &format!("smoke-{}", idx + 1), trace_text, HashMap::new(), Box::new(overlay), now_ms());
         if !res.passed() {
             return Err((422, format!("shadow smoke trace #{} failed: {}", idx + 1, res.error.unwrap_or_default())));
         }
@@ -360,7 +365,10 @@ fn drain_inflight(rt: &mut Runtime, d: &mut Dispatch, rx: &Receiver<Msg>, pendin
     while !d.replies.is_empty() {
         let Some(rem) = deadline.checked_duration_since(Instant::now()) else { break };
         match rx.recv_timeout(rem) {
-            Ok(Msg::EffectDone(id, result)) => {
+            Ok(Msg::EffectDone(gen, id, result)) => {
+                if gen != d.generation {
+                    continue;
+                }
                 let (ok, error) = match result {
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
@@ -415,7 +423,7 @@ fn run(
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
     let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch);
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new(), turn_errors: 0 };
+    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new(), turn_errors: 0, generation: 1 };
     let mut current_sha = sha256_hex(&current_source);
     let mut previous: Option<(String, String)> = None;
     let mut watch: Option<WatchWindow> = None;
@@ -476,7 +484,10 @@ fn run(
                     }
                 }
             }
-            Ok(Msg::EffectDone(id, result)) => {
+            Ok(Msg::EffectDone(gen, id, result)) => {
+                if gen != d.generation {
+                    continue;
+                }
                 let (ok, error) = match result {
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
@@ -524,6 +535,7 @@ fn run(
                             *s = source;
                         }
                         rt = new_rt;
+                        d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
                             *m = new_manifest;
                         }
@@ -531,8 +543,6 @@ fn run(
                         d.stats.set_watch_until(0);
                         d.stats.reloaded();
                         d.audit.record(Entry::new("start").text("app", &new_sha));
-                        // Requests waiting on the old runtime get a "restarted" error.
-                        d.replies.clear();
                         eprintln!("[tj] reloaded");
                         out
                     }
@@ -543,19 +553,21 @@ fn run(
                 }
             }
             Ok(Msg::SafeReload { req, done }) => {
-                let (findings, new_snap) = match shadow_validate(&req, &current_snap, &data, explain, compliance.as_ref()) {
+                let new_sha = sha256_hex(&req.source);
+                // Audit BEFORE shadow_validate decrypts live data or runs smoke traces (fail-closed).
+                if let Err(e) = d.audit.security(Entry::new("admin").who(req.actor).text("request", "reload").text("app", &new_sha)) {
+                    let _ = done.send(Err(e));
+                    continue;
+                }
+                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref()) {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = done.send(Err(e));
                         continue;
                     }
                 };
-                let new_sha = sha256_hex(&req.source);
-                if let Err(e) = d.audit.security(Entry::new("admin").who(req.actor).text("request", "reload").text("app", &new_sha)) {
-                    let _ = done.send(Err(e));
-                    continue;
-                }
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
+                d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&req.source, &data, render, explain, &refs) {
                     Ok((new_rt, out, new_manifest, _, _)) => {
@@ -567,13 +579,13 @@ fn run(
                             *s = req.source;
                         }
                         rt = new_rt;
+                        d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
                             *m = new_manifest;
                         }
-                        d.replies.clear();
                         d.stats.reloaded();
-                        let watch_secs = req.watch_secs.min(MAX_WATCH_SECS);
-                        if watch_secs > 0 && req.error_threshold > 0 {
+                        let watch_secs = if req.error_threshold > 0 { req.watch_secs.min(MAX_WATCH_SECS) } else { 0 };
+                        if watch_secs > 0 {
                             let until_ms = (now_ms() as u64).saturating_add(watch_secs * 1000);
                             d.stats.set_watch_until(until_ms);
                             watch = Some(WatchWindow {
@@ -613,6 +625,7 @@ fn run(
                     continue;
                 }
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
+                d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&prev_source, &data, render, explain, &refs) {
                     Ok((new_rt, out, new_manifest, new_snap, _)) => {
@@ -624,12 +637,12 @@ fn run(
                             *s = prev_source;
                         }
                         rt = new_rt;
+                        d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
                             *m = new_manifest;
                         }
                         watch = None;
                         d.stats.set_watch_until(0);
-                        d.replies.clear();
                         let _ = done.send(Ok(json!({ "appSha256": prev_sha, "rolledBackFrom": rolled_from_sha })));
                         out
                     }
@@ -667,10 +680,10 @@ fn run(
                                 *s = w.prev_source;
                             }
                             rt = prev_rt;
+                            d.on_swap(&rt);
                             if let Ok(mut m) = manifest.lock() {
                                 *m = prev_manifest;
                             }
-                            d.replies.clear();
                             d.stats.auto_rolled_back();
                             d.audit.record(Entry::new("admin").who(Actor::System).text("request", "auto-rollback").text("app", &w.prev_sha));
                             eprintln!("[tj] auto-rollback triggered ({} error(s) in watch window): restored {}", w.errors, &w.prev_sha[..w.prev_sha.len().min(12)]);
@@ -736,6 +749,27 @@ fn privacy_effect(rt: &mut Runtime, d: &mut Dispatch, effect: u32, method: &str,
 }
 
 impl Dispatch {
+    /// Runs after every runtime swap: bumps `generation` so stale `EffectDone`s from the old
+    /// runtime are ignored, clears uncompleted replies/privacy effects, and closes any SSE
+    /// subscribers whose `@read` rules tightened under the new bundle.
+    fn on_swap(&mut self, rt: &Runtime) {
+        self.generation += 1;
+        self.replies.clear();
+        self.privacy.clear();
+        self.turn_errors = 0;
+        self.subscribers.retain(|s| {
+            let ok = match (s.reader(), s.objects()) {
+                (Some(caller), Some(objs)) => objs.iter().all(|o| rt.may_read(o, caller).is_ok()),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            if !ok {
+                s.close();
+            }
+            ok
+        });
+    }
+
     fn outputs(&mut self, rt: &mut Runtime, out: Vec<Output>) {
         for o in out {
             match o {
@@ -767,7 +801,7 @@ impl Dispatch {
                 // tj:privacy acts on the runtime, so it runs on this thread (see `privacy_effects`).
                 Output::Effect { id, effect: Effect::Plugin { plugin, method, args } } if plugin == "privacy" => self.privacy.push((id, method, args)),
                 Output::Effect { id, effect } => {
-                    let _ = self.effects.send((id, effect));
+                    let _ = self.effects.send((self.generation, id, effect));
                 }
                 Output::Emit { object, name, data } => {
                     let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
@@ -836,8 +870,8 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool) -> Sender<(u32, Effect)> {
-    let (tx, rx) = channel::<(u32, Effect)>();
+fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool) -> Sender<(u64, u32, Effect)> {
+    let (tx, rx) = channel::<(u64, u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
     if !private_fetch {
@@ -850,7 +884,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
         let (rx, back, agent, plugins, stats, audit) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
-            let Ok((id, effect)) = job else { return };
+            let Ok((gen, id, effect)) = job else { return };
             let kind = match &effect {
                 Effect::Http { .. } => "http".to_string(),
                 Effect::Plugin { plugin, .. } => format!("plugin.{plugin}"),
@@ -867,7 +901,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
             if let Some((plugin, method)) = plugin_call {
                 audit.record(Entry::new("plugin").text("plugin", &plugin).text("method", &method).ok(result.is_ok()).num("ms", started.elapsed().as_millis() as u64));
             }
-            if back.send(Msg::EffectDone(id, result)).is_err() {
+            if back.send(Msg::EffectDone(gen, id, result)).is_err() {
                 return;
             }
         });

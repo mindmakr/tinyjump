@@ -74,6 +74,9 @@ impl Store for SharedStore {
     fn forget(&mut self, key: &str) -> Result<(), String> {
         self.0.borrow_mut().forget(key)
     }
+    fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        self.0.borrow_mut().is_erased(key)
+    }
 }
 
 /// Deterministic widget size estimator for Taffy flexbox layout during `assertLayout`.
@@ -209,7 +212,7 @@ impl TraceResult {
 
 /// Mutable state for one `.trace.jsonl` run.
 struct Harness {
-    app_dir: PathBuf,
+    app_dir: Option<PathBuf>,
     source: String,
     store: SharedStore,
     seeded_store: bool,
@@ -230,10 +233,10 @@ struct Harness {
 
 impl Harness {
     fn new(app_dir: PathBuf, source: String, cli_plugins: HashMap<String, FakePlugin>) -> Harness {
-        Self::with_store(app_dir, source, cli_plugins, SharedStore::default(), false)
+        Self::with_store(Some(app_dir), source, cli_plugins, SharedStore::default(), false, DEFAULT_START_MS)
     }
 
-    fn with_store(app_dir: PathBuf, source: String, cli_plugins: HashMap<String, FakePlugin>, store: SharedStore, seeded_store: bool) -> Harness {
+    fn with_store(app_dir: Option<PathBuf>, source: String, cli_plugins: HashMap<String, FakePlugin>, store: SharedStore, seeded_store: bool, initial_now: f64) -> Harness {
         Harness {
             app_dir,
             source,
@@ -243,7 +246,7 @@ impl Harness {
             nodes: Rc::new(RefCell::new(HashMap::new())),
             frames: HashMap::new(),
             rt: None,
-            now: DEFAULT_START_MS,
+            now: initial_now,
             seed: DEFAULT_SEED,
             server: true,
             render: true,
@@ -464,7 +467,10 @@ impl Harness {
                 let fake = if let Some(answers) = s.get("answers") {
                     FakePlugin::from_json(answers)?
                 } else if let Some(file) = s["file"].as_str() {
-                    let path = self.app_dir.join(file);
+                    let Some(app_dir) = &self.app_dir else {
+                        return Err("smoke traces cannot read server files; use inline \"answers\" instead".into());
+                    };
+                    let path = app_dir.join(file);
                     let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read plugin fake {}: {e}", path.display()))?;
                     let v: Json = serde_json::from_str(&text).map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
                     FakePlugin::from_json(&v)?
@@ -807,9 +813,10 @@ pub fn run_trace(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli
 }
 
 /// Runs a smoke trace against a caller-supplied store (e.g. a copy-on-write `OverlayStore`
-/// over a live server's data directory during shadow boot).
-pub fn run_trace_on_store(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>, store: Box<dyn Store>) -> TraceResult {
-    let h = Harness::with_store(app_dir.to_path_buf(), source.to_string(), cli_plugins, SharedStore::from_store(store), true);
+/// over a live server's data directory during shadow boot). Disables filesystem reads from
+/// `"plugin"` `"file"` steps and starts the clock at `initial_now` (live `now_ms()`).
+pub fn run_trace_on_store(source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>, store: Box<dyn Store>, initial_now: f64) -> TraceResult {
+    let h = Harness::with_store(None, source.to_string(), cli_plugins, SharedStore::from_store(store), true, initial_now);
     execute_trace(h, name, trace_text)
 }
 

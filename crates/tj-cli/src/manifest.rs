@@ -10,7 +10,7 @@ use crate::access;
 use crate::identity::sha256_hex;
 use crate::privacy;
 use serde_json::{json, Map, Value as Json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use tj_core::modules;
 use tj_core::syntax::ast::{Decorator, ExprKind, Item, TypeExpr};
 use tj_core::syntax::parse_range;
@@ -35,6 +35,7 @@ impl Manifest {
         let mut ast_objects: HashMap<String, AstObject> = HashMap::new();
         let mut imported_plugins: BTreeSet<String> = BTreeSet::new();
 
+        let canon_types = canonical_field_types(source);
         for f in modules::files(source) {
             let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
             for imp in &parsed.imports {
@@ -47,10 +48,7 @@ impl Manifest {
                 let field_types = o
                     .fields
                     .iter()
-                    .filter_map(|fl| {
-                        let ty = fl.ty.as_ref().map(format_type).or_else(|| fl.init.as_ref().and_then(infer_literal_type))?;
-                        Some((fl.name.clone(), ty))
-                    })
+                    .filter_map(|fl| canon_types.get(&(o.name.clone(), fl.name.clone())).map(|t| (fl.name.clone(), t.clone())))
                     .collect();
                 let mut method_needs = HashMap::new();
                 for m in &o.methods {
@@ -316,12 +314,76 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
     Json::Object(obj)
 }
 
-fn infer_literal_type(e: &tj_core::syntax::ast::Expr) -> Option<String> {
-    match &e.kind {
-        ExprKind::Num(_) => Some("number".into()),
-        ExprKind::Str(_) | ExprKind::Template(_) => Some("string".into()),
-        ExprKind::Bool(_) => Some("boolean".into()),
-        _ => None,
+/// Resolves local `type Foo = ...` aliases, infers literal default field types (`qty = 0`),
+/// and canonicalizes unions and record field order so `Manifest` and `compat::Snapshot`
+/// always emit identical field type strings.
+pub fn canonical_field_types(source: &str) -> HashMap<(String, String), String> {
+    let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
+    let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
+    for f in modules::files(source) {
+        let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
+        for item in &parsed.items {
+            match item {
+                Item::TypeAlias { name, generics, ty, .. } if generics.is_empty() => {
+                    aliases.insert(name.clone(), ty.clone());
+                }
+                Item::Object(o) => {
+                    for fl in &o.fields {
+                        if let Some(ty) = &fl.ty {
+                            raw_fields.push((o.name.clone(), fl.name.clone(), ty.clone()));
+                        } else if let Some(init) = &fl.init {
+                            let inferred = match &init.kind {
+                                ExprKind::Num(_) => Some("number"),
+                                ExprKind::Str(_) | ExprKind::Template(_) => Some("string"),
+                                ExprKind::Bool(_) => Some("boolean"),
+                                _ => None,
+                            };
+                            if let Some(t) = inferred {
+                                raw_fields.push((o.name.clone(), fl.name.clone(), TypeExpr::Named(t.into(), Vec::new())));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    raw_fields
+        .into_iter()
+        .map(|(o, f, ty)| ((o, f), canon_type(&ty, &aliases, &mut HashSet::new())))
+        .collect()
+}
+
+fn canon_type(ty: &TypeExpr, aliases: &HashMap<String, TypeExpr>, seen: &mut HashSet<String>) -> String {
+    match ty {
+        TypeExpr::Named(n, args) if args.is_empty() => {
+            if let Some(target) = aliases.get(n) {
+                if seen.insert(n.clone()) {
+                    let s = canon_type(target, aliases, seen);
+                    seen.remove(n);
+                    return s;
+                }
+            }
+            n.clone()
+        }
+        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(|a| canon_type(a, aliases, seen)).collect::<Vec<_>>().join(", ")),
+        TypeExpr::Array(inner) => format!("{}[]", canon_type(inner, aliases, seen)),
+        TypeExpr::Union(ts) => {
+            let mut parts: Vec<String> = ts.iter().map(|t| canon_type(t, aliases, seen)).collect();
+            parts.sort();
+            parts.dedup();
+            parts.join(" | ")
+        }
+        TypeExpr::Record(fs) => {
+            let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
+            for (k, opt, t) in fs {
+                sorted.insert(k.as_str(), format!("{k}{}: {}", if *opt { "?" } else { "" }, canon_type(t, aliases, seen)));
+            }
+            format!("{{ {} }}", sorted.into_values().collect::<Vec<_>>().join(", "))
+        }
+        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(|p| canon_type(p, aliases, seen)).collect::<Vec<_>>().join(", "), canon_type(r, aliases, seen)),
+        TypeExpr::StrLit(s) => format!("{s:?}"),
+        TypeExpr::NumLit(n) => n.to_string(),
     }
 }
 
@@ -397,22 +459,6 @@ fn decorator_strings(decorators: &[Decorator], name: &str) -> Vec<String> {
         .filter(|d| d.name == name)
         .flat_map(|d| d.args.iter().filter_map(|a| if let ExprKind::Str(s) = &a.kind { Some(s.clone()) } else { None }))
         .collect()
-}
-
-fn format_type(ty: &TypeExpr) -> String {
-    match ty {
-        TypeExpr::Named(n, args) if args.is_empty() => n.clone(),
-        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(format_type).collect::<Vec<_>>().join(", ")),
-        TypeExpr::Array(inner) => format!("{}[]", format_type(inner)),
-        TypeExpr::Union(ts) => ts.iter().map(format_type).collect::<Vec<_>>().join(" | "),
-        TypeExpr::Record(fs) => {
-            let parts: Vec<String> = fs.iter().map(|(k, opt, t)| format!("{k}{}: {}", if *opt { "?" } else { "" }, format_type(t))).collect();
-            format!("{{ {} }}", parts.join(", "))
-        }
-        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(format_type).collect::<Vec<_>>().join(", "), format_type(r)),
-        TypeExpr::StrLit(s) => format!("{s:?}"),
-        TypeExpr::NumLit(n) => n.to_string(),
-    }
 }
 
 fn str_list(v: &Json) -> Option<String> {

@@ -495,15 +495,23 @@ fn handle(mut req: Request, front: &Front) {
             asked = Some(("reload", None, None));
             let ops = ops_access.as_ref().expect("authenticated");
             result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/reload").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| read_json(&mut req)).and_then(|j| {
-                let source = match j.get("source").and_then(Json::as_str) {
-                    Some(s) if !s.trim().is_empty() => s.to_string(),
-                    Some(_) => return Err((400, "\"source\" cannot be empty".into())),
-                    None => match &front.app_file {
+                if !(j.is_object() || j.is_null()) {
+                    return Err((400, "body must be a JSON object".into()));
+                }
+                let source = match j.get("source") {
+                    None | Some(Json::Null) => match &front.app_file {
                         Some(p) => crate::app::read(p).map(|a| a.source).map_err(|e| (500, format!("cannot read {}: {e}", p.display())))?,
                         None => return Err((400, "send {\"source\": \"<app bundle>\"}".into())),
                     },
+                    Some(Json::String(s)) if !s.trim().is_empty() => s.clone(),
+                    Some(Json::String(_)) => return Err((400, "\"source\" cannot be empty".into())),
+                    Some(_) => return Err((400, "\"source\" must be a string".into())),
                 };
-                let allow_breaking = j.get("allowBreaking").and_then(Json::as_bool).unwrap_or(false);
+                let allow_breaking = match j.get("allowBreaking") {
+                    None | Some(Json::Null) => false,
+                    Some(Json::Bool(b)) => *b,
+                    Some(_) => return Err((400, "\"allowBreaking\" must be true or false".into())),
+                };
                 let smoke_traces: Vec<String> = match j.get("smokeTraces") {
                     None | Some(Json::Null) => Vec::new(),
                     Some(Json::Array(arr)) => arr
@@ -512,8 +520,14 @@ fn handle(mut req: Request, front: &Front) {
                         .collect::<Result<_, _>>()?,
                     Some(_) => return Err((400, "smokeTraces must be an array of JSONL strings".into())),
                 };
-                let watch_secs = j.get("watchSecs").and_then(Json::as_u64).unwrap_or(30);
-                let error_threshold = j.get("errorThreshold").and_then(Json::as_u64).unwrap_or(3);
+                let watch_secs = match j.get("watchSecs") {
+                    None | Some(Json::Null) => 30,
+                    Some(v) => v.as_u64().ok_or_else(|| (400, "\"watchSecs\" must be a non-negative integer".to_string()))?,
+                };
+                let error_threshold = match j.get("errorThreshold") {
+                    None | Some(Json::Null) => 3,
+                    Some(v) => v.as_u64().ok_or_else(|| (400, "\"errorThreshold\" must be a non-negative integer".to_string()))?,
+                };
                 let res = engine.safe_reload(ReloadRequest {
                     source,
                     allow_breaking,
@@ -532,7 +546,7 @@ fn handle(mut req: Request, front: &Front) {
         (Method::Post, ["_tj", "rollback"]) => {
             asked = Some(("rollback", None, None));
             let ops = ops_access.as_ref().expect("authenticated");
-            result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/rollback").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| {
+            result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/rollback").and_then(|()| check_lease(&front.leases, ops, "app")).and_then(|()| read_json(&mut req).map(|_| ())).and_then(|()| {
                 let res = engine.rollback(ops.actor())?;
                 if let Some(dev) = &front.dev {
                     dev.notify_reload();
@@ -838,6 +852,9 @@ fn sse(req: Request, events: &Mailbox, still_valid: impl Fn() -> bool) {
     let mut checked = Instant::now();
     while ok {
         let batch = events.take(SSE_KEEPALIVE);
+        if events.is_closed() {
+            break;
+        }
         if checked.elapsed() >= RECHECK_EVERY {
             checked = Instant::now();
             if !still_valid() {
@@ -1139,7 +1156,18 @@ mod tests {
         // Fix Counter/c1 to 10 so invariant passes.
         assert_eq!(call("POST", "/api/Counter/c1/set", None, Some(json!([10]))).0, 200);
 
-        // 3. Failing smoke trace rejects reload with 422 and NEVER mutates disk!
+        // 3. Failing smoke trace rejects reload with 422 and NEVER mutates disk;
+        //    smoke traces cannot read server files via `"plugin"` `"file"` (C-037.1);
+        //    wrong-typed reload fields return 400 (C-037.10); rollback requires JSON CSRF barrier (C-037.8).
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": 123 }))).0, 400);
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "watchSecs": -1 }))).0, 400);
+        let file_read_smoke = "{\"do\": \"plugin\", \"name\": \"ai\", \"file\": \"keys.json\"}";
+        let (st, file_err) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v1, "smokeTraces": [file_read_smoke] })));
+        assert_eq!(st, 422, "{file_err}");
+        assert!(file_err["error"].as_str().unwrap().contains("cannot read server files"), "{file_err}");
+        let bad_ct = agent.post(&format!("{base}/_tj/rollback")).set("Authorization", &format!("Bearer {mnt}")).set("Content-Type", "application/x-www-form-urlencoded").send_string("x=1");
+        assert!(matches!(bad_ct, Err(ureq::Error::Status(415, _))), "non-JSON rollback must be refused");
+
         let v2 = r#"
 @server @read("anyone") object Counter {
   n: number = 0
@@ -1153,6 +1181,21 @@ mod tests {
         // Disk still holds n = 10, not 999!
         assert_eq!(call("GET", "/api/Counter/c1", None, None), (200, json!({ "ok": { "n": 10 } })));
 
+        // C-037.4: tightening `@read("anyone")` -> `@read("staff")` closes existing anonymous SSE subscribers!
+        let (anon_sub, _) = front.engine.subscribe(vec!["Counter/c1".into()], 0, Some(Caller::Remote { id: String::new(), roles: Vec::new() })).unwrap();
+        assert!(!anon_sub.is_closed());
+        let tightened = r#"
+@server @read("staff") object Counter {
+  n: number = 0
+  @allow("staff") set(v: number): number { this.n = v; return this.n }
+  @allow("staff") version(): string { return "tight" }
+}
+"#;
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": tightened, "watchSecs": 0 }))).0, 200);
+        assert!(anon_sub.is_closed(), "anonymous SSE subscriber must be closed when @read tightens");
+        // Roll back to v1 before testing v2 + auto-rollback.
+        assert_eq!(call("POST", "/_tj/rollback", Some(&mnt), Some(json!({}))).0, 200);
+
         // 4. Valid upgrade + passing smoke trace (mutating overlay to 777) swaps cleanly without touching disk!
         let good_smoke = "{\"do\": \"get\", \"object\": \"Counter/c1\", \"as\": \"anon\", \"expect\": {\"n\": 10}}\n{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"set\", \"args\": [777], \"as\": \"anon\", \"expect\": 777}\n{\"do\": \"call\", \"object\": \"Counter/c1\", \"method\": \"version\", \"as\": \"anon\", \"expect\": \"v2\"}";
         let (st, ok) = call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2, "smokeTraces": [good_smoke], "watchSecs": 30, "errorThreshold": 2 })));
@@ -1164,7 +1207,7 @@ mod tests {
         // Live manifest reflects reload count & active watch window.
         let (st, m) = call("GET", "/_tj/manifest", Some(&obs), None);
         assert_eq!(st, 200);
-        assert_eq!(m["ok"]["health"]["reloads"], json!(1));
+        assert_eq!(m["ok"]["health"]["reloads"], json!(2));
         assert_eq!(m["ok"]["health"]["watching"], json!(true));
 
         // 5. Manual rollback restores v1 cleanly.

@@ -1373,7 +1373,7 @@ impl Compiler {
                 self.emit(Op::Closure(p), sp);
             }
             ExprKind::Await(x) => {
-                if self.cur().is_invariant {
+                if self.fns.iter().any(|f| f.is_invariant) {
                     self.error(Diagnostic::new("@invariant methods cannot use `await`", sp).hint("invariants must be pure synchronous checks before saving"));
                 }
                 self.expr(x);

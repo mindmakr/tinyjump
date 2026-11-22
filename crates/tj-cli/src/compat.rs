@@ -4,12 +4,9 @@
 //! cannot silently drop stored fields, break queued device calls or accidentally widen
 //! security rules.
 
-use crate::manifest::{arg_ty_from_json, Manifest};
+use crate::manifest::{arg_ty_from_json, canonical_field_types, Manifest};
 use serde_json::{json, Value as Json};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use tj_core::modules;
-use tj_core::syntax::ast::{ExprKind, Item, TypeExpr};
-use tj_core::syntax::parse_range;
+use std::collections::HashMap;
 use tj_core::vm::program::{ArgTy, Program};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -449,78 +446,6 @@ fn arg_ty_compatible(old: &ArgTy, new: &ArgTy) -> bool {
     }
 }
 
-/// Resolves local `type Foo = ...` aliases and canonicalizes unions/record field ordering so
-/// benign refactors (`type Cents = number` <-> `number`, `A | B` <-> `B | A`) are not flagged.
-fn canonical_field_types(source: &str) -> HashMap<(String, String), String> {
-    let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
-    let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
-    for f in modules::files(source) {
-        let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
-        for item in &parsed.items {
-            match item {
-                Item::TypeAlias { name, generics, ty, .. } if generics.is_empty() => {
-                    aliases.insert(name.clone(), ty.clone());
-                }
-                Item::Object(o) => {
-                    for fl in &o.fields {
-                        if let Some(ty) = &fl.ty {
-                            raw_fields.push((o.name.clone(), fl.name.clone(), ty.clone()));
-                        } else if let Some(init) = &fl.init {
-                            let inferred = match &init.kind {
-                                ExprKind::Num(_) => Some("number"),
-                                ExprKind::Str(_) | ExprKind::Template(_) => Some("string"),
-                                ExprKind::Bool(_) => Some("boolean"),
-                                _ => None,
-                            };
-                            if let Some(t) = inferred {
-                                raw_fields.push((o.name.clone(), fl.name.clone(), TypeExpr::Named(t.into(), Vec::new())));
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    raw_fields
-        .into_iter()
-        .map(|(o, f, ty)| ((o, f), canon_type(&ty, &aliases, &mut HashSet::new())))
-        .collect()
-}
-
-fn canon_type(ty: &TypeExpr, aliases: &HashMap<String, TypeExpr>, seen: &mut HashSet<String>) -> String {
-    match ty {
-        TypeExpr::Named(n, args) if args.is_empty() => {
-            if let Some(target) = aliases.get(n) {
-                if seen.insert(n.clone()) {
-                    let s = canon_type(target, aliases, seen);
-                    seen.remove(n);
-                    return s;
-                }
-            }
-            n.clone()
-        }
-        TypeExpr::Named(n, args) => format!("{n}<{}>", args.iter().map(|a| canon_type(a, aliases, seen)).collect::<Vec<_>>().join(", ")),
-        TypeExpr::Array(inner) => format!("{}[]", canon_type(inner, aliases, seen)),
-        TypeExpr::Union(ts) => {
-            let mut parts: Vec<String> = ts.iter().map(|t| canon_type(t, aliases, seen)).collect();
-            parts.sort();
-            parts.dedup();
-            parts.join(" | ")
-        }
-        TypeExpr::Record(fs) => {
-            let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
-            for (k, opt, t) in fs {
-                sorted.insert(k.as_str(), format!("{k}{}: {}", if *opt { "?" } else { "" }, canon_type(t, aliases, seen)));
-            }
-            format!("{{ {} }}", sorted.into_values().collect::<Vec<_>>().join(", "))
-        }
-        TypeExpr::Func(ps, r) => format!("({}) => {}", ps.iter().map(|p| canon_type(p, aliases, seen)).collect::<Vec<_>>().join(", "), canon_type(r, aliases, seen)),
-        TypeExpr::StrLit(s) => format!("{s:?}"),
-        TypeExpr::NumLit(n) => n.to_string(),
-    }
-}
-
 /// Effective remote readers of a field: empty whenever the object itself is not remotely readable.
 fn effective_field_read<'a>(obj_read: &'a Json, field_read: &'a Json) -> Vec<&'a str> {
     let obj = str_set(Some(obj_read));
@@ -706,5 +631,23 @@ type Cents = number
         let f_json = check_snapshots(&old_snap, &new_snap);
         let codes_json: Vec<&str> = f_json.iter().map(|x| x.code).collect();
         assert_eq!(codes, codes_json);
+
+        // C-037.5: comparing an unchanged app containing type aliases, unsorted unions
+        // (`string | null`), and unsorted record fields against its own `Manifest::build` JSON
+        // must produce zero findings.
+        let tricky = r#"
+type Cents = number
+@server @read("anyone") object Item {
+  price: Cents = 0
+  note: string | null = null
+  meta: { b: string, a: number } = { a: 0, b: "" }
+  @allow("anyone") ping() {}
+}
+"#;
+        let tp = tj_core::compile(tricky).unwrap();
+        let m_snap = Snapshot::from_manifest_json(Manifest::build(tricky, &tp, &[]).json).unwrap();
+        let s_snap = Snapshot::build(tricky, &tp);
+        let self_diff = check_snapshots(&m_snap, &s_snap);
+        assert!(self_diff.is_empty(), "unchanged app vs own manifest must have 0 findings: {}", report(&self_diff));
     }
 }

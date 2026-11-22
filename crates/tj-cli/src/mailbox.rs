@@ -62,6 +62,14 @@ impl Mailbox {
         self.reader.as_ref()
     }
 
+    pub fn objects(&self) -> Option<&[String]> {
+        self.only.as_deref()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.queue.lock().map_or(true, |q| q.closed)
+    }
+
     /// Adds an event; false once the client has gone, so the sender can forget it.
     pub fn push(&self, e: Event) -> bool {
         let Ok(mut q) = self.queue.lock() else { return false };
@@ -112,12 +120,13 @@ impl Mailbox {
         }
     }
 
-    /// The client has gone: drop what is queued and refuse more.
+    /// The client has gone (or lost read access on reload): drop what is queued and refuse more.
     pub fn close(&self) {
         if let Ok(mut q) = self.queue.lock() {
             q.closed = true;
             q.events.clear();
         }
+        self.ready.notify_all();
     }
 }
 

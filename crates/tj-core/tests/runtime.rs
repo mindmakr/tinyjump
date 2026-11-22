@@ -3257,6 +3257,31 @@ fn invariant_purity_compile_checks_and_ui_reply_dedup() {
 "#;
     assert!(compile(wrong_ret).err().expect("wrong return type").iter().any(|d| d.message.contains("boolean")));
 
+    let bare_ret = r#"
+@server @read("anyone") object D {
+  n: number = 0
+  @invariant bad(): boolean { if (this.n < 0) { return } return true }
+}
+"#;
+    assert!(compile(bare_ret).err().expect("bare return in invariant").iter().any(|d| d.message.contains("boolean")));
+
+    let alias_ret = r#"
+type Valid = boolean
+@server @read("anyone") object E {
+  n: number = 0
+  @invariant ok(): Valid { return this.n >= 0 }
+}
+"#;
+    assert!(compile(alias_ret).is_ok(), "boolean type alias must be accepted on @invariant");
+
+    let nested_await = r#"
+@server @read("anyone") object F {
+  n: number = 0
+  @invariant bad(): boolean { const fn1 = () => await fetch("https://example.com"); return fn1 !== null }
+}
+"#;
+    assert!(compile(nested_await).err().expect("nested await in invariant").iter().any(|d| d.message.contains("await")));
+
     // P3A-R1: `@invariant` cannot call `invoke(...)` (even via a plugin helper) or `this.unschedule(...)`.
     let invoke_inv = r#"//# file: app.tj
 import { sneakInvoke } from "tj:sneak"

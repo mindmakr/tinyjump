@@ -219,9 +219,10 @@ Bearer <key>`:
   `/_tj/reload`, `/_tj/rollback`, unfiltered `/api/events` and force-releasing any lease.
 - **Admin key (`TJ_ADMIN_KEY`, 24+ characters):** grants full `maintain` access (audited as
   `admin`). Without either `TJ_ADMIN_KEY` or `TJ_KEYS`, automation is off (`403`).
-- `tj review`, `tj stats`, `tj mcp`, `tj lease` and `tj privacy` send `TJ_OPS_KEY` when
-  set, falling back to `TJ_ADMIN_KEY`. `tj dev` and debug builds of the Android and iOS
-  hosts stay open when no key is sent, because they are for your own machine.
+- `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`, `tj reload` and `tj rollback`
+  send `TJ_OPS_KEY` when set, falling back to `TJ_ADMIN_KEY`. `tj dev` and debug builds of
+  the Android and iOS hosts stay open when no key is sent, because they are for your own
+  machine.
 
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on

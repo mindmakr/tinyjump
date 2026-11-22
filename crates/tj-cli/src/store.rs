@@ -45,6 +45,13 @@ impl Store for OverlayStore {
         Ok(())
     }
 
+    fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        if self.writes.contains_key(key) {
+            return Ok(false);
+        }
+        self.base.is_erased(key)
+    }
+
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         let mut set: BTreeSet<String> = self.base.keys(prefix)?.into_iter().collect();
         for (k, v) in &self.writes {

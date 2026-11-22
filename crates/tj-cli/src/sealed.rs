@@ -573,4 +573,32 @@ mod tests {
         assert!(open_store(&data, &[]).err().unwrap().contains("is encrypted"));
         fs::remove_dir_all(data).unwrap();
     }
+
+    #[test]
+    fn overlay_store_wraps_sealed_and_preserves_is_erased_without_mutating_keys() {
+        let dir = std::env::temp_dir().join(format!("tj-sealed-overlay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        let own = dir.join("own");
+        let personal = vec!["Customer".to_string()];
+        let mut live = Sealed::new(FileStore::open(&data).unwrap(), Box::new(FileStore::open(&own).unwrap()), keys(""), &personal);
+        live.save("Customer/user:ana", r#"{"email":"ana@example.com"}"#).unwrap();
+        live.save("Customer/user:bo", r#"{"email":"bo@example.com"}"#).unwrap();
+        // Simulate an erased person whose sealed record still exists on disk (e.g. from backup) while their own key is gone.
+        live.forget("Customer/user:bo").unwrap();
+
+        let base = Sealed::new(FileStore::open(&data).unwrap(), Box::new(FileStore::open(&own).unwrap()), keys(""), &personal);
+        let mut overlay = crate::store::OverlayStore::new(Box::new(base));
+        assert!(overlay.is_erased("Customer/user:bo").unwrap(), "OverlayStore forwards is_erased to Sealed");
+        assert!(!overlay.is_erased("Customer/user:ana").unwrap());
+        assert_eq!(overlay.load("Customer/user:ana").unwrap().as_deref(), Some(r#"{"email":"ana@example.com"}"#));
+        // Forgetting Ana in the overlay hides her in memory WITHOUT destroying her real own-key on disk!
+        overlay.forget("Customer/user:ana").unwrap();
+        assert_eq!(overlay.load("Customer/user:ana").unwrap(), None);
+
+        let mut verify = Sealed::new(FileStore::open(&data).unwrap(), Box::new(FileStore::open(&own).unwrap()), keys(""), &personal);
+        assert_eq!(verify.load("Customer/user:ana").unwrap().as_deref(), Some(r#"{"email":"ana@example.com"}"#), "real own-key untouched");
+        assert!(verify.is_erased("Customer/user:bo").unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
