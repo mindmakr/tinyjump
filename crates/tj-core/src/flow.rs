@@ -473,6 +473,7 @@ impl Checker {
     /// written back.
     /// Follows a call. `owner_only`: the caller owns what `X.get(caller.id)` gives, as in a
     /// method only the owner may call, a screen, and what those call on the caller's objects.
+    #[allow(clippy::too_many_arguments)]
     fn call(&mut self, f: &Rc<FnDecl>, args: Vec<Val>, this: Option<(Rc<str>, bool)>, endpoint: Endpoint, owner_only: bool, on_server: bool, captured: Option<&mut HashMap<String, Val>>) -> Taint {
         let arg_sig: Vec<String> = args.iter().map(|a| self.flatten(a).sig()).collect();
         let key = format!("{:p}|{}|{:?}|{}|{owner_only}|{on_server}", Rc::as_ptr(f), arg_sig.join(";"), this.as_ref().map(|(c, o)| format!("{c}{o}")), endpoint as u8);

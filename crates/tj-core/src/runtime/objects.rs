@@ -544,7 +544,7 @@ impl Runtime {
         let before = inst.alarms.len();
         match handle {
             Value::Num(h) => inst.alarms.retain(|a| a.id as f64 != *h),
-            Value::Str(k) => inst.alarms.retain(|a| !(a.key.as_deref() == Some(&**k) || (a.key.is_none() && a.method == &**k))),
+            Value::Str(k) => inst.alarms.retain(|a| !(a.key.as_deref() == Some(&**k) || (a.key.is_none() && a.method == **k))),
             _ => return Value::Bool(false),
         }
         let removed = inst.alarms.len() < before;
