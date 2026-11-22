@@ -2502,6 +2502,36 @@ fn an_alarm_can_be_cancelled_by_its_handle_even_after_a_restart() {
     assert_eq!(state(&mut rt, 6201.0, "Booking/b")["sent"], json!(["first"]));
 }
 
+#[test]
+fn keyed_alarms_replace_and_cancel_by_name_across_restarts() {
+    let src = r#"@server object Booking {
+  sent: string[] = []
+  scheduleKeyed(key: string, ms: number, label: string) { this.schedule(key, ms, "remind", label) }
+  schedulePlain(ms: number, label: string) { this.schedule(ms, "remind", label) }
+  cancelByName(name: string): boolean { return this.unschedule(name) }
+  remind(what: string) { this.sent.push(what) }
+}
+"#;
+    let store = Shared::default();
+    let opts = || Options { server: true, render: false, ..Options::new(0.0, 7) };
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), opts()).unwrap().0;
+    // Scheduling the same key twice replaces the earlier alarm.
+    call(&mut rt, 1.0, "Booking/b1", "scheduleKeyed", json!(["rem", 1000, "old"])).unwrap();
+    call(&mut rt, 2.0, "Booking/b1", "scheduleKeyed", json!(["rem", 2000, "new"])).unwrap();
+    call(&mut rt, 3.0, "Booking/b1", "scheduleKeyed", json!(["other", 1500, "kept"])).unwrap();
+    // Restart in between: keys persist.
+    let mut rt = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { now: 100.0, ..opts() }).unwrap().0;
+    assert_eq!(call(&mut rt, 101.0, "Booking/b1", "cancelByName", json!(["other"])).unwrap(), json!(true));
+    assert_eq!(call(&mut rt, 102.0, "Booking/b1", "cancelByName", json!(["other"])).unwrap(), json!(false));
+    rt.handle(2_500.0, Input::Tick);
+    assert_eq!(state(&mut rt, 2_501.0, "Booking/b1")["sent"], json!(["new"]));
+    // Unkeyed alarms can also be cancelled by method name without keeping a handle field.
+    call(&mut rt, 3_000.0, "Booking/b1", "schedulePlain", json!([1000, "drop"])).unwrap();
+    assert_eq!(call(&mut rt, 3_001.0, "Booking/b1", "cancelByName", json!(["remind"])).unwrap(), json!(true));
+    rt.handle(5_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 5_001.0, "Booking/b1")["sent"], json!(["new"]));
+}
+
 const SLOTS: &str = r#"@server @read("anyone") object Slot {
   title: string = ""
   @allow("anyone") name(t: string) { this.title = t }
