@@ -164,7 +164,7 @@ impl Runtime {
 
     /// The host finished an attempt. If the server was unreachable, the call is retried later;
     /// otherwise it leaves the outbox and its caller gets the result.
-    pub(crate) fn call_attempt_done(&mut self, effect: u32, ok: Option<Json>, error: Option<String>, unreachable: bool) {
+    pub(crate) fn call_attempt_done(&mut self, effect: u32, ok: Option<Json>, error: Option<String>, field: Option<String>, unreachable: bool) {
         let Some(i) = self.outbox.pending.iter().position(|p| p.effect == Some(effect)) else { return };
         if unreachable {
             let p = &mut self.outbox.pending[i];
@@ -178,7 +178,7 @@ impl Runtime {
         let p = self.outbox.pending.remove(i);
         self.save_outbox();
         match (p.promise, error) {
-            (Some(promise), error) => self.resume(promise, ok, error),
+            (Some(promise), error) => self.resume(promise, ok, error, field),
             // Queued before a restart: nobody awaits it any more, but a failure must not vanish.
             (None, Some(e)) => self.outputs.push(Output::Error { message: format!("{}.{} (queued before a restart) failed: {e}", p.object, p.method), trace: Vec::new() }),
             (None, None) => {}
@@ -219,7 +219,7 @@ impl Runtime {
             let class = p.object.split('/').next().unwrap_or_default();
             let why = format!("{class}.{} was queued by another user and was not sent", p.method);
             match p.promise {
-                Some(promise) => self.resume(promise, None, Some(why)),
+                Some(promise) => self.resume(promise, None, Some(why), None),
                 None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
             }
         }
@@ -265,7 +265,7 @@ impl Runtime {
             }
             match self.resolve_object(&i.object) {
                 Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, by: By::Invoke }),
-                Err(e) => self.reply(reply, Err(e)),
+                Err(e) => self.reply(reply, Err((e, None))),
             }
         }
         ran
@@ -322,7 +322,7 @@ impl Runtime {
     }
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.
-    pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, String>) {
+    pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, (String, Option<String>)>) {
         let Some((obj, call, keep)) = self.call_replies.remove(&internal) else { return };
         let Some((record, waiting)) = self.running_calls.remove(&call) else { return };
         if keep {

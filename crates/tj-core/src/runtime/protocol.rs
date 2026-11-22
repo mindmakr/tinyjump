@@ -75,6 +75,9 @@ pub enum Input {
         ok: Option<Json>,
         #[serde(default)]
         error: Option<String>,
+        /// The field named by `check(ok, field, message)` on a server call refusal.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
         #[serde(default)]
         unreachable: bool,
     },
@@ -154,6 +157,9 @@ pub enum Output {
         ok: Option<Json>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The field named by `check(ok, field, message)`, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field: Option<String>,
         /// For an error that is about the request rather than the app, its HTTP status:
         /// 400 (no caller), 403 (not allowed), 422 (a call id reused for another call),
         /// 503 (too many objects loaded).
@@ -309,7 +315,7 @@ impl TryFrom<Json> for Input {
                 "ui" => Input::Ui { target: Target::try_from(f.take("target"))?, event: f.string("event")?, value: f.take("value"), reply: f.opt_u64("reply")? },
                 "effectDone" => {
                     let id = f.opt_u64("id")?.and_then(|id| u32::try_from(id).ok()).ok_or("`id` must be an effect id")?;
-                    Input::EffectDone { id, ok: f.opt_json("ok"), error: f.opt_string("error")?, unreachable: f.flag("unreachable")? }
+                    Input::EffectDone { id, ok: f.opt_json("ok"), error: f.opt_string("error")?, field: f.opt_string("field")?, unreachable: f.flag("unreachable")? }
                 }
                 "sync" => Input::Sync { object: f.string("object")?, state: f.take("state"), seq: f.opt_u64("seq")? },
                 "layout" => Input::Layout { width: f.number("width")? as f32, height: f.number("height")? as f32, rtl: f.flag("rtl")? },
@@ -367,8 +373,9 @@ mod tests {
             Input::Ui { target: Target::Node { node: 4 }, event: "onPress".into(), value: Json::Null, reply: None },
             Input::Ui { target: Target::Id { id: "add".into() }, event: "onChange".into(), value: json!("x"), reply: Some(2) },
             Input::Ui { target: Target::Text { text: "Save".into() }, event: "onPress".into(), value: Json::Null, reply: None },
-            Input::EffectDone { id: 3, ok: Some(json!({ "status": 200 })), error: None, unreachable: false },
-            Input::EffectDone { id: 4, ok: None, error: Some("offline".into()), unreachable: true },
+            Input::EffectDone { id: 3, ok: Some(json!({ "status": 200 })), error: None, field: None, unreachable: false },
+            Input::EffectDone { id: 4, ok: None, error: Some("offline".into()), field: None, unreachable: true },
+            Input::EffectDone { id: 5, ok: None, error: Some("Give a title".into()), field: Some("new-title".into()), unreachable: false },
             Input::Sync { object: "A/b".into(), state: json!({ "n": 1 }), seq: Some(9) },
             Input::Layout { width: 390.0, height: 844.5, rtl: true },
             Input::Online,

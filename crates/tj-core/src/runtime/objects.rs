@@ -65,6 +65,8 @@ pub(crate) struct CallRecord {
     ok: Option<Json>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
 }
 
 impl CallRecord {
@@ -72,7 +74,7 @@ impl CallRecord {
         let text = serde_json::to_string(args).expect("JSON values serialize");
         // FNV-1a: telling one call's arguments from another's, not hiding them.
         let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None }
+        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None, field: None }
     }
 
     fn expired(&self, now: f64) -> bool {
@@ -84,17 +86,20 @@ impl CallRecord {
         self.by == other.by && self.method == other.method && self.args == other.args
     }
 
-    pub(crate) fn with_result(mut self, r: &Result<Json, String>) -> CallRecord {
+    pub(crate) fn with_result(mut self, r: &Result<Json, (String, Option<String>)>) -> CallRecord {
         match r {
             Ok(v) => self.ok = Some(v.clone()),
-            Err(e) => self.error = Some(e.clone()),
+            Err((e, f)) => {
+                self.error = Some(e.clone());
+                self.field = f.clone();
+            }
         }
         self
     }
 
-    pub(crate) fn result(&self) -> Result<Json, String> {
+    pub(crate) fn result(&self) -> Result<Json, (String, Option<String>)> {
         match &self.error {
-            Some(e) => Err(e.clone()),
+            Some(e) => Err((e.clone(), self.field.clone())),
             None => Ok(self.ok.clone().unwrap_or(Json::Null)),
         }
     }
@@ -106,6 +111,10 @@ pub(crate) struct Alarm {
     /// it. Records from before handles were saved read as 0 and get a new one.
     #[serde(default)]
     id: u64,
+    /// Optional key (`this.schedule("key", ms, "method", ...)`): rescheduling the same key
+    /// replaces the previous pending alarm, and `this.unschedule("key")` cancels it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     at: f64,
     pub method: String,
     pub args: Vec<Json>,
@@ -496,18 +505,31 @@ impl Runtime {
         Ok(())
     }
 
-    /// `this.schedule(delayMs, "method", ...args)`: a durable one-shot timer.
-    /// `this.schedule(ms, "method", ...args)`: its handle, for `this.unschedule`.
+    /// `this.schedule(delayMs, "method", ...args)` or
+    /// `this.schedule("key", delayMs, "method", ...args)`: a durable one-shot timer.
+    /// Returns its handle, for `this.unschedule(handle)`. With a key, any earlier pending
+    /// alarm with the same key on this object is replaced, and `this.unschedule("key")`
+    /// cancels it without storing a handle field.
     pub(crate) fn schedule_alarm(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<Value, Exc> {
-        let (Some(Value::Num(delay)), Some(Value::Str(method))) = (args.first(), args.get(1)) else {
-            return Err(Exc::msg("schedule(delayMs, \"method\", ...args) needs a delay and a method name"));
+        let (key, delay, method, rest) = match (args.first(), args.get(1), args.get(2)) {
+            (Some(Value::Str(k)), Some(Value::Num(delay)), Some(Value::Str(method))) => {
+                if k.is_empty() {
+                    return Err(Exc::msg("schedule key must not be empty"));
+                }
+                (Some(k.to_string()), *delay, method, &args[3..])
+            }
+            (Some(Value::Num(delay)), Some(Value::Str(method)), _) => (None, *delay, method, &args[2..]),
+            _ => return Err(Exc::msg("schedule(delayMs, \"method\", ...args) or schedule(\"key\", delayMs, \"method\", ...args) needs a delay and a method name")),
         };
-        if !delay.is_finite() || *delay < 0.0 {
+        if !delay.is_finite() || delay < 0.0 {
             return Err(Exc::msg("schedule delay must be a non-negative number of milliseconds"));
         }
         self.method(o.class, method)?;
-        let args = args[2..].iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("schedule arguments: {e}")))?;
-        let alarm = Alarm { id: self.new_alarm_id(), at: self.now + delay, method: method.to_string(), args, caller: who.to_caller() };
+        let args = rest.iter().map(Value::to_json).collect::<Result<Vec<_>, _>>().map_err(|e| Exc::msg(format!("schedule arguments: {e}")))?;
+        if let Some(k) = &key {
+            self.inst_mut(o).alarms.retain(|a| a.key.as_deref() != Some(k.as_str()));
+        }
+        let alarm = Alarm { id: self.new_alarm_id(), key, at: self.now + delay, method: method.to_string(), args, caller: who.to_caller() };
         let handle = alarm.id;
         self.push_timer(alarm.at, TimerKind::Alarm { obj: o.clone(), alarm: alarm.id });
         self.inst_mut(o).alarms.push(alarm);
@@ -515,12 +537,16 @@ impl Runtime {
         Ok(Value::Num(handle as f64))
     }
 
-    /// `this.unschedule(handle)`: cancels the alarm; false when it already ran or never was.
+    /// `this.unschedule(handleOrKey)`: cancels by handle (number), key (string), or method
+    /// name (for unkeyed alarms). Returns false when none matched.
     pub(crate) fn unschedule_alarm(&mut self, o: &Rc<ObjRef>, handle: &Value) -> Value {
-        let Value::Num(h) = handle else { return Value::Bool(false) };
         let inst = self.inst_mut(o);
         let before = inst.alarms.len();
-        inst.alarms.retain(|a| a.id as f64 != *h);
+        match handle {
+            Value::Num(h) => inst.alarms.retain(|a| a.id as f64 != *h),
+            Value::Str(k) => inst.alarms.retain(|a| !(a.key.as_deref() == Some(&**k) || (a.key.is_none() && a.method == **k))),
+            _ => return Value::Bool(false),
+        }
         let removed = inst.alarms.len() < before;
         if removed {
             // Its timer still fires, finds nothing and does nothing.
@@ -790,10 +816,11 @@ impl Runtime {
         }
         if failed {
             for o in &mut self.outputs {
-                if let Output::Reply { ok, error, status, .. } = o {
+                if let Output::Reply { ok, error, field, status, .. } = o {
                     if error.is_none() {
                         *ok = None;
                         *error = Some("the change could not be saved; try again".into());
+                        *field = None;
                         *status = Some(503);
                     }
                 }

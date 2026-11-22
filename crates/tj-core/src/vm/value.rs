@@ -119,6 +119,24 @@ impl Exc {
         Exc(error_record(&message.into()), Refusal(false))
     }
 
+    /// An error with an optional `field` (from `check(ok, field, message)`).
+    pub fn with_field(message: impl Into<String>, field: Option<String>) -> Exc {
+        let e = error_record(&message.into());
+        if let (Some(field), Value::Rec(r)) = (field, &e) {
+            r.borrow_mut().insert("field".into(), Value::Str(Rc::from(field.as_str())));
+        }
+        Exc(e, Refusal(false))
+    }
+
+    /// The `field` named by `check(ok, field, message)`, if any.
+    pub fn field(&self) -> Option<String> {
+        let Value::Rec(r) = &self.0 else { return None };
+        match r.borrow().get("field") {
+            Some(Value::Str(f)) if !f.is_empty() => Some(f.to_string()),
+            _ => None,
+        }
+    }
+
     /// An error that refuses the request, answered with 403 when nothing catches it.
     pub fn refused(message: impl Into<String>) -> Exc {
         Exc(error_record(&message.into()), Refusal(true))

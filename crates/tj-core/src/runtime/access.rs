@@ -9,7 +9,7 @@ use serde_json::Value as Json;
 use std::rc::Rc;
 
 /// The words a rule may use besides role names.
-pub const RULE_WORDS: &[&str] = &["anyone", "signedIn", "owner"];
+pub const RULE_WORDS: &[&str] = &["anyone", "signedIn", "owner", "none"];
 
 /// Who a running call belongs to; it lives on the call's fiber (see `vm::interp::Fiber`).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -84,6 +84,7 @@ fn allows_named(rule: &[Rc<str>], who: &Who, object_id: &str, named: &str) -> bo
         "signedIn" => !id.is_empty(),
         "owner" => owns(id, object_id),
         "self" => !id.is_empty() && **id == *named,
+        "none" => false,
         role => roles.iter().any(|r| **r == *role),
     })
 }

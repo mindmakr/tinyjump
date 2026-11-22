@@ -94,10 +94,11 @@ object Cart {
   The method still runs to its end, and a retried call is still answered once. Writing to
   it again (`Slot.get(id).open(...)`) brings it back as new.
 - `this.schedule(ms, "method", ...args)` calls the named method of this object after `ms`
-  milliseconds (at least 10), with the arguments given. It survives restarts and runs once.
-  - It returns a handle (a number): keep it in a field.
-  - `this.unschedule(handle)` cancels the alarm, even after a restart. It returns `false`
-    when the alarm already ran or was cancelled.
+  milliseconds (0 or more), with the arguments given. It survives restarts and runs once.
+  - Pass a key first — `this.schedule("remind", ms, "method", ...args)` — to replace any
+    earlier pending alarm with that key on this object without keeping a handle field.
+  - `this.unschedule(handleOrKey)` cancels by numeric handle, key, or (for unkeyed alarms)
+    method name, even after a restart. It returns `false` when no alarm matched.
 - Durations: `"500ms"`, `"5s"`, `"2m"`, `"1h"`, `"1d"`, or a number of milliseconds (at least 10ms).
 - If a device sleeps through several `@every` beats, the timer fires once and carries on.
   It does not fire a burst of catch-up calls.
@@ -144,9 +145,10 @@ The server is the single authority, so there are no conflicts to resolve. Timers
 
   - Typed inputs give `null` while empty, so check for it first, as above: comparing
     `null` with a number throws.
-  - In the UI, `catch (e)` gives `e.field` and `e.message`.
-  - A server refusing the call gives the message to the device's promise, without the
-    field.
+  - In the UI, `catch (e)` gives `e.field` and `e.message`, whether `check` ran locally or
+    on the server (the server sends `field` back in `{"error", "field"}` and across retries).
+    Running the shared function on the client before calling the server is optional (useful
+    for instant feedback while offline).
 
 ## Access: who may read and call
 
@@ -157,9 +159,11 @@ Without a rule, nothing can be read or called from outside the server:
 - `@allow(...)` on a method says who may call it remotely.
 - `"owner"` is the caller whose id is the object's id, as in `Cart.get(caller.id)`.
 - `@read(...)` on a field of a `@server` object narrows who sees that field, among those
-  the object's rule admits; the others see its default value. `"self"` is the person whose
-  id the field holds. One object then keeps public and private facts together, and each
-  person finds their own entries with a filter:
+  the object's rule admits; the others see its default value. Use `@read("none")` to keep
+  an internal field server-only (no remote reader sees it, not even staff). `"self"` is the
+  person whose id the field holds: hidden readers see `""` when empty and `"•••"` when set,
+  so everyone sees whether it is taken without learning who took it. One object then keeps
+  public and private facts together, and each person finds their own entries with a filter:
 
 ```tsx
 @server @read("anyone") object Slot {
@@ -171,8 +175,9 @@ const mine = Slot.all().filter(s => s.customer === caller.id)  // on the device,
 ```
 
   Let `customer` alone say whether a slot is booked (`s.customer !== ""`), so erasing the
-  customer reopens it. Readers who are not shown the field see `""`: look the customer up
-  only when there is one, `s.customer !== "" ? Customer.get(s.customer) : null`.
+  customer reopens it automatically. Hidden readers see `"•••"` when booked (never matching
+  `caller.id`) and `""` when open; only readers admitted to `customer` (such as staff)
+  should look up `Customer.get(s.customer)`.
 
 Inside a method, `caller` is `{ id, roles }` of whoever made the request. Take identity from
 `caller.id`, never from arguments. In UI code on a device, `caller` is the signed-in user
@@ -232,8 +237,11 @@ Each entry must be a record with the `@by` field as a `string` (the person's id)
 time field as a `number` when the object has `@retain`. `@read("anyone")` is not allowed
 on these objects, and an object holds either one person's data (its id is theirs) or
 shared lists, not both. Personal data revealed and copied onto another server object must
-go into a list like this one; the compiler refuses other copies. Objects that live only on
-the device may hold it, as they are cleared when the person signs out. Entries are taken
+go into a list like this one; the compiler refuses other copies. `@pii` itself is only for
+`@server` objects, but a plain device-only screen object (no `@server`, `@read` or `@allow`)
+may hold the signed-in person's own data (including `exportData(caller.id)`) for display
+without `reveal` — it is cleared at sign-out, and its taint is still followed to every sink
+(`fetch`, logs, plugins, server objects). Entries are taken
 out or moved like any array, with no `reveal`, as each still names its person:
 `this.entries = this.entries.filter(e => e.customer !== id)`, or
 `Waiting.get("w").entries.push(entry)` into another `@by` list.
@@ -273,7 +281,10 @@ out-of-range indexes are `null`.
 ### Types
 
 Types are checked the way TypeScript checks them, except there are no strict null checks
-yet: `null` fits any type. Code without annotations is `any`, so it compiles.
+in app code yet: `null` fits any type at compile time. Calls from outside (the HTTP API and
+device calls to `@server` methods) check arguments strictly against the declared parameter
+types: `start: number` refuses `null` (declare `start: number | null` when `null` is allowed).
+Code without annotations is `any`, so it compiles.
 **Annotate fields, parameters and shared types**, and you get:
 
 - record shapes: missing fields, unknown fields (`'txt' is not a field of Todo`, with
@@ -414,20 +425,26 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   - `null` while the entry is empty or not a real date (February 30).
   - Dates are in the viewer's zone, or in UTC with `zone="UTC"`.
   - Agents may type `2026-12-01 14:30` into one, and it is read as a person's entry is.
-- `import { Field, Notice, Form, FormInput } from "tj:ui"` gives ready-made pieces:
+- `import { Field, Notice, Form, FormInput, Actions } from "tj:ui"` gives ready-made pieces:
   - `<Field label="Minutes" error={e} id="minutes">…</Field>`: a visible label over its
     control, with the error below in red (`minutes-error`);
-  - `<Notice text={t} kind="ok" | "error">`: good news in green, or an error in red;
+  - `<Notice id="notice" text={t} kind="ok" | "error">`: good news in green, or an error in
+    red (`id` is optional; renders nothing when `text` is empty or `null`);
   - `Form.get("profile")`: a form's drafts and errors, with no object or setters to write.
     `<FormInput form={f} name="name" label="Name" saved={me.name} />` shows the saved value
-    until the person types, and its error below (`type`, `zone` and `placeholder` as on
-    `Input`). `f.value("name", me.name)` reads it.
-  - `f.submit(() => { validName(...); return me.save(...) })` sends one at a time
+    until the person types, and its error below (`type`, `zone`, `placeholder` and optional
+    `id` as on `Input`). Its element id defaults to `name` and its error id is `<id>-error`;
+    `name` matches the `field` passed to `check(ok, field, message)`. `f.value("name", me.name)`
+    reads it.
+  - `f.submit(() => me.save(f.value("name", me.name)))` sends one at a time
     (`f.busy()` is true meanwhile). When it works, the drafts go. When it fails, an error from
-    `check(ok, field, message)` shows at its field if the form shows that field (a
-    `FormInput`), and any other in `f.error`. A server's
-    refusal has no field, so run the shared rules first, as here, to place each error.
-  - Drafts survive a restart and go at sign-out; a restart forgets that a form was waiting.
+    `check(ok, field, message)` (local or from the server) shows at its field if the form
+    shows that field (a `FormInput`), and any other in `f.error`.
+  - `Actions.get("slots")`: per-item actions (book, cancel, remove) sharing one `error`
+    notice. `a.run(s.id, () => s.book())` guards repeat presses on the same key (`a.busy(s.id)`)
+    while letting presses on other items queue together in the outbox — even while offline.
+  - Drafts survive a restart and go at sign-out; a restart forgets in-flight `Form` and
+    `Actions` waits.
 
 ```tsx
 const f = Form.get("profile")
@@ -519,6 +536,7 @@ Keep keys in a server object nobody outside the server can read or call:
 
 ## Checking your work
 
+- `cargo web` builds the web runtime (WASM) once before running `tj dev` or `tj serve --web`.
 - `tj check app.tj` prints errors with the line, a caret and a fix hint.
 - `tj dev app.tj` runs the app with live reload.
 - In the browser, `await window.tinyjump.inspect()` gives every node with its bounds and
@@ -526,9 +544,11 @@ Keep keys in a server object nobody outside the server can read or call:
   `props.id`. `tinyjump.act({ id: "inc" }, "onPress")` presses a button.
 - Over HTTP, `POST /api/<Class>/<id>/<method>` with a JSON array of the arguments
   (`["Ana", 2]`, `Content-Type: application/json`) calls a method, and
-  `GET /api/<Class>/<id>` reads an object. Answers are `{ "ok": value }` or
-  `{ "error": "why" }` with a 4xx or 5xx status. Send who is calling as
-  `Authorization: Bearer <key or token>`.
+  `GET /api/<Class>/<id>` reads an object (an unseen id returns its default state). Answers
+  are `{ "ok": value }` or `{ "error": "why", "field"?: "name" }` with a 4xx or 5xx status.
+  Send who is calling as `Authorization: Bearer <key or token>`.
+- `POST /_tj/input` accepts one protocol input ([host protocol](host-protocol.md)), e.g.
+  `{"type":"ui","target":{"id":"inc"},"event":"onPress"}`.
 - `tj mcp` and `tj review` drive the real screen: under `tj dev`, the open browser tab
   answers them (with no tab open, the server does). `tj dev --as ana:staff` signs the
   browser in as `dev:ana` with the role `staff`.

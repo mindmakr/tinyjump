@@ -107,6 +107,9 @@ serves its own page and calls `setToken` instead.
   - `"signedIn"`: any caller with a valid credential;
   - `"owner"`: the caller whose `id` is the object's id. This covers per-user objects,
     such as `Cart.get(caller.id)`;
+  - `"self"` (on a field's `@read` only): the caller whose `id` the `string` field holds.
+    Hidden readers see `""` when empty and `"•••"` when set, and export/erasure reach it;
+  - `"none"` (on a field's `@read` only): no remote reader sees the field (server-only);
   - any other string is a role: the caller's `roles` must include it.
 - Private methods can never be called remotely, whatever the rules.
 - Compile errors, each with a hint, cover:
@@ -238,7 +241,7 @@ can come later, as a plugin.
 
 - **`setToken(token, userId, roles)`:** the host passes the user's id and roles to the
   runtime too (`identity` input). It learns them from `GET /api/whoami`, which answers
-  `{ id, roles }` for the credentials it is sent.
+  `{"ok": {"id": "...", "roles": [...], "dev": true | false}}` for the credentials it is sent.
   - Each queued server call records the identity it was made under.
   - When the identity changes, calls queued by the previous user are dropped and reported
     as errors, never sent as the new user.
