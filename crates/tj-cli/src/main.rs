@@ -17,6 +17,7 @@ mod manifest;
 mod plugin_server;
 mod plugins;
 mod privacy;
+mod retro;
 mod stats;
 mod mcp;
 mod review;
@@ -61,6 +62,10 @@ USAGE:
   tj reload [<app.tj>] [--target <url>] [--trace <file.trace.jsonl>]... [--allow-breaking] [--watch-secs <n>] [--error-threshold <n>]
                                  shadow-boot, validate invariants/smoke traces and live-reload a running server
   tj rollback [--target <url>]   roll back a running server to its previous known-good bundle
+  tj retro <app.tj> [--target <url>] [--data <dir>] [--json]
+                                 actionable health & retro report ([fix], [optimize], [prune], [rotate]):
+                                 dead private methods, access warnings, 6-viewport LTR/RTL layout sweep,
+                                 benchmark headroom, live telemetry and audit/key hygiene
   tj mcp    [--target <url>] [--record <trace.jsonl>]
                                  MCP server (stdio) so coding agents can inspect, drive, record and test an app
   tj plugin ai | fake <file.json>
@@ -95,10 +100,19 @@ ENVIRONMENT (tj serve):
   TJ_OPS_KEY      client key sent by `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`
                   (takes precedence over TJ_ADMIN_KEY when set)
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
+  TJ_MAX_OBJECT_BYTES
+                  maximum serialized JSON bytes per stored object (default 262144; 0 disables;
+                  growth past the cap returns 413 while shrinking/erasing is always allowed)
+  TJ_RATE_LIMIT   per-caller `/api/*` requests per minute on `tj serve` (default 600; 0 disables)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
+  TJ_FETCH_ALLOW  comma-separated outbound fetch host allowlist (exact `api.example.com` or
+                  strict subdomain `*.example.com`, enforced on redirects too)
   TJ_ALLOW_PRIVATE_FETCH
                   1 lets fetch reach loopback, private and link-local addresses (blocked on
                   tj serve, so app URLs and agent prompts cannot read internal services)
+  TJ_AI_MAX_CALLS_HOUR / TJ_PLUGIN_MAX_CALLS_HOUR
+                  hourly call budget for `tj:ai` or all server plugins (overridden per plugin
+                  by `maxCallsPerHour` in `plugins.json`)
   TJ_TLS_TERMINATED
                   1 when a proxy in front terminates TLS. Without it, a server on an address
                   other machines can reach refuses requests that carry credentials
@@ -234,6 +248,15 @@ fn main() -> ExitCode {
     }
     if raw.get(1).map(String::as_str) == Some("rollback") {
         return match rollback_cmd(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("retro") {
+        return match retro::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");

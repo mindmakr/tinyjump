@@ -34,7 +34,7 @@ pub(crate) struct Instance {
     /// Results of recent calls made with an id (see `calls.rs`), oldest first.
     pub(crate) calls: Vec<CallRecord>,
     /// The last persisted record, to skip unchanged writes.
-    saved: String,
+    pub(crate) saved: String,
     /// The state part of it: only a new state gets a change number and is broadcast.
     state_text: String,
     /// When it was created and last changed (epoch ms), for `@retain` and `@legalHold`.
@@ -878,6 +878,33 @@ impl Runtime {
         }
     }
 
+    /// Checks every modified, owned object in `self.touched` against `self.max_object_bytes`.
+    /// Shrinking or erasing an already-oversized object (even when a device `Idempotency-Key`
+    /// `CallRecord` makes the wrapper slightly larger while `state` strictly shrinks) is always allowed.
+    #[cfg(feature = "server")]
+    pub(crate) fn check_touched_object_sizes(&self) -> Result<(), String> {
+        if self.max_object_bytes == 0 {
+            return Ok(());
+        }
+        for key in &self.touched {
+            let Some(inst) = self.instances.get(key) else { continue };
+            if inst.remote {
+                continue;
+            }
+            let Ok(state_val) = Value::Rec(inst.state.clone().into()).to_json() else { continue };
+            let state_len = state_val.to_string().len();
+            let Json::Object(state) = state_val else { continue };
+            let record = Stored { state, alarms: inst.alarms.clone(), seq: inst.seq, calls: inst.calls.clone(), created: inst.created, changed: inst.changed };
+            let len = serde_json::to_string(&record).map(|s| s.len()).unwrap_or(0);
+            let already_over = inst.saved.len() > self.max_object_bytes;
+            let shrinking = already_over && (len <= inst.saved.len() || state_len < inst.state_text.len());
+            if len > self.max_object_bytes && !shrinking {
+                return Err(format!("{} exceeds the object size limit ({len} > {} bytes); prune old entries or split into separate objects", inst.handle.key(), self.max_object_bytes));
+            }
+        }
+        Ok(())
+    }
+
     /// Persists every object touched by the last input whose record changed. Whether every
     /// save worked.
     pub(crate) fn flush(&mut self) -> bool {
@@ -886,6 +913,27 @@ impl Runtime {
 
     /// Like [`flush`], scoping any disk-save error reply rewrite to outputs at indices `>= mark`.
     pub(crate) fn flush_from(&mut self, mark: usize) -> bool {
+        // Defense-in-depth for non-`settle` flushes: enforce per-object byte cap before saving.
+        #[cfg(feature = "server")]
+        if let Err(msg) = self.check_touched_object_sizes() {
+            self.rollback_turn(mark);
+            let mut replied = false;
+            for o in self.outputs.iter_mut().skip(mark) {
+                if let Output::Reply { ok, error, field, status, .. } = o {
+                    if error.is_none() {
+                        *ok = None;
+                        *error = Some(msg.clone());
+                        *field = None;
+                        *status = Some(413);
+                    }
+                    replied = true;
+                }
+            }
+            if !replied {
+                self.outputs.push(Output::Error { message: msg, trace: Vec::new() });
+            }
+            return false;
+        }
         let mut touched = std::mem::take(&mut self.touched);
         let consumed = std::mem::take(&mut self.consumed_alarms);
         let mut index_changed = false;

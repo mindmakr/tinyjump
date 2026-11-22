@@ -8,7 +8,7 @@
 //!   { "ai": { "command": ["tj", "plugin", "ai"], "env": ["ANTHROPIC_API_KEY"] } }
 
 use serde_json::{json, Value as Json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -19,6 +19,9 @@ use std::time::{Duration, Instant};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 const RESTART_AFTER: Duration = Duration::from_secs(1);
+const BUDGET_WINDOW: Duration = Duration::from_secs(3600);
+pub const AI_BUDGET_ENV: &str = "TJ_AI_MAX_CALLS_HOUR";
+pub const PLUGIN_BUDGET_ENV: &str = "TJ_PLUGIN_MAX_CALLS_HOUR";
 /// Variables every plugin gets, so it can start at all; nothing else leaks from the server.
 const BASE_ENV: &[&str] = &["PATH", "SYSTEMROOT", "SystemRoot", "TEMP", "TMP", "HOME"];
 
@@ -26,6 +29,7 @@ const BASE_ENV: &[&str] = &["PATH", "SYSTEMROOT", "SystemRoot", "TEMP", "TMP", "
 struct Config {
     command: Vec<String>,
     env: Vec<String>,
+    max_calls_per_hour: Option<usize>,
 }
 
 type Waiting = Arc<Mutex<HashMap<u64, Sender<Json>>>>;
@@ -48,6 +52,7 @@ struct Slot {
     config: Config,
     process: Option<Process>,
     started: Option<Instant>,
+    calls: VecDeque<Instant>,
 }
 
 #[derive(Default)]
@@ -69,17 +74,33 @@ pub fn load(entry: &Path, overrides: &[String]) -> Result<Plugins, String> {
             if command.is_empty() {
                 return Err(format!("plugin {name} in {} needs a \"command\"", file.display()));
             }
-            configs.insert(name.clone(), Config { command, env: strings("env") });
+            let max_calls_per_hour = match c.get("maxCallsPerHour") {
+                None | Some(Json::Null) => default_budget(name),
+                Some(v) => {
+                    let raw = v.as_u64().ok_or_else(|| format!("plugin {name} \"maxCallsPerHour\" must be a non-negative integer"))?;
+                    let n = usize::try_from(raw).map_err(|_| format!("plugin {name} \"maxCallsPerHour\" is too large"))?;
+                    (n > 0).then_some(n)
+                }
+            };
+            configs.insert(name.clone(), Config { command, env: strings("env"), max_calls_per_hour });
         }
     }
     for o in overrides {
         let (name, spec) = o.split_once('=').ok_or(format!("--plugin takes name=fake:file.json, got {o}"))?;
         let fake = spec.strip_prefix("fake:").ok_or(format!("--plugin {name}= supports fake:<file.json>"))?;
         let path: PathBuf = fake.into();
-        configs.insert(name.to_string(), Config { command: vec!["tj".into(), "plugin".into(), "fake".into(), path.display().to_string()], env: Vec::new() });
+        let max_calls_per_hour = configs.get(name).and_then(|c| c.max_calls_per_hour).or_else(|| default_budget(name));
+        configs.insert(name.to_string(), Config { command: vec!["tj".into(), "plugin".into(), "fake".into(), path.display().to_string()], env: Vec::new(), max_calls_per_hour });
     }
-    let slots = configs.into_iter().map(|(n, config)| (n, Mutex::new(Slot { config, process: None, started: None }))).collect();
+    let slots = configs.into_iter().map(|(n, config)| (n, Mutex::new(Slot { config, process: None, started: None, calls: VecDeque::new() }))).collect();
     Ok(Plugins { slots })
+}
+
+fn default_budget(name: &str) -> Option<usize> {
+    let env_nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+    let specific = (name == "ai").then(|| env_nonempty(AI_BUDGET_ENV)).flatten();
+    let fallback = env_nonempty(PLUGIN_BUDGET_ENV);
+    specific.or(fallback).and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0)
 }
 
 impl Plugins {
@@ -103,6 +124,7 @@ impl Plugins {
         let slot = self.slots.get(name).ok_or_else(|| format!("no plugin \"{name}\" is configured; add it to plugins.json next to the app"))?;
         let (rx, id, waiting) = {
             let mut s = slot.lock().map_err(|_| "plugin lock poisoned")?;
+            s.check_budget(name, Instant::now())?;
             s.ensure(name)?;
             let p = s.process.as_mut().expect("ensured");
             p.next_id += 1;
@@ -145,6 +167,20 @@ fn result(name: &str, reply: Json) -> Result<Json, String> {
 }
 
 impl Slot {
+    fn check_budget(&mut self, name: &str, now: Instant) -> Result<(), String> {
+        let Some(limit) = self.config.max_calls_per_hour.filter(|&l| l > 0) else {
+            return Ok(());
+        };
+        while self.calls.front().is_some_and(|&t| now.saturating_duration_since(t) >= BUDGET_WINDOW) {
+            self.calls.pop_front();
+        }
+        if self.calls.len() >= limit {
+            return Err(format!("plugin {name} reached its hourly call budget ({limit}/hour); try again later or raise maxCallsPerHour"));
+        }
+        self.calls.push_back(now);
+        Ok(())
+    }
+
     /// Starts the process if it is not running (not more than once a second).
     fn ensure(&mut self, name: &str) -> Result<(), String> {
         if let Some(p) = &mut self.process {
@@ -218,5 +254,33 @@ mod tests {
         assert_eq!(result("ai", json!({ "result": { "content": [{ "type": "text", "text": "plain" }] } })), Ok(json!("plain")));
         assert_eq!(result("ai", json!({ "result": { "isError": true, "content": [{ "type": "text", "text": "no key" }] } })), Err("no key".into()));
         assert!(result("ai", json!({ "error": { "message": "bad" } })).unwrap_err().contains("bad"));
+    }
+
+    #[test]
+    fn hourly_call_budget_blocks_excess_calls_and_recovers_after_window() {
+        let mut slot = Slot {
+            config: Config { command: vec!["tj".into()], env: Vec::new(), max_calls_per_hour: Some(2) },
+            process: None,
+            started: None,
+            calls: VecDeque::new(),
+        };
+        let t0 = Instant::now();
+        assert!(slot.check_budget("ai", t0).is_ok());
+        assert!(slot.check_budget("ai", t0 + Duration::from_secs(10)).is_ok());
+        let err = slot.check_budget("ai", t0 + Duration::from_secs(20)).unwrap_err();
+        assert!(err.contains("hourly call budget (2/hour)"), "{err}");
+        assert!(slot.check_budget("ai", t0 + Duration::from_secs(3601)).is_ok());
+
+        let dir = std::env::temp_dir().join(format!("tj-plugins-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("app.tj");
+        std::fs::write(&entry, "").unwrap();
+        std::fs::write(dir.join("plugins.json"), r#"{ "ai": { "command": ["tj", "plugin", "ai"], "maxCallsPerHour": 5 } }"#).unwrap();
+        let loaded = load(&entry, &[]).expect("valid plugins.json");
+        assert_eq!(loaded.slots["ai"].lock().unwrap().config.max_calls_per_hour, Some(5));
+        std::fs::write(dir.join("plugins.json"), r#"{ "ai": { "command": ["tj", "plugin", "ai"], "maxCallsPerHour": "five" } }"#).unwrap();
+        assert!(load(&entry, &[]).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
