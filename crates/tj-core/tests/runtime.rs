@@ -301,12 +301,12 @@ fn fetch_suspends_and_resumes() {
     assert_eq!(url, "https://api.example.com/w?city=Oslo");
     assert!(!out.iter().any(|o| matches!(o, Output::Reply { .. })), "reply waits for the effect");
 
-    let out = rt.handle(1.0, Input::EffectDone { id, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"temp\": 21.5}" })), error: None, unreachable: false });
+    let out = rt.handle(1.0, Input::EffectDone { id, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"temp\": 21.5}" })), error: None, field: None, unreachable: false });
     assert_eq!(reply(&out).unwrap(), json!(21.5));
 
     let out = rt.handle(2.0, Input::Call { object: "Weather/w".into(), method: "load".into(), args: vec![json!("X")], reply: Some(10), call: None, caller: Some(Caller::trusted()) });
     let id = out.iter().find_map(|o| if let Output::Effect { id, .. } = o { Some(*id) } else { None }).unwrap();
-    let out = rt.handle(3.0, Input::EffectDone { id, ok: None, error: Some("network down".into()), unreachable: false });
+    let out = rt.handle(3.0, Input::EffectDone { id, ok: None, error: Some("network down".into()), field: None, unreachable: false });
     assert_eq!(reply(&out).unwrap(), Json::Null);
     let state = reply(&rt.handle(4.0, Input::Get { object: "Weather/w".into(), reply: Some(1), caller: Some(Caller::trusted()) })).unwrap();
     assert_eq!(state["error"], json!("network down"));
@@ -373,7 +373,7 @@ fn server_objects_replicate_to_devices() {
         .expect("a change to broadcast");
 
     // The host relays the result and the change; the device re-renders from its replica.
-    device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None, unreachable: false });
+    device.handle(3.0, Input::EffectDone { id, ok: Some(json!(1)), error: None, field: None, unreachable: false });
     let out = device.handle(3.0, Input::Sync { object: "Room/lobby".into(), state, seq: None });
     assert!(patches(&out).iter().any(|op| matches!(op, PatchOp::Create { props, .. } if props.get("text") == Some(&json!("ana: hi")))));
 
@@ -467,7 +467,7 @@ fn note(text: &str) -> Input {
 }
 
 fn answered(id: u32, ok: Json) -> Input {
-    Input::EffectDone { id, ok: Some(ok), error: None, unreachable: false }
+    Input::EffectDone { id, ok: Some(ok), error: None, field: None, unreachable: false }
 }
 
 #[test]
@@ -485,13 +485,13 @@ fn device_calls_wait_out_outages_in_order_and_survive_restarts() {
     assert!(server_calls(&device.handle(1000.0, note("two"))).is_empty(), "calls to one object go one at a time, in order");
 
     // Unreachable: the app sees no error, and the call is retried later with the same id.
-    let out = device.handle(2000.0, Input::EffectDone { id: first[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+    let out = device.handle(2000.0, Input::EffectDone { id: first[0].0, ok: None, error: Some("offline".into()), field: None, unreachable: true });
     assert!(server_calls(&out).is_empty() && !out.iter().any(|o| matches!(o, Output::Error { .. })), "{out:?}");
     let retry = server_calls(&device.handle(3000.0, Input::Tick));
     assert_eq!((retry.len(), &retry[0].1), (1, &first[0].1), "a retry keeps its call id");
 
     // Unreachable again; the backoff doubles, but the host's `online` sends it at once.
-    device.handle(3100.0, Input::EffectDone { id: retry[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+    device.handle(3100.0, Input::EffectDone { id: retry[0].0, ok: None, error: Some("offline".into()), field: None, unreachable: true });
     assert!(server_calls(&device.handle(3200.0, Input::Tick)).is_empty(), "still backing off");
     let now = server_calls(&device.handle(3300.0, Input::Online));
     assert_eq!((now.len(), &now[0].1), (1, &first[0].1));
@@ -1458,7 +1458,7 @@ fn signing_in_as_someone_else_drops_their_queued_calls_and_replicas() {
     device.handle(0.0, Input::Identity { user: Some("user:ana".into()), roles: Vec::new() });
     device.handle(1.0, Input::Sync { object: "Board/b".into(), state: json!({ "notes": ["ana's"] }), seq: Some(5) });
     let sent = server_calls(&device.handle(2.0, note("from ana")));
-    device.handle(3.0, Input::EffectDone { id: sent[0].0, ok: None, error: Some("offline".into()), unreachable: true });
+    device.handle(3.0, Input::EffectDone { id: sent[0].0, ok: None, error: Some("offline".into()), field: None, unreachable: true });
 
     let out = device.handle(4.0, Input::Identity { user: Some("user:bo".into()), roles: Vec::new() });
     assert!(out.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Board/b")), "replicas start over: {out:?}");
@@ -1585,7 +1585,7 @@ fn fetches(out: &[Output]) -> Vec<u32> {
 type Answer = (u64, Option<Json>, Option<String>, Option<u16>);
 
 fn replies(out: &[Output]) -> Vec<Answer> {
-    out.iter().filter_map(|o| if let Output::Reply { reply, ok, error, status } = o { Some((*reply, ok.clone(), error.clone(), *status)) } else { None }).collect()
+    out.iter().filter_map(|o| if let Output::Reply { reply, ok, error, status, .. } = o { Some((*reply, ok.clone(), error.clone(), *status)) } else { None }).collect()
 }
 
 fn trusted_call(object: &str, method: &str, args: Json, reply: u64, call: Option<&str>) -> Input {
@@ -1906,7 +1906,7 @@ fn erase_effects(rt: &mut Runtime, now: f64, out: Vec<Output>) -> Vec<Output> {
                     Ok(e) => (Some(json!({ "erased": e.erased })), None),
                     Err(e) => (None, Some(e)),
                 };
-                let next = rt.handle(now, Input::EffectDone { id, ok, error, unreachable: false });
+                let next = rt.handle(now, Input::EffectDone { id, ok, error, field: None, unreachable: false });
                 all.extend(erase_effects(rt, now, next));
             }
             o => all.push(o),
@@ -2339,15 +2339,18 @@ fn a_form_keeps_drafts_shows_errors_at_their_field_and_sends_once() {
     assert_eq!((method.as_str(), args), ("save", vec![json!("Bo")]));
     assert!(call(&device.handle(3.2, ui("save", "onPress", Json::Null))).is_none(), "one at a time");
     // The answer comes: the draft goes, and the input shows what is saved.
-    device.handle(4.0, Input::EffectDone { id: effect, ok: Some(Json::Null), error: None, unreachable: false });
+    device.handle(4.0, Input::EffectDone { id: effect, ok: Some(Json::Null), error: None, field: None, unreachable: false });
     let out = device.handle(4.1, Input::Sync { object: "Customer/user:ana".into(), state: json!({ "name": "Bo" }), seq: Some(2) });
     assert!(format!("{out:?}").contains("Bo"), "{out:?}");
     assert_eq!(form(&device)["drafts"], json!({}));
-    // An error from the server shows for the whole form.
+    // An error from the server shows for the whole form, and one with a field shows at that field.
     device.handle(5.0, ui("name", "onChange", json!("Cy")));
     let (effect, ..) = call(&device.handle(5.1, ui("save", "onPress", Json::Null))).expect("sent");
-    let out = device.handle(6.0, Input::EffectDone { id: effect, ok: None, error: Some("The business is closed".into()), unreachable: false });
+    let out = device.handle(6.0, Input::EffectDone { id: effect, ok: None, error: Some("The business is closed".into()), field: None, unreachable: false });
     assert!(format!("{out:?}").contains("The business is closed") && format!("{out:?}").contains("form-error"), "{out:?}");
+    let (effect, ..) = call(&device.handle(6.1, ui("save", "onPress", Json::Null))).expect("sent");
+    let out = device.handle(6.2, Input::EffectDone { id: effect, ok: None, error: Some("Name already taken".into()), field: Some("name".into()), unreachable: false });
+    assert!(format!("{out:?}").contains("Name already taken") && format!("{out:?}").contains("name-error"), "{out:?}");
     // Sent, then the app restarts before the answer: the draft is kept, and the form is not
     // left waiting for an answer it can no longer hear. (The call itself stays in the outbox,
     // and the new one goes after it.)
@@ -2357,6 +2360,25 @@ fn a_form_keeps_drafts_shows_errors_at_their_field_and_sends_once() {
     assert!(format!("{out:?}").contains("Cy") && !format!("{out:?}").contains("\"disabled\": Bool(true)"), "the draft, and a form ready to send: {out:?}");
     let out = device.handle(8.2, ui("save", "onPress", Json::Null));
     assert!(format!("{out:?}").contains("\"disabled\": Bool(true)"), "sending again: {out:?}");
+}
+
+#[test]
+fn server_check_preserves_field_across_rpc_and_idempotent_retries() {
+    let src = r#"@server @read("owner") object Customer {
+  name: string = ""
+  @allow("owner") save(name: string) {
+    check(name.trim() !== "", "name", "Give your name")
+    this.name = name.trim()
+  }
+}
+"#;
+    let mut srv = server(src, true);
+    let call = |reply: u64| Input::Call { object: "Customer/user:ana".into(), method: "save".into(), args: vec![json!("   ")], reply: Some(reply), call: Some("k-1".into()), caller: who("user:ana", &[]) };
+    let out = srv.handle(1.0, call(1));
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { error: Some(e), field: Some(f), .. } if e == "Give your name" && f == "name")), "{out:?}");
+    // A retry with the same call id gets the same error and field from the call record.
+    let retry = srv.handle(2.0, call(2));
+    assert!(retry.iter().any(|o| matches!(o, Output::Reply { error: Some(e), field: Some(f), .. } if e == "Give your name" && f == "name")), "{retry:?}");
 }
 
 #[test]

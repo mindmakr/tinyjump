@@ -389,7 +389,7 @@ impl Runtime {
                     self.drbg.reseed(&b);
                     self.strong = true;
                 }
-                None => self.reply(None, Err("entropy needs at least 32 bytes, as hex".into())),
+                None => self.reply(None, Err(("entropy needs at least 32 bytes, as hex".into(), None))),
             },
             Input::Ui { target, event, value, reply } => {
                 let handler = self.tree.find(&target).and_then(|node| self.tree.handler(node, &event).cloned());
@@ -411,21 +411,21 @@ impl Runtime {
                                 r => self.settle(f, reply, r),
                             }
                         }
-                        Err(e) => self.reply(reply, Err(e.message())),
+                        Err(e) => self.reply(reply, Err((e.message(), e.field()))),
                     },
-                    None => self.reply(reply, Err(format!("no {event} handler on {target:?}"))),
+                    None => self.reply(reply, Err((format!("no {event} handler on {target:?}"), None))),
                 }
             }
-            Input::EffectDone { id, ok, error, unreachable } => {
+            Input::EffectDone { id, ok, error, field, unreachable } => {
                 if self.is_queued_call(id) {
-                    self.call_attempt_done(id, ok, error, unreachable);
+                    self.call_attempt_done(id, ok, error, field, unreachable);
                 } else {
-                    self.resume(id, ok, error);
+                    self.resume(id, ok, error, field);
                 }
             }
             Input::Sync { object, state, seq } => {
                 if let Err(e) = self.sync(&object, &state, seq) {
-                    self.reply(None, Err(e));
+                    self.reply(None, Err((e, None)));
                 }
             }
             // Without the layout engine (the web build) there is nothing to compute.
@@ -602,7 +602,7 @@ impl Runtime {
     fn invoke(&mut self, obj: Rc<ObjRef>, method: &str, args: Vec<Value>, external: bool, reply: Option<u64>, entry: Entry) {
         match self.method_fiber(obj, method, args, external) {
             Ok(f) => self.start(f, reply, entry),
-            Err(e) => self.reply(reply, Err(e.message())),
+            Err(e) => self.reply(reply, Err((e.message(), e.field()))),
         }
     }
 
@@ -621,7 +621,7 @@ impl Runtime {
             Ok(Run::Done(v)) => {
                 self.ran(&mut f, true);
                 if reply.is_some() {
-                    self.reply(reply, v.to_json());
+                    self.reply(reply, v.to_json().map_err(|e| (e, None)));
                 }
             }
             Err(fail) => {
@@ -635,7 +635,7 @@ impl Runtime {
                     // Through `refuse_start`, so a call run once (a device's) keeps the status
                     // and no record of the refusal is kept for it.
                     (Some(_), Some(status)) => self.refuse_start(reply, status, fail.message),
-                    (Some(_), None) => self.reply(reply, Err(fail.message)),
+                    (Some(_), None) => self.reply(reply, Err((fail.message, fail.field))),
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
             }
@@ -668,11 +668,11 @@ impl Runtime {
     }
 
     /// Continues the fiber waiting on promise `id` with an effect's result.
-    fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>) {
+    fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>, field: Option<String>) {
         if let Some((mut f, reply)) = self.waiting.remove(&id) {
             self.ran_code = true;
             let r = match error {
-                Some(e) => self.unwind(&mut f, Exc::msg(e)).and_then(|()| self.run(&mut f)),
+                Some(e) => self.unwind(&mut f, Exc::with_field(e, field)).and_then(|()| self.run(&mut f)),
                 None => {
                     f.stack.push(Value::from_json(&ok.unwrap_or(Json::Null)));
                     self.run(&mut f)
@@ -685,30 +685,30 @@ impl Runtime {
     /// Refuses a request with an HTTP-like status (see `Output::Reply`).
     fn reply_status(&mut self, reply: Option<u64>, status: u16, why: String) {
         match reply {
-            Some(id) if id >= INVOKE_REPLY_BASE => self.reply(reply, Err(why)),
-            Some(id) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(why), status: Some(status) }),
+            Some(id) if id >= INVOKE_REPLY_BASE => self.reply(reply, Err((why, None))),
+            Some(id) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(why), field: None, status: Some(status) }),
             None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
         }
     }
 
     /// Answers a request; without a reply id, errors are reported and results dropped.
-    fn reply(&mut self, reply: Option<u64>, r: Result<Json, String>) {
+    fn reply(&mut self, reply: Option<u64>, r: Result<Json, (String, Option<String>)>) {
         if let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) {
             self.finish_call(internal, r);
             return;
         }
         if let Some(internal) = reply.filter(|&id| id >= INVOKE_REPLY_BASE) {
-            let (ok, error) = match r {
-                Ok(v) => (Some(v), None),
-                Err(e) => (None, Some(e)),
+            let (ok, error, field) = match r {
+                Ok(v) => (Some(v), None, None),
+                Err((e, f)) => (None, Some(e), f),
             };
-            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error);
+            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error, field);
             return;
         }
         match (reply, r) {
-            (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None, status: None }),
-            (Some(id), Err(e)) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), status: None }),
-            (None, Err(e)) => self.outputs.push(Output::Error { message: e, trace: Vec::new() }),
+            (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None, field: None, status: None }),
+            (Some(id), Err((e, field))) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), field, status: None }),
+            (None, Err((e, _))) => self.outputs.push(Output::Error { message: e, trace: Vec::new() }),
             (None, Ok(_)) => {}
         }
     }

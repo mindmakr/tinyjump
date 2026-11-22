@@ -55,10 +55,10 @@ final class Sync: NSObject, URLSessionDataDelegate {
     /// Calls a method of an `@server` object; `done` gets its result or an error, and whether
     /// the server was unreachable (no answer, a 5xx or an unreadable reply), in which case the
     /// runtime retries. The call id makes retries safe: the server runs each call once.
-    func call(_ effect: [String: Any], done: @escaping (Any?, String?, Bool) -> Void) {
+    func call(_ effect: [String: Any], done: @escaping (Any?, String?, String?, Bool) -> Void) {
         let object = effect["object"] as? String ?? ""
         guard server != nil, let url = URL(string: objectUrl(object) + "/" + Sync.encode(effect["method"] as? String ?? "")) else {
-            done(nil, "no server configured for \(object)", false)
+            done(nil, "no server configured for \(object)", nil, false)
             return
         }
         var req = URLRequest(url: url, timeoutInterval: 30)
@@ -74,11 +74,11 @@ final class Sync: NSObject, URLSessionDataDelegate {
             DispatchQueue.main.async {
                 if status == 401 { self.onTokenExpired?() }
                 if let reply = reply, reply["error"] == nil {
-                    done(reply["ok"], nil, false)
+                    done(reply["ok"], nil, nil, false)
                 } else if let message = reply?["error"] as? String {
-                    done(nil, message, false)
+                    done(nil, message, reply?["field"] as? String, false)
                 } else {
-                    done(nil, error?.localizedDescription ?? "the server did not answer", true)
+                    done(nil, error?.localizedDescription ?? "the server did not answer", nil, true)
                 }
             }
         }.resume()

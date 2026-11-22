@@ -24,8 +24,10 @@ pub const PRIVATE_FETCH_ENV: &str = "TJ_ALLOW_PRIVATE_FETCH";
 
 /// A refused or failed request: its HTTP status and message.
 pub type Failure = (u16, String);
+/// A call failure that may also carry the field name from `check(ok, field, message)`.
+pub type CallFailure = (u16, String, Option<String>);
 
-type Reply = Sender<Result<Json, Failure>>;
+type Reply = Sender<Result<Json, CallFailure>>;
 
 /// Remote requests may load at most this many objects at once (`TJ_MAX_OBJECTS`).
 const MAX_OBJECTS: usize = 100_000;
@@ -98,14 +100,19 @@ impl Engine {
 
     /// Sends an input and waits for its reply, if the input kind has one.
     pub fn request(&self, input: Input) -> Result<Json, Failure> {
-        let stopped = || (503, "runtime stopped".to_string());
+        self.request_with_field(input).map_err(|(status, msg, _)| (status, msg))
+    }
+
+    /// Like [`Engine::request`], keeping any `field` from `check(ok, field, message)`.
+    pub fn request_with_field(&self, input: Input) -> Result<Json, CallFailure> {
+        let stopped = || (503, "runtime stopped".to_string(), None);
         if !has_reply(&input) {
             self.tx.send(Msg::Input(input, None, Instant::now())).map_err(|_| stopped())?;
             return Ok(Json::Null);
         }
         let (t, r) = channel();
         self.tx.send(Msg::Input(input, Some(t), Instant::now())).map_err(|_| stopped())?;
-        Self::wait(&r)?
+        Self::wait(&r).map_err(|(s, m)| (s, m, None))?
     }
 
     /// The core's statistics: calls, errors, refusals and VM steps per method, and objects
@@ -279,7 +286,7 @@ fn run(mut rt: Runtime, boot_out: Vec<Output>, rx: Receiver<Msg>, back: Sender<M
                     Ok(v) => (Some(v), None),
                     Err(e) => (None, Some(e)),
                 };
-                rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false })
+                rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable: false })
             }
             Ok(Msg::MayRead { objects, caller, done }) => {
                 let _ = done.send(may_read(&rt, &objects, &caller));
@@ -340,7 +347,7 @@ fn privacy_effects(rt: &mut Runtime, d: &mut Dispatch) {
                 Ok(v) => (Some(v), None),
                 Err(e) => (None, Some(e)),
             };
-            let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, unreachable: false });
+            let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable: false });
             d.outputs(rt, out);
         }
     }
@@ -386,7 +393,7 @@ impl Dispatch {
     fn outputs(&mut self, rt: &mut Runtime, out: Vec<Output>) {
         for o in out {
             match o {
-                Output::Reply { reply, ok, error, status } => {
+                Output::Reply { reply, ok, error, field, status } => {
                     if let Some(w) = self.replies.remove(&reply) {
                         if let Some((name, sent)) = &w.timed {
                             self.stats.method(name, sent.elapsed(), error.is_none());
@@ -403,7 +410,7 @@ impl Dispatch {
                             }
                         }
                         let _ = w.reply.send(match error {
-                            Some(e) => Err((status.unwrap_or(400), e)),
+                            Some(e) => Err((status.unwrap_or(400), e, field)),
                             None => Ok(ok.unwrap_or(Json::Null)),
                         });
                     }

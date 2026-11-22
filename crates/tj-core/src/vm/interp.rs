@@ -63,6 +63,8 @@ pub struct Failure {
     pub trace: Vec<String>,
     /// How a request fails, when not the default (`Exc::refused`).
     pub status: Option<u16>,
+    /// The field named by `check(ok, field, message)`, if any.
+    pub field: Option<String>,
 }
 
 impl Runtime {
@@ -495,7 +497,7 @@ impl Runtime {
                 f.stack.push(exc.0);
                 Ok(())
             }
-            None => Err(Failure { status: exc.status(), ..self.failure(f, exc.message()) }),
+            None => Err(Failure { status: exc.status(), field: exc.field(), ..self.failure(f, exc.message()) }),
         }
     }
 
@@ -519,7 +521,7 @@ impl Runtime {
                 format!("at {} ({at})", proto.name)
             })
             .collect();
-        Failure { message, trace, status: None }
+        Failure { message, trace, status: None, field: None }
     }
 
     fn call_value(&mut self, f: &mut Fiber, pos: usize) -> Result<(), Exc> {

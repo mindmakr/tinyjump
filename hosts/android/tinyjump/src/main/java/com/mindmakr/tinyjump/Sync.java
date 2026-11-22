@@ -45,8 +45,15 @@ final class Sync {
 
     /** The call got an answer, an error: retrying would not help. Anything else is unreachable. */
     static final class CallFailed extends Exception {
+        final String field;
+
         CallFailed(String message) {
+            this(message, null);
+        }
+
+        CallFailed(String message, String field) {
             super(message);
+            this.field = field;
         }
     }
 
@@ -130,7 +137,7 @@ final class Sync {
             if (status == 401) tokenExpired();
             if (status >= 500 || status == 401) throw new IOException("server answered " + status);
             JSONObject reply = new JSONObject(body(c));
-            if (reply.has("error")) throw new CallFailed(reply.getString("error"));
+            if (reply.has("error")) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
             return reply.opt("ok");
         } finally {
             c.disconnect();

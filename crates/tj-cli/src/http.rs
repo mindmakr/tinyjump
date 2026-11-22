@@ -26,7 +26,7 @@
 
 use crate::audit::{Actor, Audit, Entry};
 use crate::auth::Automation;
-use crate::engine::{Engine, Failure};
+use crate::engine::{CallFailure, Engine, Failure};
 use crate::bytes::{hex, random};
 use crate::identity::{sha256_hex, Identity};
 use crate::mailbox::{Event, Mailbox};
@@ -217,6 +217,14 @@ fn result_response(r: Result<Json, Failure>) -> Body {
     }
 }
 
+fn call_response(r: Result<Json, CallFailure>) -> Body {
+    match r {
+        Ok(v) => json_response(200, &json!({ "ok": v })),
+        Err((status, e, Some(field))) => json_response(status, &json!({ "error": e, "field": field })),
+        Err((status, e, None)) => json_response(status, &json!({ "error": e })),
+    }
+}
+
 fn percent_decode(s: &str) -> Option<String> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -314,9 +322,9 @@ fn handle(mut req: Request, front: &Front) {
             });
             // The engine writes the call to the audit log as it answers it; refusals are
             // written below, as security events.
-            result_response(r.and_then(|args| {
-                let caller = front.identity.verify(authorization.as_deref())?.caller;
-                engine.request(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
+            call_response(r.map_err(|(s, m)| (s, m, None)).and_then(|args| {
+                let caller = front.identity.verify(authorization.as_deref()).map_err(|(s, m)| (s, m, None))?.caller;
+                engine.request_with_field(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
             }))
         }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.

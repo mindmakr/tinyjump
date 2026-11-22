@@ -65,6 +65,8 @@ pub(crate) struct CallRecord {
     ok: Option<Json>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    field: Option<String>,
 }
 
 impl CallRecord {
@@ -72,7 +74,7 @@ impl CallRecord {
         let text = serde_json::to_string(args).expect("JSON values serialize");
         // FNV-1a: telling one call's arguments from another's, not hiding them.
         let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None }
+        CallRecord { id: id.to_string(), by, at, method: method.to_string(), args: format!("{hash:016x}"), ok: None, error: None, field: None }
     }
 
     fn expired(&self, now: f64) -> bool {
@@ -84,17 +86,20 @@ impl CallRecord {
         self.by == other.by && self.method == other.method && self.args == other.args
     }
 
-    pub(crate) fn with_result(mut self, r: &Result<Json, String>) -> CallRecord {
+    pub(crate) fn with_result(mut self, r: &Result<Json, (String, Option<String>)>) -> CallRecord {
         match r {
             Ok(v) => self.ok = Some(v.clone()),
-            Err(e) => self.error = Some(e.clone()),
+            Err((e, f)) => {
+                self.error = Some(e.clone());
+                self.field = f.clone();
+            }
         }
         self
     }
 
-    pub(crate) fn result(&self) -> Result<Json, String> {
+    pub(crate) fn result(&self) -> Result<Json, (String, Option<String>)> {
         match &self.error {
-            Some(e) => Err(e.clone()),
+            Some(e) => Err((e.clone(), self.field.clone())),
             None => Ok(self.ok.clone().unwrap_or(Json::Null)),
         }
     }
@@ -790,10 +795,11 @@ impl Runtime {
         }
         if failed {
             for o in &mut self.outputs {
-                if let Output::Reply { ok, error, status, .. } = o {
+                if let Output::Reply { ok, error, field, status, .. } = o {
                     if error.is_none() {
                         *ok = None;
                         *error = Some("the change could not be saved; try again".into());
+                        *field = None;
                         *status = Some(503);
                     }
                 }
