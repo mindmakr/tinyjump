@@ -75,7 +75,7 @@ impl Runtime {
     /// Pushes a call frame for `closure`. Arguments are already on the stack from `base`.
     pub(crate) fn push_frame(&self, f: &mut Fiber, closure: Rc<Closure>, base: usize, ret: usize, this: Option<Rc<ObjRef>>) -> Result<(), Exc> {
         if f.frames.len() >= MAX_FRAMES {
-            return Err(Exc::msg("stack overflow: too much recursion"));
+            return Err(Exc::fault("stack overflow: too much recursion"));
         }
         let proto = &self.program.protos[closure.proto as usize];
         let params = proto.params as usize;
@@ -556,9 +556,9 @@ impl Runtime {
             }
             Value::Class(c) => {
                 let name = &self.program.objects[c as usize].name;
-                Err(Exc::msg(format!("{name} is an object type, not a function; use {name}.get(id)")))
+                Err(Exc::fault(format!("{name} is an object type, not a function; use {name}.get(id)")))
             }
-            other => Err(Exc::msg(format!("a {} is not a function", other.type_name()))),
+            other => Err(Exc::fault(format!("a {} is not a function", other.type_name()))),
         }
     }
 
@@ -664,8 +664,8 @@ impl Runtime {
                 }
                 Err(Exc::msg(format!("{}s have no method '{name}'", recv.type_name())))
             }
-            Value::Null => Err(Exc::msg(format!("cannot call .{name}() on null; check for null first or use ?."))),
-            other => Err(Exc::msg(format!("a {} has no method '{name}'", other.type_name()))),
+            Value::Null => Err(Exc::fault(format!("cannot call .{name}() on null; check for null first or use ?."))),
+            other => Err(Exc::fault(format!("a {} has no method '{name}'", other.type_name()))),
         }
     }
 
@@ -675,8 +675,8 @@ impl Runtime {
             Value::Arr(a) if name == "length" => Ok(Value::Num(a.borrow().len() as f64)),
             Value::Str(s) if name == "length" => Ok(Value::Num(s.chars().count() as f64)),
             Value::Obj(o) => self.obj_field(this, o, name),
-            Value::Null => Err(Exc::msg(format!("cannot read '{name}' of null; check for null first or use ?."))),
-            other => Err(Exc::msg(format!("a {} has no field '{name}'", other.type_name()))),
+            Value::Null => Err(Exc::fault(format!("cannot read '{name}' of null; check for null first or use ?."))),
+            other => Err(Exc::fault(format!("a {} has no field '{name}'", other.type_name()))),
         }
     }
 
@@ -687,8 +687,8 @@ impl Runtime {
                 Ok(())
             }
             Value::Obj(o) => self.set_obj_field(this, o, name, v),
-            Value::Null => Err(Exc::msg(format!("cannot set '{name}' of null"))),
-            other => Err(Exc::msg(format!("cannot set fields on a {}", other.type_name()))),
+            Value::Null => Err(Exc::fault(format!("cannot set '{name}' of null"))),
+            other => Err(Exc::fault(format!("cannot set fields on a {}", other.type_name()))),
         }
     }
 
@@ -703,8 +703,8 @@ impl Runtime {
             (Value::Rec(r), Value::Str(k)) => Ok(Value::inside(r.readonly, r.borrow().get(&**k).cloned().unwrap_or(Value::Null))),
             (Value::Rec(r), Value::Num(n)) => Ok(Value::inside(r.readonly, r.borrow().get(fmt_num(*n).as_str()).cloned().unwrap_or(Value::Null))),
             (Value::Obj(o), Value::Str(k)) => self.obj_field(this, o, k),
-            (Value::Null, _) => Err(Exc::msg("cannot index null; check for null first or use ?.[]")),
-            (o, i) => Err(Exc::msg(format!("cannot index a {} with a {}", o.type_name(), i.type_name()))),
+            (Value::Null, _) => Err(Exc::fault("cannot index null; check for null first or use ?.[]")),
+            (o, i) => Err(Exc::fault(format!("cannot index a {} with a {}", o.type_name(), i.type_name()))),
         }
     }
 

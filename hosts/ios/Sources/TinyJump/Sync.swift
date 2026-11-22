@@ -69,8 +69,9 @@ final class Sync: NSObject, URLSessionDataDelegate {
         req.httpBody = try? JSONSerialization.data(withJSONObject: effect["args"] as? [Any] ?? [])
         URLSession.shared.dataTask(with: req) { data, response, error in
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
-            // A 401 or 429 is retried too (after token refresh or rate-limit backoff).
-            let reply = status < 500 && status != 401 && status != 429 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
+            // A 502+, 401 or 429 is retried (gateway/overload, token refresh, or rate-limit backoff);
+            // a JSON 500 with `{"error": ...}` fails deterministically instead of wedging `tj:outbox`.
+            let reply = status < 502 && status != 401 && status != 429 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
             DispatchQueue.main.async {
                 if status == 401 { self.onTokenExpired?() }
                 if let reply = reply, reply["error"] == nil {

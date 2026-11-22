@@ -437,10 +437,18 @@ fn handle(mut req: Request, front: &Front) {
     // before expensive JWT verification; `tjk_` API keys are a single SHA-256 and are verified
     // first so valid keys behind a shared NAT/proxy are never blocked by `bad:{ip}`.
     let mut api_verified: Option<Result<crate::identity::Verified, Failure>> = None;
+    // Exempt unfiltered `GET /api/events` ONLY when query params have no `object`/`ticket`
+    // AND the caller actually authenticates with `ops:maintain` or `TJ_ADMIN_KEY` (cheap SHA-256
+    // / admin key check, never OIDC crypto) so unauthenticated floods still hit `RateLimiter`.
     let unfiltered_ops_events = *req.method() == Method::Get
         && segs.as_slice() == ["api", "events"]
-        && !req.url().contains("object=")
-        && !req.url().contains("ticket=");
+        && query_values(req.url(), "object").is_ok_and(|v| v.is_empty())
+        && query_values(req.url(), "ticket").is_ok_and(|v| v.is_empty())
+        && front
+            .automation
+            .authenticate(authorization.as_deref(), &front.identity)
+            .and_then(|o| o.require(OpsScope::Maintain, front.dev.is_some(), "unfiltered /api/events"))
+            .is_ok();
     if segs.first() == Some(&"api") && !unfiltered_ops_events && front.rate.limit > 0 {
         let respond_429 = |req: Request, retry_after: u64, who: Option<Actor>| {
             if let Some(who) = who {
@@ -1596,6 +1604,66 @@ mod tests {
         }
         assert_eq!(call("POST", "/api/Account/key:ana/ping", Some(&ana_key), Some(json!([]))), (200, json!({ "ok": "v1" })));
 
+        // T1-R1: unauthenticated `GET /api/events` and percent-encoded `?%6fbject=...` MUST still
+        // hit `RateLimiter` (429) rather than bypassing it into fsynced `audit.security` refusals.
+        let mut hit_429_events = false;
+        for _ in 0..4 {
+            let r = agent
+                .get(&format!("{base}/api/events"))
+                .set("X-Forwarded-For", "198.51.100.55")
+                .call();
+            if matches!(r, Err(ureq::Error::Status(429, _))) {
+                hit_429_events = true;
+                break;
+            }
+        }
+        assert!(hit_429_events, "unauthenticated GET /api/events must be rate-limited");
+        let mut hit_429_pct = false;
+        for _ in 0..4 {
+            let r = agent
+                .get(&format!("{base}/api/events?%6fbject=Account/key:ana"))
+                .set("X-Forwarded-For", "198.51.100.56")
+                .call();
+            if matches!(r, Err(ureq::Error::Status(429, _))) {
+                hit_429_pct = true;
+                break;
+            }
+        }
+        assert!(hit_429_pct, "percent-encoded ?%6fbject= must be rate-limited");
+
+        // T1-R2: caller-input errors (`Account.get("a/b")`, `JSON.parse("{")`) return 400 (NOT 500)
+        // and MUST NOT trigger auto-rollback during the watch window!
+        let v2_input_err = r#"
+@server @read("owner", "staff") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") setEmail(e: string): string { this.email = e; return "saved" }
+  @allow("anyone") ping(): string { return "v2-ok" }
+  @allow("anyone") badLookup(id: string): string { return Account.get(id).id }
+  @allow("anyone") badJson(s: string): any { return JSON.parse(s) }
+}
+"#;
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2_input_err, "watchSecs": 30, "errorThreshold": 2 }))).0, 200);
+        for (ip, path, arg) in [
+            ("198.51.100.60", "/api/Account/a/badLookup", "a/b"),
+            ("198.51.100.61", "/api/Account/a/badJson", "{"),
+            ("198.51.100.62", "/api/Account/a/badLookup", ""),
+        ] {
+            let resp = agent
+                .post(&format!("{base}{path}"))
+                .set("Content-Type", "application/json")
+                .set("X-Forwarded-For", ip)
+                .send_string(&json!([arg]).to_string());
+            assert!(matches!(resp, Err(ureq::Error::Status(400, _))), "caller-input error on {path} must return 400: {resp:?}");
+        }
+        // Still running `v2-ok` — bad caller inputs did NOT force an auto-rollback!
+        let still_v2 = agent
+            .post(&format!("{base}/api/Account/a/ping"))
+            .set("Content-Type", "application/json")
+            .set("X-Forwarded-For", "198.51.100.63")
+            .send_string("[]")
+            .unwrap();
+        assert_eq!(still_v2.into_string().unwrap(), "{\"ok\":\"v2-ok\"}");
+
         // T1-5: uncaught HTTP VM fault (`cannot read 'x' of null` -> 500) triggers auto-rollback during watch window!
         let v2_crash = r#"
 @server @read("owner", "staff") object Account {
@@ -1607,7 +1675,7 @@ mod tests {
   }
 }
 "#;
-        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2_crash, "watchSecs": 30, "errorThreshold": 2 }))).0, 200);
+        assert_eq!(call("POST", "/_tj/reload", Some(&mnt), Some(json!({ "source": v2_crash, "allowBreaking": true, "watchSecs": 30, "errorThreshold": 2 }))).0, 200);
         // Trigger 2 HTTP 500 crashes from distinct anonymous XFF IPs (to stay under rate limit = 2).
         for ip in ["198.51.100.1", "198.51.100.2"] {
             let resp = agent
@@ -1617,7 +1685,7 @@ mod tests {
                 .send_string("[]");
             assert!(matches!(resp, Err(ureq::Error::Status(500, _))), "uncaught VM fault must return 500: {resp:?}");
         }
-        // Auto-rollback restored v1 AND cleared stale method stats (T1-8)!
+        // Auto-rollback restored v2-ok AND cleared stale method stats (T1-8)!
         let resp = agent
             .post(&format!("{base}/api/Account/a/ping"))
             .set("Content-Type", "application/json")
@@ -1625,7 +1693,7 @@ mod tests {
             .send_string("[]")
             .unwrap();
         assert_eq!(resp.status(), 200);
-        assert_eq!(resp.into_string().unwrap(), "{\"ok\":\"v1\"}");
+        assert_eq!(resp.into_string().unwrap(), "{\"ok\":\"v2-ok\"}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -301,7 +301,7 @@ export async function start(opts) {
     })
       .then((r) => {
         if (r.status === 401) tokenExpired();
-        return r.status >= 500 || r.status === 401 || r.status === 429 ? Promise.reject(new Error('server answered ' + r.status)) : r.json();
+        return r.status >= 502 || r.status === 401 || r.status === 429 ? Promise.reject(new Error('server answered ' + r.status)) : r.json();
       })
       .then((j) => send(j.error ? { type: 'effectDone', id, error: j.error, field: j.field || undefined } : { type: 'effectDone', id, ok: j.ok }))
       .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e), unreachable: true }));
