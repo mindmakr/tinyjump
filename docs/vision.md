@@ -130,7 +130,8 @@ the goal; being in the market early, to gain momentum and contributors, is.
      in `examples/members`.
    - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
      scoped agent keys (`--ops observe|test|maintain`), canonical manifest (`tj check --manifest`
-     / `/_tj/manifest`) and work leases (`/_tj/leases`, `tj lease`) (done); next: `tj test`,
+     / `/_tj/manifest`) and work leases (`/_tj/leases`, `tj lease`) (done); deterministic
+     trace runner (`tj test`) and `tj mcp` trace recording (`record_trace`) (done); next:
      `tj check --against` and `@invariant`, shadow boot and rollback, size and AI-cost caps
      and `tj retro`.
    - Then a design note on effects that already happened outside when a call is retried

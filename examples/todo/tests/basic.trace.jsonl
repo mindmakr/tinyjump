@@ -1,0 +1,27 @@
+# Deterministic trace test for examples/todo/app.tj
+{"do": "boot", "now": 1800000000000, "seed": 1, "server": true, "render": true}
+{"do": "assertScreen", "contains": ["Todos", "Nothing yet. Add one above.", "0 left"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+
+# Type a todo, submit it, verify state and UI
+{"do": "ui", "target": "#draft", "event": "onChange", "value": "Buy milk"}
+{"do": "ui", "target": "#add", "event": "onPress"}
+{"do": "ui", "target": "#draft", "event": "onChange", "value": "Walk dog"}
+{"do": "ui", "target": "#add", "event": "onPress"}
+{"do": "assertScreen", "contains": ["Buy milk", "Walk dog", "2 left"], "notContains": ["Nothing yet"]}
+
+# Mark first todo done and clear done
+{"do": "ui", "target": "#todo-1", "event": "onChange", "value": true}
+{"do": "assertScreen", "contains": ["1 left"]}
+{"do": "ui", "target": "#clear", "event": "onPress"}
+{"do": "assertScreen", "contains": ["Walk dog", "1 left"], "notContains": ["Buy milk"]}
+
+# Advance the clock 5 seconds: @every("1s") timer advances Clock.now
+{"do": "tick", "advance": "5s"}
+{"do": "get", "object": "Clock/main", "expectContains": {"now": 1800000005000}}
+
+# Simulated restart over the same store keeps durable todos
+{"do": "boot", "restart": true}
+{"do": "assertScreen", "contains": ["Walk dog", "1 left"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+{"do": "assertMetrics", "maxVmSteps": 200000}

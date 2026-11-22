@@ -272,6 +272,17 @@ Two tools build on this:
 - **`/_tj/metrics`** on `tj serve` (`observe` scope) serves the statistics as OpenMetrics
   text, for Prometheus and Grafana. It is cheaper than `inspect`, and its labels are class,
   method and effect names only, never object ids, which can identify people.
-- **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
-  language reference, to load before writing code), `manifest`, `inspect`, `act`, `call`,
-  `get`, `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.
+- **`tj mcp --target <url> [--record <trace.jsonl>]`** is an MCP server on stdio with the
+  tools `language` (the language reference, to load before writing code), `manifest`,
+  `inspect`, `act`, `call`, `get`, `screenshot`, `review`, `input` and `record_trace`, so
+  any coding agent can write, drive, test and record reproductions of an app.
+- **`tj test <app.tj> [trace.trace.jsonl ...] [--json] [--plugin name=fake:file.json]`**
+  runs deterministic `.trace.jsonl` test traces directly against `tj-core` in memory (no
+  ports or browser needed). Traces control the clock (`tick` with `advance` / `advanceMs`),
+  script fake plugins (`plugin`) and HTTP responses (`http`), switch callers (`as`),
+  simulate restarts over the same store (`boot` with `restart: true`), assert return
+  values, field errors (`expectField`), access refusals (`expectStatus`), `@pii` masking
+  (`get` / `assertInspect`), privacy export/erasure (`privacy`), rendered screen text
+  (`assertScreen`), Taffy flexbox layout + `tj review` (`assertLayout`), and work-counter
+  ceilings (`assertMetrics`). When no trace files are listed, `tj test` runs every
+  `*.trace.jsonl` next to the app and in its `tests/` folder.
