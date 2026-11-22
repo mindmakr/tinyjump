@@ -250,6 +250,11 @@ impl Harness {
         let (mut rt, mut out) = Runtime::boot(program, Box::new(self.store.clone()), opts).map_err(|e| format!("boot failed: {e}"))?;
         rt.set_measure(Box::new(TestMeasure(self.nodes.clone())));
         out.extend(rt.handle(self.now, Input::Entropy { bytes: DEFAULT_ENTROPY.into() }));
+        if let Caller::Remote { id, roles } = &self.caller {
+            if !id.is_empty() || !roles.is_empty() {
+                out.extend(rt.handle(self.now, Input::Identity { user: (!id.is_empty()).then(|| id.clone()), roles: roles.clone() }));
+            }
+        }
         self.rt = Some(rt);
         let mut replies = HashMap::new();
         self.pump(out, &mut replies)?;
@@ -1002,5 +1007,24 @@ function App() {
         let time_id = h.nodes.borrow().iter().find(|(_, (k, _))| k == "Time").map(|(id, _)| *id).expect("Time node exists");
         let frame = h.frames.get(&time_id).expect("Time node laid out");
         assert!(frame.w > 0.0 && frame.h > 0.0, "Time node must have non-zero bounds: {frame:?}");
+
+        // C-036.2: a pre-boot `{"do": "as", ...}` step (as recorded by `tj mcp record_trace`)
+        // applies `Input::Identity` on auto-boot AND across restarts so UI renders/handlers see `caller`.
+        let ui_id_src = r#"
+function App() {
+  return <Column padding={16}>
+    <Text id="who">{caller.id}:{caller.roles.join(",")}</Text>
+  </Column>
+}
+"#;
+        let pre_boot_as = r#"
+{"do": "as", "id": "dev:ana", "roles": ["staff"]}
+{"do": "boot", "server": false}
+{"do": "assertScreen", "contains": ["dev:ana:staff"]}
+{"do": "boot", "restart": true}
+{"do": "assertScreen", "contains": ["dev:ana:staff"]}
+"#;
+        let r_as = run_trace(Path::new("."), ui_id_src, "pre_boot_as.trace.jsonl", pre_boot_as, HashMap::new());
+        assert!(r_as.passed(), "pre-boot `as` identity must apply on boot and restart: {:?}", r_as.error);
     }
 }

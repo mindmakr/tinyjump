@@ -461,7 +461,7 @@ fn handle(mut req: Request, front: &Front) {
                 let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
                 if !matches!(input, Input::Get { .. } | Input::Inspect { .. }) {
                     let scope = match &input {
-                        Input::Call { object, .. } => object.split_once('/').map_or("app", |(c, _)| c),
+                        Input::Call { object, .. } => object.as_str(),
                         _ => "app",
                     };
                     check_lease(&front.leases, ops, scope)?;

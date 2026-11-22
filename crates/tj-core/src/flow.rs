@@ -1057,12 +1057,14 @@ impl Checker {
                     return clean();
                 }
                 "schedule" => {
-                    let keyed = matches!(args.get(2).map(|a| &a.kind), Some(ExprKind::Str(_))) && !matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Str(_)));
+                    let keyed = matches!(args.get(2).map(|a| &a.kind), Some(ExprKind::Str(_)))
+                        && !matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Str(_)))
+                        && !matches!(args.first().map(|a| &a.kind), Some(ExprKind::Num(_)));
                     let (method_idx, skip) = if keyed { (2, 3) } else { (1, 2) };
                     let mut vals = Vec::new();
                     for (i, a) in args.iter().enumerate() {
                         let v = self.expr(a, fr);
-                        let dest = if i >= skip { "an alarm's arguments, which are stored with the alarm" } else { "an alarm, which is stored with the alarm" };
+                        let dest = if i >= skip { "an alarm's arguments, which are stored with the alarm" } else { "an alarm, which is stored on disk" };
                         self.sink(&v, a.span, dest);
                         if i >= skip {
                             vals.push(v);

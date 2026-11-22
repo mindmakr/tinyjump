@@ -220,7 +220,11 @@ impl Leases {
 }
 
 fn scopes_overlap(a: &str, b: &str) -> bool {
-    a == b || a == "app" || b == "app"
+    a == b
+        || a == "app"
+        || b == "app"
+        || a.split_once('/').is_some_and(|(c, _)| c == b)
+        || b.split_once('/').is_some_and(|(c, _)| c == a)
 }
 
 /// `tj lease list | acquire [...] | release <id> [--target <url>]`.
@@ -334,11 +338,19 @@ mod tests {
         let conflict_app = leases.acquire_at(t0, "ops:maint-2".into(), OpsScope::Maintain, "app".into(), None, Some(60), String::new()).unwrap_err();
         assert_eq!(conflict_app.0, 409);
 
-        // `check_exclusive_at` blocks competing holders on overlapping scopes, allows self & non-overlapping scopes.
+        // `check_exclusive_at` blocks competing holders on overlapping scopes (including Class vs Class/id), allows self & non-overlapping scopes.
         assert_eq!(leases.check_exclusive_at(t0, "ops:maint-2", "Slot").unwrap_err().0, 409);
+        assert_eq!(leases.check_exclusive_at(t0, "ops:maint-2", "Slot/s1").unwrap_err().0, 409);
         assert_eq!(leases.check_exclusive_at(t0, "ops:maint-2", "app").unwrap_err().0, 409);
         assert!(leases.check_exclusive_at(t0, "ops:maint-2", "Settings").is_ok());
         assert!(leases.check_exclusive_at(t0, "ops:maint-1", "Slot").is_ok());
+
+        // Object-scoped exclusive lease (`Settings/s1`) blocks `Settings`, `Settings/s1`, and `app`, but not `Settings/s2`.
+        let s1 = leases.acquire_at(t0, "ops:maint-2".into(), OpsScope::Maintain, "Settings/s1".into(), None, Some(60), String::new()).unwrap();
+        assert_eq!(leases.check_exclusive_at(t0, "ops:maint-1", "Settings/s1").unwrap_err().0, 409);
+        assert_eq!(leases.check_exclusive_at(t0, "ops:maint-1", "Settings").unwrap_err().0, 409);
+        assert!(leases.check_exclusive_at(t0, "ops:maint-1", "Settings/s2").is_ok());
+        assert!(leases.release_at(t0, &s1.id, "ops:maint-2", false).is_ok());
 
         // Same holder renewing extends the same lease id instead of conflicting.
         let renewed = leases.acquire_at(t0 + 10_000, "ops:maint-1".into(), OpsScope::Maintain, "Slot".into(), None, Some(120), "still upgrading".into()).unwrap();
