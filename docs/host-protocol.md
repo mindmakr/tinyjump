@@ -247,17 +247,17 @@ Every snapshot also carries `stats`, the runtime statistics:
   calls waiting for `@exclusive` objects of that class, and `stats.maxBytes["Cart"]` the
   largest persisted JSON record size (in bytes) among loaded objects of that class.
 
-`tj serve` also enforces operational guardrails (all configurable via environment variables;
-`tj dev` keeps them permissive for local work):
+`tj serve` (and `tj dev`, except `TJ_RATE_LIMIT` which defaults to `0` / off in `tj dev`)
+also enforces configurable operational guardrails:
 
 - **Per-object size cap (`TJ_MAX_OBJECT_BYTES`, default `262144` / 256 KB; `0` disables):**
-  checked atomically before flushing any touched object; growth past the cap rolls back the
-  turn and returns `413`, while shrinking or erasing an already-large object is always
-  allowed.
+  checked atomically before committing a turn; growth past the cap rolls back the turn and
+  returns `413`, while shrinking or erasing an already-oversized object is always allowed.
 - **Per-caller HTTP rate cap (`TJ_RATE_LIMIT`, default `600`/min on `tj serve`, `0` on
-  `tj dev`):** sliding 60-second window on `/api/*` keyed by verified caller id or IP
-  (respecting `TJ_TRUST_PROXY=1`); excess requests receive `429` with `Retry-After` and a
-  `refused` security audit entry.
+  `tj dev`):** O(1) token bucket on `/api/*` keyed by verified caller id or IP (using the
+  rightmost valid `X-Forwarded-For` IP when `TJ_TRUST_PROXY=1`); excess requests receive
+  `429` with `Retry-After` and a non-blocking `refused` audit entry (at most once per
+  caller per minute).
 - **Outbound fetch host allowlist (`TJ_FETCH_ALLOW`):** comma-separated exact hosts
   (`api.example.com`) or strict subdomains (`*.example.com`), enforced on both the initial
   URL and DNS resolution (so redirects cannot escape the allowlist).

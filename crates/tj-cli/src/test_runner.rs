@@ -812,18 +812,22 @@ pub fn run_trace(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli
     execute_trace(h, name, trace_text)
 }
 
-/// Runs a single in-memory Taffy layout + `review::review` check for `source` at
-/// `(width, height, rtl)`, reusing `TestMeasure` and `attach_bounds` (used by `tj retro`).
-pub fn layout_findings(source: &str, width: f32, height: f32, rtl: bool) -> Result<Vec<review::Finding>, String> {
+/// Boots `source` once in memory and runs Taffy layout + `review::review` across every
+/// viewport in `viewports`, reusing `TestMeasure` and `attach_bounds` (used by `tj retro`).
+pub fn layout_findings_multi(source: &str, viewports: &[(&'static str, f32, f32, bool)]) -> Result<Vec<(&'static str, Vec<review::Finding>)>, String> {
     let mut h = Harness::new(PathBuf::from("."), source.to_string(), HashMap::new());
     h.boot(false)?;
-    let out = h.rt.as_mut().expect("booted").handle(h.now, Input::Layout { width, height, rtl });
-    let mut replies = HashMap::new();
-    h.pump(out, &mut replies)?;
-    let mut snap = h.inspect_snapshot()?;
-    snap["viewport"] = json!({ "w": width, "h": height });
-    attach_bounds(&mut snap["tree"], &h.frames, 0.0, 0.0);
-    Ok(review::review(&snap))
+    let mut results = Vec::with_capacity(viewports.len());
+    for &(label, width, height, rtl) in viewports {
+        let out = h.rt.as_mut().expect("booted").handle(h.now, Input::Layout { width, height, rtl });
+        let mut replies = HashMap::new();
+        h.pump(out, &mut replies)?;
+        let mut snap = h.inspect_snapshot()?;
+        snap["viewport"] = json!({ "w": width, "h": height });
+        attach_bounds(&mut snap["tree"], &h.frames, 0.0, 0.0);
+        results.push((label, review::review(&snap)));
+    }
+    Ok(results)
 }
 
 /// Runs a smoke trace against a caller-supplied store (e.g. a copy-on-write `OverlayStore`

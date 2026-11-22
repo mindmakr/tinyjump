@@ -4,14 +4,14 @@
 //!
 //! Every finding carries an action tag: `fix`, `optimize`, `prune`, or `rotate`.
 
-use crate::{access, app, audit, auth, bench, manifest, review, sealed, test_runner};
+use crate::{access, app, audit, auth, bench, identity, review, sealed, test_runner};
 use serde_json::{json, Map, Value as Json};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tj_core::modules;
-use tj_core::syntax::ast::{ArrayEntry, Expr, ExprKind, Item, JsxChild, JsxElement, RecordEntry, Stmt, TplPiece};
+use tj_core::syntax::ast::{ArrayEntry, Expr, ExprKind, FnDecl, Item, JsxChild, JsxElement, Pattern, RecordEntry, Stmt, TplPiece};
 use tj_core::syntax::parse_range;
 
 const SLOW_P95_MS: f64 = 200.0;
@@ -136,8 +136,7 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
     let name = file.display().to_string();
     let source = app::read(file)?.source;
     let program = tj_core::compile(&source).map_err(|errs| errs.iter().map(|d| d.render(&name, &source)).collect::<Vec<_>>().join("\n\n"))?;
-    let manifest = manifest::Manifest::build(&source, &program, &[]);
-    let app_sha256 = manifest.json["appSha256"].as_str().unwrap_or("").to_string();
+    let app_sha256 = identity::sha256_hex(&source);
     let mut findings = Vec::new();
 
     // 1. Access & privacy warnings (`fix`).
@@ -183,15 +182,32 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
         let base = url.trim_end_matches('/');
         let live_manifest = fetch_ops_json(&format!("{base}/_tj/manifest"))?;
         let live_inspect = fetch_ops_json(&format!("{base}/_tj/inspect"))?;
+        if let Some(live_sha) = live_manifest["appSha256"].as_str().filter(|s| !s.is_empty() && *s != app_sha256) {
+            findings.push(RetroFinding {
+                tag: "fix",
+                area: "drift",
+                subject: name.clone(),
+                message: format!("running server appSha256 ({}) differs from local source ({})", &live_sha[..live_sha.len().min(12)], &app_sha256[..app_sha256.len().min(12)]),
+                hint: "deploy the local bundle (`tj reload`) or check out the deployed revision so static and live findings match".into(),
+            });
+        }
         analyze_live(&live_manifest, &live_inspect, &mut findings);
         live_checked = true;
     }
 
     // 6. Local data & key hygiene.
-    let data_dir = data.map(Path::to_path_buf).or_else(|| {
-        let default = file.parent().unwrap_or(Path::new(".")).join(".tj-data");
-        default.exists().then_some(default)
-    });
+    let data_dir = match data {
+        Some(dir) => {
+            if !dir.exists() {
+                return Err(format!("data directory {} does not exist", dir.display()));
+            }
+            Some(dir.to_path_buf())
+        }
+        None => {
+            let default = file.parent().unwrap_or(Path::new(".")).join(".tj-data");
+            default.exists().then_some(default)
+        }
+    };
     let mut data_checked = false;
     if let Some(dir) = data_dir.as_deref() {
         let has_pii = program.objects.iter().any(|o| !o.pii.is_empty());
@@ -202,32 +218,49 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
     Ok(RetroReport { app: name, app_sha256, findings, bench: bench_json, live_checked, data_checked })
 }
 
-/// Flags `private` object methods (not `@every` or `@invariant`) never referenced in the bundle.
+/// Flags `private` object methods (not `@every` or `@invariant`) never called or scheduled by
+/// another method or field initializer on their own class (private methods can only be called
+/// via `this.<m>(...)` or `this.schedule(..., "<m>", ...)` / `invoke(..., "<m>", ...)`).
 pub(crate) fn check_dead_methods(source: &str, out: &mut Vec<RetroFinding>) {
     let mut private_methods: Vec<(String, String)> = Vec::new();
-    let mut refs: HashSet<String> = HashSet::new();
+    // Per-class references collected from each method/init separately so a dead self-recursive
+    // private method cannot mark itself live, and unrelated classes or UI strings don't mask it.
+    type MemberRefs = Vec<(Option<String>, HashSet<String>)>;
+    let mut class_method_refs: HashMap<String, MemberRefs> = HashMap::new();
+    let mut invoke_refs: HashSet<String> = HashSet::new();
     for f in modules::files(source) {
         let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
         for item in &parsed.items {
             match item {
                 Item::Object(o) => {
+                    let entry = class_method_refs.entry(o.name.clone()).or_default();
+                    let mut field_refs = HashSet::new();
                     for fl in &o.fields {
                         if let Some(e) = &fl.init {
-                            collect_expr_refs(e, &mut refs);
+                            collect_expr_refs(e, &mut field_refs, &mut invoke_refs);
                         }
+                    }
+                    if !field_refs.is_empty() {
+                        entry.push((None, field_refs));
                     }
                     for m in &o.methods {
                         let special = m.decorators.iter().any(|d| matches!(d.name.as_str(), "every" | "invariant"));
                         if m.private && !special {
                             private_methods.push((o.name.clone(), m.func.name.clone()));
                         }
-                        collect_stmts_refs(&m.func.body, &mut refs);
+                        let mut m_refs = HashSet::new();
+                        collect_fn_refs(&m.func, &mut m_refs, &mut invoke_refs);
+                        entry.push((Some(m.func.name.clone()), m_refs));
                     }
                 }
-                Item::Function(fn_decl) => collect_stmts_refs(&fn_decl.body, &mut refs),
+                Item::Function(fn_decl) => {
+                    let mut ignored = HashSet::new();
+                    collect_fn_refs(fn_decl, &mut ignored, &mut invoke_refs);
+                }
                 Item::Let(d) => {
+                    let mut ignored = HashSet::new();
                     if let Some(e) = &d.init {
-                        collect_expr_refs(e, &mut refs);
+                        collect_expr_refs(e, &mut ignored, &mut invoke_refs);
                     }
                 }
                 Item::TypeAlias { .. } => {}
@@ -235,7 +268,11 @@ pub(crate) fn check_dead_methods(source: &str, out: &mut Vec<RetroFinding>) {
         }
     }
     for (cls, method) in private_methods {
-        if !refs.contains(&method) {
+        let called_by_other_member = class_method_refs.get(&cls).is_some_and(|list| {
+            list.iter()
+                .any(|(owner, refs)| owner.as_deref() != Some(method.as_str()) && refs.contains(&method))
+        });
+        if !called_by_other_member && !invoke_refs.contains(&method) {
             out.push(RetroFinding {
                 tag: "prune",
                 area: "dead-code",
@@ -247,102 +284,152 @@ pub(crate) fn check_dead_methods(source: &str, out: &mut Vec<RetroFinding>) {
     }
 }
 
-fn collect_stmts_refs(stmts: &[Stmt], refs: &mut HashSet<String>) {
-    for s in stmts {
-        match s {
-            Stmt::Let(d) => {
-                if let Some(e) = &d.init {
-                    collect_expr_refs(e, refs);
+fn collect_fn_refs(f: &FnDecl, this_refs: &mut HashSet<String>, invoke_refs: &mut HashSet<String>) {
+    for p in &f.params {
+        collect_pattern_refs(&p.pattern, this_refs, invoke_refs);
+        if let Some(def) = &p.default {
+            collect_expr_refs(def, this_refs, invoke_refs);
+        }
+    }
+    collect_stmts_refs(&f.body, this_refs, invoke_refs);
+}
+
+fn collect_pattern_refs(pat: &Pattern, this_refs: &mut HashSet<String>, invoke_refs: &mut HashSet<String>) {
+    match pat {
+        Pattern::Ident(_, _) => {}
+        Pattern::Record(entries, _) => {
+            for (_, sub, def) in entries {
+                collect_pattern_refs(sub, this_refs, invoke_refs);
+                if let Some(e) = def {
+                    collect_expr_refs(e, this_refs, invoke_refs);
                 }
             }
-            Stmt::Function(f) => collect_stmts_refs(&f.body, refs),
-            Stmt::Expr(e) | Stmt::Throw(e, _) => collect_expr_refs(e, refs),
-            Stmt::Return(Some(e), _) => collect_expr_refs(e, refs),
-            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
-            Stmt::If { cond, then, els } => {
-                collect_expr_refs(cond, refs);
-                collect_stmts_refs(then, refs);
-                if let Some(els) = els {
-                    collect_stmts_refs(els, refs);
-                }
-            }
-            Stmt::While { cond, body } => {
-                collect_expr_refs(cond, refs);
-                collect_stmts_refs(body, refs);
-            }
-            Stmt::ForOf { iter, body, .. } => {
-                collect_expr_refs(iter, refs);
-                collect_stmts_refs(body, refs);
-            }
-            Stmt::For { init, cond, update, body } => {
-                if let Some(i) = init {
-                    collect_stmts_refs(std::slice::from_ref(i.as_ref()), refs);
-                }
-                if let Some(c) = cond {
-                    collect_expr_refs(c, refs);
-                }
-                if let Some(u) = update {
-                    collect_expr_refs(u, refs);
-                }
-                collect_stmts_refs(body, refs);
-            }
-            Stmt::Block(b) => collect_stmts_refs(b, refs),
-            Stmt::Try { body, handler, .. } => {
-                collect_stmts_refs(body, refs);
-                collect_stmts_refs(handler, refs);
+        }
+        Pattern::Array(subs, _) => {
+            for sub in subs {
+                collect_pattern_refs(sub, this_refs, invoke_refs);
             }
         }
     }
 }
 
-fn collect_expr_refs(e: &Expr, refs: &mut HashSet<String>) {
+fn collect_stmts_refs(stmts: &[Stmt], this_refs: &mut HashSet<String>, invoke_refs: &mut HashSet<String>) {
+    for s in stmts {
+        match s {
+            Stmt::Let(d) => {
+                collect_pattern_refs(&d.pattern, this_refs, invoke_refs);
+                if let Some(e) = &d.init {
+                    collect_expr_refs(e, this_refs, invoke_refs);
+                }
+            }
+            Stmt::Function(f) => collect_fn_refs(f, this_refs, invoke_refs),
+            Stmt::Expr(e) | Stmt::Throw(e, _) => collect_expr_refs(e, this_refs, invoke_refs),
+            Stmt::Return(Some(e), _) => collect_expr_refs(e, this_refs, invoke_refs),
+            Stmt::Return(None, _) | Stmt::Break(_) | Stmt::Continue(_) => {}
+            Stmt::If { cond, then, els } => {
+                collect_expr_refs(cond, this_refs, invoke_refs);
+                collect_stmts_refs(then, this_refs, invoke_refs);
+                if let Some(els) = els {
+                    collect_stmts_refs(els, this_refs, invoke_refs);
+                }
+            }
+            Stmt::While { cond, body } => {
+                collect_expr_refs(cond, this_refs, invoke_refs);
+                collect_stmts_refs(body, this_refs, invoke_refs);
+            }
+            Stmt::ForOf { pattern, iter, body } => {
+                collect_pattern_refs(pattern, this_refs, invoke_refs);
+                collect_expr_refs(iter, this_refs, invoke_refs);
+                collect_stmts_refs(body, this_refs, invoke_refs);
+            }
+            Stmt::For { init, cond, update, body } => {
+                if let Some(i) = init {
+                    collect_stmts_refs(std::slice::from_ref(i.as_ref()), this_refs, invoke_refs);
+                }
+                if let Some(c) = cond {
+                    collect_expr_refs(c, this_refs, invoke_refs);
+                }
+                if let Some(u) = update {
+                    collect_expr_refs(u, this_refs, invoke_refs);
+                }
+                collect_stmts_refs(body, this_refs, invoke_refs);
+            }
+            Stmt::Block(b) => collect_stmts_refs(b, this_refs, invoke_refs),
+            Stmt::Try { body, param, handler } => {
+                collect_stmts_refs(body, this_refs, invoke_refs);
+                if let Some(p) = param {
+                    collect_pattern_refs(p, this_refs, invoke_refs);
+                }
+                collect_stmts_refs(handler, this_refs, invoke_refs);
+            }
+        }
+    }
+}
+
+fn collect_expr_refs(e: &Expr, this_refs: &mut HashSet<String>, invoke_refs: &mut HashSet<String>) {
     match &e.kind {
         ExprKind::Member { obj, name, .. } => {
-            refs.insert(name.clone());
-            collect_expr_refs(obj, refs);
+            if matches!(obj.kind, ExprKind::This) {
+                this_refs.insert(name.clone());
+            }
+            collect_expr_refs(obj, this_refs, invoke_refs);
         }
-        ExprKind::Str(s) => {
-            // `this.schedule(ms, "methodName", ...)` / `invoke(..., "methodName", ...)`.
-            refs.insert(s.clone());
-        }
-        ExprKind::Call { callee, args, .. } => {
-            collect_expr_refs(callee, refs);
+        ExprKind::Call { callee, args } => {
+            // `this.schedule(delay, "method", ...)` or `this.schedule("key", delay, "method", ...)`
+            if let ExprKind::Member { obj, name, .. } = &callee.kind {
+                if matches!(obj.kind, ExprKind::This) && name == "schedule" {
+                    for idx in [1usize, 2usize] {
+                        if let Some(Expr { kind: ExprKind::Str(s), .. }) = args.get(idx) {
+                            this_refs.insert(s.clone());
+                        }
+                    }
+                }
+            }
+            // `invoke(target, "method", args)`
+            if let ExprKind::Ident(fn_name) = &callee.kind {
+                if fn_name == "invoke" {
+                    if let Some(Expr { kind: ExprKind::Str(s), .. }) = args.get(1) {
+                        invoke_refs.insert(s.clone());
+                    }
+                }
+            }
+            collect_expr_refs(callee, this_refs, invoke_refs);
             for a in args {
-                collect_expr_refs(a, refs);
+                collect_expr_refs(a, this_refs, invoke_refs);
             }
         }
         ExprKind::Index { obj, index, .. } => {
-            collect_expr_refs(obj, refs);
-            collect_expr_refs(index, refs);
+            collect_expr_refs(obj, this_refs, invoke_refs);
+            collect_expr_refs(index, this_refs, invoke_refs);
         }
         ExprKind::Binary(_, l, r) | ExprKind::Logical(_, l, r) => {
-            collect_expr_refs(l, refs);
-            collect_expr_refs(r, refs);
+            collect_expr_refs(l, this_refs, invoke_refs);
+            collect_expr_refs(r, this_refs, invoke_refs);
         }
         ExprKind::Assign { target, value, .. } => {
-            collect_expr_refs(target, refs);
-            collect_expr_refs(value, refs);
+            collect_expr_refs(target, this_refs, invoke_refs);
+            collect_expr_refs(value, this_refs, invoke_refs);
         }
-        ExprKind::Unary(_, x) | ExprKind::Await(x) | ExprKind::Update { target: x, .. } => collect_expr_refs(x, refs),
+        ExprKind::Unary(_, x) | ExprKind::Await(x) | ExprKind::Update { target: x, .. } => collect_expr_refs(x, this_refs, invoke_refs),
         ExprKind::Cond(c, a, b) => {
-            collect_expr_refs(c, refs);
-            collect_expr_refs(a, refs);
-            collect_expr_refs(b, refs);
+            collect_expr_refs(c, this_refs, invoke_refs);
+            collect_expr_refs(a, this_refs, invoke_refs);
+            collect_expr_refs(b, this_refs, invoke_refs);
         }
         ExprKind::Array(xs) => {
             for x in xs {
                 match x {
-                    ArrayEntry::Item(ex) | ArrayEntry::Spread(ex) => collect_expr_refs(ex, refs),
+                    ArrayEntry::Item(ex) | ArrayEntry::Spread(ex) => collect_expr_refs(ex, this_refs, invoke_refs),
                 }
             }
         }
         ExprKind::Record(fs) => {
             for entry in fs {
                 match entry {
-                    RecordEntry::Field(_, v) | RecordEntry::Spread(v) => collect_expr_refs(v, refs),
+                    RecordEntry::Field(_, v) | RecordEntry::Spread(v) => collect_expr_refs(v, this_refs, invoke_refs),
                     RecordEntry::Computed(k, v) => {
-                        collect_expr_refs(k, refs);
-                        collect_expr_refs(v, refs);
+                        collect_expr_refs(k, this_refs, invoke_refs);
+                        collect_expr_refs(v, this_refs, invoke_refs);
                     }
                 }
             }
@@ -350,35 +437,35 @@ fn collect_expr_refs(e: &Expr, refs: &mut HashSet<String>) {
         ExprKind::Template(parts) => {
             for p in parts {
                 if let TplPiece::Expr(ex) = p {
-                    collect_expr_refs(ex, refs);
+                    collect_expr_refs(ex, this_refs, invoke_refs);
                 }
             }
         }
-        ExprKind::Arrow(f) => collect_stmts_refs(&f.body, refs),
-        ExprKind::Jsx(el) => collect_jsx_refs(el, refs),
-        ExprKind::Num(_) | ExprKind::Bool(_) | ExprKind::Null | ExprKind::Ident(_) | ExprKind::This => {}
+        ExprKind::Arrow(f) => collect_fn_refs(f, this_refs, invoke_refs),
+        ExprKind::Jsx(el) => collect_jsx_refs(el, this_refs, invoke_refs),
+        ExprKind::Num(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null | ExprKind::Ident(_) | ExprKind::This => {}
     }
 }
 
-fn collect_jsx_refs(el: &JsxElement, refs: &mut HashSet<String>) {
+fn collect_jsx_refs(el: &JsxElement, this_refs: &mut HashSet<String>, invoke_refs: &mut HashSet<String>) {
     for (_, v) in &el.attrs {
-        collect_expr_refs(v, refs);
+        collect_expr_refs(v, this_refs, invoke_refs);
     }
     for ch in &el.children {
         match ch {
-            JsxChild::Expr(ex) => collect_expr_refs(ex, refs),
-            JsxChild::Element(sub) => collect_jsx_refs(sub, refs),
+            JsxChild::Expr(ex) => collect_expr_refs(ex, this_refs, invoke_refs),
+            JsxChild::Element(sub) => collect_jsx_refs(sub, this_refs, invoke_refs),
             JsxChild::Text(_) => {}
         }
     }
 }
 
 fn check_layouts(source: &str, out: &mut Vec<RetroFinding>) {
-    // Group identical (check, node, message) findings across viewports so reports stay concise.
+    // Group identical (check, node, message) findings across viewports using a single boot.
     let mut grouped: BTreeMap<(String, String), (review::Severity, Vec<&'static str>)> = BTreeMap::new();
-    for &(label, w, h, rtl) in VIEWPORTS {
-        match test_runner::layout_findings(source, w, h, rtl) {
-            Ok(list) => {
+    match test_runner::layout_findings_multi(source, VIEWPORTS) {
+        Ok(all) => {
+            for (label, list) in all {
                 for f in list {
                     let key = (format!("{} {}", f.check, f.node), f.message);
                     let entry = grouped.entry(key).or_insert((f.severity, Vec::new()));
@@ -387,16 +474,16 @@ fn check_layouts(source: &str, out: &mut Vec<RetroFinding>) {
                     }
                 }
             }
-            Err(e) => {
-                out.push(RetroFinding {
-                    tag: "fix",
-                    area: "layout",
-                    subject: label.into(),
-                    message: format!("layout sweep failed: {e}"),
-                    hint: "ensure the app boots cleanly for UI layout".into(),
-                });
-                break;
-            }
+        }
+        Err(e) => {
+            out.push(RetroFinding {
+                tag: "fix",
+                area: "layout",
+                subject: "viewports".into(),
+                message: format!("layout sweep failed: {e}"),
+                hint: "ensure the app boots cleanly for UI layout".into(),
+            });
+            return;
         }
     }
     for ((subject, message), (sev, vps)) in grouped {
@@ -417,22 +504,23 @@ fn check_budget_headroom(file: &Path, b: &bench::Bench, out: &mut Vec<RetroFindi
     let Ok(budget) = serde_json::from_str::<Json>(&text) else { return };
     let norm = file.to_string_lossy().replace('\\', "/");
     let apps = budget["apps"].as_object();
-    if let Some((_, lim)) = apps.and_then(|m| m.iter().find(|(k, _)| norm.ends_with(k.as_str()))) {
-        for (metric, actual) in [
-            ("vm_steps", b.vm_steps as f64),
-            ("patch_ops", b.patch_ops as f64),
-            ("renders", b.renders as f64),
-            ("boot_ms", b.boot_ms),
-            ("tick_ms", b.tick_ms),
+    if let Some((_, lim)) = apps.and_then(|m| m.iter().find(|(k, _)| norm == k.as_str() || norm.ends_with(&format!("/{k}")))) {
+        for (metric, actual, is_ms) in [
+            ("vm_steps", b.vm_steps as f64, false),
+            ("patch_ops", b.patch_ops as f64, false),
+            ("renders", b.renders as f64, false),
+            ("boot_ms", b.boot_ms, true),
+            ("tick_ms", b.tick_ms, true),
         ] {
             if let Some(cap) = lim[metric].as_f64().filter(|&c| c > 0.0) {
                 let pct = actual / cap;
                 if pct >= BUDGET_WARN_PCT {
+                    let shown = if is_ms { format!("{actual:.3} / {cap}") } else { format!("{actual:.0} / {cap:.0}") };
                     out.push(RetroFinding {
                         tag: "optimize",
                         area: "budget",
                         subject: format!("{norm} ({metric})"),
-                        message: format!("{metric} is at {:.0}% of budget ({actual} / {cap})", pct * 100.0),
+                        message: format!("{metric} is at {:.0}% of budget ({shown})", pct * 100.0),
                         hint: "trim render/tick work before hitting the scripts/budget.json ceiling".into(),
                     });
                 }
@@ -562,14 +650,29 @@ fn check_data_hygiene(data: &Path, has_pii: bool, out: &mut Vec<RetroFinding>) {
             hint: "move the audit key outside `<data>` and set `TJ_AUDIT_KEY_FILE`".into(),
         });
     }
-    if has_pii && std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()).is_none() {
-        out.push(RetroFinding {
-            tag: "fix",
-            area: "security",
-            subject: data.display().to_string(),
-            message: "app declares @pii fields but TJ_KEY_FILE is not set".into(),
-            hint: "set `TJ_KEY_FILE` outside `<data>` and run `tj store rekey --data <dir>` with the server stopped".into(),
-        });
+    match std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()) {
+        None if has_pii => {
+            out.push(RetroFinding {
+                tag: "fix",
+                area: "security",
+                subject: data.display().to_string(),
+                message: "app declares @pii fields but TJ_KEY_FILE is not set".into(),
+                hint: "set `TJ_KEY_FILE` outside `<data>` and run `tj store rekey --data <dir>` with the server stopped".into(),
+            });
+        }
+        Some(path) => {
+            let key_path = PathBuf::from(&path);
+            if !audit::kept_apart(&key_path, data) {
+                out.push(RetroFinding {
+                    tag: "rotate",
+                    area: "security",
+                    subject: key_path.display().to_string(),
+                    message: "storage encryption key (TJ_KEY_FILE) sits inside the data directory".into(),
+                    hint: "move `TJ_KEY_FILE` outside `<data>` and rotate the key with `tj store rekey`".into(),
+                });
+            }
+        }
+        None => {}
     }
     if let Some(keys_path) = std::env::var_os(crate::identity::KEYS_ENV).filter(|v| !v.is_empty()) {
         let path = Path::new(&keys_path);
@@ -588,18 +691,23 @@ fn check_data_hygiene(data: &Path, has_pii: bool, out: &mut Vec<RetroFinding>) {
 }
 
 fn fetch_ops_json(url: &str) -> Result<Json, String> {
-    let mut req = ureq::get(url);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(10)).build();
+    let mut req = agent.get(url);
     if let Some(h) = auth::client_header() {
         req = req.set("Authorization", &h);
     }
-    let resp = match req.call() {
-        Ok(r) | Err(ureq::Error::Status(_, r)) => r,
+    let (status, resp) = match req.call() {
+        Ok(r) => (r.status(), r),
+        Err(ureq::Error::Status(s, r)) => (s, r),
         Err(e) => return Err(format!("cannot reach {url}: {e}")),
     };
     let text = resp.into_string().map_err(|e| e.to_string())?;
-    let body: Json = serde_json::from_str(&text).map_err(|e| format!("bad reply from {url}: {e}"))?;
+    let body: Json = serde_json::from_str(&text).map_err(|e| format!("bad reply from {url} (HTTP {status}): {e}"))?;
     if let Some(e) = body["error"].as_str() {
         return Err(format!("{url}: {e}"));
+    }
+    if status >= 400 {
+        return Err(format!("{url}: HTTP {status}"));
     }
     Ok(body["ok"].clone())
 }
@@ -617,20 +725,22 @@ mod tests {
   private used() { this.n += 1 }
   private scheduled() { this.n += 1 }
   private orphan() { this.n += 99 }
+  private selfLoop() { this.selfLoop() }
   @every("10s") private tick() {}
   @invariant ok(): boolean { return this.n >= 0 }
 }
 function App() {
   return <Column padding={16}>
+    <Text>orphan</Text>
     <Button onPress={() => {}}></Button>
   </Column>
 }
 "#;
         let mut findings = Vec::new();
         check_dead_methods(src, &mut findings);
-        assert_eq!(findings.len(), 1, "{findings:?}");
-        assert_eq!(findings[0].tag, "prune");
-        assert_eq!(findings[0].subject, "Box.orphan");
+        let dead: Vec<&str> = findings.iter().map(|f| f.subject.as_str()).collect();
+        assert_eq!(dead, vec!["Box.orphan", "Box.selfLoop"], "self-recursive & UI-string-matching private methods must still be flagged: {findings:?}");
+        assert!(findings.iter().all(|f| f.tag == "prune"));
 
         // Multi-viewport layout sweep catches the unlabelled button across all 6 viewports!
         check_layouts(src, &mut findings);

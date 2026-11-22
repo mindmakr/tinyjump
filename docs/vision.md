@@ -128,12 +128,12 @@ the goal; being in the market early, to gain momentum and contributors, is.
    - region compliance packs (done): files outside the runtime that anyone can write or
      extend, checked by `tj check --compliance`. No pack is built in; a sample GDPR pack is
      in `examples/members`.
-   - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
+   - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps", **done**):
      scoped agent keys (`--ops observe|test|maintain`), canonical manifest (`tj check --manifest`
-     / `/_tj/manifest`) and work leases (`/_tj/leases`, `tj lease`) (done); deterministic
-     trace runner (`tj test`) and `tj mcp` trace recording (`record_trace`) (done); next:
-     `tj check --against` and `@invariant`, shadow boot and rollback, size and AI-cost caps
-     and `tj retro`.
+     / `/_tj/manifest`) and work leases (`/_tj/leases`, `tj lease`), deterministic trace runner
+     (`tj test`) and `tj mcp` trace recording (`record_trace`), `tj check --against` and
+     `@invariant` with atomic rollback, shadow boot with live reload and automatic rollback
+     (`tj reload`, `tj rollback`), size/rate/fetch/AI-budget caps, and `tj retro`.
    - Then a design note on effects that already happened outside when a call is retried
      after a crash (durable effect records, or idempotency keys passed to `fetch`).
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
@@ -276,9 +276,9 @@ and upgrades keep state and connections running), **responsive** (sub-millisecon
 native frames, bounded turns), **reactive** (every state change streams in order to every
 replica, screen and subscriber) and **progressive** (one plain `.tj` file offline on day
 one, growing into modules, `@server` authority, access/privacy rules, plugins and
-compliance without a rewrite). Proposed steps (`feedback/2026-11-20-critic-001-agentic-living-apps.md`
-and `feedback/2026-11-20-critic-003-two-way-case-and-refactoring.md`; not built yet, open
-for builder pushback and owner decision after the trust work):
+compliance without a rewrite). Implemented steps
+(`feedback/2026-11-20-critic-001-agentic-living-apps.md` and
+`feedback/2026-11-20-critic-003-two-way-case-and-refactoring.md`):
 
 1. **Self-aware (built):** every app states its own contract (`tj check --manifest`,
    `GET /_tj/manifest`, `tj mcp` `manifest`: object schemas, access rules, personal-data map,

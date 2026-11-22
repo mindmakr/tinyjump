@@ -421,19 +421,20 @@ impl Runtime {
                                     self.settle(f, reply, Ok(Run::Done(Value::Null)), mark);
                                 }
                                 Ok(Run::Await(p)) => {
-                                    let ok = self.settle(f, None, Ok(Run::Await(p)), mark);
-                                    if ok {
-                                        self.reply(reply, Ok(Json::Null));
-                                    } else if reply.is_some() {
-                                        // Invariant failed before suspending; replace the trailing Output::Error with Output::Reply.
-                                        let msg = match self.outputs.last() {
-                                            Some(Output::Error { .. }) => match self.outputs.pop() {
-                                                Some(Output::Error { message, .. }) => message,
-                                                _ => unreachable!(),
-                                            },
-                                            _ => "invariant failed".into(),
-                                        };
-                                        self.reply_status(reply, 422, msg);
+                                    match self.settle(f, None, Ok(Run::Await(p)), mark) {
+                                        None => self.reply(reply, Ok(Json::Null)),
+                                        Some(status) if reply.is_some() => {
+                                            // Constraint failed before suspending; replace the trailing Output::Error with Output::Reply.
+                                            let msg = match self.outputs.last() {
+                                                Some(Output::Error { .. }) => match self.outputs.pop() {
+                                                    Some(Output::Error { message, .. }) => message,
+                                                    _ => unreachable!(),
+                                                },
+                                                _ => "turn constraint failed".into(),
+                                            };
+                                            self.reply_status(reply, status, msg);
+                                        }
+                                        Some(_) => {}
                                     }
                                 }
                                 r => {
@@ -643,53 +644,55 @@ impl Runtime {
         self.settle(f, reply, r, mark);
     }
 
-    /// Completes or suspends a fiber, enforcing `@invariant`s and atomic rollback per turn.
-    /// Returns `true` when the turn committed or suspended cleanly, `false` when rolled back.
-    pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: usize) -> bool {
+    /// Completes or suspends a fiber, enforcing `@invariant`s, per-object size caps, and atomic
+    /// rollback per turn BEFORE committing `waiting`, `park`, `ran`, or `reply`.
+    /// Returns `None` when the turn committed or suspended cleanly, or `Some(status)` when rolled back.
+    pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: usize) -> Option<u16> {
         match r {
             Ok(Run::Await(p)) => {
-                if let Err(msg) = self.check_touched_invariants() {
+                if let Err((status, msg)) = self.check_turn_constraints() {
                     self.ran(&mut f, false);
                     self.release_frames(&mut f, 0);
                     self.rollback_turn(mark);
                     self.count_error(f.stat);
-                    self.reply_invariant_err(reply, msg);
+                    self.reply_constraint_err(reply, status, msg);
                     self.flush_from(mark);
-                    return false;
+                    return Some(status);
                 }
                 self.waiting.insert(p, (f, reply));
                 self.flush_from(mark);
-                true
+                None
             }
             Ok(Run::Blocked(key)) => {
-                if let Err(msg) = self.check_touched_invariants() {
+                if let Err((status, msg)) = self.check_turn_constraints() {
                     self.ran(&mut f, false);
                     self.release_frames(&mut f, 0);
                     self.rollback_turn(mark);
                     self.count_error(f.stat);
-                    self.reply_invariant_err(reply, msg);
+                    self.reply_constraint_err(reply, status, msg);
                     self.flush_from(mark);
-                    return false;
+                    return Some(status);
                 }
                 self.park(key, f, reply);
                 self.flush_from(mark);
-                true
+                None
             }
             Ok(Run::Done(v)) => {
-                if let Err(msg) = self.check_touched_invariants() {
+                if let Err((status, msg)) = self.check_turn_constraints() {
                     self.ran(&mut f, false);
+                    self.release_frames(&mut f, 0);
                     self.rollback_turn(mark);
                     self.count_error(f.stat);
-                    self.reply_invariant_err(reply, msg);
+                    self.reply_constraint_err(reply, status, msg);
                     self.flush_from(mark);
-                    return false;
+                    return Some(status);
                 }
                 self.ran(&mut f, true);
                 if reply.is_some() {
                     self.reply(reply, v.to_json().map_err(|e| (e, None)));
                 }
                 self.flush_from(mark);
-                true
+                None
             }
             Err(fail) => {
                 self.ran(&mut f, false);
@@ -701,6 +704,7 @@ impl Runtime {
                     Some(_) => self.count_refused_slot(f.stat),
                     None => self.count_error(f.stat),
                 }
+                let status = fail.status.unwrap_or(400);
                 match (reply, fail.status) {
                     // Through `refuse_start`, so a call run once (a device's) keeps the status
                     // and no record of the refusal is kept for it.
@@ -709,15 +713,27 @@ impl Runtime {
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
                 self.flush_from(mark);
-                false
+                Some(status)
             }
         }
     }
 
-    fn reply_invariant_err(&mut self, reply: Option<u64>, msg: String) {
+    fn check_turn_constraints(&mut self) -> Result<(), (u16, String)> {
+        self.check_touched_invariants().map_err(|m| (422, m))?;
+        #[cfg(feature = "server")]
+        self.check_touched_object_sizes().map_err(|m| (413, m))?;
+        Ok(())
+    }
+
+    fn reply_constraint_err(&mut self, reply: Option<u64>, status: u16, msg: String) {
+        if status == 413 {
+            // Do not persist a `CallRecord` on an object that just exceeded its size cap.
+            self.refuse_start(reply, 413, msg);
+            return;
+        }
         match reply {
-            Some(id) if id >= CALL_REPLY_BASE => self.finish_call(id, Err((msg, None)), Some(422)),
-            Some(id) => self.reply_status(Some(id), 422, msg),
+            Some(id) if id >= CALL_REPLY_BASE => self.finish_call(id, Err((msg, None)), Some(status)),
+            Some(id) => self.reply_status(Some(id), status, msg),
             None => self.outputs.push(Output::Error { message: msg, trace: Vec::new() }),
         }
     }

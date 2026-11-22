@@ -41,7 +41,7 @@ use crate::identity::{sha256_hex, Identity};
 use crate::leases::Leases;
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -73,10 +73,16 @@ const DEFAULT_RATE_LIMIT: u32 = 600;
 const RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_KEYS: usize = 10_000;
 
-/// Sliding-window per-caller HTTP rate limiter with bounded memory.
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+    audited_at: Option<Instant>,
+}
+
+/// Constant-memory (`O(1)` per key) token-bucket HTTP rate limiter with bounded key map.
 struct RateLimiter {
     limit: u32,
-    buckets: Mutex<HashMap<String, VecDeque<Instant>>>,
+    buckets: Mutex<HashMap<String, Bucket>>,
 }
 
 impl RateLimiter {
@@ -84,33 +90,74 @@ impl RateLimiter {
         RateLimiter { limit, buckets: Mutex::default() }
     }
 
-    /// Returns `Ok(())` if allowed, or `Err(retry_after_secs)` if the caller exceeded `limit`.
-    fn check(&self, key: &str, now: Instant) -> Result<(), u64> {
+    fn refill(b: &mut Bucket, cap: f64, now: Instant) {
+        let elapsed = now.saturating_duration_since(b.last).as_secs_f64();
+        let rate = cap / RATE_WINDOW.as_secs_f64();
+        b.tokens = (b.tokens + elapsed * rate).min(cap);
+        b.last = now;
+    }
+
+    /// Cheap check whether `key` is already exhausted (short-circuits forged-token floods from
+    /// an IP before running expensive JWT signature verification).
+    fn is_exhausted(&self, key: &str, now: Instant) -> Option<u64> {
+        if self.limit == 0 {
+            return None;
+        }
+        let Ok(mut map) = self.buckets.lock() else { return None };
+        let b = map.get_mut(key)?;
+        let cap = self.limit as f64;
+        Self::refill(b, cap, now);
+        if b.tokens < 1.0 {
+            let rate = cap / RATE_WINDOW.as_secs_f64();
+            Some(((1.0 - b.tokens) / rate).ceil().max(1.0) as u64)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `Ok(())` if allowed, or `Err((retry_after_secs, audit_now))` if over limit.
+    /// `audit_now` is true at most once per caller per `RATE_WINDOW` to prevent audit flooding.
+    fn check(&self, key: &str, now: Instant) -> Result<(), (u64, bool)> {
         if self.limit == 0 {
             return Ok(());
         }
+        let cap = self.limit as f64;
+        let rate = cap / RATE_WINDOW.as_secs_f64();
         let Ok(mut map) = self.buckets.lock() else { return Ok(()) };
         if map.len() >= MAX_RATE_KEYS && !map.contains_key(key) {
-            map.retain(|_, q| {
-                while q.front().is_some_and(|&t| now.saturating_duration_since(t) >= RATE_WINDOW) {
-                    q.pop_front();
-                }
-                !q.is_empty()
+            map.retain(|_, b| {
+                Self::refill(b, cap, now);
+                b.tokens < cap - 0.001
             });
             if map.len() >= MAX_RATE_KEYS {
-                return Err(1);
+                let is_authed = !key.starts_with("ip:") && !key.starts_with("bad:");
+                let victim = if is_authed {
+                    map.iter()
+                        .filter(|(k, _)| k.starts_with("ip:") || k.starts_with("bad:"))
+                        .min_by_key(|(_, b)| b.last)
+                        .or_else(|| map.iter().min_by_key(|(_, b)| b.last))
+                        .map(|(k, _)| k.clone())
+                } else {
+                    None
+                };
+                if let Some(v) = victim {
+                    map.remove(&v);
+                } else {
+                    return Err((1, false));
+                }
             }
         }
-        let q = map.entry(key.to_string()).or_default();
-        while q.front().is_some_and(|&t| now.saturating_duration_since(t) >= RATE_WINDOW) {
-            q.pop_front();
+        let b = map.entry(key.to_string()).or_insert(Bucket { tokens: cap, last: now, audited_at: None });
+        Self::refill(b, cap, now);
+        if b.tokens < 1.0 {
+            let wait = ((1.0 - b.tokens) / rate).ceil().max(1.0) as u64;
+            let audit_now = b.audited_at.map_or(true, |t| now.saturating_duration_since(t) >= RATE_WINDOW);
+            if audit_now {
+                b.audited_at = Some(now);
+            }
+            return Err((wait, audit_now));
         }
-        if q.len() >= self.limit as usize {
-            let oldest = q.front().copied().unwrap_or(now);
-            let wait = RATE_WINDOW.saturating_sub(now.saturating_duration_since(oldest)).as_secs().max(1);
-            return Err(wait);
-        }
-        q.push_back(now);
+        b.tokens -= 1.0;
         Ok(())
     }
 }
@@ -380,30 +427,45 @@ fn handle(mut req: Request, front: &Front) {
         return;
     }
     // Per-caller HTTP rate cap on `/api/*` (`TJ_RATE_LIMIT`, default 600/min on `tj serve`).
-    // Verify the credential at most once and reuse it below so OIDC JWTs are not checked twice.
+    // Anonymous requests and IPs already flooding invalid tokens are limited before running
+    // JWT verification; valid credentials are verified once and reused below.
     let mut api_verified: Option<Result<crate::identity::Verified, Failure>> = None;
     if segs.first() == Some(&"api") && front.rate.limit > 0 {
-        let verified = front.identity.verify(authorization.as_deref());
-        let rate_key = match &verified {
-            Ok(v) => match &v.caller {
-                Caller::Remote { id, .. } if !id.is_empty() => id.clone(),
-                _ => format!("ip:{}", client_ip(&req, front.trust_proxy)),
-            },
-            Err(_) => format!("ip:{}", client_ip(&req, front.trust_proxy)),
-        };
-        if let Err(retry_after) = front.rate.check(&rate_key, started) {
-            let who = match &verified {
-                Ok(v) => Actor::of(&v.caller),
-                Err(_) => Actor::Invalid,
-            };
-            let _ = front.audit.security(Entry::new("refused").who(who).text("request", "rate limit").num("status", 429));
+        let respond_429 = |req: Request, retry_after: u64, who: Option<Actor>| {
+            if let Some(who) = who {
+                front.audit.record(Entry::new("refused").who(who).text("request", "rate limit").num("status", 429));
+            }
             let resp = json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
                 .with_header(header("Retry-After", &retry_after.to_string()));
             let _ = req.respond(resp);
             front.engine.stats().request(started.elapsed(), false);
-            return;
+        };
+        if authorization.is_none() {
+            let ip_key = format!("ip:{}", client_ip(&req, front.trust_proxy));
+            if let Err((retry_after, audit_now)) = front.rate.check(&ip_key, started) {
+                respond_429(req, retry_after, audit_now.then_some(Actor::Anonymous));
+                return;
+            }
+        } else {
+            let bad_key = format!("bad:{}", client_ip(&req, front.trust_proxy));
+            if let Some(retry_after) = front.rate.is_exhausted(&bad_key, started) {
+                respond_429(req, retry_after, None);
+                return;
+            }
+            let verified = front.identity.verify(authorization.as_deref());
+            let (rate_key, actor) = match &verified {
+                Ok(v) => match &v.caller {
+                    Caller::Remote { id, .. } if !id.is_empty() => (id.clone(), Actor::of(&v.caller)),
+                    _ => (format!("ip:{}", client_ip(&req, front.trust_proxy)), Actor::Anonymous),
+                },
+                Err(_) => (bad_key, Actor::Invalid),
+            };
+            if let Err((retry_after, audit_now)) = front.rate.check(&rate_key, started) {
+                respond_429(req, retry_after, audit_now.then_some(actor));
+                return;
+            }
+            api_verified = Some(verified);
         }
-        api_verified = Some(verified);
     }
     let method = req.method().clone();
     let engine = &front.engine;
@@ -920,10 +982,15 @@ fn release(front: &Front, slot: Option<&str>) {
     }
 }
 
+/// Client IP address: behind a single trusted reverse proxy (`TJ_TRUST_PROXY=1`), uses the
+/// rightmost valid IP in `X-Forwarded-For` (the entry appended by the proxy, not an
+/// attacker-controlled leftmost value), falling back to the peer socket address.
 fn client_ip(req: &Request, trust_proxy: bool) -> String {
     if trust_proxy {
-        if let Some(first) = header_value(req, "X-Forwarded-For").and_then(|v| v.split(',').next().map(|s| s.trim().to_string())) {
-            return first;
+        if let Some(ip) = header_value(req, "X-Forwarded-For")
+            .and_then(|v| v.rsplit(',').map(str::trim).find(|s| !s.is_empty()).and_then(|s| s.parse::<std::net::IpAddr>().ok()))
+        {
+            return ip.to_string();
         }
     }
     req.remote_addr().map_or_else(|| "unknown".into(), |a| a.ip().to_string())
@@ -1357,7 +1424,9 @@ mod tests {
         let (audit, _) = Audit::start(&data).unwrap();
         let engine = Engine::start(src.into(), data.clone(), false, false, Arc::default(), audit.clone()).unwrap();
         let leases = Leases::open(&data);
-        let front = Arc::new(Front::new(engine, None, None, Automation::Open, Identity::anonymous(), audit, leases, false).with_rate_limit(2));
+        let mut front = Front::new(engine, None, None, Automation::Open, Identity::anonymous(), audit, leases, false).with_rate_limit(2);
+        front.trust_proxy = true;
+        let front = Arc::new(front);
         let server = Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap();
         let f = front.clone();
@@ -1369,26 +1438,41 @@ mod tests {
 
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
         let url = format!("http://{addr}/api/Ping/p1/hit");
-        // First 2 requests succeed.
-        assert_eq!(agent.post(&url).set("Content-Type", "application/json").send_string("[]").unwrap().status(), 200);
-        assert_eq!(agent.post(&url).set("Content-Type", "application/json").send_string("[]").unwrap().status(), 200);
-        // 3rd request within the 60s window returns 429 with `Retry-After`.
-        match agent.post(&url).set("Content-Type", "application/json").send_string("[]") {
-            Err(ureq::Error::Status(429, resp)) => {
-                assert!(resp.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n >= 1));
+        // C-039.2: Spoofing different leftmost `X-Forwarded-For` entries cannot bypass the limit
+        // because `client_ip` reads the proxy-appended rightmost valid IP (`203.0.113.9`).
+        assert_eq!(agent.post(&url).set("Content-Type", "application/json").set("X-Forwarded-For", "1.1.1.1, 203.0.113.9").send_string("[]").unwrap().status(), 200);
+        assert_eq!(agent.post(&url).set("Content-Type", "application/json").set("X-Forwarded-For", "2.2.2.2, 203.0.113.9").send_string("[]").unwrap().status(), 200);
+        // 3rd and 4th requests within the window return 429 with `Retry-After`.
+        for fake in ["3.3.3.3, 203.0.113.9", "4.4.4.4, 203.0.113.9"] {
+            match agent.post(&url).set("Content-Type", "application/json").set("X-Forwarded-For", fake).send_string("[]") {
+                Err(ureq::Error::Status(429, resp)) => {
+                    assert!(resp.header("Retry-After").and_then(|s| s.parse::<u64>().ok()).is_some_and(|n| n >= 1));
+                }
+                other => panic!("expected 429, got {other:?}"),
             }
-            other => panic!("expected 429, got {other:?}"),
         }
         // `/_tj/*` is exempt from the `/api/*` caller rate limit so operators can still inspect!
         assert_eq!(agent.get(&format!("http://{addr}/_tj/manifest")).call().unwrap().status(), 200);
 
-        let entries: String = std::fs::read_dir(data.join("audit"))
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl"))
-            .map(|e| std::fs::read_to_string(e.path()).unwrap())
-            .collect();
-        assert!(entries.contains("\"request\":\"rate limit\"") && entries.contains("\"status\":429"), "{entries}");
+        // Wait briefly for the non-blocking audit writer to flush; verify at most ONE 429 entry
+        // was recorded in the window (C-039.3: no audit-fsync flood).
+        let read_audit = || -> String {
+            std::fs::read_dir(data.join("audit"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl"))
+                .map(|e| std::fs::read_to_string(e.path()).unwrap())
+                .collect()
+        };
+        let mut entries = String::new();
+        for _ in 0..30 {
+            entries = read_audit();
+            if entries.contains("\"request\":\"rate limit\"") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(entries.matches("\"request\":\"rate limit\"").count(), 1, "expected exactly 1 deduplicated 429 audit entry: {entries}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

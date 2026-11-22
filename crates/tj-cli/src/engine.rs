@@ -98,15 +98,42 @@ fn max_object_bytes_from_env() -> usize {
     std::env::var(MAX_OBJECT_BYTES_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
 }
 
-pub(crate) fn parse_fetch_allow(spec: &str) -> Vec<String> {
-    spec.split(',')
-        .map(|s| s.trim().trim_end_matches('.').to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect()
+pub(crate) fn parse_fetch_allow(spec: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for raw in spec.split(',') {
+        let mut s = raw.trim().to_ascii_lowercase();
+        if s.is_empty() {
+            continue;
+        }
+        if let Some(inner) = s.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+            s = inner.to_string();
+        }
+        let s = s.trim_end_matches('.').to_string();
+        let invalid_chars = s.is_empty()
+            || s.contains("://")
+            || s.contains('/')
+            || s.contains('?')
+            || s.contains('#')
+            || s.chars().any(char::is_whitespace);
+        // Reject `host:port` (unless the whole entry is a valid bare IPv6 address).
+        let has_port = s.contains(':') && s.parse::<std::net::Ipv6Addr>().is_err();
+        let bad_wild = s.starts_with('*') && !s.strip_prefix("*.").is_some_and(|d| !d.is_empty() && !d.contains('*'));
+        if invalid_chars || has_port || bad_wild || (!s.starts_with("*.") && s.contains('*')) {
+            return Err(format!("{FETCH_ALLOW_ENV}: invalid host entry {raw:?} (use bare hostnames like `api.example.com`, `*.example.com`, or an IP address)"));
+        }
+        out.push(s);
+    }
+    if out.is_empty() {
+        return Err(format!("{FETCH_ALLOW_ENV} is set but contains no hosts (unset it to allow any public host)"));
+    }
+    Ok(out)
 }
 
-fn fetch_allow_from_env() -> Vec<String> {
-    std::env::var(FETCH_ALLOW_ENV).ok().map(|s| parse_fetch_allow(&s)).unwrap_or_default()
+fn fetch_allow_from_env() -> Result<Vec<String>, String> {
+    match std::env::var(FETCH_ALLOW_ENV) {
+        Ok(s) if !s.is_empty() => parse_fetch_allow(&s),
+        _ => Ok(Vec::new()),
+    }
 }
 
 struct Booted {
@@ -156,7 +183,7 @@ impl Engine {
         let shared_ref = shared_slot.clone();
         let live_source = Arc::new(Mutex::new(source.clone()));
         let live_source_ref = live_source.clone();
-        let fetch_allow = fetch_allow_from_env();
+        let fetch_allow = fetch_allow_from_env()?;
         let fetch_allowlist = !fetch_allow.is_empty();
         thread::Builder::new()
             .name("tj-runtime".into())
@@ -1314,10 +1341,11 @@ import { erase, exportData } from "tj:privacy"
 
     #[test]
     fn fetch_allowlist_matches_exact_and_strict_subdomains_and_blocks_disallowed() {
-        let allow = vec!["api.example.com".to_string(), "*.partner.org".to_string()];
-        // Exact host match (case-insensitive, with port or trailing dot).
+        let allow = parse_fetch_allow("api.example.com, *.partner.org, [2606:4700::1111]").unwrap();
+        // Exact host match (case-insensitive, with port or trailing dot) and normalized IPv6 literal.
         assert!(netloc_allowed("api.example.com:443", &allow));
         assert!(netloc_allowed("API.EXAMPLE.COM.:80", &allow));
+        assert!(netloc_allowed("[2606:4700::1111]:443", &allow));
         assert!(!netloc_allowed("sub.api.example.com:443", &allow));
         assert!(!netloc_allowed("evilapi.example.com:443", &allow));
         // Strict wildcard subdomain match: bare apex and suffix-spoofing rejected.
@@ -1325,6 +1353,10 @@ import { erase, exportData } from "tj:privacy"
         assert!(netloc_allowed("a.b.partner.org:443", &allow));
         assert!(!netloc_allowed("partner.org:443", &allow));
         assert!(!netloc_allowed("evilpartner.org:443", &allow));
+        // Malformed / whitespace-only env entries fail startup instead of failing open (C-039.4).
+        assert!(parse_fetch_allow(" , ").is_err());
+        assert!(parse_fetch_allow("https://api.example.com").is_err());
+        assert!(parse_fetch_allow("api.example.com:443").is_err());
         // URL parsing including userinfo stripping.
         assert!(url_host_allowed("https://api.example.com/v1/ok?x=1", &allow));
         assert!(url_host_allowed("https://user:pass@hooks.partner.org:8443/cb", &allow));
@@ -1345,5 +1377,43 @@ import { erase, exportData } from "tj:privacy"
         .unwrap_err();
         assert!(err.contains(FETCH_ALLOW_ENV), "{err}");
         assert!(!err.contains("TOPSECRET") && !err.contains("evil.com"), "error must not leak URL: {err}");
+
+        // C-039.4: end-to-end HTTP 302 redirect from an allowed host (127.0.0.1) to a disallowed
+        // host is caught and blocked by `ureq`'s `.resolver(...)`.
+        let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = srv.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok(req) = srv.recv() {
+                let loc = tiny_http::Header::from_bytes(&b"Location"[..], &b"http://disallowed.example.invalid/secret"[..]).unwrap();
+                let _ = req.respond(tiny_http::Response::empty(302).with_header(loc));
+            }
+        });
+        let local_allow = Arc::new(parse_fetch_allow("127.0.0.1").unwrap());
+        let a_ref = local_allow.clone();
+        let redirect_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(5))
+            .resolver(move |netloc: &str| {
+                if !netloc_allowed(netloc, &a_ref) {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("blocked by {FETCH_ALLOW_ENV}")));
+                }
+                use std::net::ToSocketAddrs;
+                Ok(netloc.to_socket_addrs()?.collect())
+            })
+            .build();
+        let redir_err = perform(
+            &redirect_agent,
+            &Plugins::default(),
+            &local_allow,
+            Effect::Http {
+                url: format!("http://127.0.0.1:{port}/start"),
+                method: "GET".into(),
+                headers: Json::Null,
+                body: None,
+            },
+        )
+        .unwrap_err();
+        assert!(redir_err.contains("the request failed"), "redirect to disallowed host must fail: {redir_err}");
+        assert!(!redir_err.contains("disallowed.example.invalid"), "redirect error must not leak URL: {redir_err}");
+        let _ = handle.join();
     }
 }

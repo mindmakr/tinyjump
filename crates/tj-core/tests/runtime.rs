@@ -3394,4 +3394,50 @@ fn per_object_byte_cap_rejects_growth_atomically_allows_shrinking_and_reports_ma
     // ...but shrinking/clearing succeeds!
     assert_eq!(call_as(&mut rt_tight, 22.0, "Log/l1", "clear", json!([]), who("", &[])).unwrap(), json!(0));
     assert_eq!(state(&mut rt_tight, 23.0, "Log/l1")["items"], json!([]));
+
+    // C-039.1 & C-039.6: async + @exclusive hitting max_object_bytes before `await` must NOT leak
+    // the fiber or deadlock the @exclusive lock, must count the error, and must reject `invoke()`.
+    let async_src = r#"//# file: app.tj
+import { callPeer } from "tj:helper"
+@server @read("anyone") object Vault {
+  items: string[] = []
+  @allow("anyone") @exclusive async bloatThenFetch(s: string): string {
+    this.items.push(s)
+    await fetch("https://example.com/slow")
+    return "ok"
+  }
+  @allow("anyone") @exclusive ping(): string { return "pong" }
+  @allow("anyone") push(s: string): string { this.items.push(s); return "pushed" }
+  @allow("anyone") pop(): number { this.items.pop(); return this.items.length }
+  @allow("anyone") async viaInvoke(s: string): string {
+    return await callPeer("Vault/v1", "push", [s])
+  }
+}
+//# file: tj:helper
+export async function callPeer(obj: string, m: string, a: any[]): any {
+  return await invoke(obj, m, a)
+}
+"#;
+    let s2 = Shared::default();
+    let mut rt2 = Runtime::boot(compile(async_src).unwrap(), Box::new(s2.clone()), Options { server: true, render: false, max_object_bytes: 160, ..Options::new(0.0, 7) }).unwrap().0;
+    let out = rt2.handle(1.0, Input::Call { object: "Vault/v1".into(), method: "bloatThenFetch".into(), args: vec![json!("z".repeat(200))], reply: Some(10), call: Some("cid-1".into()), caller: who("", &[]) });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 10, status: Some(413), .. })), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Effect { .. })), "rolled-back async turn must not emit Effect: {out:?}");
+    // `@exclusive` lock was released: next exclusive call succeeds immediately!
+    assert_eq!(call_as(&mut rt2, 2.0, "Vault/v1", "ping", json!([]), who("", &[])).unwrap(), json!("pong"));
+    assert_eq!(rt2.stats()["methods"]["Vault.bloatThenFetch"]["errors"], json!(1), "413 must increment error count");
+
+    // `invoke()` promise rejects when the invoked method exceeds `max_object_bytes`.
+    let inv_err = call_as(&mut rt2, 3.0, "Vault/v1", "viaInvoke", json!(["z".repeat(200)]), who("", &[])).unwrap_err();
+    assert!(inv_err.1.contains("limit"), "invoke() must reject on 413: {inv_err:?}");
+
+    // C-039.6(3): on an already-oversized object, a small shrink with `Idempotency-Key` succeeds
+    // even though the `CallRecord` itself adds ~120 bytes to the outer wrapper!
+    let mut rt_unbounded = Runtime::boot(compile(async_src).unwrap(), Box::new(s2.clone()), Options { server: true, render: false, max_object_bytes: 0, ..Options::new(10.0, 7) }).unwrap().0;
+    call_as(&mut rt_unbounded, 11.0, "Vault/v2", "push", json!(["a".repeat(200)]), who("", &[])).unwrap();
+    call_as(&mut rt_unbounded, 12.0, "Vault/v2", "push", json!(["b"]), who("", &[])).unwrap();
+    drop(rt_unbounded);
+    let mut rt_shr = Runtime::boot(compile(async_src).unwrap(), Box::new(s2.clone()), Options { server: true, render: false, max_object_bytes: 160, ..Options::new(20.0, 7) }).unwrap().0;
+    let out_pop = rt_shr.handle(21.0, Input::Call { object: "Vault/v2".into(), method: "pop".into(), args: vec![], reply: Some(99), call: Some("shrink-call-1".into()), caller: who("", &[]) });
+    assert!(out_pop.iter().any(|o| matches!(o, Output::Reply { reply: 99, ok: Some(v), error: None, .. } if v == &json!(1))), "shrinking state with Idempotency-Key must succeed: {out_pop:?}");
 }

@@ -77,7 +77,8 @@ pub fn load(entry: &Path, overrides: &[String]) -> Result<Plugins, String> {
             let max_calls_per_hour = match c.get("maxCallsPerHour") {
                 None | Some(Json::Null) => default_budget(name),
                 Some(v) => {
-                    let n = v.as_u64().ok_or_else(|| format!("plugin {name} \"maxCallsPerHour\" must be a non-negative integer"))? as usize;
+                    let raw = v.as_u64().ok_or_else(|| format!("plugin {name} \"maxCallsPerHour\" must be a non-negative integer"))?;
+                    let n = usize::try_from(raw).map_err(|_| format!("plugin {name} \"maxCallsPerHour\" is too large"))?;
                     (n > 0).then_some(n)
                 }
             };
@@ -96,9 +97,10 @@ pub fn load(entry: &Path, overrides: &[String]) -> Result<Plugins, String> {
 }
 
 fn default_budget(name: &str) -> Option<usize> {
-    let specific = (name == "ai").then(|| std::env::var(AI_BUDGET_ENV).ok()).flatten();
-    let fallback = std::env::var(PLUGIN_BUDGET_ENV).ok();
-    specific.or(fallback).and_then(|v| v.parse::<usize>().ok()).filter(|&n| n > 0)
+    let env_nonempty = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+    let specific = (name == "ai").then(|| env_nonempty(AI_BUDGET_ENV)).flatten();
+    let fallback = env_nonempty(PLUGIN_BUDGET_ENV);
+    specific.or(fallback).and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0)
 }
 
 impl Plugins {
