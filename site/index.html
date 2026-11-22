@@ -161,10 +161,10 @@
     <section>
       <h2>Measured, not claimed</h2>
       <div class="numbers">
-        <div class="num"><b>700 KB</b><span>web runtime, compiler included (266 KB compressed)</span></div>
-        <div class="num"><b>~1 MB</b><span>native library per Android CPU type (690 KB on 32-bit ARM)</span></div>
+        <div class="num"><b>781 KB</b><span>web runtime, compiler included (298 KB compressed)</span></div>
+        <div class="num"><b>~1 MB</b><span>native library per Android CPU type (743 KB on 32-bit ARM)</span></div>
         <div class="num"><b>&lt;0.2 ms</b><span>to boot each example app on a laptop (<code>tj bench</code>)</span></div>
-        <div class="num"><b>130</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
+        <div class="num"><b>194</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
         <div class="num"><b>Android 5</b><span>and up, iOS 13 and up, and 2019-era browsers</span></div>
         <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM</span></div>
       </div>
@@ -184,11 +184,11 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Checking where personal data flows, retention, and per-person keys so an erasure reaches backups too.</li>
-          <li>Compliance packs for the EU, Saudi Arabia, the wider MENA region and the US, which others can extend.</li>
-          <li>Servers that talk to each other, and webhooks.</li>
-          <li>More native components (navigation, long lists, forms), translations, and one-command app builds.</li>
-          <li>GPU graphics and 3D, as an optional module.</li>
+          <li>Living-app tooling: app manifests, scoped agent keys, deterministic trace tests (<code>tj test</code>), schema compatibility checks, <code>@invariant</code>, shadow boot with rollback, and <code>tj retro</code>.</li>
+          <li>A registry of small, typed, agent-ported libraries.</li>
+          <li>Servers that talk to each other (replicated objects) and webhooks.</li>
+          <li>More native components (navigation, long lists, custom native views), translations, and one-command app builds (<code>tj build</code>).</li>
+          <li>Device capabilities and calls as plugins, plus optional GPU graphics and 3D (<code>wgpu</code>).</li>
         </ul>
       </div>
     </section>
@@ -197,7 +197,10 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
-          <li><b>Personal data, marked and masked.</b> <code>@pii("contact", "account")</code> marks a field with its category and purpose. Its owner reads it; other readers and every tool, agents included, see <code>•••</code>. <code>tj privacy export</code> and <code>erase</code> act on everything held about one person, erasures reach their devices like any other change, and the audit log forgets them. <code>tj check --privacy</code> prints the data map. Still to come, and said so in the docs: checking where personal data flows in code, retention, and backups.</li>
+          <li><b>Milestone 1 booking app, across all four platforms.</b> A 283-line booking app (<code>examples/booking/app.tj</code>) proven through three blind build/review rounds — staff publish slots, customers book and cancel with <code>@exclusive</code> double-booking guards, external check webhooks, keyed reminder alarms, offline queuing and full subject rights — verified live on the web, Android emulator, iOS Simulator and Linux <code>tj serve</code>.</li>
+          <li><b>Forms, dates, queries, per-field rules and deletion.</b> Built-in <code>Time</code> arithmetic and typed date/number inputs, <code>Class.all()</code> live queries, <code>this.delete()</code>, keyed alarms (<code>this.schedule("remind", ...)</code>), per-field <code>@read</code> rules with <code>"self"</code> presence masking and <code>"none"</code> server-only fields, <code>Form</code>/<code>FormInput</code>/<code>Actions</code> in <code>tj:ui</code>, and <code>check()</code> validation errors that keep their field name across server RPCs and retries.</li>
+          <li><b>Personal-data flow checks, retention, per-person keys and compliance packs.</b> Compile-time flow checking tracks <code>@pii</code> across functions, components and <code>tj:ui</code> so personal data cannot reach <code>fetch</code>, logs, errors or plugins without <code>reveal(value, purpose)</code>, while letting a person view their own <code>exportData(caller.id)</code> on screen. Includes <code>@retain</code>, <code>@legalHold</code>, per-person encryption keys (crypto-shredded on erase), <code>@by</code> shared lists, <code>tj:consent</code> with <code>@needs</code>, <code>const lawfulBasis</code>, GDPR article 30 records (<code>tj check --privacy --record</code>), and extensible data-only compliance packs (<code>tj check --compliance</code>, <code>tj serve --compliance</code>).</li>
+          <li><b>Personal data, marked and masked.</b> <code>@pii("contact", "account")</code> marks a field with its category and purpose. Its owner (and any readers the field names) reads it; other readers and every tool, agents included, see <code>•••</code>. <code>tj privacy export</code> and <code>erase</code> act on everything held about one person, erasures reach their devices like any other change, and the audit log forgets them.</li>
           <li><b>Encrypted at rest, and secrets for apps.</b> Set <code>TJ_KEY_FILE</code> and every stored object is sealed with AES-256-GCM under its own key; file names reveal nothing, and keys change without re-encrypting. Apps get <code>crypto.randomId()</code>, <code>crypto.hmac()</code> and <code>crypto.timingSafeEqual()</code>, backed by secure random bytes from every host. A server reachable from other machines refuses credentials over plain HTTP. On the way we fixed an older flaw: a record that could not be read made its object start empty, and its next save overwrote it. Now the call fails instead.</li>
           <li><b>An audit log that shows tampering.</b> Every API call, refusal, admin request, timer, alarm, agent tool and plugin call is written down: who, what, the outcome and the time taken, never values. Each line is chained to the one before with a keyed hash, and signed checkpoints can be copied off the machine. <code>tj audit verify</code> finds a changed, removed or reordered line, and with that copy, a history rewritten by someone holding the key. People appear as random tokens, so forgetting someone does not mean editing the log.</li>
           <li><b>One call at a time, where it matters.</b> Mark a method <code>@exclusive</code> and an object runs one such call at a time, like an actor, even across <code>await</code>. Three payments of 60 from a balance of 100, sent at once: one goes through instead of all three. Calls that would wait for each other fail at once instead of hanging, and an agent's tools never wait for the agent.</li>

@@ -34,11 +34,17 @@ cargo tj check examples/durable-cart/app.tj --access   # who may read and call w
 
 Examples (`cargo tj dev examples/<name>/app.tj`):
 
+- **booking:** end-to-end appointment booking (283 lines): staff publish slots, customers
+  save profiles, book and cancel with `@exclusive` guards, keyed reminder alarms, `Form`
+  and `Actions` in `tj:ui`, per-field `@read` rules with `"self"` presence masking,
+  `@pii`/`@retain`, `tj:privacy` export/erase and a sample GDPR compliance check.
 - **durable-cart:** one cart shared by every device, the backend, the HTTP API and AI agents.
   Change it anywhere, and every subscribed screen updates at once. Held stock is released
   by a durable timer on the backend. A shop assistant changes the cart in plain words
   through the `tj:ai` plugin (set `ANTHROPIC_API_KEY`, or run with
   `--plugin ai=fake:examples/durable-cart/fake-ai.json`). Staff restock with an API key.
+- **members:** personal data (`@pii`), consent (`tj:consent` + `@needs`) and a sample GDPR
+  compliance pack (`examples/members/gdpr-eu.sample.json`).
 - **smart-meter:** an event-driven workflow. Timer readings, API readings, actions and
   durable alarms move it between normal, high and alert, and every step notifies
   subscribers.
@@ -50,9 +56,11 @@ browsers. `Room` is an `@server` object: it lives on the server, and each device
 live, offline-cached replica of it.
 
 Other commands: `tj docs` (the language reference, for agents), `tj check app.tj` (compile
-errors with fix hints and types), `tj bench app.tj` (timings and work counters) and
-`tj serve app.tj` (backend only; add `--host 0.0.0.0` to expose it; its automation needs `TJ_ADMIN_KEY`). Apps can span several
-files with `import { Cart } from "./cart"`.
+errors with fix hints, types, `--access`, `--privacy`, `--record` and `--compliance`),
+`tj bench app.tj` (timings and work counters), `tj audit verify` (tamper-evident audit log)
+and `tj serve app.tj` (backend, plus `--web` to serve the browser app; add `--host 0.0.0.0`
+to expose it; its automation needs `TJ_ADMIN_KEY`). Apps can span several files with
+`import { Cart } from "./cart"`.
 
 Testing and agents: `tj review --target <url>` checks a running app for layout,
 accessibility and contrast problems and prints its work counters. `tj mcp --target <url>`
@@ -109,7 +117,8 @@ docs/            vision, language, host protocol
 
 - [Vision and guardrails](docs/vision.md)
 - [Language](docs/language.md), written for people and AI agents
-- [Host protocol](docs/host-protocol.md), for building a host on a new platform
+- [Access control](docs/access-control.md), [Personal data](docs/privacy.md), [Compliance](docs/compliance.md) and [Trust](docs/trust.md)
+- [Plugins](docs/plugins.md) and [Host protocol](docs/host-protocol.md), for building a host on a new platform
 
 ## Develop
 
