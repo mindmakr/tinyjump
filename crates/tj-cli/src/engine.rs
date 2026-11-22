@@ -1026,7 +1026,7 @@ fn url_host_allowed(url: &str, allowed: &[String]) -> bool {
 /// The public addresses of `netloc` (`host:port`): a server's `fetch` must not reach this
 /// machine, its private network or the cloud metadata service (169.254.169.254), where an
 /// app's URL argument or an agent's prompt could otherwise read internal data.
-fn public_only(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+pub(crate) fn public_only(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
     use std::net::ToSocketAddrs;
     let public: Vec<_> = netloc.to_socket_addrs()?.filter(|a| is_public(a.ip())).collect();
     if public.is_empty() {
