@@ -3713,4 +3713,199 @@ object Local {
     let eff_ok = ok_out.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).expect("retry after disk recovery must emit Effect");
     let done_out = frt.handle(5.0, Input::EffectDone { id: eff_ok, ok: Some(json!({ "status": 200, "headers": {}, "body": "" })), error: None, field: None, unreachable: false });
     assert!(done_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(v), .. } if *v == json!(2))), "{done_out:?}");
+
+    // 4. Critic 048 regressions (IK-1..IK-6):
+    // IK-5: `@invariant` on `@server`, `crypto["idempotencyKey"]`, and `const { idempotencyKey } = crypto` fail compile!
+    assert!(compile("@server object O { @invariant ok(): boolean { return crypto.idempotencyKey(\"x\").length > 0 } }").is_err());
+    assert!(compile("function f() { return crypto[\"idempotencyKey\"](\"x\") }").is_err());
+    assert!(compile("function f() { const { idempotencyKey } = crypto; return idempotencyKey(\"x\") }").is_err());
+
+    // IK-1: device `Run::Await` flush failure after `remote_call` drops the outbox entry from
+    // memory & disk (`tj:outbox`) so future RPCs are NOT wedged and restart sends NO phantom RPC!
+    let dev_src = r#"
+@server @read("anyone") object Remote {
+  n: number = 0
+  @allow("anyone") inc(): number { this.n += 1; return this.n }
+}
+object Draft {
+  text: string = ""
+  async saveAndSend(t: string): number {
+    this.text = t
+    return await Remote.get("r1").inc()
+  }
+}
+"#;
+    struct FailDraftSave {
+        inner: Shared,
+        fail_draft: StdRc<Cell<bool>>,
+    }
+    impl Store for FailDraftSave {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_draft.get() && key.starts_with("Draft/") {
+                return Err("disk full".into());
+            }
+            self.inner.save(key, value)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let dev_store = Shared::default();
+    let fail_draft = StdRc::new(Cell::new(true));
+    let mut drt = Runtime::boot(
+        compile(dev_src).unwrap(),
+        Box::new(FailDraftSave { inner: dev_store.clone(), fail_draft: fail_draft.clone() }),
+        Options { server: false, render: false, ..Options::new(1.0, 3) },
+    )
+    .unwrap()
+    .0;
+    let d_fail = drt.handle(2.0, Input::Call { object: "Draft/d1".into(), method: "saveAndSend".into(), args: vec![json!("hi")], reply: Some(1), call: None, caller: None });
+    assert!(d_fail.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "{d_fail:?}");
+    assert!(!d_fail.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { .. }, .. })), "aborted turn must not emit Effect::Call: {d_fail:?}");
+    // Restart device from same store: NO phantom RPC dispatched from `tj:outbox`!
+    let (mut drt2, boot_out) = Runtime::boot(
+        compile(dev_src).unwrap(),
+        Box::new(FailDraftSave { inner: dev_store.clone(), fail_draft: fail_draft.clone() }),
+        Options { server: false, render: false, ..Options::new(3.0, 4) },
+    )
+    .unwrap();
+    let tick_out = drt2.handle(4.0, Input::Tick);
+    assert!(!boot_out.iter().chain(&tick_out).any(|o| matches!(o, Output::Effect { effect: Effect::Call { .. }, .. })), "no phantom RPC on restart");
+    // Disk recovers: subsequent call on `Draft/d1` dispatches cleanly (no head-of-line wedge)!
+    fail_draft.set(false);
+    let d_ok = drt2.handle(5.0, Input::Call { object: "Draft/d1".into(), method: "saveAndSend".into(), args: vec![json!("ok")], reply: Some(2), call: None, caller: None });
+    assert!(d_ok.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { object, method, .. }, .. } if object == "Remote/r1" && method == "inc")), "{d_ok:?}");
+
+    // IK-2 & IK-3 & IK-6: catch-and-rethrow preserves `retryable: true` / `503` (uncached);
+    // `invoke()` propagates `503` without caching 400; cross-object, cross-method & NUL/colon framing isolation!
+    let ik_src = r#"
+//# file: app.tj
+import { callInner } from "tj:helper"
+@server @read("anyone") object Service {
+  @allow("anyone") keyFor(label: string): string { return crypto.idempotencyKey(label) }
+  @allow("anyone") keyForOther(label: string): string { return crypto.idempotencyKey(label) }
+  @allow("anyone") async catchAndRethrow(): string {
+    try {
+      await fetch("https://api.example.com/flaky")
+      return "ok"
+    } catch (e) {
+      check(e.retryable === true, "net", "expected retryable flag")
+      throw e
+    }
+  }
+  @allow("anyone") async outerInvoke(): any {
+    return await callInner("Service/s1", "catchAndRethrow", [])
+  }
+}
+//# file: tj:helper
+export async function callInner(obj: string, m: string, args: any[]): any {
+  return await invoke(obj, m, args)
+}
+"#;
+    let ik_store = Shared::default();
+    let mut irt = Runtime::boot(compile(ik_src).unwrap(), Box::new(ik_store.clone()), Options { server: true, render: false, ..Options::new(1.0, 9) }).unwrap().0;
+
+    // IK-3: catch-and-rethrow preserves `e.retryable === true` and returns 503 WITHOUT caching CallRecord!
+    let r1 = irt.handle(2.0, Input::Call { object: "Service/s1".into(), method: "catchAndRethrow".into(), args: vec![], reply: Some(1), call: Some("rethrow-1".into()), caller: who("alice", &[]) });
+    let e1 = r1.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let r1_done = irt.handle(3.0, Input::EffectDone { id: e1, ok: None, error: Some("conn reset".into()), field: None, unreachable: true });
+    assert!(r1_done.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "rethrown transport error must stay 503: {r1_done:?}");
+    // Retry same call_id "rethrow-1" runs again (not cached as 400)!
+    let r1_retry = irt.handle(4.0, Input::Call { object: "Service/s1".into(), method: "catchAndRethrow".into(), args: vec![], reply: Some(2), call: Some("rethrow-1".into()), caller: who("alice", &[]) });
+    assert!(r1_retry.iter().any(|o| matches!(o, Output::Effect { .. })), "503 must not have been cached: {r1_retry:?}");
+
+    // IK-2: `invoke()` propagates 503 so outer `call_once` also returns 503 without caching!
+    let r2 = irt.handle(5.0, Input::Call { object: "Service/s2".into(), method: "outerInvoke".into(), args: vec![], reply: Some(3), call: Some("inv-503".into()), caller: who("alice", &[]) });
+    let e2 = r2.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let r2_done = irt.handle(6.0, Input::EffectDone { id: e2, ok: None, error: Some("timeout".into()), field: None, unreachable: true });
+    assert!(r2_done.iter().any(|o| matches!(o, Output::Reply { reply: 3, status: Some(503), .. })), "invoke() must propagate 503: {r2_done:?}");
+    let r2_retry = irt.handle(7.0, Input::Call { object: "Service/s2".into(), method: "outerInvoke".into(), args: vec![], reply: Some(4), call: Some("inv-503".into()), caller: who("alice", &[]) });
+    assert!(r2_retry.iter().any(|o| matches!(o, Output::Effect { .. })), "invoke 503 must not cache CallRecord: {r2_retry:?}");
+
+    // IK-6: cross-object, cross-method, and NUL/colon framing isolation!
+    let get_key = |obj: &str, method: &str, call_id: &str, label: &str| -> String {
+        // Snapshot `ik_store` (sharing `tj:secret`) by value so each probe starts with a clean CallRecord table.
+        let snap = ik_store.0.borrow().clone();
+        let mut r = Runtime::boot(compile(ik_src).unwrap(), Box::new(snap), Options { server: true, render: false, ..Options::new(10.0, 9) }).unwrap().0;
+        let out = r.handle(11.0, Input::Call { object: obj.into(), method: method.into(), args: vec![json!(label)], reply: Some(1), call: Some(call_id.into()), caller: who("alice", &[]) });
+        out.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::String(s)), .. } => Some(s.clone()), _ => None }).unwrap_or_else(|| panic!("expected key reply, got {out:?}"))
+    };
+    let k_base = get_key("Service/a", "keyFor", "c1", "l1");
+    assert_ne!(k_base, get_key("Service/b", "keyFor", "c1", "l1"), "cross-object isolation");
+    assert_ne!(k_base, get_key("Service/a", "keyForOther", "c1", "l1"), "cross-method isolation");
+    // Delimiter collision attempt: ("a:b", "c") vs ("a", "b:c") and NUL bytes!
+    assert_ne!(get_key("Service/a", "keyFor", "x:y", "z"), get_key("Service/a", "keyFor", "x", "y:z"), "colon framing");
+    assert_ne!(get_key("Service/a", "keyFor", "x\0y", "z"), get_key("Service/a", "keyFor", "x", "y\0z"), "NUL framing");
+
+    // IK-6: `store_secret()` failure returns 503 (not 400) without burning `used_labels`!
+    struct FailSecret {
+        inner: MemStore,
+        fail: StdRc<Cell<bool>>,
+    }
+    impl Store for FailSecret {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+            if self.fail.get() && key == "tj:secret" { Err("secret store unavailable".into()) } else { self.inner.load(key) }
+        }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail.get() && key == "tj:secret" { Err("secret store read-only".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let fail_sec = StdRc::new(Cell::new(true));
+    let mut srt_sec = Runtime::boot(
+        compile(ik_src).unwrap(),
+        Box::new(FailSecret { inner: MemStore::default(), fail: fail_sec.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let sec_err = srt_sec.handle(2.0, Input::Call { object: "Service/a".into(), method: "keyFor".into(), args: vec![json!("step")], reply: Some(1), call: None, caller: who("alice", &[]) });
+    assert!(sec_err.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "store_secret failure must fail closed with 503: {sec_err:?}");
+    fail_sec.set(false);
+    let sec_ok = srt_sec.handle(3.0, Input::Call { object: "Service/a".into(), method: "keyFor".into(), args: vec![json!("step")], reply: Some(2), call: None, caller: who("alice", &[]) });
+    assert!(sec_ok.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(Json::String(s)), .. } if s.starts_with("tj_"))), "{sec_ok:?}");
+
+    // IK-6: `Run::Blocked` disk-save failure releases already-held `@exclusive` lock on A and does NOT park on B!
+    let blk_src = r#"
+@server @read("anyone") object LockObj {
+  n: number = 0
+  @allow("anyone") @exclusive async hold() { await fetch("https://api.example.com/wait") }
+  @allow("anyone") @exclusive mutateAndEnterB(): number {
+    this.n += 1
+    return LockObj.get("b").touch()
+  }
+  @allow("anyone") @exclusive touch(): number { this.n += 1; return this.n }
+}
+"#;
+    let fail_blk = StdRc::new(Cell::new(false));
+    struct FailA {
+        inner: MemStore,
+        fail_a: StdRc<Cell<bool>>,
+    }
+    impl Store for FailA {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_a.get() && key == "LockObj/a" { Err("disk full".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let mut brt = Runtime::boot(
+        compile(blk_src).unwrap(),
+        Box::new(FailA { inner: MemStore::default(), fail_a: fail_blk.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    // Hold LockObj/b via an in-flight `await fetch`.
+    let _ = brt.handle(2.0, Input::Call { object: "LockObj/b".into(), method: "hold".into(), args: vec![], reply: Some(1), call: None, caller: who("alice", &[]) });
+    // Now make saving LockObj/a fail and call `a.mutateAndEnterB()` -> hits `Run::Blocked(LockObj/b)` -> flush fails -> 503 & releases LockObj/a!
+    fail_blk.set(true);
+    let blk_out = brt.handle(3.0, Input::Call { object: "LockObj/a".into(), method: "mutateAndEnterB".into(), args: vec![], reply: Some(2), call: None, caller: who("alice", &[]) });
+    assert!(blk_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, status: Some(503), .. })), "Run::Blocked flush failure must return 503: {blk_out:?}");
+    // Disk recovers: LockObj/a must be FREE (immediately answers `touch()` without waiting on LockObj/b)!
+    fail_blk.set(false);
+    let a_free = brt.handle(4.0, Input::Call { object: "LockObj/a".into(), method: "touch".into(), args: vec![], reply: Some(3), call: None, caller: who("alice", &[]) });
+    assert!(a_free.iter().any(|o| matches!(o, Output::Reply { reply: 3, ok: Some(v), .. } if *v == json!(1))), "LockObj/a lock must be released: {a_free:?}");
 }

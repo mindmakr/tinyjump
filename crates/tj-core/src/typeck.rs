@@ -311,9 +311,9 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
                 let is_server = o.decorators.iter().any(|d| d.name == "server");
                 for m in &o.methods {
                     let saved = c.this_obj.replace(name.clone());
-                    #[cfg(feature = "check")]
-                    let saved_server = std::mem::replace(&mut c.this_server, is_server);
                     let is_inv = m.decorators.iter().any(|d| d.name == "invariant");
+                    #[cfg(feature = "check")]
+                    let saved_server = std::mem::replace(&mut c.this_server, is_server && !is_inv);
                     let fn_ty = c.function(&m.func, None);
                     if is_inv {
                         let bad_ret = match &m.func.ret {
@@ -564,6 +564,12 @@ impl<'a> Checker<'a> {
 
     fn let_decl(&mut self, d: &LetDecl) {
         self.type_span = d.span;
+        #[cfg(feature = "check")]
+        if let (Some(init), Pattern::Record(entries, span)) = (&d.init, &d.pattern) {
+            if entries.iter().any(|(k, _, _)| k == "idempotencyKey") {
+                self.check_idempotency_key(init, "idempotencyKey", *span);
+            }
+        }
         let declared = d.ty.as_ref().map(|t| self.resolve(t));
         let ty = match (&d.init, declared) {
             (Some(e), Some(dt)) => {
@@ -776,6 +782,10 @@ impl<'a> Checker<'a> {
             ExprKind::Index { obj, index, .. } => {
                 let t = self.expr(obj, None);
                 let it = self.expr(index, None);
+                #[cfg(feature = "check")]
+                if let Ty::StrLit(k) = &it {
+                    self.check_idempotency_key(obj, k, sp);
+                }
                 match (self.deref(&t), it) {
                     (Ty::Arr(e), _) => *e,
                     (Ty::Dict(v), _) => *v,

@@ -1089,7 +1089,15 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effec
                 .source()
                 .and_then(|s| s.downcast_ref::<std::io::Error>())
                 .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
-            return Err((format!("the request failed: {}", t.kind()), !policy));
+            let deterministic = matches!(
+                t.kind(),
+                ureq::ErrorKind::InvalidUrl
+                    | ureq::ErrorKind::UnknownScheme
+                    | ureq::ErrorKind::TooManyRedirects
+                    | ureq::ErrorKind::InsecureRequestHttpsOnly
+                    | ureq::ErrorKind::InvalidProxyUrl
+            );
+            return Err((format!("the request failed: {}", t.kind()), !policy && !deterministic));
         }
     };
     let status = resp.status();
@@ -1287,6 +1295,11 @@ mod tests {
         let (e2, unreachable2) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "http://127.0.0.1:1/".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e2.starts_with("the request failed"), "{e2}");
         assert!(unreachable2, "real transport failure must mark unreachable=true");
+
+        // IK-4: deterministic URL parse errors (`InvalidUrl`) must NOT mark `unreachable = true`.
+        let (e3, unreachable3) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "https://[bad url".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        assert!(e3.starts_with("the request failed"), "{e3}");
+        assert!(!unreachable3, "InvalidUrl must not trigger infinite 503 retries");
     }
 
     #[test]

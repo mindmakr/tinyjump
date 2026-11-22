@@ -27,7 +27,7 @@ use std::rc::Rc;
 /// An `invoke` waiting for its calling fiber to suspend: the promise it settles, the call,
 /// and who it acts for, in which chain.
 pub(crate) struct Invocation {
-    pub(crate) promise: u32,
+    promise: u32,
     object: String,
     method: String,
     args: Vec<Value>,
@@ -160,6 +160,20 @@ impl Runtime {
 
     pub(crate) fn is_queued_call(&self, effect: u32) -> bool {
         self.outbox.pending.iter().any(|p| p.effect == Some(effect))
+    }
+
+    pub(crate) fn outbox_len(&self) -> usize {
+        self.outbox.pending.len()
+    }
+
+    /// Drops server calls queued during an aborted turn so they neither wedge the head of the
+    /// outbox nor dispatch as phantom RPCs after a restart.
+    pub(crate) fn rollback_outbox(&mut self, mark: usize) {
+        if self.outbox.pending.len() > mark {
+            self.outbox.pending.truncate(mark);
+            self.save_outbox();
+            self.dispatch_calls();
+        }
     }
 
     /// The host finished an attempt. If the server was unreachable, the call is retried later;

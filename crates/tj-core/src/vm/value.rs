@@ -109,8 +109,9 @@ pub struct Elem {
 /// A thrown value. Runtime errors are records `{ name: "Error", message }`, like `new Error(msg)`.
 pub struct Exc(pub Value, pub ExcKind);
 
-/// Classifies how an exception originated: set only by the runtime, so app code cannot
-/// forge an HTTP status or hide a VM crash.
+/// Classifies how an exception originated: set by the runtime (plus the server-only
+/// `throw { retryable: true }` opt-in to `ExcKind::Busy` / HTTP 503), so app code cannot
+/// forge `403`/`409`/`500` or hide a VM crash.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ExcKind {
     /// Explicit user `throw`, `check(ok, field, msg)`, caller-input error, or effect failure (400).
@@ -120,7 +121,7 @@ pub enum ExcKind {
     Refused,
     /// Deadlock / conflict refusal (`Exc::conflict`, 409).
     Conflict,
-    /// Transient capacity/lock/storage busy error (`Exc::busy`, 503).
+    /// Transient capacity/lock/storage/transport busy error (`Exc::busy`, 503).
     Busy,
     /// Internal VM/code defect (null deref, bad call, stack overflow, runaway: 500 on server).
     Fault,
@@ -137,9 +138,16 @@ impl Exc {
         Exc(error_record(&message.into()), ExcKind::Fault)
     }
 
-    /// A transient overload, lock-timeout, or store I/O error, answered with 503 when uncaught.
+    /// A transient overload, lock-timeout, store I/O, or downstream transport error, answered
+    /// with 503 when uncaught. On servers, carries `retryable: true` so `catch (e) { throw e }`
+    /// preserves 503 instead of caching a permanent 400 call record.
     pub fn busy(message: impl Into<String>) -> Exc {
-        Exc(error_record(&message.into()), ExcKind::Busy)
+        let e = error_record(&message.into());
+        #[cfg(feature = "server")]
+        if let Value::Rec(r) = &e {
+            r.borrow_mut().insert("retryable".into(), Value::Bool(true));
+        }
+        Exc(e, ExcKind::Busy)
     }
 
     /// A conflict (such as an `@exclusive` lock deadlock cycle), answered with 409 when uncaught.

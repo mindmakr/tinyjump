@@ -110,6 +110,15 @@ enum TimerKind {
     Clock,
 }
 
+/// Snapshot of output, invocation, and device-outbox queue lengths at the start of a turn,
+/// so an aborted turn rolls back every side effect it queued.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnMark {
+    pub(crate) out: usize,
+    pub(crate) inv: usize,
+    pub(crate) outbox: usize,
+}
+
 /// How a method call starts: who it is for, its chain (0: a new one, see `exclusive.rs`),
 /// and what started it.
 pub(crate) struct Entry {
@@ -427,7 +436,7 @@ impl Runtime {
                             // person: once it returns a promise it does not await (`onPress={() =>
                             // cart.add(x)}`) or first waits (for a server that may be offline). What
                             // happens after is on the screen, and errors are reported as usual.
-                            let mark = self.outputs.len();
+                            let mark = self.turn_mark();
                             match self.run(&mut f) {
                                 Ok(Run::Done(Value::Promise(_))) => {
                                     self.settle(f, reply, Ok(Run::Done(Value::Null)), mark);
@@ -700,42 +709,44 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn turn_mark(&self) -> TurnMark {
+        TurnMark { out: self.outputs.len(), inv: self.invocations.len(), outbox: self.outbox_len() }
+    }
+
     fn drive(&mut self, mut f: Fiber, reply: Option<u64>) {
-        let mark = self.outputs.len();
+        let mark = self.turn_mark();
         self.ran_code = true;
         let r = self.run(&mut f);
         self.settle(f, reply, r, mark);
     }
 
     #[inline(never)]
-    fn abort_turn(&mut self, f: &mut Fiber, mark: usize, drop_invoke: Option<u32>) {
+    fn rollback_queued(&mut self, mark: TurnMark) {
+        self.rollback_turn(mark.out);
+        self.invocations.truncate(mark.inv);
+        self.rollback_outbox(mark.outbox);
+    }
+
+    #[inline(never)]
+    fn abort_turn(&mut self, f: &mut Fiber, mark: TurnMark) {
         self.ran(f, false);
         self.release_frames(f, 0);
-        self.rollback_turn(mark);
-        if let Some(p) = drop_invoke {
-            for _ in 0..self.invocations.len() {
-                if let Some(inv) = self.invocations.pop_front() {
-                    if inv.promise != p {
-                        self.invocations.push_back(inv);
-                    }
-                }
-            }
-        }
+        self.rollback_queued(mark);
         self.count_error(f.stat);
     }
 
     /// Completes or suspends a fiber, enforcing `@invariant`s, per-object size caps, and atomic
     /// rollback per turn BEFORE committing `waiting`, `park`, `ran`, or `reply`.
     /// Returns `None` when the turn committed or suspended cleanly, or `Some(status)` when rolled back.
-    pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: usize) -> Option<u16> {
+    pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: TurnMark) -> Option<u16> {
         let ok = match r {
             Ok(ok) => ok,
             Err(fail) => {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
-                // Atomic turns: an uncaught error rolls back every object mutated in this turn
-                // before recording the error reply (so idempotency call records stay clean).
-                self.rollback_turn(mark);
+                // Atomic turns: an uncaught error rolls back every object, invocation, and
+                // outbox call from this turn before recording the error reply.
+                self.rollback_queued(mark);
                 match fail.status {
                     Some(403) => self.count_refused_slot(f.stat),
                     _ => self.count_error(f.stat),
@@ -752,18 +763,14 @@ impl Runtime {
                     (Some(_), None) => self.reply(reply, Err((fail.message, fail.field))),
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
-                self.flush_from(mark);
+                self.flush_from(mark.out);
                 return Some(status);
             }
         };
-        let drop_invoke = match &ok {
-            Run::Await(p) => Some(*p),
-            _ => None,
-        };
         if let Err((status, msg)) = self.check_turn_constraints() {
-            self.abort_turn(&mut f, mark, drop_invoke);
+            self.abort_turn(&mut f, mark);
             self.reply_constraint_err(reply, status, msg);
-            self.flush_from(mark);
+            self.flush_from(mark.out);
             return Some(status);
         }
         match ok {
@@ -772,11 +779,11 @@ impl Runtime {
                 if reply.is_some() {
                     self.reply(reply, v.to_json().map_err(|e| (e, None)));
                 }
-                self.flush_from(mark);
+                self.flush_from(mark.out);
                 None
             }
-            Run::Await(_) | Run::Blocked(_) if !self.flush_from(mark) => {
-                self.abort_turn(&mut f, mark, drop_invoke);
+            Run::Await(_) | Run::Blocked(_) if !self.flush_from(mark.out) => {
+                self.abort_turn(&mut f, mark);
                 self.refuse_start(reply, 503, "the change could not be saved; try again".into());
                 Some(503)
             }
@@ -845,12 +852,12 @@ impl Runtime {
             if !self.touched.is_empty() {
                 self.flush();
             }
-            let mark = self.outputs.len();
+            let mark = self.turn_mark();
             self.ran_code = true;
             let r = match error {
                 Some(e) => {
                     #[cfg(feature = "server")]
-                    let exc = if unreachable { Exc::busy(e) } else { Exc::with_field(e, field) };
+                    let exc = if self.server && unreachable { Exc::busy(e) } else { Exc::with_field(e, field) };
                     #[cfg(not(feature = "server"))]
                     let exc = {
                         let _ = unreachable;
@@ -870,7 +877,7 @@ impl Runtime {
     /// Refuses a request with an HTTP-like status (see `Output::Reply`).
     fn reply_status(&mut self, reply: Option<u64>, status: u16, why: String) {
         match reply {
-            Some(id) if id >= INVOKE_REPLY_BASE => self.reply(reply, Err((why, None))),
+            Some(id) if id >= INVOKE_REPLY_BASE => self.reply_with_status(reply, Err((why, None)), Some(status)),
             Some(id) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(why), field: None, status: Some(status) }),
             None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
         }
@@ -891,7 +898,7 @@ impl Runtime {
                 Ok(v) => (Some(v), None, None),
                 Err((e, f)) => (None, Some(e), f),
             };
-            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error, field, false);
+            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error, field, cfg!(feature = "server") && status == Some(503));
             return;
         }
         match (reply, r) {

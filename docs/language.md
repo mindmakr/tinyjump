@@ -539,10 +539,15 @@ For secrets, use `crypto`, never `Math.random()`:
   (e.g. `"Idempotency-Key": crypto.idempotencyKey("charge")`) and checkpoint state before the
   next `await` so retries after a crash never double-execute (`docs/retried-effects.md`).
   Calling the same `label` twice in one live call fails fast (include an item id inside loops).
+  Alarms (`this.schedule`) and `@every` timers have no incoming `Idempotency-Key` (so
+  `crypto.idempotencyKey()` generates a fresh random key per firing); for external writes from
+  an alarm, persist a `pendingId = crypto.randomId()` field on `this` before `await` and
+  reschedule a keyed retry alarm before `await` (`docs/retried-effects.md`).
   When a downstream HTTP API returns a transient `5xx` or `429` response, `throw { message: "...", retryable: true }`
   returns HTTP `503` without caching a permanent `400` call record, so the device outbox
   safely retries with the same `Idempotency-Key`; use `check(res.ok, field, msg)` for
-  permanent `4xx` declines.
+  permanent `4xx` declines. Transport failures from `fetch` carry `e.retryable === true`, so
+  `catch (e) { console.error(e.message); throw e }` also preserves HTTP `503`.
 
 Keep keys in a server object nobody outside the server can read or call:
 

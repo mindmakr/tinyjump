@@ -96,7 +96,7 @@ Keep the VM stateless across restarts and give `@server` methods **one** explici
 | Dimension | Assessment |
 |---|---|
 | **Closes crash between remote execution & local save?** | **Yes** — for every external API that honors `Idempotency-Key` (Stripe, Adyen, PayPal, Twilio, Resend, Square, GitHub, and downstream tinyjump servers). |
-| **Multi-step `async`** | **Yes, explicitly.** Because `tj-core` flushes touched state at every `Run::Await`, guarding Step 1 (`this.chargeId === ""`) and Step 2 (`!this.receiptSent`) independently ensures Step 1 never re-runs if Step 2 crashes, while Step 2 still completes on retry. |
+| **Multi-step `async`** | **Yes, explicitly.** Because `tj-core` flushes touched state at every `Run::Await` (atomically per object, so keep step checkpoints on `this`), guarding Step 1 (`this.chargeId === ""`) and Step 2 (`!this.receiptSent`) independently ensures Step 1 never re-runs if Step 2 crashes, while Step 2 still completes on retry. |
 | **Live reload (`tj reload`) compatibility** | **Excellent.** No replay journal to corrupt; keys are bound to explicit labels (`"charge"`, `"receipt"`), not bytecode offsets or call indices, so refactoring surrounding lines never changes a step's key. |
 | **Privacy (`@pii`) & storage cap** | **Zero storage bloat.** Nothing extra is persisted in object records; keys are opaque keyed hashes (`tj_<32 hex>`) containing no caller id or `@pii`. |
 | **Core binary size & complexity** | **Small.** Runtime derivation lives behind `#[cfg(feature = "server")]` (~0.5 KB in server builds); device builds only pay the type-checker/builtin signature (~0.3–0.6 KB — must be measured against `scripts/budget.sh`, where WASM currently has 2 KB headroom). |
