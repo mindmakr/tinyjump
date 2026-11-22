@@ -6,11 +6,11 @@
 
 tinyjump already makes **object state** run at most once for retried calls (`docs/host-protocol.md`, `crates/tj-core/src/runtime/calls.rs`):
 
-- Every device call to an `@server` object carries a unique `Idempotency-Key` (`call` id) and retries from `tj:outbox` on network failure, `5xx`, `401`, or `429`.
-- On the server, `Runtime::finish_call` atomically persists the `CallRecord` alongside the object's updated state in one write (remembering the last 100 calls for 72 hours).
-- Within an `async` method, `Runtime::settle` (`crates/tj-core/src/runtime/mod.rs`) flushes every modified object to disk at every `await` (`Run::Await`) before emitting `Output::Effect`.
+- Every device call to an `@server` object carries a unique `Idempotency-Key` (`call` id) and retries from `tj:outbox` on network failure, `502`/`503`/`504`, `401`, or `429`.
+- On the server, `Runtime::finish_call` atomically persists the `CallRecord` alongside the object's updated state in one write (remembering the last 100 calls for 72 hours, scoped by `(call_id, caller, method, args_hash)`).
+- Within an `async` method, `Runtime::settle` (`crates/tj-core/src/runtime/mod.rs`) flushes every modified object to disk at every `await` (`Run::Await`).
 
-What is **not** solved yet is an **external side effect** (`await fetch(...)` or `await plugin(...)` such as charging a card or sending an email) when the server crashes *while the effect is in flight*:
+What is **not** solved yet is an **external side effect** (`await fetch(...)` or `await plugin(...)`, such as charging a card or sending an email) when the server crashes *while the effect is in flight*:
 
 ### Failure windows
 
@@ -25,11 +25,11 @@ What is **not** solved yet is an **external side effect** (`await fetch(...)` or
      -> Runs pay() from line 1 -> calls Stripe a SECOND time -> double charge.
    ```
 2. **Multi-step `async` methods:**
-   Step 1 (`await fetch(charge)`) succeeds, `this.chargeId = r.id` is saved at the next `await` (`Run::Await` flush), Step 2 (`await fetch(sendReceipt)`) crashes. On retry, if the method does not guard Step 1 with `if (!this.chargeId)`, Step 1 runs twice even though `this.chargeId` is already on disk.
+   Step 1 (`await fetch(charge)`) succeeds, `this.chargeId = data.id` is flushed at the next `await` (`Run::Await`), and Step 2 (`await fetch(sendReceipt)`) crashes. On retry, Step 1 must not re-run (it is already recorded in `this.chargeId`), *and* Step 2 must still execute rather than being skipped by an early return.
 3. **Alarms and `@every` timers crashing mid-`await` (the lost-effect window):**
-   `consumed_alarms` is persisted when the alarm suspends at `Run::Await` (`objects.rs`), so a server crash mid-`await` does *not* re-fire the alarm automatically. Unlike device outbox calls, nobody retries an alarm unless the app persists an explicit status (`"pending"`) and a reconciliation timer/alarm.
+   `take_alarm` (`crates/tj-core/src/runtime/objects.rs`) removes the fired alarm before `Run::Await` flushes to disk, so a server crash mid-`await` does **not** re-fire the alarm automatically. And if the app schedules a reconciliation alarm, `new_alarm_id()` allocates a **new** handle every time (even for keyed alarms). Therefore an alarm's handle cannot serve as a crash-stable idempotency key; alarms that perform external writes must persist an explicit domain/operation id on the object *before* `await`.
 4. **In-flight `EffectDone` across `tj reload`:**
-   `drain_inflight` waits up to 2 seconds (`engine.rs`) before swapping bundles; an external HTTP call taking >2 s has its late `EffectDone` discarded by `Dispatch.generation`, while the client's retry arrives on the new bundle with the same `Idempotency-Key`.
+   `drain_inflight` waits up to 2 seconds (`crates/tj-cli/src/engine.rs`) before swapping bundles; an external HTTP call taking >2 s has its late `EffectDone` discarded by `Dispatch.generation`, while the client's retry arrives on the new bundle with the same `Idempotency-Key`.
 
 ---
 
@@ -37,42 +37,54 @@ What is **not** solved yet is an **external side effect** (`await fetch(...)` or
 
 ### Option A — Durable effect journal (workflow replay, Temporal / Restate style)
 
-Persist an effect log inside each object's record: before emitting `Output::Effect`, save an intent; when `Input::EffectDone` returns, save `(call_id, effect_seq, result)` to disk. On retry after a crash, replay the method from the start and feed cached effect results from the journal instead of re-executing `fetch`/`plugin`.
+Persist an effect log inside each object's record: before emitting `Output::Effect`, save an intent (which could also carry an external idempotency key); when `Input::EffectDone` returns, save `(call_id, effect_seq, result)` to disk. On retry after a crash, replay the method from the start and feed cached effect results from the journal instead of re-executing `fetch`/`plugin`.
 
 | Dimension | Assessment |
 |---|---|
-| **Closes crash between remote execution & local save?** | **No.** If the server crashes *after* Stripe charges the card and *before* `EffectDone` is written to the journal, replay has no cached result and **still double-charges** unless an external idempotency key is also sent. |
-| **Multi-step `async` without manual checks** | **Yes** — once Step 1's `EffectDone` is journaled, Step 2 crashing won't replay Step 1. |
+| **Closes crash between remote execution & local save?** | **Only if paired with external idempotency keys.** A local journal alone still double-executes if the server crashes *after* Stripe charges the card and *before* `EffectDone` is written to disk. |
+| **Multi-step `async` without manual checks** | **Yes** — once Step 1's `EffectDone` is journaled, Step 2 crashing replays Step 1 from disk instead of calling the network. |
 | **Live reload (`tj reload`) compatibility** | **Poor.** Reordering or editing any `await` in a method breaks positional `effect_seq` replay ("history non-determinism errors"), clashing directly with tinyjump's Living Apps live-reload workflow. |
 | **Privacy (`@pii`) & storage cap (`TJ_MAX_OBJECT_BYTES`)** | **High risk.** Caching raw HTTP/plugin responses in object records silently persists untagged third-party payloads (potentially containing `@pii` or tokens), bypasses `@pii` masking/erasure, and blows up the 256 KB per-object cap. |
 | **Core binary size & complexity** | **High** (~8–15 KB in `tj-core`, new persistence format, replay mismatch error surface, GC for incomplete journals). |
 
-### Option B — Deterministic idempotency keys passed to `fetch` & `plugin`, paired with checkpointed object state
+### Option B — Deterministic idempotency keys (`crypto.idempotencyKey`) + checkpointed object state
 
-Keep the VM stateless across restarts and give server methods a **deterministic, crash-stable idempotency key** derived from the incoming call's `Idempotency-Key` (or alarm handle) and a developer-chosen step label, plus explicit opt-in forwarding to `fetch` and `plugin`:
+Keep the VM stateless across restarts and give `@server` methods **one** explicit primitive — `crypto.idempotencyKey(label)` — returning a deterministic, crash-stable key derived from the incoming `Idempotency-Key` and a caller-supplied step label, paired with explicit state checkpoints flushed at each `await`:
 
 ```ts
 @server @read("owner") object Order {
   status: string = "open"
   chargeId: string = ""
+  receiptSent: boolean = false
 
   @allow("owner") @exclusive async pay(amount: number): string {
-    if (this.chargeId !== "") return this.chargeId
-    // Stable across crashes & retries of the same client Idempotency-Key:
-    const res = await fetch("https://api.stripe.com/v1/charges", {
-      method: "POST",
-      idempotency: "charge",        // sends `Idempotency-Key: tj:<hmac(secret, obj, callId, "charge")>`
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ amount })
-    })
-    this.chargeId = JSON.parse(res.body).id
-    this.status = "paid"
-    // `Run::Await` flushes `this.chargeId` and `this.status` to disk BEFORE the next fetch!
-    await fetch("https://api.mail.example/send", {
-      method: "POST",
-      idempotency: "receipt",
-      body: JSON.stringify({ order: this.id })
-    })
+    // Step 1: charge card (skipped on retry once `chargeId` was checkpointed).
+    if (this.chargeId === "") {
+      const res = await fetch("https://api.stripe.com/v1/charges", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": crypto.idempotencyKey("charge")
+        },
+        body: JSON.stringify({ amount })
+      })
+      check(res.ok, "payment", `charge failed (${res.status})`)
+      this.chargeId = res.json().id
+      this.status = "paid"
+    }
+    // `Run::Await` flushes `this.chargeId` and `this.status` to disk BEFORE Step 2!
+    if (!this.receiptSent) {
+      const mail = await fetch("https://api.mail.example/send", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": crypto.idempotencyKey("receipt")
+        },
+        body: JSON.stringify({ order: this.id, chargeId: this.chargeId })
+      })
+      check(mail.ok, "receipt", `receipt failed (${mail.status})`)
+      this.receiptSent = true
+    }
     return this.chargeId
   }
 }
@@ -80,62 +92,93 @@ Keep the VM stateless across restarts and give server methods a **deterministic,
 
 | Dimension | Assessment |
 |---|---|
-| **Closes crash between remote execution & local save?** | **Yes** — for every external API that honors `Idempotency-Key` (Stripe, Adyen, PayPal, Twilio, Resend, Square, GitHub, and every downstream tinyjump server). |
-| **Multi-step `async`** | **Yes, explicitly.** Because `tj-core` already flushes touched state at every `Run::Await`, guarding Step 1 with `if (this.chargeId !== "")` prevents Step 1 from re-running if Step 2 crashes, and `idempotency: "charge"` protects Step 1 itself if the crash happens mid-HTTP. |
-| **Live reload (`tj reload`) compatibility** | **Excellent.** No replay journal to corrupt; keys are keyed by explicit step label (`"charge"`), not bytecode offset or call index, so refactoring surrounding lines never changes a step's key. |
-| **Privacy (`@pii`) & storage cap** | **Zero risk.** Nothing extra is persisted in object records; keys are opaque keyed hashes (`tj_<hex>`) containing neither the caller id nor any `@pii`. |
-| **Core binary size & complexity** | **Tiny** (~0.5–1 KB, gated behind `#[cfg(feature = "server")]` so WASM / Android / iOS pay **0 bytes**). |
-| **Non-idempotent legacy APIs** | **Limitation:** an external API that ignores `Idempotency-Key` (e.g. legacy POST endpoint or raw SMTP) still has the narrow in-flight crash window during its single HTTP round-trip, though checkpointing state before/after limits retries and outgoing webhooks (with `X-TinyJump-Delivery`) handle fire-and-forget notifications. |
+| **Closes crash between remote execution & local save?** | **Yes** — for every external API that honors `Idempotency-Key` (Stripe, Adyen, PayPal, Twilio, Resend, Square, GitHub, and downstream tinyjump servers). |
+| **Multi-step `async`** | **Yes, explicitly.** Because `tj-core` flushes touched state at every `Run::Await`, guarding Step 1 (`this.chargeId === ""`) and Step 2 (`!this.receiptSent`) independently ensures Step 1 never re-runs if Step 2 crashes, while Step 2 still completes on retry. |
+| **Live reload (`tj reload`) compatibility** | **Excellent.** No replay journal to corrupt; keys are bound to explicit labels (`"charge"`, `"receipt"`), not bytecode offsets or call indices, so refactoring surrounding lines never changes a step's key. |
+| **Privacy (`@pii`) & storage cap** | **Zero storage bloat.** Nothing extra is persisted in object records; keys are opaque keyed hashes (`tj_<32 hex>`) containing no caller id or `@pii`. |
+| **Core binary size & complexity** | **Small.** Runtime derivation lives behind `#[cfg(feature = "server")]` (~0.5 KB in server builds); device builds only pay the type-checker/builtin signature (~0.3–0.6 KB — must be measured against `scripts/budget.sh`, where WASM currently has 2 KB headroom). |
+| **Non-idempotent legacy APIs** | **Limitation:** an external API that ignores idempotency keys still has the narrow in-flight crash window during its single HTTP round-trip; checkpointing state before/after bounds retries, and outgoing webhooks (with `X-TinyJump-Delivery`) handle fire-and-forget notifications. |
 
 ---
 
-## Recommendation: Option B + explicit checkpoints (no VM replay journal)
+## Recommendation: Option B with ONE primitive (`crypto.idempotencyKey`)
 
-Do **not** build a Temporal-style VM replay journal into `tj-core`. It adds substantial complexity, breaks cleanly across live reloads, creates `@pii` retention hazards, and *still* cannot close the remote-execution crash window without an external idempotency key.
+Do **not** build a Temporal-style VM replay journal into `tj-core`. Instead, adopt **Option B** with **one** clear way to do each thing (`AGENTS.md`): **`crypto.idempotencyKey(label: string): string`**.
 
-Instead, adopt **Option B** in three small, additive pieces:
+Why `crypto.idempotencyKey(label)` alone (instead of also adding a separate `fetch(..., { idempotency })` option):
+- One surface works identically for standard `Idempotency-Key` headers, custom headers (`X-Request-Id`), JSON body fields, and `plugin()` arguments — zero duplicate ways to do the same thing, zero case-insensitive header-merging edge cases, and zero host protocol changes.
 
-### 1. Deterministic server-side idempotency keys (`tj-core`, `#[cfg(feature = "server")]`)
+### 1. Key derivation (`tj-core`, `#[cfg(feature = "server")]`)
 
-- **Key derivation:** When a `@server` method runs with an incoming `call` id (`Idempotency-Key` from HTTP or device outbox) or inside a durable alarm (which has a persisted `alarm.id`), the runtime can derive a stable key for any step label `step: string`:
-  ```text
-  idempotencyKey(step) = "tj_" + hex(HMAC-SHA256(store_secret, object_key + "\0" + root_id + "\0" + step))[..32]
-  ```
-  - `store_secret` is the existing per-store secret (`Runtime::secret`, already persisted for `caller_tag`), so keys are unguessable to external observers and leak neither internal object structure nor caller identity.
-  - `root_id` is:
-    - `"call:" + call_id` for calls with an `Idempotency-Key` (propagated across nested `invoke()` calls in the same chain so `tj:agent` tool calls get deterministic keys too);
-    - `"alarm:" + alarm_id` for durable alarms;
-    - a fresh random id (from `drbg`) when neither is present (e.g. an ad-hoc HTTP POST without `Idempotency-Key`, or a periodic `@every` timer), so calling `idempotencyKey` never fails on non-idempotent callers.
-- **Why keyed by label, not auto-numbered:** Passing an explicit label (`"charge"`, `"receipt"`) survives code edits and `tj reload`, stays readable for agents, and lets the same method make two independent external requests with distinct keys.
-- **Why opt-in, not auto-injected on every `fetch`:** Blindly adding an `Idempotency-Key` header to every `fetch` would break strict third-party APIs and CORS preflights, and makes no sense on `GET` requests. Opting in via `idempotency: "charge"` (in `fetch` options) or `crypto.idempotencyKey("charge")` (for APIs that take the key in a custom header like `X-Request-Id` or JSON body field, or for `plugin()` arguments) keeps one clear way to do each thing.
+When an `@server` method runs with an incoming `call` id (`Input::Call.call`, from HTTP `Idempotency-Key` or device `tj:outbox`):
 
-### 2. Plugin & bridge forwarding (`tj-cli`)
+```text
+idempotencyKey(label) = "tj_" + hex(HMAC-SHA256(store_secret, len_prefixed(
+    object_key,
+    method_name,
+    caller_tag,
+    call_id,
+    label
+)))[..32]
+```
 
-- `Effect::Plugin` already carries `args: Json`. Plugin modules (`plugins/<name>/plugin.tj`) can pass `idempotencyKey: crypto.idempotencyKey("...")` directly in their typed arguments — zero host protocol changes needed!
-- For `fetch(url, { method: "POST", idempotency: "charge", ... })`, `tj-core` resolves the `idempotency` label into the `Idempotency-Key` header (unless the caller already set `Idempotency-Key` explicitly) before emitting `Effect::Http` — again **zero changes to `docs/host-protocol.md` or any device/server host**.
+Key security and correctness properties:
+- **Length-prefixed framing (`u32_be(len) || bytes`)** instead of `\0` delimiters: immune to embedded NULs or delimiter injection in `call_id` or `label`.
+- **Scoped by `(object_key, method_name, caller_tag, call_id, label)`:** matches `call_once`'s exact caller-scoped key space (`calls.rs`), so two different callers sending a predictable HTTP `Idempotency-Key: 1` on a shared `@server` object (even after a crash or 72h / 100-record eviction) can **never** derive the same downstream key or replay each other's external response.
+- **Shared `store_secret()` (failing closed with `503`):** extracts the existing `tj:secret` loader out of `caller_tag` (`privacy.rs`) so it works for every caller (including `Who::System`) and fails closed with `503` if the store cannot read or persist the secret.
+- **When no incoming `call_id` exists** (e.g. an ad-hoc HTTP POST without `Idempotency-Key`, or a timer/alarm): derives from a fresh per-turn random `drbg` root (so `crypto.idempotencyKey` still produces a valid unique key rather than colliding across unrelated requests).
+- **Duplicate-label guard within one live call:** tracks labels already issued on the current `Fiber` and fails fast with a clear fix hint if the same `label` is requested twice inside one call (catching accidental loop collisions like `for (const item of items) { ... crypto.idempotencyKey("item") }` — fix hint: include a unique item id, e.g. `crypto.idempotencyKey("item:" + item.id)`).
+- **Server-only compile check:** `crypto.idempotencyKey(...)` is only meaningful on `@server` objects; calling it from device/UI code is a compile error with a fix hint (`call crypto.idempotencyKey() inside an @server object method`).
+- **No automatic propagation across `tj:agent` `invoke()` loops:** an LLM agent loop (`plugins/agent/plugin.tj`) is non-deterministic across restarts and may invoke the same `(object, method)` multiple times in one turn. Agent tool methods should key off a durable domain id (e.g. `orderId`, `stepId`) or explicit per-tool-call argument rather than inheriting the outer chat turn's `call_id`.
+- **Privacy flow check (`flow.rs`):** `crypto.idempotencyKey(label)` outputs a keyed hash (safe to send in headers), and `flow.rs` treats `label` as a sink argument so passing un-revealed `@pii` as `label` is caught at compile time.
 
-### 3. Static guidance & durable patterns (`tj check`, `docs/language.md`)
+### 2. Alarm & timer durability pattern (no `"alarm:" + alarm_id`)
 
-- **Guard mutating `fetch` with `@exclusive` + checkpointed state:**
-  1. Mark payment/external-write methods `@exclusive` so two concurrent calls on the same object cannot race past `if (this.chargeId !== "")`.
-  2. Persist the result (`this.chargeId = ...`) before any subsequent `await` (or return).
-  3. For alarms that perform external writes and must survive crashes mid-`await`, persist `pendingOp` state + schedule a reconciliation alarm before `await`, and `unschedule` it once the write completes.
-- **Advisory `tj check` warning (optional follow-up):** Warn (never break existing apps) when an `@server` method calls `fetch` with a non-GET method (`POST`/`PUT`/`PATCH`/`DELETE`) without either `idempotency` or an explicit `Idempotency-Key` header, pointing to this note.
-- **Fire-and-forget external notifications:** Use the upcoming **outgoing webhooks** system (durable delivery queue with retries, backoff, and `X-TinyJump-Delivery` idempotency header) instead of putting best-effort notifications inline inside critical transaction methods.
+Because `take_alarm` removes a fired alarm before `Run::Await` flushes and reconciliation alarms always allocate a new `alarm.id`, alarms that make external writes use an explicit persisted operation id:
+
+```ts
+@server object Payout {
+  pendingId: string = ""
+  paid: boolean = false
+
+  @allow("staff") start() {
+    if (this.pendingId === "") this.pendingId = "payout_" + crypto.randomId()
+    this.schedule("retry", 0, "attempt")
+  }
+
+  private async attempt() {
+    if (this.paid) return
+    // Schedule reconciliation BEFORE `await` so a mid-flight crash retries automatically:
+    this.schedule("retry", 60_000, "attempt")
+    const res = await fetch("https://api.stripe.com/v1/transfers", {
+      method: "POST",
+      headers: { "Idempotency-Key": this.pendingId },
+      body: JSON.stringify({ amount: 500 })
+    })
+    if (res.ok) {
+      this.paid = true
+      this.unschedule("retry")
+    }
+  }
+}
+```
+
+### 3. Required runtime prerequisites before shipping Option B
+
+Auditing `tj-core` and `tj-cli` surfaced **two existing runtime bugs** that the implementation PR for Option B MUST fix first so retries actually work end-to-end:
+
+1. **Abort `Run::Await` if `flush_from(mark)` fails to save to disk (`crates/tj-core/src/runtime/mod.rs:661`):**
+   Currently `Runtime::fetch` pushes `Output::Effect` before `settle()` runs `flush_from(mark)`, and `settle()` ignores `flush_from`'s `bool` return value. If persisting the pre-`await` checkpoint fails (e.g. disk full), `flush_from` reverts object state while leaving `Output::Effect` queued and the fiber parked in `self.waiting`. Fix: when `flush_from(mark)` returns `false` on `Run::Await`, remove the fiber from `self.waiting`, release its `@exclusive` locks (`release_frames`), drop uncommitted `Output::Effect`s in `mark..`, and reply `503` via `refuse_start`.
+2. **Do not permanently cache transient `fetch` transport failures in `CallRecord` (`crates/tj-cli/src/engine.rs:1083`, `crates/tj-core/src/runtime/mod.rs:712, 779`):**
+   Today, a server-side `fetch` timeout or TCP disconnect (`ureq::Error::Transport`) comes back as `EffectDone { error: Some(...), unreachable: false }`, unwinds via `Exc::with_field` (`ExcKind::User`), and `finish_call` caches it as a permanent HTTP `400` `CallRecord` for 72 hours. A device retrying the same `Idempotency-Key` gets the cached `400` forever — and if the client generates a fresh `Idempotency-Key` to work around it, it gets a *different* downstream key and double-charges! Fix: report `ureq::Error::Transport` with `unreachable: true` (or a transient `502`/`503` flag on `ExcKind::Transient`) so an uncaught downstream transport failure replies `502`/`503` via `refuse_start` (NOT caching a permanent `CallRecord`), allowing the device outbox to safely retry the **same** `Idempotency-Key`! (App code that catches the error with `try/catch` handles it as normal.)
 
 ---
 
-## Trade-offs & open questions for Critic / Owner
+## Rollout plan
 
-1. **Key derivation secret when a store is restored to a new server:** Using `Runtime::secret` (stored in the data directory alongside objects) means keys survive normal restarts and backups of `<data>`, while rotating/losing the store secret naturally starts a fresh key namespace. Is `Runtime::secret` right, or should the key be purely `SHA-256(object_key + "\0" + call_id + "\0" + step)` (no secret needed, still opaque because `call_id` is 128-bit random)?
-   - *Case for HMAC with `Runtime::secret`:* Protects against predictable caller-supplied HTTP `Idempotency-Key` values (e.g. a curl client sending `Idempotency-Key: 1`) colliding across apps or leaking the object id if a downstream API logs keys.
-   - *Case for plain SHA-256:* Simpler; no dependency on `Runtime::secret` existing before first use.
-   - *Recommendation:* Keep HMAC with `Runtime::secret` (which `tj-core` already creates lazily and persists in `store`).
-2. **Scope of `root_id` across `invoke()`:** Should a `tj:agent` tool call (`invoke`) derive its key from `(parent_call_id, tool_object, tool_method, step)` so two different tools invoked in one turn using the same label `"send"` never collide?
-   - *Yes:* Including `object_key` (and `method` name) in the HMAC input guarantees distinct objects/methods never collide even with the same step label.
-3. **Header name customization:** `fetch(url, { idempotency: "charge" })` sets `Idempotency-Key` (the IETF `draft-ietf-httpapi-idempotency-key-header` standard used by Stripe, Adyen, Square, Resend, and tinyjump itself). APIs expecting a custom header or body field call `crypto.idempotencyKey("charge")` directly — keeping the `fetch` options surface minimal (one new optional string field).
-4. **Device builds cost:** All key derivation and `call` id propagation on `Fiber` stay behind `#[cfg(feature = "server")]` (devices calling `crypto.idempotencyKey(...)` in local code get a deterministic/random fallback or compile-time server-only hint), costing **0 bytes** in WASM and Android/iOS builds.
-
-## Next step
-
-Once Critic and owner sign off on this design, implement `crypto.idempotencyKey(step)` + `fetch(..., { idempotency })` in one focused PR (~150 lines in `tj-core` behind `#[cfg(feature = "server")]`, end-to-end crash-and-retry tests in `crates/tj-core/tests/runtime.rs`, and `docs/language.md` documentation).
+1. **PR (implementation, after owner/Critic sign-off):**
+   - Fix the two runtime prerequisites (`Run::Await` flush-failure abort, and transient `fetch` transport errors returning `502`/`503` via `refuse_start` instead of caching permanent `400` `CallRecord`s).
+   - Implement `crypto.idempotencyKey(label)` with length-prefixed HMAC over `(object_key, method_name, caller_tag, call_id, label)`, `store_secret()`, per-fiber duplicate-label detection, compile-time `@server`-only check, and `flow.rs` sink check.
+   - Add crash-and-retry E2E tests in `crates/tj-core/tests/runtime.rs` (including multi-step crash, transport-error retry with same `Idempotency-Key`, cross-caller key isolation, and duplicate-label rejection) and verify `scripts/budget.sh` (watch the 2 KB WASM headroom).
+   - Document `crypto.idempotencyKey(label)` and the alarm reconciliation pattern in `docs/language.md`.
+2. **Defer:** No noisy blanket `tj check` warning on all non-GET `fetch` calls (avoids false positives on read-only POST search/GraphQL endpoints); outgoing fire-and-forget notifications are handled by outgoing webhooks (Track 2 Step 3).
