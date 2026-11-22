@@ -263,6 +263,9 @@ impl Runtime {
                     continue;
                 }
             }
+            if !self.touched.is_empty() {
+                self.flush();
+            }
             match self.resolve_object(&i.object) {
                 Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, by: By::Invoke }),
                 Err(e) => self.reply(reply, Err((e, None))),
@@ -300,7 +303,7 @@ impl Runtime {
         let mine = CallRecord::new(&call, by, method, args, self.now);
         if let Some(done) = self.call_record(&obj, &call) {
             match done.same_call(&mine) {
-                true => self.reply(reply, done.result()),
+                true => self.reply_with_status(reply, done.result(), done.status()),
                 false => self.reply_status(reply, 422, "this call id was already used for another call".into()),
             }
             return;
@@ -322,14 +325,14 @@ impl Runtime {
     }
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.
-    pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, (String, Option<String>)>) {
+    pub(crate) fn finish_call(&mut self, internal: u64, r: Result<Json, (String, Option<String>)>, status: Option<u16>) {
         let Some((obj, call, keep)) = self.call_replies.remove(&internal) else { return };
         let Some((record, waiting)) = self.running_calls.remove(&call) else { return };
         if keep {
-            self.record_call(&obj, record.with_result(&r));
+            self.record_call(&obj, record.with_result(&r, status));
         }
         for reply in waiting {
-            self.reply(reply, r.clone());
+            self.reply_with_status(reply, r.clone(), status);
         }
     }
 }

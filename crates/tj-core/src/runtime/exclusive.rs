@@ -225,12 +225,16 @@ impl Runtime {
     pub(crate) fn run_ready(&mut self) -> bool {
         let ran = !self.ready.is_empty();
         while !self.ready.is_empty() {
+            if !self.touched.is_empty() {
+                self.flush();
+            }
             let r = self.ready.remove(0);
             let mut f = r.fiber;
             let chain = f.chain;
+            let mark = self.outputs.len();
             self.ran_code = true;
             let result = self.run(&mut f);
-            self.settle(f, r.reply, result);
+            self.settle(f, r.reply, result, mark);
             // A call that failed before entering gives its reserved turn to the next.
             if let Some(key) = r.reserved {
                 if self.lock(&key).is_some_and(|l| l.chain == chain && l.depth == 0) {
@@ -258,10 +262,14 @@ impl Runtime {
         for (key, w) in expired {
             let why = format!("{} was busy for {} s with another exclusive call; try again", self.describe(&key), WAIT_MS / 1000.0);
             if w.started {
+                if !self.touched.is_empty() {
+                    self.flush();
+                }
                 let mut f = w.fiber;
+                let mark = self.outputs.len();
                 self.ran_code = true;
                 let r = self.unwind(&mut f, Exc::msg(why)).and_then(|()| self.run(&mut f));
-                self.settle(f, w.reply, r);
+                self.settle(f, w.reply, r, mark);
             } else {
                 self.refuse_start(w.reply, 503, why);
             }

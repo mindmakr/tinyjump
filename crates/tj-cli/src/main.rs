@@ -6,6 +6,7 @@ mod audit;
 mod auth;
 mod bench;
 mod bytes;
+mod compat;
 mod compliance;
 mod engine;
 mod http;
@@ -39,9 +40,10 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj> [--manifest [--json]] [--access] [--privacy] [--compliance <pack.json>]
+  tj check <app.tj> [--manifest [--json]] [--against <old.tj> [--allow-breaking]] [--access] [--privacy] [--compliance <pack.json>]
                                  compile and report errors; --manifest prints the canonical app contract
                                  (hash, objects, rules, personal data, plugins, warnings; JSON with --json),
+                                 --against compares schemas, outbox signatures and rules against an older app,
                                  --access prints who may read and call what, --privacy the personal data
                                  the app holds and for what (with --record: GDPR article 30 Markdown),
                                  and --compliance checks the app against a compliance pack
@@ -116,6 +118,8 @@ struct Args {
     budget: Option<PathBuf>,
     json: bool,
     manifest: bool,
+    against: Option<PathBuf>,
+    allow_breaking: bool,
     access: bool,
     privacy: bool,
     record: bool,
@@ -140,7 +144,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -152,6 +156,8 @@ fn parse_args() -> Result<Args, String> {
             "--budget" => args.budget = Some(PathBuf::from(value()?)),
             "--json" => args.json = true,
             "--manifest" => args.manifest = true,
+            "--against" => args.against = Some(PathBuf::from(value()?)),
+            "--allow-breaking" => args.allow_breaking = true,
             "--access" => args.access = true,
             "--privacy" => args.privacy = true,
             "--record" => {
@@ -239,7 +245,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.manifest, args.json, args.access, args.privacy, args.record, args.compliance.as_deref())),
+        "check" => args.file().and_then(|f| check(f, args.manifest, args.json, args.against.as_deref(), args.allow_breaking, args.access, args.privacy, args.record, args.compliance.as_deref())),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -310,7 +316,10 @@ fn read_source(file: &Path) -> Result<String, String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn check(file: &Path, show_manifest: bool, as_json: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>, allow_breaking: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+    if as_json && show_manifest && against.is_some() {
+        return Err("pass either --manifest --json or --against <old.tj> --json, not both".into());
+    }
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
@@ -321,6 +330,52 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, access: bool, privacy:
                 let m = manifest::Manifest::build(&src, &program, &refs);
                 println!("{}", serde_json::to_string_pretty(&m.json).expect("JSON serializes"));
                 return Ok(());
+            }
+            if let Some(old_file) = against {
+                let old_src = read_source(old_file)?;
+                let old_name = old_file.display().to_string();
+                let old_prog = tj_core::compile(&old_src).map_err(|errs| errs.iter().map(|d| d.render(&old_name, &old_src)).collect::<Vec<_>>().join("\n\n"))?;
+                let findings = compat::check(&old_src, &old_prog, &src, &program);
+                if as_json {
+                    let j = serde_json::json!({
+                        "compatible": !compat::has_breaking(&findings),
+                        "findings": findings.iter().map(compat::Finding::json).collect::<Vec<_>>(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&j).expect("JSON serializes"));
+                    if !allow_breaking && compat::has_breaking(&findings) {
+                        return Err("breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                    }
+                    return Ok(());
+                }
+                println!("ok: {name}");
+                print!("{}", compat::report(&findings));
+                let mut failed: Option<String> = (!allow_breaking && compat::has_breaking(&findings)).then(|| "breaking upgrade changes found (above); pass --allow-breaking if intentional".into());
+                if show_manifest {
+                    let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+                    let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+                    let m = manifest::Manifest::build(&src, &program, &refs);
+                    print!("{}", m.text());
+                }
+                if access {
+                    print!("{}", access::report(&src));
+                }
+                if privacy && record {
+                    print!("{}", privacy::record(&src, &program));
+                } else if privacy {
+                    print!("{}", privacy::report(&program));
+                }
+                if let Some(pack) = pack {
+                    let pack = compliance::Pack::load(pack)?;
+                    let (report, ok) = pack.report(&pack.evaluate(&src, &program, None));
+                    print!("{report}");
+                    if !ok {
+                        failed = Some("some controls are not met (above)".into());
+                    }
+                }
+                return match failed {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                };
             }
             println!("ok: {name}");
             if show_manifest {
@@ -454,7 +509,9 @@ not starting: some controls of the compliance pack are not met (above)"));
 fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
     let stamps = |files: &[PathBuf]| -> Vec<Option<SystemTime>> { files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect() };
     let spawned = thread::Builder::new().name("tj-watch".into()).spawn(move || {
-        let mut files = app::read(&file).map(|a| a.files).unwrap_or_else(|_| vec![file.clone()]);
+        let initial = app::read(&file).ok();
+        let mut prev_snap = initial.as_ref().and_then(|a| tj_core::compile(&a.source).ok().map(|p| compat::Snapshot::build(&a.source, &p)));
+        let mut files = initial.map(|a| a.files).unwrap_or_else(|| vec![file.clone()]);
         let mut last = stamps(&files);
         loop {
             thread::sleep(Duration::from_millis(300));
@@ -464,7 +521,18 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
             match app::read(&file) {
                 Ok(app) => {
                     match tj_core::compile(&app.source) {
-                        Ok(_) => engine.reload(app.source),
+                        Ok(new_prog) => {
+                            let new_snap = compat::Snapshot::build(&app.source, &new_prog);
+                            // Non-blocking upgrade check during `tj dev` iteration (`R-003.1`).
+                            if let Some(old_snap) = &prev_snap {
+                                let findings = compat::check_snapshots(old_snap, &new_snap);
+                                if !findings.is_empty() {
+                                    eprint!("[tj] upgrade notice:\n{}", compat::report(&findings));
+                                }
+                            }
+                            prev_snap = Some(new_snap);
+                            engine.reload(app.source);
+                        }
                         Err(errs) => eprintln!("{}", errs.iter().map(|d| d.render(&file.display().to_string(), &app.source)).collect::<Vec<_>>().join("\n\n")),
                     }
                     files = app.files; // imports may have changed

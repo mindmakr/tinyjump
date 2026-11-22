@@ -941,9 +941,8 @@ fn a_runaway_call_on_a_server_fails_and_the_server_carries_on() {
     let steps = rt.stats()["methods"]["Spin.forever"]["steps"].as_u64().unwrap();
     assert!((20_000_000..20_000_100).contains(&steps), "{steps}");
     assert_eq!(call_as(&mut rt, 2.0, "Spin/s", "ok", json!([]), who("", &[])), Ok(json!("alive")));
-    // Like any thrown error, it keeps the changes made before it failed (see
-    // feedback/2026-11-20-builder-005-failed-calls-keep-changes.md).
-    assert!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap() > 0);
+    // Failed calls roll back uncommitted mutations atomically (atomic turns).
+    assert_eq!(state(&mut rt, 3.0, "Spin/s")["n"].as_u64().unwrap(), 0);
 }
 
 /// The account object the flow tests build on.
@@ -2995,4 +2994,183 @@ fn a_screen_that_shows_the_time_is_drawn_again_each_minute() {
 fn encode_uri_component_works_as_in_javascript() {
     let mut rt = boot("object U {\n  enc(s: string): string { return encodeURIComponent(s) }\n}\n");
     assert_eq!(call(&mut rt, 1.0, "U/u", "enc", json!(["a b&c/é?x=1-_.!~*'()"])).unwrap(), json!("a%20b%26c%2F%C3%A9%3Fx%3D1-_.!~*'()"));
+}
+
+#[test]
+fn invariants_roll_back_bad_mutations_and_failed_calls_are_atomic() {
+    // Compile errors with fix hints for invalid @invariant usage.
+    assert!(compile("object A { @invariant bad(x: number): boolean { return x > 0 } }").is_err());
+    assert!(compile("@server @read(\"anyone\") object A { @invariant @allow(\"anyone\") ok(): boolean { return true } }").is_err());
+    assert!(compile("object A { @invariant(\"x\") ok(): boolean { return true } }").is_err());
+
+    let src = r#"
+@server @read("anyone") object Account {
+  balance: number = 100
+  log: string[] = []
+  @invariant nonNegative(): boolean { return this.balance >= 0 }
+  @allow("anyone") deposit(n: number) { this.balance += n }
+  @allow("anyone") withdraw(n: number) {
+    this.balance -= n
+    this.emit("withdrew", { n })
+    this.schedule("fee", 5000, "chargeFee")
+  }
+  @allow("anyone") transferTo(other: string, n: number) {
+    Account.get(other).deposit(n)
+    this.balance -= n
+  }
+  @allow("anyone") mutateThenThrow(n: number) {
+    this.balance += n
+    this.schedule("fee", 5000, "chargeFee")
+    this.emit("mutated", { n })
+    throw new Error("boom")
+  }
+  private chargeFee() { this.log.push("fee") }
+}
+"#;
+    let mut rt = server(src, false);
+    let anon = || who("", &[]);
+
+    // Valid mutation passes the invariant and saves.
+    assert!(call_as(&mut rt, 1.0, "Account/a", "deposit", json!([50]), anon()).is_ok());
+    assert_eq!(state(&mut rt, 2.0, "Account/a")["balance"], json!(150));
+
+    // Breaking @invariant rolls back state, alarms and emits, and returns status 422.
+    let out = rt.handle(3.0, Input::Call { object: "Account/a".into(), method: "withdraw".into(), args: vec![json!(200)], reply: Some(1), call: None, caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { error: Some(e), status: Some(422), .. } if e.contains("Account.nonNegative"))), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "withdrew")), "no phantom emit: {out:?}");
+    assert_eq!(state(&mut rt, 4.0, "Account/a")["balance"], json!(150), "balance rolled back");
+    rt.handle(10_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 11_000.0, "Account/a")["log"], json!([]), "scheduled alarm rolled back too");
+
+    // Multi-object mutation rolls back BOTH objects if any touched object breaks its invariant.
+    let err = call_as(&mut rt, 12.0, "Account/a", "transferTo", json!(["b", 500]), anon()).unwrap_err();
+    assert_eq!(err.0, Some(422));
+    assert_eq!(state(&mut rt, 13.0, "Account/a")["balance"], json!(150));
+    assert_eq!(state(&mut rt, 14.0, "Account/b")["balance"], json!(100), "receiver deposit rolled back atomically");
+
+    // Uncaught throw rolls back state, alarms and emits atomically, while idempotency still caches the error.
+    let out = rt.handle(15.0, Input::Call { object: "Account/a".into(), method: "mutateThenThrow".into(), args: vec![json!(25)], reply: Some(2), call: Some("k1".into()), caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { error: Some(e), .. } if e.contains("boom"))), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Emit { name, .. } if name == "mutated")), "{out:?}");
+    assert_eq!(state(&mut rt, 16.0, "Account/a")["balance"], json!(150), "thrown call rolled back balance");
+    rt.handle(25_000.0, Input::Tick);
+    assert_eq!(state(&mut rt, 26_000.0, "Account/a")["log"], json!([]), "thrown call rolled back alarm");
+    // Replaying the idempotent key returns the cached error without mutating.
+    let replay = rt.handle(27.0, Input::Call { object: "Account/a".into(), method: "mutateThenThrow".into(), args: vec![json!(25)], reply: Some(3), call: Some("k1".into()), caller: anon() });
+    assert!(replay.iter().any(|o| matches!(o, Output::Reply { error: Some(e), .. } if e.contains("boom"))), "{replay:?}");
+
+    // `check_invariants()` verifies all stored live objects cleanly (`Account/a`; `Account/b` was rolled back).
+    assert_eq!(rt.check_invariants().unwrap(), 1);
+}
+
+#[test]
+fn invariant_and_rollback_edge_cases_from_critic_035() {
+    // C-035.11: @invariant rejects @exclusive / @needs at compile time and forbids state mutation at runtime.
+    assert!(compile("object A { @invariant @exclusive ok(): boolean { return true } }").is_err());
+    assert!(compile("@server @read(\"owner\") object A { @invariant @needs(\"consent:a\") ok(): boolean { return true } }").is_err());
+    let mut mut_rt = server(r#"
+@server @read("anyone") object Bad {
+  n: number = 0
+  @invariant sneaky(): boolean { this.n = 99; return true }
+  @allow("anyone") bump() { this.n += 1 }
+}
+"#, false);
+    let err = call_as(&mut mut_rt, 1.0, "Bad/a", "bump", json!([]), who("", &[])).unwrap_err();
+    assert_eq!(err.0, Some(422));
+    assert_eq!(state(&mut mut_rt, 2.0, "Bad/a")["n"], json!(0));
+
+    // C-035.2: `this.delete()` + invalid mutation cannot bypass @invariant; `this.delete()` + throw restores metadata.
+    let del_src = r#"
+@server @read("anyone") object Item {
+  balance: number = 10
+  @invariant nonNeg(): boolean { return this.balance >= 0 }
+  @allow("anyone") set(n: number) { this.balance = n }
+  @allow("anyone") bypass() { this.delete(); this.balance = -5 }
+  @allow("anyone") deleteThenThrow() { this.delete(); throw new Error("nope") }
+  @allow("anyone") remove() { this.delete() }
+}
+"#;
+    let mut rt = server(del_src, false);
+    let anon = || who("", &[]);
+    call_as(&mut rt, 100.0, "Item/x", "set", json!([25]), anon()).unwrap();
+    assert_eq!(call_as(&mut rt, 101.0, "Item/x", "bypass", json!([]), anon()).unwrap_err().0, Some(422));
+    assert_eq!(state(&mut rt, 102.0, "Item/x")["balance"], json!(25));
+    assert!(call_as(&mut rt, 103.0, "Item/x", "deleteThenThrow", json!([]), anon()).is_err());
+    assert_eq!(state(&mut rt, 104.0, "Item/x")["balance"], json!(25));
+    // Subsequent invalid mutation MUST still be caught (cleared was restored to false).
+    assert_eq!(call_as(&mut rt, 105.0, "Item/x", "set", json!([-1]), anon()).unwrap_err().0, Some(422));
+    assert_eq!(state(&mut rt, 106.0, "Item/x")["balance"], json!(25));
+    // Pure `this.delete()` succeeds cleanly.
+    assert!(call_as(&mut rt, 107.0, "Item/x", "remove", json!([]), anon()).is_ok());
+
+    // C-035.5 & C-035.6: @invariant failure before `await fetch` drops Output::Effect & cancels fiber;
+    // `call_once` caches the 422 result cleanly.
+    let async_src = r#"
+@server @read("anyone") object Pay {
+  balance: number = 10
+  @invariant nonNeg(): boolean { return this.balance >= 0 }
+  @allow("anyone") deposit(n: number) { this.balance += n }
+  @allow("anyone") async overdrawAndFetch(n: number): string {
+    this.balance -= n
+    await fetch("https://example.com/hook")
+    return "sent"
+  }
+}
+"#;
+    let mut rt = server(async_src, false);
+    let out = rt.handle(1.0, Input::Call { object: "Pay/p".into(), method: "overdrawAndFetch".into(), args: vec![json!(50)], reply: Some(10), call: Some("idem-422".into()), caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 10, error: Some(_), status: Some(422), .. })), "{out:?}");
+    assert!(!out.iter().any(|o| matches!(o, Output::Effect { .. })), "uncommitted fetch effect must be dropped: {out:?}");
+    assert_eq!(state(&mut rt, 2.0, "Pay/p")["balance"], json!(10));
+    // Even after a deposit makes balance 100, replaying `idem-422` returns the cached 422 error without running!
+    call_as(&mut rt, 3.0, "Pay/p", "deposit", json!([90]), anon()).unwrap();
+    let replay = rt.handle(4.0, Input::Call { object: "Pay/p".into(), method: "overdrawAndFetch".into(), args: vec![json!(50)], reply: Some(11), call: Some("idem-422".into()), caller: anon() });
+    assert!(replay.iter().any(|o| matches!(o, Output::Reply { reply: 11, error: Some(_), status: Some(422), .. })), "cached 422: {replay:?}");
+    assert_eq!(state(&mut rt, 5.0, "Pay/p")["balance"], json!(100), "replayed 422 did not re-execute");
+
+    // C-035.1 & C-035.3: two alarms failing @invariant in the same tick do not loop, and a
+    // failing due timer never clobbers a committed request's Reply or Emit in the same handle().
+    let timer_src = r#"
+@server @read("anyone") object Box {
+  n: number = 0
+  @invariant nonNeg(): boolean { return this.n >= 0 }
+  @allow("anyone") arm(delay: number) { this.schedule(delay, "bad") }
+  @allow("anyone") ok(): string { this.n += 1; this.emit("ok", {}); return "good" }
+  private bad() { this.n = -1 }
+}
+"#;
+    let mut rt = server(timer_src, false);
+    call_as(&mut rt, 1.0, "Box/1", "arm", json!([10]), anon()).unwrap();
+    call_as(&mut rt, 1.0, "Box/2", "arm", json!([10]), anon()).unwrap();
+    // Request `ok()` arrives at t=20 when both failing alarms are due: `ok()` commits cleanly!
+    let out = rt.handle(20.0, Input::Call { object: "Box/3".into(), method: "ok".into(), args: vec![], reply: Some(99), call: None, caller: anon() });
+    assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 99, ok: Some(v), .. } if *v == json!("good"))), "{out:?}");
+    assert!(out.iter().any(|o| matches!(o, Output::Emit { object, name, .. } if object == "Box/3" && name == "ok")), "{out:?}");
+    assert_eq!(state(&mut rt, 21.0, "Box/1")["n"], json!(0));
+    assert_eq!(state(&mut rt, 21.0, "Box/2")["n"], json!(0));
+
+    // C-035.1 (disk-save failure during alarm): does not infinite loop in fire_timers().
+    let flaky = Flaky::default();
+    let mut frt = Runtime::boot(compile(timer_src).unwrap(), Box::new(flaky.clone()), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    call_as(&mut frt, 1.0, "Box/1", "arm", json!([10]), anon()).unwrap();
+    // Fail disk writes during the tick when the alarm fires: must return cleanly (no hang) and retry next tick.
+    flaky.1.set(true);
+    let out = frt.handle(20.0, Input::Tick);
+    assert!(out.iter().any(|o| matches!(o, Output::Error { .. })), "{out:?}");
+    flaky.1.set(false);
+    let _ = frt.handle(30.0, Input::Tick);
+
+    // C-035.4: GDPR erasure on a shared object with `@invariant` succeeds without deadlocking.
+    let gdpr_src = r#"
+@server @read("anyone") object Slot {
+  status: string = "open"
+  @read("staff", "self") customer: string = ""
+  @invariant bookedNeedsCustomer(): boolean { return this.status !== "booked" || this.customer !== "" }
+  @allow("signedIn") book() { this.status = "booked"; this.customer = caller.id }
+}
+"#;
+    let mut grt = server(gdpr_src, false);
+    call_as(&mut grt, 1.0, "Slot/s1", "book", json!([]), who("user:ana", &[])).unwrap();
+    let erased = grt.erase_subject("user:ana", None).expect("erasure must not be blocked by app invariant");
+    assert!(erased.erased.contains(&"Slot/s1#customer".to_string()), "{:?}", erased.erased);
 }

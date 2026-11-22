@@ -238,6 +238,11 @@ pub struct Runtime {
     erasures: std::collections::BTreeMap<String, f64>,
     /// The secret behind `caller_tag`, once read or made.
     secret: Option<Rc<str>>,
+    /// Alarms already fired and consumed during the current turn: kept removed even if the
+    /// alarm handler throws or fails an `@invariant`, so a failing alarm never re-fires forever.
+    pub(crate) consumed_alarms: Vec<((u16, Rc<str>), u64)>,
+    /// True while evaluating an `@invariant` method (forbids state mutation and I/O).
+    pub(crate) in_invariant: bool,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
     stats: stats::Table,
@@ -307,6 +312,8 @@ impl Runtime {
             #[cfg(feature = "server")]
             erasures: std::collections::BTreeMap::new(),
             secret: None,
+            consumed_alarms: Vec::new(),
+            in_invariant: false,
             outputs: Vec::new(),
             metrics: Metrics::default(),
             stats: stats::table(&program),
@@ -402,13 +409,27 @@ impl Runtime {
                             // person: once it returns a promise it does not await (`onPress={() =>
                             // cart.add(x)}`) or first waits (for a server that may be offline). What
                             // happens after is on the screen, and errors are reported as usual.
+                            let mark = self.outputs.len();
                             match self.run(&mut f) {
-                                Ok(Run::Done(Value::Promise(_))) => self.settle(f, reply, Ok(Run::Done(Value::Null))),
-                                Ok(Run::Await(p)) => {
-                                    self.settle(f, None, Ok(Run::Await(p)));
-                                    self.reply(reply, Ok(Json::Null));
+                                Ok(Run::Done(Value::Promise(_))) => {
+                                    self.settle(f, reply, Ok(Run::Done(Value::Null)), mark);
                                 }
-                                r => self.settle(f, reply, r),
+                                Ok(Run::Await(p)) => {
+                                    let ok = self.settle(f, None, Ok(Run::Await(p)), mark);
+                                    if ok {
+                                        self.reply(reply, Ok(Json::Null));
+                                    } else {
+                                        // Invariant failed before suspending; surface the error to the UI caller too.
+                                        let msg = match self.outputs.last() {
+                                            Some(Output::Error { message, .. }) => message.clone(),
+                                            _ => "invariant failed".into(),
+                                        };
+                                        self.reply_status(reply, 422, msg);
+                                    }
+                                }
+                                r => {
+                                    self.settle(f, reply, r, mark);
+                                }
                             }
                         }
                         Err(e) => self.reply(reply, Err((e.message(), e.field()))),
@@ -450,10 +471,10 @@ impl Runtime {
         self.run_queued();
         self.fire_timers();
         self.run_queued();
+        self.flush();
         if std::mem::take(&mut self.ran_code) && self.render {
             self.render_app();
         }
-        self.flush();
         self.drain()
     }
 
@@ -607,26 +628,66 @@ impl Runtime {
     }
 
     fn drive(&mut self, mut f: Fiber, reply: Option<u64>) {
+        let mark = self.outputs.len();
         self.ran_code = true;
         let r = self.run(&mut f);
-        self.settle(f, reply, r);
+        self.settle(f, reply, r, mark);
     }
 
-    fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>) {
+    /// Completes or suspends a fiber, enforcing `@invariant`s and atomic rollback per turn.
+    /// Returns `true` when the turn committed or suspended cleanly, `false` when rolled back.
+    pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: usize) -> bool {
         match r {
             Ok(Run::Await(p)) => {
+                if let Err(msg) = self.check_touched_invariants() {
+                    self.ran(&mut f, false);
+                    self.release_frames(&mut f, 0);
+                    self.rollback_turn(mark);
+                    self.count_error(f.stat);
+                    self.reply_invariant_err(reply, msg);
+                    self.flush_from(mark);
+                    return false;
+                }
                 self.waiting.insert(p, (f, reply));
+                self.flush_from(mark);
+                true
             }
-            Ok(Run::Blocked(key)) => self.park(key, f, reply),
+            Ok(Run::Blocked(key)) => {
+                if let Err(msg) = self.check_touched_invariants() {
+                    self.ran(&mut f, false);
+                    self.release_frames(&mut f, 0);
+                    self.rollback_turn(mark);
+                    self.count_error(f.stat);
+                    self.reply_invariant_err(reply, msg);
+                    self.flush_from(mark);
+                    return false;
+                }
+                self.park(key, f, reply);
+                self.flush_from(mark);
+                true
+            }
             Ok(Run::Done(v)) => {
+                if let Err(msg) = self.check_touched_invariants() {
+                    self.ran(&mut f, false);
+                    self.rollback_turn(mark);
+                    self.count_error(f.stat);
+                    self.reply_invariant_err(reply, msg);
+                    self.flush_from(mark);
+                    return false;
+                }
                 self.ran(&mut f, true);
                 if reply.is_some() {
                     self.reply(reply, v.to_json().map_err(|e| (e, None)));
                 }
+                self.flush_from(mark);
+                true
             }
             Err(fail) => {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
+                // Atomic turns: an uncaught error rolls back every object mutated in this turn
+                // before recording the error reply (so idempotency call records stay clean).
+                self.rollback_turn(mark);
                 match fail.status {
                     Some(_) => self.count_refused_slot(f.stat),
                     None => self.count_error(f.stat),
@@ -638,7 +699,17 @@ impl Runtime {
                     (Some(_), None) => self.reply(reply, Err((fail.message, fail.field))),
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
+                self.flush_from(mark);
+                false
             }
+        }
+    }
+
+    fn reply_invariant_err(&mut self, reply: Option<u64>, msg: String) {
+        match reply {
+            Some(id) if id >= CALL_REPLY_BASE => self.finish_call(id, Err((msg, None)), Some(422)),
+            Some(id) => self.reply_status(Some(id), 422, msg),
+            None => self.outputs.push(Output::Error { message: msg, trace: Vec::new() }),
         }
     }
 
@@ -670,6 +741,10 @@ impl Runtime {
     /// Continues the fiber waiting on promise `id` with an effect's result.
     fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>, field: Option<String>) {
         if let Some((mut f, reply)) = self.waiting.remove(&id) {
+            if !self.touched.is_empty() {
+                self.flush();
+            }
+            let mark = self.outputs.len();
             self.ran_code = true;
             let r = match error {
                 Some(e) => self.unwind(&mut f, Exc::with_field(e, field)).and_then(|()| self.run(&mut f)),
@@ -678,7 +753,7 @@ impl Runtime {
                     self.run(&mut f)
                 }
             };
-            self.settle(f, reply, r);
+            self.settle(f, reply, r, mark);
         }
     }
 
@@ -693,8 +768,12 @@ impl Runtime {
 
     /// Answers a request; without a reply id, errors are reported and results dropped.
     fn reply(&mut self, reply: Option<u64>, r: Result<Json, (String, Option<String>)>) {
+        self.reply_with_status(reply, r, None);
+    }
+
+    pub(crate) fn reply_with_status(&mut self, reply: Option<u64>, r: Result<Json, (String, Option<String>)>, status: Option<u16>) {
         if let Some(internal) = reply.filter(|&id| id >= CALL_REPLY_BASE) {
-            self.finish_call(internal, r);
+            self.finish_call(internal, r, status);
             return;
         }
         if let Some(internal) = reply.filter(|&id| id >= INVOKE_REPLY_BASE) {
@@ -707,7 +786,7 @@ impl Runtime {
         }
         match (reply, r) {
             (Some(id), Ok(j)) => self.outputs.push(Output::Reply { reply: id, ok: Some(j), error: None, field: None, status: None }),
-            (Some(id), Err((e, field))) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), field, status: None }),
+            (Some(id), Err((e, field))) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), field, status }),
             (None, Err((e, _))) => self.outputs.push(Output::Error { message: e, trace: Vec::new() }),
             (None, Ok(_)) => {}
         }
@@ -721,8 +800,19 @@ impl Runtime {
     }
 
     fn fire_timers(&mut self) {
+        if !self.touched.is_empty() {
+            self.flush();
+        }
+        // Only fire timers that already existed on entry: a timer re-queued by a failed disk
+        // save gets seq > cutoff and retries on the next tick instead of looping forever.
+        let cutoff = self.seq;
+        let mut deferred = Vec::new();
         while self.timers.peek().is_some_and(|Reverse(t)| t.at <= self.now) {
             let Some(Reverse(t)) = self.timers.pop() else { break };
+            if t.seq > cutoff {
+                deferred.push(Reverse(t));
+                continue;
+            }
             match t.kind {
                 // A deleted object's timers stop.
                 TimerKind::Every { obj, .. } if self.is_gone(&obj) => {}
@@ -752,6 +842,9 @@ impl Runtime {
                 #[cfg(feature = "server")]
                 TimerKind::Retain => self.retain_step(),
             }
+        }
+        for t in deferred {
+            self.timers.push(t);
         }
     }
 }
