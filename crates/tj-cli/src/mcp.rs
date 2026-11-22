@@ -17,13 +17,19 @@ struct Recorder {
 }
 
 pub fn run(target: &str, record_file: Option<PathBuf>) -> Result<(), String> {
-    let recorder = record_file.map(|f| Recorder { file: Some(f), steps: Vec::new() });
     let client = Client {
         agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(),
         target: target.trim_end_matches('/').to_string(),
         auth: crate::auth::client_header(),
-        recorder: RefCell::new(recorder),
+        recorder: RefCell::new(None),
     };
+    if let Some(f) = record_file {
+        let mut steps = Vec::new();
+        if let Some((id, roles)) = client.whoami() {
+            steps.push(json!({ "do": "as", "id": id, "roles": roles }));
+        }
+        *client.recorder.borrow_mut() = Some(Recorder { file: Some(f), steps });
+    }
     let mut stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -185,7 +191,15 @@ impl Client {
                 let inp = &a["input"];
                 let r = self.input(inp);
                 if inp["type"].as_str() == Some("tick") {
-                    self.record_step(json!({ "do": "tick", "advanceMs": 1000 }));
+                    let mut step = json!({ "do": "tick" });
+                    if let Some(ms) = inp.get("advanceMs").and_then(Json::as_f64) {
+                        step["advanceMs"] = json!(ms);
+                    } else if let Some(adv) = inp.get("advance").and_then(Json::as_str) {
+                        step["advance"] = json!(adv);
+                    } else {
+                        step["advanceMs"] = json!(1000);
+                    }
+                    self.record_step(step);
                 }
                 text(r?.to_string())
             }
@@ -254,11 +268,24 @@ impl Client {
         Ok(Some((rec.file, body)))
     }
 
+    fn whoami(&self) -> Option<(String, Vec<String>)> {
+        let resp = self.agent.get(&self.url("/api/whoami")).call().ok()?;
+        let body: Json = serde_json::from_str(&resp.into_string().ok()?).ok()?;
+        let ok = body.get("ok")?;
+        let id = ok["id"].as_str().filter(|s| !s.is_empty())?.to_string();
+        let roles = ok["roles"].as_array().map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect()).unwrap_or_default();
+        Some((id, roles))
+    }
+
     fn record_trace(&self, a: &Json) -> Result<String, String> {
         match a["action"].as_str().unwrap_or("") {
             "start" => {
                 let file = a["file"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
-                *self.recorder.borrow_mut() = Some(Recorder { file: file.clone(), steps: Vec::new() });
+                let mut steps = Vec::new();
+                if let Some((id, roles)) = self.whoami() {
+                    steps.push(json!({ "do": "as", "id": id, "roles": roles }));
+                }
+                *self.recorder.borrow_mut() = Some(Recorder { file: file.clone(), steps });
                 match file {
                     Some(p) => Ok(format!("recording trace to {}", p.display())),
                     None => Ok("recording trace in memory (call record_trace stop to retrieve)".into()),
@@ -334,5 +361,33 @@ mod tests {
         assert_eq!(saved.lines().count(), 2);
         assert!(saved.contains("\"do\":\"ui\"") && saved.contains("\"do\":\"call\""), "{saved}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_trace_captures_whoami_identity_and_tick_advance() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        std::thread::spawn(move || {
+            for req in server.incoming_requests() {
+                let body = if req.url() == "/api/whoami" {
+                    r#"{"ok":{"id":"dev:ana","roles":["staff"],"dev":true}}"#
+                } else {
+                    r#"{"ok":null}"#
+                };
+                let _ = req.respond(tiny_http::Response::from_string(body));
+            }
+        });
+        let c = Client {
+            agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build(),
+            target: format!("http://127.0.0.1:{port}"),
+            auth: None,
+            recorder: RefCell::new(None),
+        };
+        c.handle("tools/call", &json!({ "name": "record_trace", "arguments": { "action": "start" } })).unwrap();
+        c.handle("tools/call", &json!({ "name": "input", "arguments": { "input": { "type": "tick", "advanceMs": 5000 } } })).unwrap();
+        let stop = c.handle("tools/call", &json!({ "name": "record_trace", "arguments": { "action": "stop" } })).unwrap();
+        let text = stop["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("\"do\":\"as\"") && text.contains("\"dev:ana\"") && text.contains("\"staff\""), "{text}");
+        assert!(text.contains("\"do\":\"tick\"") && text.contains("\"advanceMs\":5000"), "{text}");
     }
 }

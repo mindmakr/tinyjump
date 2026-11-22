@@ -447,6 +447,9 @@ fn handle(mut req: Request, front: &Front) {
                 let (Some(action @ ("export" | "erase")), Some(subject)) = (j["action"].as_str(), j["subject"].as_str().filter(|s| !s.is_empty())) else {
                     return Err((400, "send {\"action\": \"export\" or \"erase\", \"subject\": \"<person id>\"}".into()));
                 };
+                if action == "erase" {
+                    check_lease(&front.leases, ops, "app")?;
+                }
                 front.audit.security(Entry::new("admin").who(ops.actor()).text("request", &format!("privacy {action}")).person("subject", subject))?;
                 engine.privacy(subject.to_string(), action == "erase")
             }))
@@ -456,6 +459,13 @@ fn handle(mut req: Request, front: &Front) {
             let ops = ops_access.as_ref().expect("authenticated");
             result_response(ops.require(OpsScope::Test, dev_mode, "/_tj/input").and_then(|()| read_json(&mut req)).and_then(|j| {
                 let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
+                if !matches!(input, Input::Get { .. } | Input::Inspect { .. }) {
+                    let scope = match &input {
+                        Input::Call { object, .. } => object.as_str(),
+                        _ => "app",
+                    };
+                    check_lease(&front.leases, ops, scope)?;
+                }
                 front.audit.security(admin_input(ops.actor(), &input))?;
                 // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
                 // reads stay here, where the server's objects live.
@@ -516,6 +526,13 @@ fn handle(mut req: Request, front: &Front) {
     engine.stats().request(started.elapsed(), status < 400);
 }
 
+fn check_lease(leases: &Leases, ops: &OpsAccess, scope: &str) -> Result<(), Failure> {
+    match ops {
+        OpsAccess::Admin => Ok(()),
+        OpsAccess::Scoped { .. } => leases.check_exclusive(&ops.holder(), scope),
+    }
+}
+
 /// A refusal, written to the audit log before the answer goes out: who (re-checked here, so
 /// only refusals pay for it), what was asked, and the status. Never credentials, bodies or
 /// arguments. The request is refused either way, so a log that cannot be written changes
@@ -523,7 +540,14 @@ fn handle(mut req: Request, front: &Front) {
 fn refused(front: &Front, authorization: Option<&str>, ops: Option<&OpsAccess>, (asked, class, method): Asked, status: u16) {
     let who = match ops {
         Some(o) => o.actor(),
-        None => front.identity.verify(authorization).map_or(Actor::Invalid, |v| Actor::of(&v.caller)),
+        None => match front.identity.verify(authorization) {
+            Ok(v) => Actor::of(&v.caller),
+            Err(_) => authorization
+                .and_then(|h| h.strip_prefix("Bearer ").map(str::trim))
+                .filter(|t| t.starts_with(crate::identity::KEY_PREFIX))
+                .and_then(|t| front.identity.verify_ops_key(t).ok().flatten())
+                .map_or(Actor::Invalid, |(name, _)| Actor::Ops(name)),
+        },
     };
     let mut e = Entry::new("refused").who(who).text("request", asked).num("status", status.into());
     if let Some(class) = class {
@@ -608,35 +632,44 @@ fn ticket(req: &mut Request, front: &Front, authorization: Option<&str>) -> Resu
     Ok(json!({ "ticket": value }))
 }
 
+enum StreamAuth {
+    User(String),
+    Ops(String),
+}
+
 /// An admitted stream: its events, its slot in the per-caller cap, and the credential to
 /// re-check while it is open.
 struct Opened {
     events: Arc<Mailbox>,
     slot: Option<String>,
-    credential: Option<String>,
+    auth: Option<StreamAuth>,
 }
 
 /// `GET /api/events`: checks who may stream what, caps streams per caller, then streams.
 fn stream(req: Request, front: &Front, authorization: Option<String>) {
+    let mut ops_access: Option<OpsAccess> = None;
     let opened = (|| -> Result<Opened, Failure> {
         let since_header = header_value(&req, "Last-Event-ID");
         let since = since_header.into_iter().chain(query_values(req.url(), "since")?).find_map(|s| s.trim().parse().ok()).unwrap_or(0);
         let ticket = query_values(req.url(), "ticket")?.into_iter().next();
-        let (caller, objects, credential) = match ticket {
+        let (caller, objects, auth) = match ticket {
             Some(value) => {
                 let t = front.tickets.lock().ok().and_then(|mut m| m.remove(&sha256_hex(&value))).filter(|t| t.expires > Instant::now());
                 let t = t.ok_or((401, "this stream ticket is unknown, used or expired; get a new one".to_string()))?;
-                (Some(t.caller), t.objects, t.credential)
+                (Some(t.caller), t.objects, t.credential.map(StreamAuth::User))
             }
             None => {
                 let objects = query_values(req.url(), "object")?;
                 if objects.is_empty() {
                     // Every object, unfiltered, requires `maintain` or the admin key.
                     let ops = front.automation.authenticate(authorization.as_deref(), &front.identity).map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
+                    ops_access = Some(ops.clone());
                     ops.require(OpsScope::Maintain, front.dev.is_some(), "unfiltered /api/events").map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
-                    (None, objects, None)
+                    front.audit.security(Entry::new("admin").who(ops.actor()).text("request", "stream"))?;
+                    let auth = matches!(ops, OpsAccess::Scoped { .. }).then(|| authorization.clone()).flatten().map(StreamAuth::Ops);
+                    (None, objects, auth)
                 } else {
-                    (Some(front.identity.verify(authorization.as_deref())?.caller), objects, authorization.clone())
+                    (Some(front.identity.verify(authorization.as_deref())?.caller), objects, authorization.clone().map(StreamAuth::User))
                 }
             }
         };
@@ -664,7 +697,11 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
                     let who = caller_id.as_deref().map_or(Actor::Anonymous, |id| Actor::id(Some(id)));
                     let _ = front.audit.security(Entry::new("refused").who(who).text("request", "stream").text("classes", &classes(&refused)).num("status", 403));
                 }
-                Ok(Opened { events, slot, credential: credential.filter(|_| caller_id.is_some()) })
+                let keep_auth = match auth {
+                    Some(StreamAuth::User(c)) => caller_id.is_some().then_some(StreamAuth::User(c)),
+                    other => other,
+                };
+                Ok(Opened { events, slot, auth: keep_auth })
             }
             Err(e) => {
                 release(front, slot.as_deref());
@@ -673,15 +710,23 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
         }
     })();
     match opened {
-        Ok(Opened { events, slot, credential }) => {
+        Ok(Opened { events, slot, auth }) => {
             // Re-check the credential while the stream is open: expired tokens and revoked
-            // keys must not keep receiving changes.
-            let first = credential.as_deref().map(|c| front.identity.verify(Some(c)).ok().map(|v| (v.caller, v.expires)));
-            let still_valid = || match (&credential, &first) {
-                (Some(c), Some(Some((caller, expires)))) => {
+            // keys (including scoped `ops:maintain` keys) must not keep receiving changes.
+            let first = match &auth {
+                Some(StreamAuth::User(c)) => Some(front.identity.verify(Some(c)).ok().map(|v| (v.caller, v.expires))),
+                _ => None,
+            };
+            let still_valid = || match (&auth, &first) {
+                (Some(StreamAuth::User(c)), Some(Some((caller, expires)))) => {
                     expires.map_or(true, |t| SystemTime::now() < t) && front.identity.verify(Some(c)).is_ok_and(|v| v.caller == *caller)
                 }
-                (Some(_), _) => false,
+                (Some(StreamAuth::User(_)), _) => false,
+                (Some(StreamAuth::Ops(c)), _) => front
+                    .automation
+                    .authenticate(Some(c), &front.identity)
+                    .and_then(|o| o.require(OpsScope::Maintain, front.dev.is_some(), "unfiltered /api/events"))
+                    .is_ok(),
                 (None, _) => true,
             };
             sse(req, &events, still_valid);
@@ -689,7 +734,7 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
         }
         Err((status, e)) => {
             if matches!(status, 401 | 403) {
-                refused(front, authorization.as_deref(), None, ("stream", None, None), status);
+                refused(front, authorization.as_deref(), ops_access.as_ref(), ("stream", None, None), status);
             }
             let _ = req.respond(json_response(status, &json!({ "error": e })));
         }
@@ -798,6 +843,7 @@ mod tests {
         let obs = crate::identity::new_key("critic", &[], Some(OpsScope::Observe), &keys_file).unwrap();
         let tst = crate::identity::new_key("tester", &[], Some(OpsScope::Test), &keys_file).unwrap();
         let mnt = crate::identity::new_key("maint", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
+        let mnt2 = crate::identity::new_key("maint2", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
         let ana = crate::identity::new_key("ana", &[], None, &keys_file).unwrap();
 
         let source = r#"
@@ -840,8 +886,13 @@ mod tests {
             (status, serde_json::from_str(&r.into_string().unwrap()).unwrap())
         };
 
-        // Ana saves PII via the normal app API.
+        // Ana saves PII via the normal app API; `--ops` keys are refused on `/api/*` (L1-1).
         assert_eq!(call("POST", "/api/Account/key:ana/set", Some(&ana), Some(json!(["ana@example.com"]))).0, 200);
+        assert_eq!(call("POST", "/api/Account/key:critic/set", Some(&obs), Some(json!(["bad@example.com"]))).0, 403);
+        assert_eq!(call("POST", "/api/Account/key:tester/set", Some(&tst), Some(json!(["bad@example.com"]))).0, 403);
+
+        // Unfiltered `/api/events` refuses `ops:observe` (L1-2).
+        assert_eq!(call("GET", "/api/events", Some(&obs), None).0, 403);
 
         // Plain user key & unauthenticated requests are refused on /_tj/*.
         assert_eq!(call("GET", "/_tj/manifest", None, None).0, 401);
@@ -886,11 +937,27 @@ mod tests {
         assert_eq!(m2["ok"]["health"]["activeLeases"], json!(1));
         assert_eq!(m2["ok"]["leases"][0]["holder"], json!("ops:maint"));
 
-        // `ops:maintain` can run privacy export and /_tj/input.
+        // `ops:maintain` holder can run privacy & /_tj/input; competing `ops:maint2` gets 409 on mutating calls while lease is held, while read-only diagnostics stay open (L1-3).
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt2), Some(json!({ "type": "tick" }))).0, 409);
+        assert_eq!(call("POST", "/_tj/privacy", Some(&mnt2), Some(json!({ "action": "erase", "subject": "key:ana" }))).0, 409);
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt2), Some(json!({ "type": "inspect" }))).0, 200);
+        assert_eq!(call("POST", "/_tj/privacy", Some(&mnt2), Some(json!({ "action": "export", "subject": "key:ana" }))).0, 200);
         let (st, exp) = call("POST", "/_tj/privacy", Some(&mnt), Some(json!({ "action": "export", "subject": "key:ana" })));
         assert_eq!(st, 200);
         assert_eq!(exp["ok"]["Account/key:ana"]["email"], json!("ana@example.com"));
         assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
+        // Once the lease is released, `ops:maint2` can proceed.
+        assert_eq!(call("DELETE", &format!("/_tj/leases/{mnt_id}"), Some(&mnt), None).0, 200);
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt2), Some(json!({ "type": "tick" }))).0, 200);
+
+        // Unfiltered `/api/events` accepts `ops:maintain` and writes an admin stream audit entry (L1-2).
+        let sse_resp = agent
+            .get(&format!("{base}/api/events"))
+            .set("Authorization", &format!("Bearer {mnt}"))
+            .call()
+            .expect("ops:maintain opens unfiltered stream");
+        assert_eq!(sse_resp.status(), 200);
+        drop(sse_resp);
 
         // Audit log records scoped operational actors by name (`ops:critic`, `ops:tester`, `ops:maint`).
         let entries: String = std::fs::read_dir(data.join("audit"))
@@ -903,6 +970,8 @@ mod tests {
         assert!(entries.contains("\"who\":\"ops:tester\""), "{entries}");
         assert!(entries.contains("\"who\":\"ops:maint\""), "{entries}");
         assert!(entries.contains("\"kind\":\"lease\""), "{entries}");
+        assert!(entries.contains("\"kind\":\"admin\"") && entries.contains("\"request\":\"stream\""), "{entries}");
+        assert!(entries.contains("\"kind\":\"refused\"") && entries.contains("\"who\":\"ops:critic\"") && entries.contains("\"request\":\"stream\""), "{entries}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

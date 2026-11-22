@@ -3174,3 +3174,58 @@ fn invariant_and_rollback_edge_cases_from_critic_035() {
     let erased = grt.erase_subject("user:ana", None).expect("erasure must not be blocked by app invariant");
     assert!(erased.erased.contains(&"Slot/s1#customer".to_string()), "{:?}", erased.erased);
 }
+
+#[test]
+fn schedule_checks_every_argument_and_tools_mask_self_person_fields() {
+    // P48-1: non-literal method name or 2-arg unkeyed schedule must still taint-check every arg.
+    let keyed_var_method = r#"
+@server @read("owner") object User {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") arm(m: string) { this.schedule(this.email, 60000, m) }
+  private remind() {}
+}
+"#;
+    let err1 = compile(keyed_var_method).err().expect("must fail privacy flow check");
+    assert!(err1.iter().any(|d| d.message.contains("this.email") && d.message.contains("alarm")), "{err1:?}");
+
+    let unkeyed_two_args = r#"
+@server @read("owner") object User {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") arm() { this.schedule(60000, this.email) }
+}
+"#;
+    let err2 = compile(unkeyed_two_args).err().expect("must fail privacy flow check");
+    assert!(err2.iter().any(|d| d.message.contains("this.email") && d.message.contains("alarm")), "{err2:?}");
+
+    // P48-2: tools (`inspect` and `Caller::trusted()` `Get`) mask `@read(..., "self")` person-id
+    // fields with presence masking (`""` when empty, `"•••"` when set).
+    let slot_src = r#"
+@server @read("anyone") object Slot {
+  title: string = ""
+  @read("staff", "self") customer: string = ""
+  @allow("signedIn") book() { this.customer = caller.id }
+}
+"#;
+    let mut rt = server(slot_src, false);
+    // Unbooked: inspect and trusted Get show empty string `""`.
+    let _ = state(&mut rt, 1.0, "Slot/s1");
+    let snap_empty = rt.inspect();
+    let s1_empty = snap_empty["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Slot/s1").unwrap();
+    assert_eq!(s1_empty["state"]["customer"], json!(""));
+    assert_eq!(state(&mut rt, 1.5, "Slot/s1")["customer"], json!(""));
+
+    // Booked by Ana: Ana and staff see `"user:ana"`, while inspect and trusted Get see `"•••"`.
+    call_as(&mut rt, 2.0, "Slot/s1", "book", json!([]), who("user:ana", &[])).unwrap();
+    let snap_booked = rt.inspect();
+    let s1_booked = snap_booked["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Slot/s1").unwrap();
+    assert_eq!(s1_booked["state"]["customer"], json!("•••"), "inspect must mask \"self\" person IDs");
+    assert_eq!(state(&mut rt, 2.5, "Slot/s1")["customer"], json!("•••"), "trusted Get must mask \"self\" person IDs");
+    // Remote owner and staff still see the real id.
+    let get_as = |rt: &mut Runtime, caller: Option<Caller>| -> Json {
+        let out = rt.handle(3.0, Input::Get { object: "Slot/s1".into(), reply: Some(1), caller });
+        out.into_iter().find_map(|o| match o { Output::Reply { ok, .. } => ok, _ => None }).unwrap()
+    };
+    assert_eq!(get_as(&mut rt, who("user:ana", &[]))["customer"], json!("user:ana"));
+    assert_eq!(get_as(&mut rt, who("key:sam", &["staff"]))["customer"], json!("user:ana"));
+    assert_eq!(get_as(&mut rt, who("user:bo", &[]))["customer"], json!("•••"));
+}

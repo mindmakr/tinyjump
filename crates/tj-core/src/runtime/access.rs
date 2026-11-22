@@ -132,7 +132,7 @@ impl Runtime {
         guards
             .filter(|(_, g)| match who {
                 Who::Remote { .. } => !allows_named(&g.rule, who, id, state.get(&*g.field).and_then(Json::as_str).unwrap_or("")),
-                _ => g.pii,
+                _ => g.pii || g.names_a_person(),
             })
             .map(|(i, _)| i)
             .collect()

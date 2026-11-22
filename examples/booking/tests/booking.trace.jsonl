@@ -30,8 +30,9 @@
 {"do": "get", "object": "Slot/s1", "as": "key:sam:staff", "expectContains": {"customer": "user:ana"}}
 {"do": "get", "object": "Slot/s1", "as": "user:bo", "expectContains": {"title": "Haircut", "customer": "•••"}}
 
-# Tools (inspect) always see @pii masked
+# Tools (inspect) always see @pii and "self" person-id fields masked
 {"do": "assertInspect", "object": "Customer/user:ana", "expectContains": {"name": "•••", "phone": "•••"}}
+{"do": "assertInspect", "object": "Slot/s1", "expectContains": {"title": "Haircut", "customer": "•••"}}
 
 # Simulated restart preserves slot + scheduled reminder alarm
 {"do": "boot", "restart": true}

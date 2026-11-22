@@ -721,9 +721,13 @@ impl Runtime {
     pub(crate) fn object_states(&self) -> Json {
         let state = |i: &Instance| {
             let mut s = Value::Rec(i.state.clone().into()).to_json().unwrap_or(Json::Null);
-            for g in self.program.objects[i.handle.class as usize].guards.iter().filter(|g| g.pii) {
+            for g in self.program.objects[i.handle.class as usize].guards.iter().filter(|g| g.pii || g.names_a_person()) {
                 if let Some(v) = s.get_mut(&*g.field) {
-                    *v = Json::from(super::privacy::MASK);
+                    *v = if g.pii || v.as_str().is_some_and(|t| !t.is_empty()) {
+                        Json::from(super::privacy::MASK)
+                    } else {
+                        Json::from("")
+                    };
                 }
             }
             s

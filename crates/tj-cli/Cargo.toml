@@ -13,7 +13,7 @@ name = "tj"
 path = "src/main.rs"
 
 [dependencies]
-tj-core = { workspace = true, features = ["check", "server"] }
+tj-core = { workspace = true, features = ["check", "server", "layout"] }
 serde_json.workspace = true
 tiny_http = "0.12"
 ureq = "2"

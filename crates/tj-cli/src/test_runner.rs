@@ -81,8 +81,11 @@ impl Measure for TestMeasure {
         let px = num_prop("px").unwrap_or(pad);
         let py = num_prop("py").unwrap_or(pad);
         match kind.as_str() {
-            "Text" => {
-                let text = str_prop("text");
+            "Text" | "Time" => {
+                let text = match (kind.as_str(), str_prop("text")) {
+                    ("Time", "") => "2026-11-22 14:30",
+                    (_, t) => t,
+                };
                 let raw_w = text.chars().count() as f32 * char_w;
                 let inner_max = max_width.map(|mw| (mw - px * 2.0).max(char_w));
                 let (w, lines) = match inner_max {
@@ -247,6 +250,11 @@ impl Harness {
         let (mut rt, mut out) = Runtime::boot(program, Box::new(self.store.clone()), opts).map_err(|e| format!("boot failed: {e}"))?;
         rt.set_measure(Box::new(TestMeasure(self.nodes.clone())));
         out.extend(rt.handle(self.now, Input::Entropy { bytes: DEFAULT_ENTROPY.into() }));
+        if let Caller::Remote { id, roles } = &self.caller {
+            if !id.is_empty() || !roles.is_empty() {
+                out.extend(rt.handle(self.now, Input::Identity { user: (!id.is_empty()).then(|| id.clone()), roles: roles.clone() }));
+            }
+        }
         self.rt = Some(rt);
         let mut replies = HashMap::new();
         self.pump(out, &mut replies)?;
@@ -388,6 +396,15 @@ impl Harness {
 
     fn step(&mut self, s: &Json) -> Result<(), String> {
         let action = s["do"].as_str().ok_or("every trace step must have a \"do\" string")?;
+        self.last_errors.clear();
+        let res = self.run_step(action, s);
+        if res.is_ok() && !self.last_errors.is_empty() {
+            return Err(format!("{action} produced app error: {}", std::mem::take(&mut self.last_errors).join("; ")));
+        }
+        res
+    }
+
+    fn run_step(&mut self, action: &str, s: &Json) -> Result<(), String> {
         match action {
             "boot" => {
                 if let Some(now) = s["now"].as_f64() {
@@ -475,9 +492,15 @@ impl Harness {
                 let res = self.send_and_wait(Input::Ui { target, event: event.clone(), value, reply: None })?;
                 if let Some(want) = s["expectError"].as_str() {
                     match res {
-                        Err((_, msg, _)) if msg.contains(want) => return Ok(()),
+                        Err((_, msg, _)) if msg.contains(want) => {
+                            self.last_errors.clear();
+                            return Ok(());
+                        }
                         Err((_, msg, _)) => return Err(format!("ui {event}: expected error containing {want:?}, got {msg:?}")),
-                        Ok(_) if self.last_errors.iter().any(|e| e.contains(want)) => return Ok(()),
+                        Ok(_) if self.last_errors.iter().any(|e| e.contains(want)) => {
+                            self.last_errors.clear();
+                            return Ok(());
+                        }
                         Ok(_) => return Err(format!("ui {event}: expected error containing {want:?}, but succeeded")),
                     }
                 }
@@ -947,5 +970,61 @@ function App() {
         let layout_check = r#"{"do": "assertLayout", "width": 390, "height": 844, "review": true}"#;
         let bad = run_trace(Path::new("."), bad_ui, "bad_ui.trace.jsonl", layout_check, HashMap::new());
         assert!(bad.error.as_deref().is_some_and(|e| e.contains("layout review failed")), "{bad:?}");
+    }
+
+    #[test]
+    fn catches_output_errors_on_non_ui_steps_and_measures_time_nodes() {
+        // L2-1: Output::Error emitted during a `call` step (e.g. a due alarm that throws when
+        // another call arrives at the same timestamp) must fail the step, never be dropped.
+        let err_src = r#"
+@server @read("anyone") object Clock {
+  n: number = 0
+  @allow("anyone") arm() { this.schedule(0, "boom") }
+  @allow("anyone") ping(): number { this.n += 1; return this.n }
+  private boom() { throw "alarm exploded" }
+}
+"#;
+        let err_trace = r#"
+{"do": "boot", "now": 1000, "render": false}
+{"do": "call", "object": "Clock/c", "method": "arm", "as": "anon"}
+{"do": "call", "object": "Clock/c", "method": "ping", "as": "anon", "expect": 1}
+"#;
+        let r = run_trace(Path::new("."), err_src, "err.trace.jsonl", err_trace, HashMap::new());
+        assert!(!r.passed(), "Output::Error from due alarm during `call` must fail the trace");
+        assert!(r.error.unwrap().contains("alarm exploded"));
+
+        // L2-2: <Time> receives non-zero layout bounds in `assertLayout`.
+        let time_src = r#"
+function App() {
+  return <Column padding={16}>
+    <Time id="slot-time" value={1800000000000} />
+  </Column>
+}
+"#;
+        let mut h = Harness::new(PathBuf::from("."), time_src.into(), HashMap::new());
+        h.step(&json!({ "do": "boot", "now": 1800000000000.0 })).unwrap();
+        h.step(&json!({ "do": "assertLayout", "width": 390, "height": 844, "review": true })).unwrap();
+        let time_id = h.nodes.borrow().iter().find(|(_, (k, _))| k == "Time").map(|(id, _)| *id).expect("Time node exists");
+        let frame = h.frames.get(&time_id).expect("Time node laid out");
+        assert!(frame.w > 0.0 && frame.h > 0.0, "Time node must have non-zero bounds: {frame:?}");
+
+        // C-036.2: a pre-boot `{"do": "as", ...}` step (as recorded by `tj mcp record_trace`)
+        // applies `Input::Identity` on auto-boot AND across restarts so UI renders/handlers see `caller`.
+        let ui_id_src = r#"
+function App() {
+  return <Column padding={16}>
+    <Text id="who">{caller.id}:{caller.roles.join(",")}</Text>
+  </Column>
+}
+"#;
+        let pre_boot_as = r#"
+{"do": "as", "id": "dev:ana", "roles": ["staff"]}
+{"do": "boot", "server": false}
+{"do": "assertScreen", "contains": ["dev:ana:staff"]}
+{"do": "boot", "restart": true}
+{"do": "assertScreen", "contains": ["dev:ana:staff"]}
+"#;
+        let r_as = run_trace(Path::new("."), ui_id_src, "pre_boot_as.trace.jsonl", pre_boot_as, HashMap::new());
+        assert!(r_as.passed(), "pre-boot `as` identity must apply on boot and restart: {:?}", r_as.error);
     }
 }

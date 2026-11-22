@@ -1057,17 +1057,18 @@ impl Checker {
                     return clean();
                 }
                 "schedule" => {
-                    let keyed = matches!(args.get(2).map(|a| &a.kind), Some(ExprKind::Str(_))) && !matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Str(_)));
+                    let keyed = matches!(args.get(2).map(|a| &a.kind), Some(ExprKind::Str(_)))
+                        && !matches!(args.get(1).map(|a| &a.kind), Some(ExprKind::Str(_)))
+                        && !matches!(args.first().map(|a| &a.kind), Some(ExprKind::Num(_)));
                     let (method_idx, skip) = if keyed { (2, 3) } else { (1, 2) };
-                    if keyed {
-                        let kv = self.expr(&args[0], fr);
-                        self.sink(&kv, args[0].span, "an alarm's key, which is stored with the alarm");
-                    }
                     let mut vals = Vec::new();
-                    for a in args.iter().skip(skip) {
+                    for (i, a) in args.iter().enumerate() {
                         let v = self.expr(a, fr);
-                        self.sink(&v, a.span, "an alarm's arguments, which are stored with the alarm");
-                        vals.push(v);
+                        let dest = if i >= skip { "an alarm's arguments, which are stored with the alarm" } else { "an alarm, which is stored on disk" };
+                        self.sink(&v, a.span, dest);
+                        if i >= skip {
+                            vals.push(v);
+                        }
                     }
                     // Follow the alarm into its method, so where it sends revealed data is seen.
                     if vals.iter().any(|v| !self.flatten(v).revealed.is_empty()) {
