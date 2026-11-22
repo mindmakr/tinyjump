@@ -3908,4 +3908,81 @@ export async function callInner(obj: string, m: string, args: any[]): any {
     fail_blk.set(false);
     let a_free = brt.handle(4.0, Input::Call { object: "LockObj/a".into(), method: "touch".into(), args: vec![], reply: Some(3), call: None, caller: who("alice", &[]) });
     assert!(a_free.iter().any(|o| matches!(o, Output::Reply { reply: 3, ok: Some(v), .. } if *v == json!(1))), "LockObj/a lock must be released: {a_free:?}");
+
+    // 5. Critic 047 regressions (IK-1 & IK-2):
+    // IK-1: multi-object Run::Await flush failure (A saves, B fails) restores A on disk & memory,
+    // drops Output::Changed, suppresses Output::Error on reply.is_some() (no false turn_errors),
+    // and emits only ONE Output::Error on reply.is_none() (no duplicate from refuse_start).
+    let multi_src = r#"
+@server @read("anyone") object BoxObj {
+  v: number = 0
+  @allow("anyone") async touchTwoAndWait(): number {
+    this.v = 1
+    BoxObj.get("b").set(2)
+    await fetch("https://api.example.com/multi")
+    return this.v
+  }
+  @allow("anyone") set(x: number) { this.v = x }
+}
+"#;
+    let fail_b = StdRc::new(Cell::new(true));
+    let multi_store = Shared::default();
+    struct FailB {
+        inner: Shared,
+        fail_b: StdRc<Cell<bool>>,
+    }
+    impl Store for FailB {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_b.get() && key == "BoxObj/b" { Err("ENOSPC".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let mut mrt = Runtime::boot(
+        compile(multi_src).unwrap(),
+        Box::new(FailB { inner: multi_store.clone(), fail_b: fail_b.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let m_out = mrt.handle(2.0, Input::Call { object: "BoxObj/a".into(), method: "touchTwoAndWait".into(), args: vec![], reply: Some(1), call: Some("m1".into()), caller: who("alice", &[]) });
+    assert!(m_out.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "{m_out:?}");
+    assert!(!m_out.iter().any(|o| matches!(o, Output::Changed { .. })), "uncommitted Changed must be dropped: {m_out:?}");
+    assert!(!m_out.iter().any(|o| matches!(o, Output::Error { .. })), "reply.is_some() 503 must not also emit Output::Error: {m_out:?}");
+    assert_eq!(state(&mut mrt, 3.0, "BoxObj/a")["v"], json!(0), "earlier saved object A must be reverted in memory");
+    assert!(!multi_store.0.borrow().data.contains_key("BoxObj/a"), "earlier saved new object A must be removed from disk");
+    // reply.is_none() emits exactly ONE Output::Error (the specific save error, no duplicate).
+    let m_noreply = mrt.handle(4.0, Input::Call { object: "BoxObj/a".into(), method: "touchTwoAndWait".into(), args: vec![], reply: None, call: None, caller: who("alice", &[]) });
+    assert_eq!(m_noreply.iter().filter(|o| matches!(o, Output::Error { .. })).count(), 1, "reply.is_none() must emit exactly 1 Output::Error: {m_noreply:?}");
+    assert!(!m_noreply.iter().any(|o| matches!(o, Output::Changed { .. })), "{m_noreply:?}");
+
+    // IK-2: same-fiber cross-object method calls scope `crypto.idempotencyKey` by innermost `this`.
+    let cross_src = r#"
+@server @read("anyone") object Item {
+  @allow("anyone") reserve(): string { return crypto.idempotencyKey("reserve") }
+}
+@server @read("anyone") object Cart {
+  @allow("anyone") checkout(): string[] {
+    return [Item.get("sku-1").reserve(), Item.get("sku-2").reserve()]
+  }
+  @allow("anyone") dupSameItem(): string[] {
+    return [Item.get("sku-1").reserve(), Item.get("sku-1").reserve()]
+  }
+}
+"#;
+    let cross_store = Shared::default();
+    let mut crt = Runtime::boot(compile(cross_src).unwrap(), Box::new(cross_store.clone()), Options { server: true, render: false, ..Options::new(1.0, 2) }).unwrap().0;
+    let c_out1 = crt.handle(2.0, Input::Call { object: "Cart/c1".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys1 = c_out1.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap_or_else(|| panic!("expected two keys, got {c_out1:?}"));
+    assert_eq!(keys1.len(), 2);
+    assert_ne!(keys1[0], keys1[1], "distinct objects on same fiber must derive distinct keys");
+    // Crash & replay same call_id on fresh runtime sharing `tj:secret` -> identical keys!
+    let mut crt2 = Runtime::boot(compile(cross_src).unwrap(), Box::new(cross_store.0.borrow().clone()), Options { server: true, render: false, ..Options::new(3.0, 9) }).unwrap().0;
+    let c_out2 = crt2.handle(4.0, Input::Call { object: "Cart/c2".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys2 = c_out2.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap();
+    assert_eq!(keys1, keys2, "cross-object keys must be crash-deterministic");
+    // Same object + same label twice in one fiber STILL fails fast!
+    let c_dup = crt.handle(5.0, Input::Call { object: "Cart/c1".into(), method: "dupSameItem".into(), args: vec![], reply: Some(2), call: Some("co-2".into()), caller: who("alice", &[]) });
+    assert!(c_dup.iter().any(|o| matches!(o, Output::Reply { reply: 2, error: Some(e), .. } if e.contains("already called in this call"))), "{c_dup:?}");
 }

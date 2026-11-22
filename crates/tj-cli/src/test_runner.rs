@@ -176,6 +176,7 @@ struct HttpMock {
     headers: Json,
     body: String,
     error: Option<String>,
+    unreachable: bool,
 }
 
 impl HttpMock {
@@ -351,6 +352,7 @@ impl Harness {
     }
 
     fn perform_effect(&mut self, id: u32, effect: Effect) -> Input {
+        let mut unreachable = false;
         let result = match effect {
             Effect::Plugin { plugin, method, args } if plugin == "privacy" => self.privacy_effect(id, &method, &args),
             Effect::Plugin { plugin, method, .. } => match self.plugins.get_mut(&plugin) {
@@ -359,7 +361,10 @@ impl Harness {
             },
             Effect::Http { url, .. } => match self.http_mocks.iter().rev().find(|m| m.matches(&url)) {
                 Some(mock) => match &mock.error {
-                    Some(e) => Err(e.clone()),
+                    Some(e) => {
+                        unreachable = mock.unreachable;
+                        Err(e.clone())
+                    }
                     None => Ok(json!({ "status": mock.status, "headers": mock.headers, "body": mock.body })),
                 },
                 None => Err(format!("no scripted HTTP mock for {url:?}; add {{\"do\": \"http\", \"match\": ..., \"status\": 200, \"body\": ...}}")),
@@ -370,7 +375,7 @@ impl Harness {
             Ok(v) => (Some(v), None),
             Err(e) => (None, Some(e)),
         };
-        Input::EffectDone { id, ok, error, field: None, unreachable: false }
+        Input::EffectDone { id, ok, error, field: None, unreachable }
     }
 
     fn privacy_effect(&mut self, id: u32, method: &str, args: &Json) -> Result<Json, String> {
@@ -495,7 +500,8 @@ impl Harness {
                     _ => String::new(),
                 };
                 let error = s["error"].as_str().map(str::to_string);
-                self.http_mocks.push(HttpMock { pattern, status, headers, body, error });
+                let unreachable = s["unreachable"].as_bool().unwrap_or(error.is_some());
+                self.http_mocks.push(HttpMock { pattern, status, headers, body, error, unreachable });
                 Ok(())
             }
             "call" => {
@@ -1114,5 +1120,32 @@ function App() {
 "#;
         let r_as = run_trace(Path::new("."), ui_id_src, "pre_boot_as.trace.jsonl", pre_boot_as, HashMap::new());
         assert!(r_as.passed(), "pre-boot `as` identity must apply on boot and restart: {:?}", r_as.error);
+    }
+
+    #[test]
+    fn http_mock_error_defaults_to_unreachable_503_and_allows_override() {
+        let src = r#"
+@server @read("anyone") object Pay {
+  @allow("anyone") async callApi(): string {
+    const r = await fetch("https://api.example.com/pay")
+    return `${r.status}:${r.text()}`
+  }
+}
+"#;
+        // Default `error` mock sends `unreachable: true` -> HTTP 503 (uncached), so retrying the
+        // same `idempotencyKey` after a 200 mock succeeds!
+        let trace = r#"
+{"do": "boot", "render": false}
+{"do": "http", "match": "https://api.example.com/pay", "error": "connection reset"}
+{"do": "call", "object": "Pay/p1", "method": "callApi", "as": "anon", "idempotencyKey": "k1", "expectStatus": 503}
+{"do": "http", "match": "https://api.example.com/pay", "status": 200, "body": "paid"}
+{"do": "call", "object": "Pay/p1", "method": "callApi", "as": "anon", "idempotencyKey": "k1", "expect": "200:paid"}
+{"do": "http", "match": "https://api.example.com/pay", "error": "blocked by policy", "unreachable": false}
+{"do": "call", "object": "Pay/p2", "method": "callApi", "as": "anon", "idempotencyKey": "k2", "expectStatus": 400, "expectError": "blocked by policy"}
+{"do": "http", "match": "https://api.example.com/pay", "status": 200, "body": "should-not-run"}
+{"do": "call", "object": "Pay/p2", "method": "callApi", "as": "anon", "idempotencyKey": "k2", "expectStatus": 400, "expectError": "blocked by policy"}
+"#;
+        let r = run_trace(Path::new("."), src, "http_unreachable.trace.jsonl", trace, HashMap::new());
+        assert!(r.passed(), "http mock unreachable parity failed: {:?}", r.error);
     }
 }

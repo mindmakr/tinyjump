@@ -913,12 +913,12 @@ fn collect_stmts_caps(stmts: &[Stmt], caps: &mut UsedCapabilities) {
 
 fn starts_with_http_ci(s: &str) -> bool {
     let t = s.trim();
-    t.starts_with("//") || (t.len() >= 7 && t[..7].eq_ignore_ascii_case("http://"))
+    t.starts_with("//") || t.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://"))
 }
 
 fn extract_https_host(s: &str, must_end_authority: bool) -> Option<String> {
     let t = s.trim();
-    if t.len() < 8 || !t[..8].eq_ignore_ascii_case("https://") {
+    if !t.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://")) {
         return None;
     }
     let rest = &t[8..];

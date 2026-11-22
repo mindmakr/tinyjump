@@ -23,7 +23,7 @@ pub(crate) struct IdempotencyCtx {
     pub method: Rc<str>,
     pub call_id: Option<Rc<str>>,
     pub fallback_root: Option<[u8; 16]>,
-    pub used_labels: std::collections::HashSet<String>,
+    pub used_labels: std::collections::HashSet<(String, String)>,
 }
 
 #[derive(Default)]
@@ -578,8 +578,17 @@ impl Runtime {
             Value::Native(n) => {
                 let args = f.stack.split_off(pos + 1);
                 f.stack.truncate(pos);
-                let r = (n.f)(self, &args)?;
-                f.stack.push(r);
+                #[cfg(feature = "server")]
+                let prev_this = std::mem::replace(
+                    &mut self.running_this,
+                    f.frames.iter().rev().find_map(|fr| fr.this.as_ref().map(|o| Rc::from(o.key()))),
+                );
+                let r = (n.f)(self, &args);
+                #[cfg(feature = "server")]
+                {
+                    self.running_this = prev_this;
+                }
+                f.stack.push(r?);
                 Ok(())
             }
             Value::Class(c) => {

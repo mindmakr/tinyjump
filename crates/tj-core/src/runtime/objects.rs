@@ -952,6 +952,10 @@ impl Runtime {
         let mut index_changed = false;
         let mut seq_changed = false;
         let mut failed = false;
+        #[cfg(feature = "server")]
+        let multi = touched.len() > 1;
+        #[cfg(feature = "server")]
+        let mut saved_before: Vec<((u16, Rc<str>), String, String)> = Vec::new();
         // An object that now has alarms goes into the alarm index before it is saved, so a
         // restart always finds it. If the index cannot be saved, nothing is.
         let joining: Vec<String> = touched.iter().filter_map(|k| self.instances.get(k)).filter(|i| !i.alarms.is_empty()).map(|i| i.handle.key()).filter(|o| !self.alarm_index.contains(o)).collect();
@@ -995,6 +999,8 @@ impl Runtime {
             if text == inst.saved {
                 continue;
             }
+            #[cfg(feature = "server")]
+            let prev_saved = multi.then(|| inst.saved.clone());
             // Alarms and call records are bookkeeping; only a new state is a change to share.
             if state_changed && !remote {
                 // A new state of an object this runtime owns gets the next change number.
@@ -1025,6 +1031,10 @@ impl Runtime {
                 inst.created = record.created;
                 inst.cleared = false;
             }
+            #[cfg(feature = "server")]
+            if let Some(prev) = prev_saved {
+                saved_before.push((key, object.clone(), prev));
+            }
             // Objects joined the index above; leaving it can wait, as a stale entry only loads
             // an object without alarms at boot.
             index_changed |= !has_alarms && self.alarm_index.remove(&object);
@@ -1034,6 +1044,26 @@ impl Runtime {
             }
         }
         if failed {
+            #[cfg(feature = "server")]
+            if !saved_before.is_empty() {
+                for (prev_key, prev_obj, prev_saved) in saved_before.into_iter().rev() {
+                    if prev_saved.is_empty() {
+                        let _ = self.store.remove(&prev_obj);
+                    } else {
+                        let _ = self.store.save(&prev_obj, &prev_saved);
+                    }
+                    if let Some(inst) = self.instances.get_mut(&prev_key) {
+                        inst.saved = prev_saved;
+                    }
+                    self.revert(&prev_key, &consumed, true);
+                }
+                let mut i = 0;
+                self.outputs.retain(|o| {
+                    let keep = i < mark || !matches!(o, Output::Changed { .. });
+                    i += 1;
+                    keep
+                });
+            }
             for o in self.outputs.iter_mut().skip(mark) {
                 if let Output::Reply { ok, error, field, status, .. } = o {
                     if error.is_none() {
