@@ -214,6 +214,7 @@ pub fn analyze(file: &Path, target: Option<&str>, data: Option<&Path>) -> Result
         check_data_hygiene(dir, has_pii, &mut findings);
         data_checked = true;
     }
+    check_keys_hygiene(&mut findings);
 
     Ok(RetroReport { app: name, app_sha256, findings, bench: bench_json, live_checked, data_checked })
 }
@@ -498,9 +499,22 @@ fn check_layouts(source: &str, out: &mut Vec<RetroFinding>) {
     }
 }
 
+fn find_budget_file(file: &Path) -> Option<PathBuf> {
+    let start = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let canon = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    for dir in canon.ancestors() {
+        let candidate = dir.join("scripts").join("budget.json");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let cwd = PathBuf::from("scripts/budget.json");
+    cwd.exists().then_some(cwd)
+}
+
 fn check_budget_headroom(file: &Path, b: &bench::Bench, out: &mut Vec<RetroFinding>) {
-    let budget_path = Path::new("scripts/budget.json");
-    let Ok(text) = std::fs::read_to_string(budget_path) else { return };
+    let Some(budget_path) = find_budget_file(file) else { return };
+    let Ok(text) = std::fs::read_to_string(&budget_path) else { return };
     let Ok(budget) = serde_json::from_str::<Json>(&text) else { return };
     let norm = file.to_string_lossy().replace('\\', "/");
     let apps = budget["apps"].as_object();
@@ -574,13 +588,15 @@ pub(crate) fn analyze_live(manifest: &Json, inspect: &Json, out: &mut Vec<RetroF
                 hint: "add a deterministic .trace.jsonl regression test and fix the failing path".into(),
             });
         }
-        if refused > 0 {
+        // Only flag unusually high refusal volume/ratios (and never as `[fix]`, so autonomous
+        // agents are not nudged to weaken `@allow` rules when normal probes get 403).
+        if refused >= 10 && (calls == 0 || refused * 2 >= calls) {
             out.push(RetroFinding {
-                tag: "fix",
+                tag: "optimize",
                 area: "access",
                 subject: name.into(),
-                message: format!("{name} had {refused} access refusal(s) (403)"),
-                hint: "check whether UI is hiding controls for unauthorized roles or a client has stale credentials".into(),
+                message: format!("{name} had {refused} access refusal(s) (403) across {calls} allowed call(s)"),
+                hint: "do NOT widen @allow rules; check whether UI exposes unauthorized buttons or clients hold stale credentials".into(),
             });
         }
         let steps_per_call = steps.checked_div(calls).unwrap_or(0);
@@ -674,6 +690,9 @@ fn check_data_hygiene(data: &Path, has_pii: bool, out: &mut Vec<RetroFinding>) {
         }
         None => {}
     }
+}
+
+fn check_keys_hygiene(out: &mut Vec<RetroFinding>) {
     if let Some(keys_path) = std::env::var_os(crate::identity::KEYS_ENV).filter(|v| !v.is_empty()) {
         let path = Path::new(&keys_path);
         if let Ok(age) = std::fs::metadata(path).and_then(|m| m.modified()).and_then(|t| SystemTime::now().duration_since(t).map_err(|_| std::io::Error::other("clock"))) {
@@ -759,7 +778,7 @@ function App() {
         let inspect = json!({
             "stats": {
                 "methods": {
-                    "Box.bump": { "calls": 10, "errors": 2, "refused": 1, "steps": 600000 }
+                    "Box.bump": { "calls": 10, "errors": 2, "refused": 12, "steps": 600000 }
                 },
                 "waiting": { "Box": 3 },
                 "maxBytes": { "Box": 800 }
@@ -775,7 +794,7 @@ function App() {
         let areas_tags: Vec<(&str, &str)> = live.iter().map(|f| (f.tag, f.area)).collect();
         assert!(areas_tags.contains(&("fix", "runtime")), "{live:?}");
         assert!(areas_tags.contains(&("fix", "security")), "{live:?}");
-        assert!(areas_tags.contains(&("fix", "access")), "{live:?}");
+        assert!(areas_tags.contains(&("optimize", "access")), "{live:?}");
         assert!(areas_tags.contains(&("optimize", "runtime")), "{live:?}");
         assert!(areas_tags.contains(&("optimize", "storage")), "{live:?}");
     }

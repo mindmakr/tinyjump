@@ -94,7 +94,7 @@ pub fn now_ms() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
-fn max_object_bytes_from_env() -> usize {
+pub(crate) fn max_object_bytes_from_env() -> usize {
     std::env::var(MAX_OBJECT_BYTES_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(DEFAULT_MAX_OBJECT_BYTES)
 }
 
@@ -412,7 +412,7 @@ fn shadow_validate(
     for (idx, trace_text) in smoke_traces.iter().enumerate() {
         let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
         let overlay = OverlayStore::new(base);
-        let res = test_runner::run_trace_on_store(source, &format!("smoke-{}", idx + 1), trace_text, HashMap::new(), Box::new(overlay), now_ms());
+        let res = test_runner::run_trace_on_store(source, &format!("smoke-{}", idx + 1), trace_text, HashMap::new(), Box::new(overlay), now_ms(), max_object_bytes);
         if !res.passed() {
             return Err((422, format!("shadow smoke trace #{} failed: {}", idx + 1, res.error.unwrap_or_default())));
         }
@@ -604,6 +604,7 @@ fn run(
                         }
                         watch = None;
                         d.stats.set_watch_until(0);
+                        d.stats.reset_methods();
                         d.stats.reloaded();
                         d.audit.record(Entry::new("start").text("app", &new_sha));
                         eprintln!("[tj] reloaded");
@@ -617,11 +618,14 @@ fn run(
             }
             Ok(Msg::SafeReload { req, done }) => {
                 let new_sha = sha256_hex(&req.source);
-                // Audit BEFORE shadow_validate decrypts live data or runs smoke traces (fail-closed).
+                // Audit BEFORE draining or shadow_validate decrypts live data (fail-closed).
                 if let Err(e) = d.audit.security(Entry::new("admin").who(req.actor).text("request", "reload").text("app", &new_sha)) {
                     let _ = done.send(Err(e));
                     continue;
                 }
+                // Drain in-flight effects BEFORE shadow_validate so all pending writes are on disk
+                // and validated against the new bundle's `@invariant`s and smoke traces (T1-5).
+                drain_inflight(&mut rt, &mut d, &rx, &mut pending);
                 let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref()) {
                     Ok(v) => v,
                     Err(e) => {
@@ -629,7 +633,6 @@ fn run(
                         continue;
                     }
                 };
-                drain_inflight(&mut rt, &mut d, &rx, &mut pending);
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&req.source, &data, render, explain, &refs) {
@@ -646,6 +649,7 @@ fn run(
                         if let Ok(mut m) = manifest.lock() {
                             *m = new_manifest;
                         }
+                        d.stats.reset_methods();
                         d.stats.reloaded();
                         let watch_secs = if req.error_threshold > 0 { req.watch_secs.min(MAX_WATCH_SECS) } else { 0 };
                         if watch_secs > 0 {
@@ -706,6 +710,7 @@ fn run(
                         }
                         watch = None;
                         d.stats.set_watch_until(0);
+                        d.stats.reset_methods();
                         let _ = done.send(Ok(json!({ "appSha256": prev_sha, "rolledBackFrom": rolled_from_sha })));
                         out
                     }
@@ -747,10 +752,12 @@ fn run(
                             if let Ok(mut m) = manifest.lock() {
                                 *m = prev_manifest;
                             }
+                            d.stats.reset_methods();
                             d.stats.auto_rolled_back();
                             d.audit.record(Entry::new("admin").who(Actor::System).text("request", "auto-rollback").text("app", &w.prev_sha));
                             eprintln!("[tj] auto-rollback triggered ({} error(s) in watch window): restored {}", w.errors, &w.prev_sha[..w.prev_sha.len().min(12)]);
                             d.outputs(&mut rt, boot_out);
+                            privacy_effects(&mut rt, &mut d);
                         }
                         Err(e) => eprintln!("[tj] auto-rollback boot failed: {e}"),
                     }
@@ -837,7 +844,9 @@ impl Dispatch {
         for o in out {
             match o {
                 Output::Reply { reply, ok, error, field, status } => {
-                    if status == Some(503) {
+                    // Only internal VM/runtime faults (500) count toward auto-rollback; caller-triggerable
+                    // `503` (max_objects / @exclusive wait), user `throw`/`check` (400), and `403` do not.
+                    if status == Some(500) {
                         self.turn_errors += 1;
                     }
                     if let Some(w) = self.replies.remove(&reply) {

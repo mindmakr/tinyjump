@@ -270,7 +270,7 @@ fn check(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     if let Value::Rec(r) = &e {
         r.borrow_mut().insert("field".into(), Value::Str(field));
     }
-    Err(Exc(e, super::value::Refusal(false)))
+    Err(Exc(e, super::value::ExcKind::User))
 }
 
 /// `plugin(name, method, args)`: a call to a plugin, answered by the host (docs/plugins.md).

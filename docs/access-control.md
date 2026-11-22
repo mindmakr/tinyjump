@@ -29,8 +29,9 @@ at the end.
 - TLS is the proxy's job: put `tj serve` behind a TLS-terminating proxy, or a platform
   that provides it, and set `TJ_TLS_TERMINATED=1`. On an address other machines can
   reach, a server without that setting refuses every request that carries credentials,
-  so a token never crosses the network readable. `fetch` warns on plain-HTTP URLs.
-  Outbound request filtering for `fetch` comes later (see the end).
+  so a token never crosses the network readable. `fetch` warns on plain-HTTP URLs, blocks
+  private/loopback/link-local addresses on `tj serve`, and supports an outbound host
+  allowlist (`TJ_FETCH_ALLOW`, enforced on redirects too).
 
 ## Who is calling: identity
 
@@ -76,14 +77,14 @@ admin key. Make them in the same `TJ_KEYS` file with `tj key <name> --keys keys.
 - **`test`** (testers): everything in `observe`, plus `POST /_tj/input` **only** on `tj dev`
   (refused with `403` on a live `tj serve` store), plus own `observe`/`test` leases.
 - **`maintain`** (maintainers, operators): everything, including `POST /_tj/input`,
-  `POST /_tj/privacy` (`export` and `erase`), unfiltered `/api/events`, and force-releasing
-  any lease.
+  `POST /_tj/privacy` (`export` and `erase`), `POST /_tj/reload`, `POST /_tj/rollback`,
+  unfiltered `/api/events`, exclusive leases, and force-releasing any lease.
 
 Each operational key is audited under its own name (`ops:<name>`), can be revoked by
 removing its line from `TJ_KEYS`, and works on `tj serve` even when `TJ_ADMIN_KEY` is unset.
-CLI tools (`tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`) send `TJ_OPS_KEY`
-when set, falling back to `TJ_ADMIN_KEY`. The legacy admin key (`TJ_ADMIN_KEY`) remains
-supported as full `maintain` access (`who: "admin"`).
+CLI tools (`tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`, `tj reload`,
+`tj rollback`, `tj retro`) send `TJ_OPS_KEY` when set, falling back to `TJ_ADMIN_KEY`. The
+legacy admin key (`TJ_ADMIN_KEY`) remains supported as full `maintain` access (`who: "admin"`).
 
 **`tj dev`** accepts the same credentials. It also takes `--as <name>:<role,role>`, an
 identity applied to requests that carry none, so you can try an app as a given user. Its id
@@ -291,14 +292,12 @@ can come later, as a plugin.
     `by`, `user`).
 - `tj key` makes API keys and scoped `--ops` keys (above).
 - `tj lease list|acquire|release` manages operational work leases on `/_tj/leases`.
-- `tj mcp`, `tj review`, `tj stats`, `tj lease` and `tj privacy` send `TJ_OPS_KEY` when
-  set, or `TJ_ADMIN_KEY`.
+- `tj mcp`, `tj review`, `tj stats`, `tj lease`, `tj privacy`, `tj reload`, `tj rollback`
+  and `tj retro` send `TJ_OPS_KEY` when set, or `TJ_ADMIN_KEY`.
 
 ## Later
 
 - Expiry dates and last-used times for API keys.
-- Per-caller request rate limits beyond the stream and object caps.
-- An outbound allowlist for server-side `fetch`, against SSRF.
 - Signing in inside tinyjump, as a plugin.
 
 ## Rollout in this repo

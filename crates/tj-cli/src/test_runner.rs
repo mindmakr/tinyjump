@@ -216,6 +216,8 @@ struct Harness {
     source: String,
     store: SharedStore,
     seeded_store: bool,
+    shadow: bool,
+    max_object_bytes: usize,
     booted_once: bool,
     nodes: NodeTable,
     frames: HashMap<u32, Frame>,
@@ -233,15 +235,18 @@ struct Harness {
 
 impl Harness {
     fn new(app_dir: PathBuf, source: String, cli_plugins: HashMap<String, FakePlugin>) -> Harness {
-        Self::with_store(Some(app_dir), source, cli_plugins, SharedStore::default(), false, DEFAULT_START_MS)
+        Self::with_store(Some(app_dir), source, cli_plugins, SharedStore::default(), false, false, DEFAULT_START_MS, 0)
     }
 
-    fn with_store(app_dir: Option<PathBuf>, source: String, cli_plugins: HashMap<String, FakePlugin>, store: SharedStore, seeded_store: bool, initial_now: f64) -> Harness {
+    #[allow(clippy::too_many_arguments)]
+    fn with_store(app_dir: Option<PathBuf>, source: String, cli_plugins: HashMap<String, FakePlugin>, store: SharedStore, seeded_store: bool, shadow: bool, initial_now: f64, max_object_bytes: usize) -> Harness {
         Harness {
             app_dir,
             source,
             store,
             seeded_store,
+            shadow,
+            max_object_bytes,
             booted_once: false,
             nodes: Rc::new(RefCell::new(HashMap::new())),
             frames: HashMap::new(),
@@ -273,7 +278,7 @@ impl Harness {
         self.nodes.borrow_mut().clear();
         self.frames.clear();
         let program: Program = compile(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
-        let opts = Options { now: self.now, seed: self.seed, render: self.render, server: self.server, explain: true, max_objects: 100_000, max_object_bytes: 0 };
+        let opts = Options { now: self.now, seed: self.seed, render: self.render, server: self.server, explain: true, max_objects: 100_000, max_object_bytes: self.max_object_bytes };
         let (mut rt, mut out) = Runtime::boot(program, Box::new(self.store.clone()), opts).map_err(|e| format!("boot failed: {e}"))?;
         rt.set_measure(Box::new(TestMeasure(self.nodes.clone())));
         out.extend(rt.handle(self.now, Input::Entropy { bytes: DEFAULT_ENTROPY.into() }));
@@ -503,7 +508,7 @@ impl Harness {
                     None => self.caller.clone(),
                 };
                 let res = self.send_and_wait(Input::Call { object: object.clone(), method: method.clone(), args, reply: None, call, caller: Some(caller) })?;
-                check_reply(&format!("call {object}.{method}"), res, s)
+                check_reply(&format!("call {object}.{method}"), res, s, self.shadow)
             }
             "get" => {
                 let object = s["object"].as_str().ok_or("\"get\" needs \"object\"")?.to_string();
@@ -511,8 +516,15 @@ impl Harness {
                     Some(v) => parse_caller(v)?,
                     None => self.caller.clone(),
                 };
+                if self.shadow {
+                    // Shadow smoke traces run over decrypted live data without per-subject privacy
+                    // audit logs: only `"trusted"` (`@pii` masked) or `"anon"` may `get`.
+                    if matches!(&caller, Caller::Remote { id, .. } if !id.is_empty()) {
+                        return Err("shadow smoke trace \"get\" cannot impersonate a person id; use \"trusted\" or \"anon\"".into());
+                    }
+                }
                 let res = self.send_and_wait(Input::Get { object: object.clone(), reply: None, caller: Some(caller) })?;
-                check_reply(&format!("get {object}"), res, s)
+                check_reply(&format!("get {object}"), res, s, self.shadow)
             }
             "ui" => {
                 let target = parse_target(s.get("target").ok_or("\"ui\" needs \"target\"")?)?;
@@ -579,6 +591,9 @@ impl Harness {
                 Ok(())
             }
             "privacy" => {
+                if self.shadow {
+                    return Err("\"privacy\" steps are not allowed in reload smoke traces; use audited POST /_tj/privacy instead".into());
+                }
                 self.ensure_booted()?;
                 let op = s["action"].as_str().ok_or("\"privacy\" needs \"action\": \"export\" or \"erase\"")?;
                 let subject = s["subject"].as_str().filter(|x| !x.is_empty()).ok_or("\"privacy\" needs \"subject\"")?;
@@ -595,7 +610,7 @@ impl Harness {
                     },
                     other => return Err(format!("unknown privacy action {other:?}; use \"export\" or \"erase\"")),
                 };
-                check_reply(&format!("privacy {op} {subject}"), res, s)
+                check_reply(&format!("privacy {op} {subject}"), res, s, self.shadow)
             }
             "assertScreen" => {
                 let snap = self.inspect_snapshot()?;
@@ -662,7 +677,7 @@ impl Harness {
                     .and_then(|arr| arr.iter().find(|o| o["object"].as_str() == Some(object)))
                     .map(|o| o["state"].clone())
                     .ok_or_else(|| format!("inspect did not contain loaded object {object:?}"))?;
-                check_value(&format!("inspect {object}"), &found, s)
+                check_value(&format!("inspect {object}"), &found, s, self.shadow)
             }
             other => Err(format!("unknown trace action {other:?}; expected boot, as, plugin, http, call, get, ui, tick, privacy, assertScreen, assertLayout, assertMetrics or assertInspect")),
         }
@@ -691,11 +706,17 @@ fn attach_bounds(nodes: &mut Json, frames: &HashMap<u32, Frame>, parent_x: f32, 
     }
 }
 
-fn check_reply(what: &str, res: CallReply, step: &Json) -> Result<(), String> {
+fn check_reply(what: &str, res: CallReply, step: &Json, shadow: bool) -> Result<(), String> {
     let wants_err = step.get("expectError").is_some() || step.get("expectField").is_some() || step.get("expectStatus").is_some();
     match (res, wants_err) {
-        (Ok(val), false) => check_value(what, &val, step),
-        (Ok(val), true) => Err(format!("{what}: expected error, but succeeded with {val}")),
+        (Ok(val), false) => check_value(what, &val, step, shadow),
+        (Ok(val), true) => {
+            if shadow {
+                Err(format!("{what}: expected error, but succeeded (payload redacted in shadow mode)"))
+            } else {
+                Err(format!("{what}: expected error, but succeeded with {val}"))
+            }
+        }
         (Err((status, msg, _)), false) => Err(format!("{what}: unexpected error (status {status}): {msg}")),
         (Err((status, msg, field)), true) => {
             if let Some(want_status) = step["expectStatus"].as_u64() {
@@ -718,14 +739,20 @@ fn check_reply(what: &str, res: CallReply, step: &Json) -> Result<(), String> {
     }
 }
 
-fn check_value(what: &str, actual: &Json, step: &Json) -> Result<(), String> {
+fn check_value(what: &str, actual: &Json, step: &Json, shadow: bool) -> Result<(), String> {
     if let Some(want) = step.get("expect") {
         if actual != want {
+            if shadow {
+                return Err(format!("{what}: result did not match expected value (redacted in shadow mode)"));
+            }
             return Err(format!("{what}: expected {want}, got {actual}"));
         }
     }
     if let Some(want) = step.get("expectContains") {
         if !json_contains(actual, want) {
+            if shadow {
+                return Err(format!("{what}: result did not contain expected value (redacted in shadow mode)"));
+            }
             return Err(format!("{what}: expected value containing {want}, got {actual}"));
         }
     }
@@ -832,9 +859,10 @@ pub fn layout_findings_multi(source: &str, viewports: &[(&'static str, f32, f32,
 
 /// Runs a smoke trace against a caller-supplied store (e.g. a copy-on-write `OverlayStore`
 /// over a live server's data directory during shadow boot). Disables filesystem reads from
-/// `"plugin"` `"file"` steps and starts the clock at `initial_now` (live `now_ms()`).
-pub fn run_trace_on_store(source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>, store: Box<dyn Store>, initial_now: f64) -> TraceResult {
-    let h = Harness::with_store(None, source.to_string(), cli_plugins, SharedStore::from_store(store), true, initial_now);
+/// `"plugin"` `"file"` steps, enforces `max_object_bytes`, blocks `"privacy"` / subject `"get"`,
+/// redacts mismatch payloads so live `@pii` cannot leak in `422` errors, and uses `initial_now`.
+pub fn run_trace_on_store(source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>, store: Box<dyn Store>, initial_now: f64, max_object_bytes: usize) -> TraceResult {
+    let h = Harness::with_store(None, source.to_string(), cli_plugins, SharedStore::from_store(store), true, true, initial_now, max_object_bytes);
     execute_trace(h, name, trace_text)
 }
 

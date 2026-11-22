@@ -135,7 +135,7 @@ final class Sync {
             int status = c.getResponseCode();
             // A 401 is retried too, once the embedding app has refreshed the token.
             if (status == 401) tokenExpired();
-            if (status >= 500 || status == 401) throw new IOException("server answered " + status);
+            if (status >= 500 || status == 401 || status == 429) throw new IOException("server answered " + status);
             JSONObject reply = new JSONObject(body(c));
             if (reply.has("error")) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
             return reply.opt("ok");

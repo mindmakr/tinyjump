@@ -3409,6 +3409,12 @@ import { callPeer } from "tj:helper"
   @allow("anyone") @exclusive ping(): string { return "pong" }
   @allow("anyone") push(s: string): string { this.items.push(s); return "pushed" }
   @allow("anyone") pop(): number { this.items.pop(); return this.items.length }
+  @allow("anyone") popAndBloatAlarm(big: string): number {
+    this.items.pop()
+    this.schedule(5000, "noop", big)
+    return this.items.length
+  }
+  private noop(_s: string) {}
   @allow("anyone") async viaInvoke(s: string): string {
     return await callPeer("Vault/v1", "push", [s])
   }
@@ -3440,4 +3446,9 @@ export async function callPeer(obj: string, m: string, a: any[]): any {
     let mut rt_shr = Runtime::boot(compile(async_src).unwrap(), Box::new(s2.clone()), Options { server: true, render: false, max_object_bytes: 160, ..Options::new(20.0, 7) }).unwrap().0;
     let out_pop = rt_shr.handle(21.0, Input::Call { object: "Vault/v2".into(), method: "pop".into(), args: vec![], reply: Some(99), call: Some("shrink-call-1".into()), caller: who("", &[]) });
     assert!(out_pop.iter().any(|o| matches!(o, Output::Reply { reply: 99, ok: Some(v), error: None, .. } if v == &json!(1))), "shrinking state with Idempotency-Key must succeed: {out_pop:?}");
+
+    // T1-9: shrinking state by 1 item while scheduling a huge alarm payload on an already-oversized
+    // object MUST be rejected with 413 (no alarm-bloat bypass!).
+    let bloat_err = call_as(&mut rt_shr, 22.0, "Vault/v2", "popAndBloatAlarm", json!(["b".repeat(400)]), who("", &[])).unwrap_err();
+    assert_eq!(bloat_err.0, Some(413), "alarm bloat on oversized record must fail with 413: {bloat_err:?}");
 }

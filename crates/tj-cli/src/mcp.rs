@@ -169,7 +169,7 @@ impl Client {
                 let args = a.get("args").cloned().unwrap_or(json!([]));
                 let input = json!({ "type": "call", "object": a["object"], "method": a["method"], "args": args });
                 let r = self.input(&input);
-                let mut rec = json!({ "do": "call", "object": a["object"], "method": a["method"], "args": args });
+                let mut rec = json!({ "do": "call", "object": a["object"], "method": a["method"], "args": args, "as": "trusted" });
                 match &r {
                     Ok(v) => rec["expect"] = v.clone(),
                     Err(e) => rec["expectError"] = json!(e),
@@ -179,7 +179,7 @@ impl Client {
             }
             "get" => {
                 let r = self.input(&json!({ "type": "get", "object": a["object"] }));
-                let mut rec = json!({ "do": "get", "object": a["object"] });
+                let mut rec = json!({ "do": "get", "object": a["object"], "as": "trusted" });
                 match &r {
                     Ok(v) => rec["expect"] = v.clone(),
                     Err(e) => rec["expectError"] = json!(e),
