@@ -362,18 +362,18 @@ controls; it cannot weaken another pack's.
    (built).
 5. **The encrypted store:** a random key per record wrapped by a key-encryption key,
    hashed file names, `crypto.*` and the transport checks (built).
-6. **Personal data:**
-   - `@pii` for single-subject objects;
-   - masking;
-   - the flow check;
+6. **Personal data** (built):
+   - `@pii` for single-subject objects and `@by` shared lists;
+   - masking and per-field `@read` rules;
+   - the flow check (including `tj:ui`, components and device-local screen display);
    - `delete` on every store;
-   - export and erase with crypto-shredding;
-   - retention sweeps;
-   - the data map.
-7. **Compliance:**
-   - the data-only pack format;
-   - `gdpr-eu` and `pdpl-ksa` as drafts;
-   - `tj check --compliance`;
+   - export and erase with crypto-shredding (`tj privacy` and `tj:privacy`);
+   - retention sweeps (`@retain`) and legal holds (`@legalHold`);
+   - the data map and GDPR article 30 record (`tj check --privacy --record`).
+7. **Compliance** (built):
+   - the data-only pack format with `extends`;
+   - sample GDPR pack in `examples/members` (packs live outside the runtime);
+   - `tj check --compliance` and `tj serve --compliance`;
    - transfers;
-   - lawful basis;
-   - `tj:consent`.
+   - `const lawfulBasis`;
+   - `tj:consent` and `@needs`.
