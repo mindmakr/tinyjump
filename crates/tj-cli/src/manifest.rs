@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tj_core::modules;
 use tj_core::syntax::ast::{Decorator, ExprKind, Item, TypeExpr};
 use tj_core::syntax::parse_range;
-use tj_core::vm::program::{ObjectDef, Program, SPECIAL_CATEGORIES};
+use tj_core::vm::program::{ArgTy, ObjectDef, Program, SPECIAL_CATEGORIES};
 
 #[derive(Clone)]
 pub struct Manifest {
@@ -44,7 +44,14 @@ impl Manifest {
             }
             for item in &parsed.items {
                 let Item::Object(o) = item else { continue };
-                let field_types = o.fields.iter().filter_map(|fl| fl.ty.as_ref().map(|t| (fl.name.clone(), format_type(t)))).collect();
+                let field_types = o
+                    .fields
+                    .iter()
+                    .filter_map(|fl| {
+                        let ty = fl.ty.as_ref().map(format_type).or_else(|| fl.init.as_ref().and_then(infer_literal_type))?;
+                        Some((fl.name.clone(), ty))
+                    })
+                    .collect();
                 let mut method_needs = HashMap::new();
                 for m in &o.methods {
                     let needs = decorator_strings(&m.decorators, "needs");
@@ -283,7 +290,7 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
             let params: Vec<Json> = m
                 .params
                 .iter()
-                .map(|(p, opt, ty)| json!({ "name": &**p, "optional": opt, "type": ty.describe() }))
+                .map(|(p, opt, ty)| json!({ "name": &**p, "optional": opt, "type": ty.describe(), "schema": arg_ty_to_json(ty) }))
                 .collect();
             obj.insert("params".into(), json!(params));
             Json::Object(obj)
@@ -307,6 +314,81 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
     obj.insert("fields".into(), json!(fields));
     obj.insert("methods".into(), json!(methods));
     Json::Object(obj)
+}
+
+fn infer_literal_type(e: &tj_core::syntax::ast::Expr) -> Option<String> {
+    match &e.kind {
+        ExprKind::Num(_) => Some("number".into()),
+        ExprKind::Str(_) | ExprKind::Template(_) => Some("string".into()),
+        ExprKind::Bool(_) => Some("boolean".into()),
+        _ => None,
+    }
+}
+
+pub fn arg_ty_to_json(ty: &ArgTy) -> Json {
+    match ty {
+        ArgTy::Any => json!("any"),
+        ArgTy::Num => json!("number"),
+        ArgTy::Str => json!("string"),
+        ArgTy::Bool => json!("boolean"),
+        ArgTy::Null => json!("null"),
+        ArgTy::StrLit(s) => json!({ "lit": &**s }),
+        ArgTy::NumLit(n) => json!({ "num": n }),
+        ArgTy::BoolLit(b) => json!({ "bool": b }),
+        ArgTy::Arr(inner) => json!({ "arr": arg_ty_to_json(inner) }),
+        ArgTy::Dict(inner) => json!({ "dict": arg_ty_to_json(inner) }),
+        ArgTy::Rec(fields) => json!({
+            "rec": fields.iter().map(|(k, opt, t)| json!({ "name": &**k, "optional": opt, "ty": arg_ty_to_json(t) })).collect::<Vec<_>>()
+        }),
+        ArgTy::Union(ts) => json!({ "union": ts.iter().map(arg_ty_to_json).collect::<Vec<_>>() }),
+    }
+}
+
+pub fn arg_ty_from_json(v: &Json) -> Option<ArgTy> {
+    if let Some(s) = v.as_str() {
+        return match s {
+            "any" => Some(ArgTy::Any),
+            "number" => Some(ArgTy::Num),
+            "string" => Some(ArgTy::Str),
+            "boolean" => Some(ArgTy::Bool),
+            "null" => Some(ArgTy::Null),
+            _ => None,
+        };
+    }
+    let obj = v.as_object()?;
+    if let Some(s) = obj.get("lit").and_then(Json::as_str) {
+        return Some(ArgTy::StrLit(s.into()));
+    }
+    if let Some(n) = obj.get("num").and_then(Json::as_f64) {
+        return Some(ArgTy::NumLit(n));
+    }
+    if let Some(b) = obj.get("bool").and_then(Json::as_bool) {
+        return Some(ArgTy::BoolLit(b));
+    }
+    if let Some(a) = obj.get("arr") {
+        return Some(ArgTy::Arr(Box::new(arg_ty_from_json(a)?)));
+    }
+    if let Some(d) = obj.get("dict") {
+        return Some(ArgTy::Dict(Box::new(arg_ty_from_json(d)?)));
+    }
+    if let Some(fields) = obj.get("rec").and_then(Json::as_array) {
+        let mut out = Vec::with_capacity(fields.len());
+        for f in fields {
+            let name = f["name"].as_str()?;
+            let opt = f["optional"].as_bool().unwrap_or(false);
+            let ty = arg_ty_from_json(&f["ty"])?;
+            out.push((name.into(), opt, ty));
+        }
+        return Some(ArgTy::Rec(out.into()));
+    }
+    if let Some(ts) = obj.get("union").and_then(Json::as_array) {
+        let mut out = Vec::with_capacity(ts.len());
+        for t in ts {
+            out.push(arg_ty_from_json(t)?);
+        }
+        return Some(ArgTy::Union(out));
+    }
+    None
 }
 
 fn decorator_strings(decorators: &[Decorator], name: &str) -> Vec<String> {

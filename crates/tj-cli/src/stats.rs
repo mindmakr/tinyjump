@@ -107,6 +107,10 @@ pub struct Stats {
     methods: Timings,
     /// Effects by kind: `http`, `plugin.<name>`.
     effects: Timings,
+    /// Live reloads applied, automatic rollbacks triggered, and active watch-window deadline (epoch ms).
+    reloads: AtomicU64,
+    auto_rollbacks: AtomicU64,
+    watch_until_ms: AtomicU64,
 }
 
 impl Default for Stats {
@@ -125,6 +129,9 @@ impl Default for Stats {
             dropped: AtomicU64::new(0),
             methods: Timings::default(),
             effects: Timings::default(),
+            reloads: AtomicU64::new(0),
+            auto_rollbacks: AtomicU64::new(0),
+            watch_until_ms: AtomicU64::new(0),
         }
     }
 }
@@ -178,6 +185,18 @@ impl Stats {
         self.dropped.fetch_add(1, Relaxed);
     }
 
+    pub fn reloaded(&self) {
+        self.reloads.fetch_add(1, Relaxed);
+    }
+
+    pub fn auto_rolled_back(&self) {
+        self.auto_rollbacks.fetch_add(1, Relaxed);
+    }
+
+    pub fn set_watch_until(&self, epoch_ms: u64) {
+        self.watch_until_ms.store(epoch_ms, Relaxed);
+    }
+
     /// Health summary for `GET /_tj/manifest` (aggregate counters only; zero user data).
     pub fn health(&self, core: &Json, dev: bool, max_objects: usize, audit_dropped: u64, active_leases: usize) -> Json {
         let empty = Map::new();
@@ -192,6 +211,8 @@ impl Stats {
                 })
                 .sum()
         };
+        let now_ms = crate::engine::now_ms() as u64;
+        let watching = self.watch_until_ms.load(Relaxed) > now_ms;
         json!({
             "mode": if dev { "dev" } else { "serve" },
             "uptimeSecs": self.started.elapsed().as_secs(),
@@ -205,6 +226,9 @@ impl Stats {
             "realtimeClients": self.clients.load(Relaxed),
             "auditDropped": audit_dropped,
             "activeLeases": active_leases,
+            "reloads": self.reloads.load(Relaxed),
+            "autoRollbacks": self.auto_rollbacks.load(Relaxed),
+            "watching": watching,
         })
     }
 

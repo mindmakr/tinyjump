@@ -296,7 +296,7 @@ fn invoke(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
         Value::Null => Vec::new(),
         _ => return Err(Exc::msg("invoke(object, method, args) takes the arguments as an array")),
     };
-    Ok(Value::Promise(rt.invoke_as_caller(object, method, args)))
+    Ok(Value::Promise(rt.invoke_as_caller(object, method, args)?))
 }
 
 fn sort(_: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {

@@ -42,9 +42,21 @@ const MAX_TICK_STEPS: usize = 10_000;
 
 type CallReply = Result<Json, (u16, String, Option<String>)>;
 
-/// In-memory store shared across simulated restarts within one trace.
-#[derive(Clone, Default)]
-struct SharedStore(Rc<RefCell<MemStore>>);
+/// In-memory (or overlay) store shared across simulated restarts within one trace.
+#[derive(Clone)]
+struct SharedStore(Rc<RefCell<Box<dyn Store>>>);
+
+impl Default for SharedStore {
+    fn default() -> Self {
+        SharedStore(Rc::new(RefCell::new(Box::new(MemStore::default()))))
+    }
+}
+
+impl SharedStore {
+    fn from_store(store: Box<dyn Store>) -> Self {
+        SharedStore(Rc::new(RefCell::new(store)))
+    }
+}
 
 impl Store for SharedStore {
     fn load(&mut self, key: &str) -> Result<Option<String>, String> {
@@ -58,6 +70,9 @@ impl Store for SharedStore {
     }
     fn remove(&mut self, key: &str) -> Result<(), String> {
         self.0.borrow_mut().remove(key)
+    }
+    fn forget(&mut self, key: &str) -> Result<(), String> {
+        self.0.borrow_mut().forget(key)
     }
 }
 
@@ -197,6 +212,8 @@ struct Harness {
     app_dir: PathBuf,
     source: String,
     store: SharedStore,
+    seeded_store: bool,
+    booted_once: bool,
     nodes: NodeTable,
     frames: HashMap<u32, Frame>,
     rt: Option<Runtime>,
@@ -213,10 +230,16 @@ struct Harness {
 
 impl Harness {
     fn new(app_dir: PathBuf, source: String, cli_plugins: HashMap<String, FakePlugin>) -> Harness {
+        Self::with_store(app_dir, source, cli_plugins, SharedStore::default(), false)
+    }
+
+    fn with_store(app_dir: PathBuf, source: String, cli_plugins: HashMap<String, FakePlugin>, store: SharedStore, seeded_store: bool) -> Harness {
         Harness {
             app_dir,
             source,
-            store: SharedStore::default(),
+            store,
+            seeded_store,
+            booted_once: false,
             nodes: Rc::new(RefCell::new(HashMap::new())),
             frames: HashMap::new(),
             rt: None,
@@ -240,9 +263,10 @@ impl Harness {
     }
 
     fn boot(&mut self, restart: bool) -> Result<(), String> {
-        if !restart {
+        if !restart && (!self.seeded_store || self.booted_once) {
             self.store = SharedStore::default();
         }
+        self.booted_once = true;
         self.nodes.borrow_mut().clear();
         self.frames.clear();
         let program: Program = compile(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
@@ -778,7 +802,18 @@ fn parse_duration_ms(s: &str) -> Result<f64, String> {
 
 /// Runs one `.trace.jsonl` text against `source`.
 pub fn run_trace(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>) -> TraceResult {
-    let mut h = Harness::new(app_dir.to_path_buf(), source.to_string(), cli_plugins);
+    let h = Harness::new(app_dir.to_path_buf(), source.to_string(), cli_plugins);
+    execute_trace(h, name, trace_text)
+}
+
+/// Runs a smoke trace against a caller-supplied store (e.g. a copy-on-write `OverlayStore`
+/// over a live server's data directory during shadow boot).
+pub fn run_trace_on_store(app_dir: &Path, source: &str, name: &str, trace_text: &str, cli_plugins: HashMap<String, FakePlugin>, store: Box<dyn Store>) -> TraceResult {
+    let h = Harness::with_store(app_dir.to_path_buf(), source.to_string(), cli_plugins, SharedStore::from_store(store), true);
+    execute_trace(h, name, trace_text)
+}
+
+fn execute_trace(mut h: Harness, name: &str, trace_text: &str) -> TraceResult {
     let mut executed = 0;
     let mut error = None;
     for (idx, raw) in trace_text.lines().enumerate() {

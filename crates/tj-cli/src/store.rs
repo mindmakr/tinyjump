@@ -2,10 +2,63 @@
 //! renamed over the old one, and the folder is synced, so a crash leaves the old record or
 //! the new one, never a torn or lost write. Only the server's user can read the files.
 
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tj_core::Store;
+
+/// Copy-on-write overlay over a backing store: reads fall through to `base`, while every
+/// `save`, `remove` and `forget` stays strictly in memory. Used for shadow boot and smoke
+/// traces so upgrades can be validated against real stored data without mutating disk.
+pub struct OverlayStore {
+    base: Box<dyn Store>,
+    writes: HashMap<String, Option<String>>,
+}
+
+impl OverlayStore {
+    pub fn new(base: Box<dyn Store>) -> OverlayStore {
+        OverlayStore { base, writes: HashMap::new() }
+    }
+}
+
+impl Store for OverlayStore {
+    fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+        if let Some(v) = self.writes.get(key) {
+            return Ok(v.clone());
+        }
+        self.base.load(key)
+    }
+
+    fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.writes.insert(key.to_string(), Some(value.to_string()));
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        self.writes.insert(key.to_string(), None);
+        Ok(())
+    }
+
+    fn forget(&mut self, key: &str) -> Result<(), String> {
+        self.writes.insert(key.to_string(), None);
+        Ok(())
+    }
+
+    fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
+        let mut set: BTreeSet<String> = self.base.keys(prefix)?.into_iter().collect();
+        for (k, v) in &self.writes {
+            if k.starts_with(prefix) {
+                if v.is_some() {
+                    set.insert(k.clone());
+                } else {
+                    set.remove(k);
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
+    }
+}
 
 pub struct FileStore {
     dir: PathBuf,
@@ -145,5 +198,30 @@ mod tests {
         s.save("Cart/alice", "\"a\"").unwrap();
         assert_eq!((s.load("Cart/Alice").unwrap(), s.load("Cart/alice").unwrap()), (Some("\"A\"".into()), Some("\"a\"".into())));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn overlay_store_reads_base_and_never_mutates_disk() {
+        let dir = std::env::temp_dir().join(format!("tj-overlay-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut base = FileStore::open(&dir).unwrap();
+        base.save("Slot/s1", r#"{"title":"Cut"}"#).unwrap();
+        base.save("Slot/s2", r#"{"title":"Trim"}"#).unwrap();
+
+        let mut overlay = OverlayStore::new(Box::new(FileStore::open(&dir).unwrap()));
+        assert_eq!(overlay.load("Slot/s1").unwrap().as_deref(), Some(r#"{"title":"Cut"}"#));
+        overlay.save("Slot/s1", r#"{"title":"Edited"}"#).unwrap();
+        overlay.save("Slot/s3", r#"{"title":"New"}"#).unwrap();
+        overlay.remove("Slot/s2").unwrap();
+        assert_eq!(overlay.load("Slot/s1").unwrap().as_deref(), Some(r#"{"title":"Edited"}"#));
+        assert_eq!(overlay.load("Slot/s2").unwrap(), None);
+        assert_eq!(overlay.keys("Slot/").unwrap(), ["Slot/s1", "Slot/s3"]);
+
+        // Disk is completely untouched!
+        let mut verify = FileStore::open(&dir).unwrap();
+        assert_eq!(verify.load("Slot/s1").unwrap().as_deref(), Some(r#"{"title":"Cut"}"#));
+        assert_eq!(verify.load("Slot/s2").unwrap().as_deref(), Some(r#"{"title":"Trim"}"#));
+        assert_eq!(verify.keys("Slot/").unwrap(), ["Slot/s1", "Slot/s2"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
