@@ -21,6 +21,7 @@ mod mcp;
 mod review;
 mod sealed;
 mod store;
+mod test_runner;
 
 use engine::Engine;
 
@@ -46,6 +47,8 @@ USAGE:
                                  and --compliance checks the app against a compliance pack
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
+  tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
+                                 fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
   tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
@@ -53,7 +56,8 @@ USAGE:
   tj privacy export|erase <person id> [--target <url>]
                                  everything a running server holds about a person, or erase it
   tj lease list|acquire|release  view, acquire or release operational work leases on a running server
-  tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
+  tj mcp    [--target <url>] [--record <trace.jsonl>]
+                                 MCP server (stdio) so coding agents can inspect, drive, record and test an app
   tj plugin ai | fake <file.json>
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
   tj key <name> --keys <file> [--role <r>]... [--ops observe|test|maintain]
@@ -115,6 +119,7 @@ struct Args {
     access: bool,
     privacy: bool,
     record: bool,
+    record_file: Option<PathBuf>,
     compliance: Option<PathBuf>,
     web: bool,
     as_user: Option<String>,
@@ -135,7 +140,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, access: false, privacy: false, record: false, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -149,7 +154,13 @@ fn parse_args() -> Result<Args, String> {
             "--manifest" => args.manifest = true,
             "--access" => args.access = true,
             "--privacy" => args.privacy = true,
-            "--record" => args.record = true,
+            "--record" => {
+                if args.command == "mcp" {
+                    args.record_file = Some(PathBuf::from(value()?));
+                } else {
+                    args.record = true;
+                }
+            }
             "--compliance" => args.compliance = Some(PathBuf::from(value()?)),
             "--web" => args.web = true,
             "--as" => args.as_user = Some(value()?),
@@ -194,6 +205,15 @@ fn main() -> ExitCode {
             }
         };
     }
+    if raw.get(1).map(String::as_str) == Some("test") {
+        return match test_runner::run(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw.get(1).map(String::as_str) == Some("plugin") {
         let Some(name) = raw.get(2) else {
             eprintln!("error: tj plugin needs a name (ai, fake)\n\n{USAGE}");
@@ -228,7 +248,7 @@ fn main() -> ExitCode {
         "stats" => inspect(&args.target).map(|s| print!("{}", stats::report(&s))),
         "audit" => audit_verify(&args),
         "store" => store_rekey(&args),
-        "mcp" => mcp::run(&args.target),
+        "mcp" => mcp::run(&args.target, args.record_file),
         other => Err(format!("unknown command {other}\n\n{USAGE}")),
     };
     match result {

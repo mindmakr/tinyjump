@@ -1,0 +1,49 @@
+# Deterministic trace test for examples/booking/app.tj:
+# covers staff publish, validation field errors, HTTP check mock, customer profile + booking,
+# "self" presence masking, @pii tool masking, reminder alarm via clock advance, restart, and GDPR erasure.
+{"do": "boot", "now": 1800000000000, "seed": 1, "server": true, "render": false}
+
+# Staff validation error preserves `field` from check()
+{"do": "call", "object": "Slot/s1", "method": "publish", "args": ["", 1800007200000, 30], "as": "key:sam:staff", "expectError": "Give the slot a title", "expectField": "new-title"}
+
+# Non-staff cannot publish slots (403 refusal)
+{"do": "call", "object": "Slot/s1", "method": "publish", "args": ["Haircut", 1800007200000, 30], "as": "user:ana", "expectStatus": 403}
+
+# Staff configures a check URL + reminder window (30 min before start) and publishes a slot 2 hours out
+{"do": "call", "object": "Settings/main", "method": "saveCheck", "args": ["https://clinic.example.com/verify"], "as": "key:sam:staff"}
+{"do": "call", "object": "Settings/main", "method": "saveReminder", "args": [30], "as": "key:sam:staff"}
+{"do": "call", "object": "Slot/s1", "method": "publish", "args": ["Haircut", 1800007200000, 30], "as": "key:sam:staff"}
+
+# Staff cannot book slots
+{"do": "call", "object": "Slot/s1", "method": "book", "args": [], "as": "key:sam:staff", "expectError": "Staff cannot book slots"}
+
+# Customer saves PII profile and books (mocked external check URL returns 200)
+{"do": "http", "match": "https://clinic.example.com/verify", "status": 200, "body": "ok"}
+{"do": "call", "object": "Customer/user:ana", "method": "save", "args": ["Ana", "+1-555-0100"], "as": "user:ana"}
+{"do": "call", "object": "Slot/s1", "method": "book", "args": [], "as": "user:ana", "idempotencyKey": "book-s1-ana"}
+
+# Idempotent retry returns ok without double-booking error
+{"do": "call", "object": "Slot/s1", "method": "book", "args": [], "as": "user:ana", "idempotencyKey": "book-s1-ana"}
+
+# Field-level @read("staff", "self") presence masking: Ana & staff see "user:ana"; Bo sees "•••"
+{"do": "get", "object": "Slot/s1", "as": "user:ana", "expectContains": {"title": "Haircut", "customer": "user:ana"}}
+{"do": "get", "object": "Slot/s1", "as": "key:sam:staff", "expectContains": {"customer": "user:ana"}}
+{"do": "get", "object": "Slot/s1", "as": "user:bo", "expectContains": {"title": "Haircut", "customer": "•••"}}
+
+# Tools (inspect) always see @pii masked
+{"do": "assertInspect", "object": "Customer/user:ana", "expectContains": {"name": "•••", "phone": "•••"}}
+
+# Simulated restart preserves slot + scheduled reminder alarm
+{"do": "boot", "restart": true}
+
+# Advance clock 95 minutes (past the 30-minute-before reminder at +90m): reminder fires automatically
+{"do": "tick", "advance": "95m"}
+{"do": "get", "object": "Customer/user:ana", "as": "user:ana", "expectContains": {"reminders": [{"slot": "s1", "title": "Haircut", "at": 1800007200000}]}}
+
+# Staff cannot read Ana's reminders (@read("owner"))
+{"do": "get", "object": "Customer/user:ana", "as": "key:sam:staff", "expectContains": {"name": "Ana", "reminders": []}}
+
+# GDPR erasure clears Ana's profile AND reopens Slot/s1 cleanly
+{"do": "privacy", "action": "erase", "subject": "user:ana"}
+{"do": "get", "object": "Slot/s1", "as": "user:bo", "expectContains": {"customer": ""}}
+{"do": "assertMetrics", "maxVmSteps": 200000}

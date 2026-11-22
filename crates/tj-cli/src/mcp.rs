@@ -4,13 +4,26 @@
 
 use crate::review;
 use serde_json::{json, Value as Json};
+use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 const MAX_IMAGE: u64 = 20 << 20;
 
-pub fn run(target: &str) -> Result<(), String> {
-    let client = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(), target: target.trim_end_matches('/').to_string(), auth: crate::auth::client_header() };
+struct Recorder {
+    file: Option<PathBuf>,
+    steps: Vec<Json>,
+}
+
+pub fn run(target: &str, record_file: Option<PathBuf>) -> Result<(), String> {
+    let recorder = record_file.map(|f| Recorder { file: Some(f), steps: Vec::new() });
+    let client = Client {
+        agent: ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build(),
+        target: target.trim_end_matches('/').to_string(),
+        auth: crate::auth::client_header(),
+        recorder: RefCell::new(recorder),
+    };
     let mut stdout = std::io::stdout();
     for line in std::io::stdin().lock().lines() {
         let line = line.map_err(|e| e.to_string())?;
@@ -32,6 +45,8 @@ pub fn run(target: &str) -> Result<(), String> {
         };
         writeln!(stdout, "{reply}").and_then(|()| stdout.flush()).map_err(|e| e.to_string())?;
     }
+    // Flush any active --record trace on clean EOF.
+    let _ = client.flush_recorder();
     Ok(())
 }
 
@@ -54,7 +69,11 @@ fn tools() -> Json {
         { "name": "screenshot", "description": "Capture the screen as an image (iOS and Android hosts).", "inputSchema": none },
         { "name": "review", "description": "Check the screen for layout (overflow, overlap), accessibility, touch-target and contrast problems; reports work counters for performance tracking.", "inputSchema": none },
         { "name": "input", "description": "Send any protocol input (advanced), e.g. {\"type\":\"tick\"}. See docs/host-protocol.md.",
-          "inputSchema": { "type": "object", "required": ["input"], "properties": { "input": { "type": "object" } } } }
+          "inputSchema": { "type": "object", "required": ["input"], "properties": { "input": { "type": "object" } } } },
+        { "name": "record_trace", "description": "Record subsequent act, call, get, review and tick steps as a deterministic .trace.jsonl file for `tj test`.",
+          "inputSchema": { "type": "object", "required": ["action"], "properties": {
+            "action": { "type": "string", "description": "start, stop or status" },
+            "file": { "type": "string", "description": "optional output path for action=start (e.g. repro.trace.jsonl)" } } } }
     ])
 }
 
@@ -72,8 +91,9 @@ fn target(s: &str) -> Json {
 struct Client {
     agent: ureq::Agent,
     target: String,
-    /// `Authorization` for a `tj serve` target, from `TJ_ADMIN_KEY`.
+    /// `Authorization` for a `tj serve` target, from `TJ_OPS_KEY` or `TJ_ADMIN_KEY`.
     auth: Option<String>,
+    recorder: RefCell<Option<Recorder>>,
 }
 
 impl Client {
@@ -117,20 +137,59 @@ impl Client {
             }
             "review" => {
                 let s = self.inspect()?;
+                let w = s["viewport"]["w"].as_f64().unwrap_or(390.0);
+                let h = s["viewport"]["h"].as_f64().unwrap_or(844.0);
+                self.record_step(json!({ "do": "assertLayout", "width": w, "height": h, "review": true }));
                 text(review::report(&s, &review::review(&s)))
             }
             "act" => {
-                let input = json!({ "type": "ui", "target": target(a["target"].as_str().unwrap_or("")), "event": a["event"], "value": a.get("value").cloned().unwrap_or(Json::Null) });
-                self.input(&input)?;
+                let t = a["target"].as_str().unwrap_or("");
+                let val = a.get("value").cloned().unwrap_or(Json::Null);
+                let input = json!({ "type": "ui", "target": target(t), "event": a["event"], "value": val });
+                let r = self.input(&input);
+                let mut rec = json!({ "do": "ui", "target": t, "event": a["event"] });
+                if !val.is_null() {
+                    rec["value"] = val;
+                }
+                if let Err(e) = &r {
+                    rec["expectError"] = json!(e);
+                }
+                self.record_step(rec);
+                r?;
                 let s = self.inspect()?;
                 text(format!("done; the screen is now:\n{}", review::outline(&s["tree"])))
             }
             "call" => {
-                let input = json!({ "type": "call", "object": a["object"], "method": a["method"], "args": a.get("args").cloned().unwrap_or(json!([])) });
-                text(self.input(&input)?.to_string())
+                let args = a.get("args").cloned().unwrap_or(json!([]));
+                let input = json!({ "type": "call", "object": a["object"], "method": a["method"], "args": args });
+                let r = self.input(&input);
+                let mut rec = json!({ "do": "call", "object": a["object"], "method": a["method"], "args": args });
+                match &r {
+                    Ok(v) => rec["expect"] = v.clone(),
+                    Err(e) => rec["expectError"] = json!(e),
+                }
+                self.record_step(rec);
+                text(r?.to_string())
             }
-            "get" => text(serde_json::to_string_pretty(&self.input(&json!({ "type": "get", "object": a["object"] }))?).unwrap_or_default()),
-            "input" => text(self.input(&a["input"])?.to_string()),
+            "get" => {
+                let r = self.input(&json!({ "type": "get", "object": a["object"] }));
+                let mut rec = json!({ "do": "get", "object": a["object"] });
+                match &r {
+                    Ok(v) => rec["expect"] = v.clone(),
+                    Err(e) => rec["expectError"] = json!(e),
+                }
+                self.record_step(rec);
+                text(serde_json::to_string_pretty(&r?).unwrap_or_default())
+            }
+            "input" => {
+                let inp = &a["input"];
+                let r = self.input(inp);
+                if inp["type"].as_str() == Some("tick") {
+                    self.record_step(json!({ "do": "tick", "advanceMs": 1000 }));
+                }
+                text(r?.to_string())
+            }
+            "record_trace" => text(self.record_trace(a)?),
             "screenshot" => {
                 let png = self.screenshot()?;
                 Ok(json!([{ "type": "image", "data": crate::bytes::base64(&png), "mimeType": "image/png" }]))
@@ -177,6 +236,47 @@ impl Client {
         self.result(self.request("GET", "/_tj/manifest").call())
     }
 
+    fn record_step(&self, step: Json) {
+        if let Some(rec) = self.recorder.borrow_mut().as_mut() {
+            rec.steps.push(step);
+        }
+    }
+
+    fn flush_recorder(&self) -> Result<Option<(Option<PathBuf>, String)>, String> {
+        let Some(rec) = self.recorder.borrow_mut().take() else { return Ok(None) };
+        let body = rec.steps.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("\n") + if rec.steps.is_empty() { "" } else { "\n" };
+        if let Some(path) = &rec.file {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(path, &body).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        }
+        Ok(Some((rec.file, body)))
+    }
+
+    fn record_trace(&self, a: &Json) -> Result<String, String> {
+        match a["action"].as_str().unwrap_or("") {
+            "start" => {
+                let file = a["file"].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
+                *self.recorder.borrow_mut() = Some(Recorder { file: file.clone(), steps: Vec::new() });
+                match file {
+                    Some(p) => Ok(format!("recording trace to {}", p.display())),
+                    None => Ok("recording trace in memory (call record_trace stop to retrieve)".into()),
+                }
+            }
+            "stop" => match self.flush_recorder()? {
+                Some((Some(path), body)) => Ok(format!("saved {} step(s) to {}\n{body}", body.lines().count(), path.display())),
+                Some((None, body)) => Ok(format!("recorded {} step(s):\n{body}", body.lines().count())),
+                None => Err("no trace recording is active; call record_trace with action \"start\" first".into()),
+            },
+            "status" => match self.recorder.borrow().as_ref() {
+                Some(rec) => Ok(format!("recording ({} step(s){})", rec.steps.len(), rec.file.as_ref().map(|p| format!(", file: {}", p.display())).unwrap_or_default())),
+                None => Ok("not recording".into()),
+            },
+            other => Err(format!("record_trace action must be start, stop or status, got {other:?}")),
+        }
+    }
+
     fn input(&self, input: &Json) -> Result<Json, String> {
         self.result(self.request("POST", "/_tj/input").set("Content-Type", "application/json").send_string(&input.to_string()))
     }
@@ -207,11 +307,11 @@ mod tests {
 
     #[test]
     fn speaks_mcp_without_a_running_app() {
-        let c = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_millis(200)).build(), target: "http://127.0.0.1:9".into(), auth: None };
+        let c = Client { agent: ureq::AgentBuilder::new().timeout(Duration::from_millis(200)).build(), target: "http://127.0.0.1:9".into(), auth: None, recorder: RefCell::new(None) };
         let init = c.handle("initialize", &json!({ "protocolVersion": "2025-06-18" })).unwrap();
         assert_eq!(init["capabilities"]["tools"], json!({}));
         let names: Vec<String> = c.handle("tools/list", &json!({})).unwrap()["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-        assert_eq!(names, ["language", "manifest", "inspect", "act", "call", "get", "screenshot", "review", "input"]);
+        assert_eq!(names, ["language", "manifest", "inspect", "act", "call", "get", "screenshot", "review", "input", "record_trace"]);
         // The language reference works without an app: agents load it before writing code.
         let docs = c.handle("tools/call", &json!({ "name": "language", "arguments": {} })).unwrap();
         assert!(docs["content"][0]["text"].as_str().unwrap().starts_with("# The tinyjump language"));
@@ -219,5 +319,20 @@ mod tests {
         assert_eq!(call["isError"], json!(true));
         assert!(call["content"][0]["text"].as_str().unwrap().contains("cannot reach the app"));
         assert_eq!(c.handle("nope", &json!({})).unwrap_err().0, -32601);
+
+        // Trace recording writes valid JSONL lines and saves to disk on stop.
+        let dir = std::env::temp_dir().join(format!("tj-mcp-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out_file = dir.join("repro.trace.jsonl");
+        let start = c.handle("tools/call", &json!({ "name": "record_trace", "arguments": { "action": "start", "file": out_file } })).unwrap();
+        assert!(start["content"][0]["text"].as_str().unwrap().contains("recording trace"));
+        c.record_step(json!({ "do": "ui", "target": "#add", "event": "onPress" }));
+        c.record_step(json!({ "do": "call", "object": "Todos/main", "method": "add", "args": [], "expect": null }));
+        let stop = c.handle("tools/call", &json!({ "name": "record_trace", "arguments": { "action": "stop" } })).unwrap();
+        assert!(stop["content"][0]["text"].as_str().unwrap().contains("saved 2 step(s)"));
+        let saved = std::fs::read_to_string(&out_file).unwrap();
+        assert_eq!(saved.lines().count(), 2);
+        assert!(saved.contains("\"do\":\"ui\"") && saved.contains("\"do\":\"call\""), "{saved}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
