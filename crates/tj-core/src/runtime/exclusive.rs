@@ -201,6 +201,7 @@ impl Runtime {
         match self.may_enter(&key, f.chain) {
             Ok(true) => Ok(None),
             Ok(false) => Ok(Some(key)),
+            Err((409, why)) => Err(Exc::conflict(why)),
             Err((_, why)) => Err(Exc::busy(why)),
         }
     }

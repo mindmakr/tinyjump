@@ -118,6 +118,8 @@ pub enum ExcKind {
     User,
     /// Access/privacy refusal (`Exc::refused`, 403).
     Refused,
+    /// Deadlock / conflict refusal (`Exc::conflict`, 409).
+    Conflict,
     /// Transient capacity/lock/storage busy error (`Exc::busy`, 503).
     Busy,
     /// Internal VM/code defect (null deref, bad call, stack overflow, runaway: 500 on server).
@@ -135,9 +137,14 @@ impl Exc {
         Exc(error_record(&message.into()), ExcKind::Fault)
     }
 
-    /// A transient overload or lock-timeout error, answered with 503 when uncaught.
+    /// A transient overload, lock-timeout, or store I/O error, answered with 503 when uncaught.
     pub fn busy(message: impl Into<String>) -> Exc {
         Exc(error_record(&message.into()), ExcKind::Busy)
+    }
+
+    /// A conflict (such as an `@exclusive` lock deadlock cycle), answered with 409 when uncaught.
+    pub fn conflict(message: impl Into<String>) -> Exc {
+        Exc(error_record(&message.into()), ExcKind::Conflict)
     }
 
     /// An error with an optional `field` (from `check(ok, field, message)` or effect failure).
@@ -163,10 +170,11 @@ impl Exc {
         Exc(error_record(&message.into()), ExcKind::Refused)
     }
 
-    /// The status a request fails with when nothing catches this error (`403` / `503`).
+    /// The status a request fails with when nothing catches this error (`403` / `409` / `503`).
     pub fn status(&self) -> Option<u16> {
         match self.1 {
             ExcKind::Refused => Some(403),
+            ExcKind::Conflict => Some(409),
             ExcKind::Busy => Some(503),
             ExcKind::User | ExcKind::Fault => None,
         }

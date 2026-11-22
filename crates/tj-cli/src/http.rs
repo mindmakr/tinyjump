@@ -1630,6 +1630,20 @@ mod tests {
             }
         }
         assert!(hit_429_pct, "percent-encoded ?%6fbject= must be rate-limited");
+        // Forged JWT on `GET /api/events` also hits `RateLimiter` (429).
+        let mut hit_429_jwt = false;
+        for _ in 0..4 {
+            let r = agent
+                .get(&format!("{base}/api/events"))
+                .set("Authorization", "Bearer forged.jwt.events")
+                .set("X-Forwarded-For", "198.51.100.57")
+                .call();
+            if matches!(r, Err(ureq::Error::Status(429, _))) {
+                hit_429_jwt = true;
+                break;
+            }
+        }
+        assert!(hit_429_jwt, "forged JWT on GET /api/events must be rate-limited");
 
         // T1-R2: caller-input errors (`Account.get("a/b")`, `JSON.parse("{")`) return 400 (NOT 500)
         // and MUST NOT trigger auto-rollback during the watch window!

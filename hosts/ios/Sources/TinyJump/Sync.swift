@@ -74,10 +74,10 @@ final class Sync: NSObject, URLSessionDataDelegate {
             let reply = status < 502 && status != 401 && status != 429 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
             DispatchQueue.main.async {
                 if status == 401 { self.onTokenExpired?() }
-                if let reply = reply, reply["error"] == nil {
-                    done(reply["ok"], nil, nil, false)
-                } else if let message = reply?["error"] as? String {
+                if let message = reply?["error"] as? String {
                     done(nil, message, reply?["field"] as? String, false)
+                } else if (200..<300).contains(status), let reply = reply {
+                    done(reply["ok"], nil, nil, false)
                 } else {
                     done(nil, error?.localizedDescription ?? "the server did not answer", nil, true)
                 }

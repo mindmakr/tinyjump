@@ -254,7 +254,7 @@ impl Runtime {
                         let items: Vec<Value> = match &v {
                             Value::Arr(other) => other.borrow().iter().map(|x| Value::inside(other.readonly, x.clone())).collect(),
                             Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
-                            other => throw!(Exc::msg(format!("cannot spread a {} into an array", other.type_name()))),
+                            other => throw!(Exc::fault(format!("cannot spread a {} into an array", other.type_name()))),
                         };
                         if let Value::Arr(a) = top!() {
                             a.borrow_mut().extend(items);
@@ -273,7 +273,7 @@ impl Runtime {
                         let key: Rc<str> = match key {
                             Value::Str(s) => s,
                             Value::Num(n) => Rc::from(fmt_num(n).as_str()),
-                            other => throw!(Exc::msg(format!("record keys must be strings, got {}", other.type_name()))),
+                            other => throw!(Exc::fault(format!("record keys must be strings, got {}", other.type_name()))),
                         };
                         if let Value::Rec(r) = top!() {
                             r.borrow_mut().insert(key, v);
@@ -284,7 +284,7 @@ impl Runtime {
                         let entries: Vec<(Rc<str>, Value)> = match &v {
                             Value::Rec(src) => src.borrow().iter().map(|(k, v)| (k.clone(), Value::inside(src.readonly, v.clone()))).collect(),
                             Value::Null => Vec::new(),
-                            other => throw!(Exc::msg(format!("cannot spread a {} into a record", other.type_name()))),
+                            other => throw!(Exc::fault(format!("cannot spread a {} into a record", other.type_name()))),
                         };
                         if let Value::Rec(r) = top!() {
                             r.borrow_mut().extend(entries);
@@ -296,7 +296,7 @@ impl Runtime {
                         let v = match (&a, &b) {
                             (Value::Num(x), Value::Num(y)) => Value::Num(x + y),
                             (Value::Str(_), _) | (_, Value::Str(_)) => Value::str(&(a.display() + &b.display())),
-                            _ => throw!(Exc::msg(format!("cannot add {} and {}", a.type_name(), b.type_name()))),
+                            _ => throw!(Exc::fault(format!("cannot add {} and {}", a.type_name(), b.type_name()))),
                         };
                         f.stack.push(v);
                     }
@@ -304,7 +304,7 @@ impl Runtime {
                         let b = pop!();
                         let a = pop!();
                         let (Value::Num(x), Value::Num(y)) = (&a, &b) else {
-                            throw!(Exc::msg(format!("arithmetic needs numbers, got {} and {}", a.type_name(), b.type_name())))
+                            throw!(Exc::fault(format!("arithmetic needs numbers, got {} and {}", a.type_name(), b.type_name())))
                         };
                         f.stack.push(Value::Num(match op {
                             Op::Sub => x - y,
@@ -315,7 +315,7 @@ impl Runtime {
                     }
                     Op::Neg => match pop!() {
                         Value::Num(n) => f.stack.push(Value::Num(-n)),
-                        other => throw!(Exc::msg(format!("cannot negate a {}", other.type_name()))),
+                        other => throw!(Exc::fault(format!("cannot negate a {}", other.type_name()))),
                     },
                     Op::Not => {
                         let v = pop!();
@@ -332,7 +332,7 @@ impl Runtime {
                         let ord = match (&a, &b) {
                             (Value::Num(x), Value::Num(y)) => x.partial_cmp(y),
                             (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
-                            _ => throw!(Exc::msg(format!("cannot compare {} and {}", a.type_name(), b.type_name()))),
+                            _ => throw!(Exc::fault(format!("cannot compare {} and {}", a.type_name(), b.type_name()))),
                         };
                         let r = ord.is_some_and(|o| match op {
                             Op::Lt => o.is_lt(),
@@ -351,7 +351,7 @@ impl Runtime {
                         let n = match pop!() {
                             Value::Arr(a) => a.borrow().len(),
                             Value::Str(s) => s.chars().count(),
-                            other => throw!(Exc::msg(format!("cannot loop over a {}; for...of works on arrays and strings (use Object.keys for records)", other.type_name()))),
+                            other => throw!(Exc::fault(format!("cannot loop over a {}; for...of works on arrays and strings (use Object.keys for records)", other.type_name()))),
                         };
                         f.stack.push(Value::Num(n as f64));
                     }
@@ -645,8 +645,8 @@ impl Runtime {
                         f.stack[pos] = callee;
                         self.call_value(f, pos)
                     }
-                    Some(other) => Err(Exc::msg(format!("'{name}' is a {}, not a function", other.type_name()))),
-                    None => Err(Exc::msg(format!("the record has no function '{name}'"))),
+                    Some(other) => Err(Exc::fault(format!("'{name}' is a {}, not a function", other.type_name()))),
+                    None => Err(Exc::fault(format!("the record has no function '{name}'"))),
                 }
             }
             Value::Arr(_) | Value::Str(_) | Value::Num(_) => {
@@ -662,7 +662,7 @@ impl Runtime {
                     f.stack.insert(pos, self.globals[slot as usize].clone());
                     return self.call_value(f, pos);
                 }
-                Err(Exc::msg(format!("{}s have no method '{name}'", recv.type_name())))
+                Err(Exc::fault(format!("{}s have no method '{name}'", recv.type_name())))
             }
             Value::Null => Err(Exc::fault(format!("cannot call .{name}() on null; check for null first or use ?."))),
             other => Err(Exc::fault(format!("a {} has no method '{name}'", other.type_name()))),
@@ -731,7 +731,7 @@ impl Runtime {
                 Ok(())
             }
             (Value::Obj(o), Value::Str(k)) => self.set_obj_field(this, o, k, v),
-            (o, i) => Err(Exc::msg(format!("cannot set index {} on a {}", i.type_name(), o.type_name()))),
+            (o, i) => Err(Exc::fault(format!("cannot set index {} on a {}", i.type_name(), o.type_name()))),
         }
     }
 }

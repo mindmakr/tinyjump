@@ -701,8 +701,8 @@ impl Runtime {
                 // before recording the error reply (so idempotency call records stay clean).
                 self.rollback_turn(mark);
                 match fail.status {
-                    Some(_) => self.count_refused_slot(f.stat),
-                    None => self.count_error(f.stat),
+                    Some(403) => self.count_refused_slot(f.stat),
+                    _ => self.count_error(f.stat),
                 }
                 #[cfg(feature = "server")]
                 let effective_status = if fail.status.is_none() && fail.fault && self.server { Some(500) } else { fail.status };

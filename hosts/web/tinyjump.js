@@ -301,9 +301,14 @@ export async function start(opts) {
     })
       .then((r) => {
         if (r.status === 401) tokenExpired();
-        return r.status >= 502 || r.status === 401 || r.status === 429 ? Promise.reject(new Error('server answered ' + r.status)) : r.json();
+        if (r.status >= 502 || r.status === 401 || r.status === 429) return Promise.reject(new Error('server answered ' + r.status));
+        return r.json().then((j) => {
+          if (j && typeof j.error === 'string') return { error: j.error, field: j.field || undefined };
+          if (r.status >= 200 && r.status < 300) return { ok: j ? j.ok : null };
+          return Promise.reject(new Error('server answered ' + r.status));
+        });
       })
-      .then((j) => send(j.error ? { type: 'effectDone', id, error: j.error, field: j.field || undefined } : { type: 'effectDone', id, ok: j.ok }))
+      .then((j) => send(j.error !== undefined ? { type: 'effectDone', id, error: j.error, field: j.field } : { type: 'effectDone', id, ok: j.ok }))
       .catch((e) => send({ type: 'effectDone', id, error: String(e && e.message || e), unreachable: true }));
   }
 

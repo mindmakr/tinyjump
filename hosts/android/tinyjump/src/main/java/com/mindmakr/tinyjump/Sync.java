@@ -142,7 +142,8 @@ final class Sync {
             } catch (org.json.JSONException e) {
                 throw new IOException("non-JSON server reply (" + status + ")", e);
             }
-            if (reply.has("error")) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
+            if (reply.opt("error") instanceof String) throw new CallFailed(reply.getString("error"), reply.isNull("field") ? null : reply.optString("field", null));
+            if (status < 200 || status >= 300) throw new IOException("server answered " + status);
             return reply.opt("ok");
         } finally {
             c.disconnect();

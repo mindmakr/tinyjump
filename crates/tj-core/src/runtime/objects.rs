@@ -168,8 +168,8 @@ impl Runtime {
         let mut saved = String::new();
         let (mut created, mut changed) = (self.now, self.now);
         let mut dated = true;
-        if let Some(text) = self.store.load(&handle.key()).map_err(|e| Exc::msg(format!("{} could not be read: {e}", handle.key())))? {
-            let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::msg(format!("{} has unreadable stored state: {e}", handle.key())))?;
+        if let Some(text) = self.store.load(&handle.key()).map_err(|e| Exc::busy(format!("{} could not be read: {e}", handle.key())))? {
+            let stored: Stored = serde_json::from_str(&text).map_err(|e| Exc::fault(format!("{} has unreadable stored state: {e}", handle.key())))?;
             // Stored fields override defaults; fields no longer declared are dropped.
             let mut s = state.borrow_mut();
             for (k, v) in &stored.state {
@@ -226,7 +226,13 @@ impl Runtime {
     pub(crate) fn defaults(&mut self, class: u16) -> Result<Rc<RefCell<Record>>, Exc> {
         let init = Rc::new(Closure { proto: self.program.objects[class as usize].init, upvals: Vec::new(), this: None });
         let f = self.fiber_for(&Value::Func(init), Vec::new())?;
-        match self.run_sync(f).map_err(|fail| Exc::msg(fail.message))? {
+        match self.run_sync(f).map_err(|fail| {
+            #[cfg(feature = "server")]
+            if fail.fault {
+                return Exc::fault(fail.message);
+            }
+            Exc::msg(fail.message)
+        })? {
             Value::Rec(state) => Ok(Rc::clone(&state)),
             _ => unreachable!("object init returns a record"),
         }

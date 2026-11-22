@@ -3451,4 +3451,43 @@ export async function callPeer(obj: string, m: string, a: any[]): any {
     // object MUST be rejected with 413 (no alarm-bloat bypass!).
     let bloat_err = call_as(&mut rt_shr, 22.0, "Vault/v2", "popAndBloatAlarm", json!(["b".repeat(400)]), who("", &[])).unwrap_err();
     assert_eq!(bloat_err.0, Some(413), "alarm bloat on oversized record must fail with 413: {bloat_err:?}");
+
+    // P60-2, P60-3, P60-4, P60-6: VM faults (`null[0] = 1`, `for...of null`) return 500,
+    // `store.load` failure inside a method returns 503, and nested `@exclusive` timeout returns
+    // 503 counted under `errors` (NOT `refused`).
+    let fault_src = r#"
+@server @read("anyone") object Faulty {
+  @allow("anyone") badIndex() { const a: any = null; a[0] = 1 }
+  @allow("anyone") badLoop() { const a: any = null; for (const x of a) { } }
+  @allow("anyone") loadPeer(): string { return Peer.get("fail").id }
+  @allow("anyone") @exclusive async hold() { await fetch("https://example.com/slow") }
+  @allow("anyone") callHold() { Faulty.get("f1").hold() }
+}
+@server @read("anyone") object Peer {
+  v: number = 0
+}
+"#;
+    let mut frt = server(fault_src, false);
+    assert_eq!(call_as(&mut frt, 1.0, "Faulty/f1", "badIndex", json!([]), who("", &[])).unwrap_err().0, Some(500));
+    assert_eq!(call_as(&mut frt, 2.0, "Faulty/f1", "badLoop", json!([]), who("", &[])).unwrap_err().0, Some(500));
+    // Nested `@exclusive` wait-timeout returns 503 and counts under `errors` (not `refused`).
+    let _ = frt.handle(10.0, Input::Call { object: "Faulty/f1".into(), method: "hold".into(), args: vec![], reply: Some(1), call: None, caller: who("", &[]) });
+    let _ = frt.handle(11.0, Input::Call { object: "Faulty/f1".into(), method: "callHold".into(), args: vec![], reply: Some(2), call: None, caller: who("", &[]) });
+    let exp = frt.handle(35_000.0, Input::Tick);
+    assert!(exp.iter().any(|o| matches!(o, Output::Reply { reply: 2, status: Some(503), .. })), "{exp:?}");
+    assert_eq!(frt.stats()["methods"]["Faulty.callHold"]["errors"], json!(1));
+    assert_eq!(frt.stats()["methods"]["Faulty.callHold"]["refused"], json!(0));
+
+    // `store.load` failure inside a method returns 503 (P60-2).
+    struct FailLoad;
+    impl Store for FailLoad {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+            if key == "Peer/fail" { Err("disk io error".into()) } else { Ok(None) }
+        }
+        fn save(&mut self, _: &str, _: &str) -> Result<(), String> { Ok(()) }
+        fn remove(&mut self, _: &str) -> Result<(), String> { Ok(()) }
+        fn keys(&mut self, _: &str) -> Result<Vec<String>, String> { Ok(Vec::new()) }
+    }
+    let mut srt = Runtime::boot(compile(fault_src).unwrap(), Box::new(FailLoad), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
+    assert_eq!(call_as(&mut srt, 1.0, "Faulty/f1", "loadPeer", json!([]), who("", &[])).unwrap_err().0, Some(503));
 }
