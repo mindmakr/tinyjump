@@ -15,6 +15,17 @@ const MAX_FRAMES: usize = 256;
 const STEP_BUDGET: u64 = 200_000_000;
 pub(crate) const SERVER_STEP_BUDGET: u64 = 20_000_000;
 
+/// Per-fiber context for deterministic `crypto.idempotencyKey(label)` derivation on servers
+/// (`docs/retried-effects.md`).
+#[cfg(feature = "server")]
+pub(crate) struct IdempotencyCtx {
+    pub object: Rc<str>,
+    pub method: Rc<str>,
+    pub call_id: Option<Rc<str>>,
+    pub fallback_root: Option<[u8; 16]>,
+    pub used_labels: std::collections::HashSet<String>,
+}
+
 #[derive(Default)]
 pub struct Fiber {
     pub stack: Vec<Value>,
@@ -29,6 +40,9 @@ pub struct Fiber {
     pub chain: u64,
     /// On a server, what started a call nobody requested (a timer, alarm or `invoke`).
     pub origin: Option<crate::runtime::Origin>,
+    /// Server-side scope for `crypto.idempotencyKey(label)` and duplicate-label detection.
+    #[cfg(feature = "server")]
+    pub(crate) idempotency: Option<IdempotencyCtx>,
 }
 
 pub struct Frame {
@@ -94,10 +108,16 @@ impl Runtime {
         if f.chain == 0 {
             f.chain = self.new_chain();
         }
-        // Builtins that act for the caller (`invoke`) need to know who that is, and its chain.
+        // Builtins that act for the caller (`invoke`, `crypto.idempotencyKey`) need the active fiber's context.
         let outer = std::mem::replace(&mut self.running_caller, f.caller.clone());
         let outer_chain = std::mem::replace(&mut self.running_chain, f.chain);
+        #[cfg(feature = "server")]
+        let outer_idem = std::mem::replace(&mut self.running_idempotency, f.idempotency.take());
         let r = self.run_steps(f, &mut budget);
+        #[cfg(feature = "server")]
+        {
+            f.idempotency = std::mem::replace(&mut self.running_idempotency, outer_idem);
+        }
         self.running_caller = outer;
         self.running_chain = outer_chain;
         self.metrics.vm_steps += limit - budget;
@@ -477,7 +497,15 @@ impl Runtime {
                     }
                     Op::Throw => {
                         let v = pop!();
-                        throw!(Exc(v, crate::vm::value::ExcKind::User));
+                        #[cfg(feature = "server")]
+                        let kind = if self.server && matches!(&v, Value::Rec(r) if matches!(r.borrow().get("retryable"), Some(Value::Bool(true)))) {
+                            crate::vm::value::ExcKind::Busy
+                        } else {
+                            crate::vm::value::ExcKind::User
+                        };
+                        #[cfg(not(feature = "server"))]
+                        let kind = crate::vm::value::ExcKind::User;
+                        throw!(Exc(v, kind));
                     }
                     Op::TryBegin(t) => f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize }),
                     Op::TryEnd => {

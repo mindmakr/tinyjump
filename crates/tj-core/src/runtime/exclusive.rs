@@ -163,6 +163,20 @@ impl Runtime {
     pub(crate) fn start(&mut self, mut f: Fiber, reply: Option<u64>, entry: Entry) {
         f.caller = entry.who;
         f.chain = if entry.chain == 0 { self.new_chain() } else { entry.chain };
+        #[cfg(feature = "server")]
+        if self.server {
+            if let (Some(obj), Some((class, m))) = (f.frames.first().and_then(|fr| fr.this.as_ref()), f.stat) {
+                if let Some((method, _)) = self.program.objects[class as usize].methods.get_index(m as usize) {
+                    f.idempotency = Some(crate::vm::interp::IdempotencyCtx {
+                        object: Rc::from(obj.key()),
+                        method: method.clone(),
+                        call_id: entry.call_id,
+                        fallback_root: None,
+                        used_labels: std::collections::HashSet::new(),
+                    });
+                }
+            }
+        }
         self.origin(&mut f, entry.by);
         let key = f.stat.filter(|_| self.any_exclusive).and_then(|(c, m)| {
             let (_, def) = self.program.objects[c as usize].methods.get_index(m as usize)?;

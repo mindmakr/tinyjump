@@ -1,6 +1,6 @@
 # Retried external effects after a crash
 
-**Status:** Design note (proposed, not yet implemented; open for Critic and owner review).
+**Status:** Built (Option B approved by owner on 2026-11-23; implemented in `tj-core` and `tj-cli`).
 
 ## The problem
 
@@ -68,6 +68,9 @@ Keep the VM stateless across restarts and give `@server` methods **one** explici
         },
         body: JSON.stringify({ amount })
       })
+      if (res.status === 429 || res.status >= 500) {
+        throw { message: `payment provider busy (${res.status})`, retryable: true }
+      }
       check(res.ok, "payment", `charge failed (${res.status})`)
       this.chargeId = res.json().id
       this.status = "paid"

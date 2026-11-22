@@ -116,11 +116,19 @@ pub(crate) struct Entry {
     pub who: Who,
     pub chain: u64,
     pub by: By,
+    #[cfg(feature = "server")]
+    pub call_id: Option<Rc<str>>,
 }
 
 impl Entry {
     pub(crate) fn new(who: Who) -> Entry {
-        Entry { who, chain: 0, by: By::Request }
+        Entry {
+            who,
+            chain: 0,
+            by: By::Request,
+            #[cfg(feature = "server")]
+            call_id: None,
+        }
     }
 }
 
@@ -199,6 +207,8 @@ pub struct Runtime {
     /// code.
     pub(crate) device_roles: Rc<[Rc<str>]>,
     pub(crate) running_chain: u64,
+    #[cfg(feature = "server")]
+    pub(crate) running_idempotency: Option<crate::vm::interp::IdempotencyCtx>,
     next_chain: u64,
     /// `@exclusive` (see `exclusive.rs`): held objects and calls whose turn has come.
     locks: Vec<exclusive::Lock>,
@@ -288,6 +298,8 @@ impl Runtime {
             class_streams: std::collections::HashSet::new(),
             device_roles: Rc::from([]),
             running_chain: 0,
+            #[cfg(feature = "server")]
+            running_idempotency: None,
             next_chain: 0,
             locks: Vec::new(),
             ready: Vec::new(),
@@ -451,7 +463,7 @@ impl Runtime {
                 if self.is_queued_call(id) {
                     self.call_attempt_done(id, ok, error, field, unreachable);
                 } else {
-                    self.resume(id, ok, error, field);
+                    self.resume(id, ok, error, field, unreachable);
                 }
             }
             Input::Sync { object, state, seq } => {
@@ -526,6 +538,57 @@ impl Runtime {
         self.rng ^= self.rng >> 27;
         let x = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
         (x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Derives a deterministic, crash-stable external idempotency key for an `@server` method
+    /// (`docs/retried-effects.md`), failing closed on store secret errors or duplicate labels in
+    /// the same live call.
+    #[cfg(feature = "server")]
+    pub(crate) fn idempotency_key(&mut self, label: &str) -> Result<String, Exc> {
+        if !self.server {
+            return Err(Exc::msg("crypto.idempotencyKey() is only available on @server objects"));
+        }
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot call crypto.idempotencyKey()"));
+        }
+        if label.is_empty() || label.len() > 128 {
+            return Err(Exc::msg("crypto.idempotencyKey(label) needs a label of 1-128 characters"));
+        }
+        let Some(mut ctx) = self.running_idempotency.take() else {
+            return Err(Exc::msg("crypto.idempotencyKey() must be called inside an @server object method"));
+        };
+        let res = (|| -> Result<String, Exc> {
+            if ctx.used_labels.contains(label) {
+                return Err(Exc::msg(format!(
+                    "crypto.idempotencyKey({label:?}) was already called in this call; include a unique id in the label (e.g. crypto.idempotencyKey(\"{label}:\" + item.id))"
+                )));
+            }
+            let secret = self.store_secret().map_err(Exc::busy)?;
+            let who = self.running_caller.clone();
+            let caller_tag = self.caller_tag(&who).map_err(Exc::busy)?;
+            let call_scope = match &ctx.call_id {
+                Some(id) => format!("call:{id}"),
+                None => {
+                    let root = *ctx.fallback_root.get_or_insert_with(|| {
+                        let mut b = [0u8; 16];
+                        self.drbg.fill(&mut b);
+                        b
+                    });
+                    format!("turn:{}", crate::crypto::hex(&root))
+                }
+            };
+            let parts: &[&[u8]] = &[b"tj-idem-v1", ctx.object.as_bytes(), ctx.method.as_bytes(), caller_tag.as_bytes(), call_scope.as_bytes(), label.as_bytes()];
+            let mut framed = Vec::with_capacity(parts.iter().map(|p| 4 + p.len()).sum());
+            for p in parts {
+                framed.extend_from_slice(&(p.len() as u32).to_be_bytes());
+                framed.extend_from_slice(p);
+            }
+            let mac = crate::crypto::hmac(secret.as_bytes(), &[&framed]);
+            ctx.used_labels.insert(label.to_string());
+            Ok(format!("tj_{}", &crate::crypto::hex(&mac)[..32]))
+        })();
+        self.running_idempotency = Some(ctx);
+        res
     }
 
     pub(crate) fn log(&mut self, level: &str, message: String) {
@@ -644,56 +707,29 @@ impl Runtime {
         self.settle(f, reply, r, mark);
     }
 
+    #[inline(never)]
+    fn abort_turn(&mut self, f: &mut Fiber, mark: usize, drop_invoke: Option<u32>) {
+        self.ran(f, false);
+        self.release_frames(f, 0);
+        self.rollback_turn(mark);
+        if let Some(p) = drop_invoke {
+            for _ in 0..self.invocations.len() {
+                if let Some(inv) = self.invocations.pop_front() {
+                    if inv.promise != p {
+                        self.invocations.push_back(inv);
+                    }
+                }
+            }
+        }
+        self.count_error(f.stat);
+    }
+
     /// Completes or suspends a fiber, enforcing `@invariant`s, per-object size caps, and atomic
     /// rollback per turn BEFORE committing `waiting`, `park`, `ran`, or `reply`.
     /// Returns `None` when the turn committed or suspended cleanly, or `Some(status)` when rolled back.
     pub(crate) fn settle(&mut self, mut f: Fiber, reply: Option<u64>, r: Result<Run, Failure>, mark: usize) -> Option<u16> {
-        match r {
-            Ok(Run::Await(p)) => {
-                if let Err((status, msg)) = self.check_turn_constraints() {
-                    self.ran(&mut f, false);
-                    self.release_frames(&mut f, 0);
-                    self.rollback_turn(mark);
-                    self.count_error(f.stat);
-                    self.reply_constraint_err(reply, status, msg);
-                    self.flush_from(mark);
-                    return Some(status);
-                }
-                self.waiting.insert(p, (f, reply));
-                self.flush_from(mark);
-                None
-            }
-            Ok(Run::Blocked(key)) => {
-                if let Err((status, msg)) = self.check_turn_constraints() {
-                    self.ran(&mut f, false);
-                    self.release_frames(&mut f, 0);
-                    self.rollback_turn(mark);
-                    self.count_error(f.stat);
-                    self.reply_constraint_err(reply, status, msg);
-                    self.flush_from(mark);
-                    return Some(status);
-                }
-                self.park(key, f, reply);
-                self.flush_from(mark);
-                None
-            }
-            Ok(Run::Done(v)) => {
-                if let Err((status, msg)) = self.check_turn_constraints() {
-                    self.ran(&mut f, false);
-                    self.release_frames(&mut f, 0);
-                    self.rollback_turn(mark);
-                    self.count_error(f.stat);
-                    self.reply_constraint_err(reply, status, msg);
-                    self.flush_from(mark);
-                    return Some(status);
-                }
-                self.ran(&mut f, true);
-                if reply.is_some() {
-                    self.reply(reply, v.to_json().map_err(|e| (e, None)));
-                }
-                self.flush_from(mark);
-                None
-            }
+        let ok = match r {
+            Ok(ok) => ok,
             Err(fail) => {
                 self.ran(&mut f, false);
                 self.release_frames(&mut f, 0);
@@ -717,7 +753,40 @@ impl Runtime {
                     (None, _) => self.outputs.push(Output::Error { message: fail.message, trace: fail.trace }),
                 }
                 self.flush_from(mark);
-                Some(status)
+                return Some(status);
+            }
+        };
+        let drop_invoke = match &ok {
+            Run::Await(p) => Some(*p),
+            _ => None,
+        };
+        if let Err((status, msg)) = self.check_turn_constraints() {
+            self.abort_turn(&mut f, mark, drop_invoke);
+            self.reply_constraint_err(reply, status, msg);
+            self.flush_from(mark);
+            return Some(status);
+        }
+        match ok {
+            Run::Done(v) => {
+                self.ran(&mut f, true);
+                if reply.is_some() {
+                    self.reply(reply, v.to_json().map_err(|e| (e, None)));
+                }
+                self.flush_from(mark);
+                None
+            }
+            Run::Await(_) | Run::Blocked(_) if !self.flush_from(mark) => {
+                self.abort_turn(&mut f, mark, drop_invoke);
+                self.refuse_start(reply, 503, "the change could not be saved; try again".into());
+                Some(503)
+            }
+            Run::Await(p) => {
+                self.waiting.insert(p, (f, reply));
+                None
+            }
+            Run::Blocked(key) => {
+                self.park(key, f, reply);
+                None
             }
         }
     }
@@ -768,7 +837,10 @@ impl Runtime {
     }
 
     /// Continues the fiber waiting on promise `id` with an effect's result.
-    fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>, field: Option<String>) {
+    /// When `unreachable` is true (a transient downstream `fetch` transport error), an uncaught
+    /// failure unwinds with `Exc::busy` (HTTP 503 via `refuse_start`) instead of caching a
+    /// permanent `400` `CallRecord`, so devices safely retry the same `Idempotency-Key`.
+    fn resume(&mut self, id: u32, ok: Option<Json>, error: Option<String>, field: Option<String>, unreachable: bool) {
         if let Some((mut f, reply)) = self.waiting.remove(&id) {
             if !self.touched.is_empty() {
                 self.flush();
@@ -776,7 +848,16 @@ impl Runtime {
             let mark = self.outputs.len();
             self.ran_code = true;
             let r = match error {
-                Some(e) => self.unwind(&mut f, Exc::with_field(e, field)).and_then(|()| self.run(&mut f)),
+                Some(e) => {
+                    #[cfg(feature = "server")]
+                    let exc = if unreachable { Exc::busy(e) } else { Exc::with_field(e, field) };
+                    #[cfg(not(feature = "server"))]
+                    let exc = {
+                        let _ = unreachable;
+                        Exc::with_field(e, field)
+                    };
+                    self.unwind(&mut f, exc).and_then(|()| self.run(&mut f))
+                }
                 None => {
                     f.stack.push(Value::from_json(&ok.unwrap_or(Json::Null)));
                     self.run(&mut f)
@@ -810,7 +891,7 @@ impl Runtime {
                 Ok(v) => (Some(v), None, None),
                 Err((e, f)) => (None, Some(e), f),
             };
-            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error, field);
+            self.resume((internal - INVOKE_REPLY_BASE) as u32, ok, error, field, false);
             return;
         }
         match (reply, r) {
@@ -852,14 +933,40 @@ impl Runtime {
                         next = self.now + interval;
                     }
                     self.push_timer(next, TimerKind::Every { obj: obj.clone(), method: method.clone(), interval });
-                    self.invoke(obj, &method, Vec::new(), false, None, Entry { who: Who::System, chain: 0, by: By::Timer });
+                    self.invoke(
+                        obj,
+                        &method,
+                        Vec::new(),
+                        false,
+                        None,
+                        Entry {
+                            who: Who::System,
+                            chain: 0,
+                            by: By::Timer,
+                            #[cfg(feature = "server")]
+                            call_id: None,
+                        },
+                    );
                 }
                 TimerKind::Alarm { obj, alarm } => {
                     if let Some(a) = self.take_alarm(&obj, alarm) {
                         let args = a.args.iter().map(Value::from_json).collect();
                         // An alarm runs as whoever scheduled it, so rules on data still hold.
                         let who = a.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
-                        self.invoke(obj, &a.method, args, false, None, Entry { who, chain: 0, by: By::Alarm });
+                        self.invoke(
+                            obj,
+                            &a.method,
+                            args,
+                            false,
+                            None,
+                            Entry {
+                                who,
+                                chain: 0,
+                                by: By::Alarm,
+                                #[cfg(feature = "server")]
+                                call_id: None,
+                            },
+                        );
                     }
                 }
                 TimerKind::Outbox => self.dispatch_calls(),

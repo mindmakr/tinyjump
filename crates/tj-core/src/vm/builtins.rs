@@ -22,7 +22,7 @@ pub const GLOBALS: &[Global] = &[
     // `reveal(value, purpose)`: personal data leaving on purpose. The compiler checks the
     // purpose (flow.rs); at run time it is the value.
     ("reveal", || native("reveal", |_, a| Ok(arg(a, 0).clone()))),
-    ("crypto", || namespace(&[("hmac", crypto_hmac), ("timingSafeEqual", timing_safe_equal), ("randomId", random_id)])),
+    ("crypto", || namespace(&[("hmac", crypto_hmac), ("timingSafeEqual", timing_safe_equal), ("randomId", random_id), ("idempotencyKey", idempotency_key)])),
     ("Array", || namespace(&[("isArray", |_, a| Ok(Value::Bool(matches!(arg(a, 0), Value::Arr(_)))))])),
     ("String", || native("String", |_, a| Ok(Value::str(&arg(a, 0).display())))),
     ("Number", || native("Number", |_, a| Ok(Value::Num(to_number(arg(a, 0)))))),
@@ -542,6 +542,21 @@ fn random_id(rt: &mut Runtime, _: &[Value]) -> Result<Value, Exc> {
     let mut id = [0u8; 16];
     rt.secure_bytes(&mut id)?;
     Ok(Value::str(&crate::crypto::hex(&id)))
+}
+
+/// `crypto.idempotencyKey(label)`: deterministic, crash-stable external idempotency key for
+/// `@server` methods (`docs/retried-effects.md`).
+fn idempotency_key(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    #[cfg(feature = "server")]
+    {
+        let label = text(a, 0, "crypto.idempotencyKey")?;
+        Ok(Value::str(&rt.idempotency_key(&label)?))
+    }
+    #[cfg(not(feature = "server"))]
+    {
+        let _ = (rt, a);
+        Err(Exc::msg("crypto.idempotencyKey() is server-only"))
+    }
 }
 
 #[cfg(test)]

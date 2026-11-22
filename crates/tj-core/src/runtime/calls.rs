@@ -27,7 +27,7 @@ use std::rc::Rc;
 /// An `invoke` waiting for its calling fiber to suspend: the promise it settles, the call,
 /// and who it acts for, in which chain.
 pub(crate) struct Invocation {
-    promise: u32,
+    pub(crate) promise: u32,
     object: String,
     method: String,
     args: Vec<Value>,
@@ -178,7 +178,7 @@ impl Runtime {
         let p = self.outbox.pending.remove(i);
         self.save_outbox();
         match (p.promise, error) {
-            (Some(promise), error) => self.resume(promise, ok, error, field),
+            (Some(promise), error) => self.resume(promise, ok, error, field, false),
             // Queued before a restart: nobody awaits it any more, but a failure must not vanish.
             (None, Some(e)) => self.outputs.push(Output::Error { message: format!("{}.{} (queued before a restart) failed: {e}", p.object, p.method), trace: Vec::new() }),
             (None, None) => {}
@@ -219,7 +219,7 @@ impl Runtime {
             let class = p.object.split('/').next().unwrap_or_default();
             let why = format!("{class}.{} was queued by another user and was not sent", p.method);
             match p.promise {
-                Some(promise) => self.resume(promise, None, Some(why), None),
+                Some(promise) => self.resume(promise, None, Some(why), None, false),
                 None => self.outputs.push(Output::Error { message: why, trace: Vec::new() }),
             }
         }
@@ -270,7 +270,20 @@ impl Runtime {
                 self.flush();
             }
             match self.resolve_object(&i.object) {
-                Ok(obj) => self.invoke(obj, &i.method, i.args, true, reply, Entry { who: i.who, chain: i.chain, by: By::Invoke }),
+                Ok(obj) => self.invoke(
+                    obj,
+                    &i.method,
+                    i.args,
+                    true,
+                    reply,
+                    Entry {
+                        who: i.who,
+                        chain: i.chain,
+                        by: By::Invoke,
+                        #[cfg(feature = "server")]
+                        call_id: None,
+                    },
+                ),
                 Err(e) => self.reply(reply, Err((e, None))),
             }
         }
@@ -322,9 +335,24 @@ impl Runtime {
         self.next_call_reply += 1;
         let internal = CALL_REPLY_BASE + self.next_call_reply;
         self.call_replies.insert(internal, (obj.clone(), call.clone(), true));
+        #[cfg(feature = "server")]
+        let call_rc: Rc<str> = Rc::from(call.as_str());
         self.running_calls.insert(call, (mine, vec![reply]));
         let args = args.iter().map(Value::from_json).collect();
-        self.invoke(obj, method, args, true, Some(internal), Entry::new(who));
+        self.invoke(
+            obj,
+            method,
+            args,
+            true,
+            Some(internal),
+            Entry {
+                who,
+                chain: 0,
+                by: By::Request,
+                #[cfg(feature = "server")]
+                call_id: Some(call_rc),
+            },
+        );
     }
 
     /// Records the result of a call run by [`Runtime::call_once`] and answers everyone waiting.

@@ -3491,3 +3491,226 @@ export async function callPeer(obj: string, m: string, a: any[]): any {
     let mut srt = Runtime::boot(compile(fault_src).unwrap(), Box::new(FailLoad), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
     assert_eq!(call_as(&mut srt, 1.0, "Faulty/f1", "loadPeer", json!([]), who("", &[])).unwrap_err().0, Some(503));
 }
+
+#[test]
+fn retried_external_effects_idempotency_key_and_prerequisites() {
+    use std::cell::Cell;
+    use std::rc::Rc as StdRc;
+
+    // 1. Compile-time `@server`-only check and `flow.rs` PII sink check.
+    let bad_client = r#"
+object Local {
+  go(): string { return crypto.idempotencyKey("step") }
+}
+"#;
+    let errs = compile(bad_client).err().expect("must fail compile");
+    assert!(errs.iter().any(|d| d.message.contains("only available inside @server")), "{errs:?}");
+    assert!(compile("function App() { const k = crypto.idempotencyKey(\"x\"); return <Text>{k}</Text> }").is_err());
+
+    let pii_label = r#"
+@server @read("owner") object User {
+  @pii("contact", "billing") email: string = "a@b.c"
+  @allow("owner") async pay() {
+    const k = crypto.idempotencyKey(this.email)
+    await fetch("https://api.example.com/pay", { headers: { "Idempotency-Key": k } })
+  }
+}
+"#;
+    let errs = compile(pii_label).err().expect("must fail compile");
+    assert!(errs.iter().any(|d| d.message.contains("email")), "un-revealed @pii in label must fail compile: {errs:?}");
+
+    // 2. Crash-and-retry multi-step `async` method + cross-caller isolation + duplicate-label guard +
+    //    downstream `{ retryable: true }` vs permanent `check(...)` + ad-hoc turn keys.
+    let pay_src = r#"
+@server @read("anyone") object Order {
+  status: string = "open"
+  chargeId: string = ""
+  receiptSent: boolean = false
+
+  @allow("anyone") @exclusive async pay(amount: number): string {
+    if (this.chargeId === "") {
+      const res = await fetch("https://api.stripe.com/v1/charges", {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.idempotencyKey("charge") },
+        body: JSON.stringify({ amount })
+      })
+      if (res.status === 429 || res.status >= 500) {
+        throw { message: `busy (${res.status})`, retryable: true }
+      }
+      check(res.ok, "payment", `declined (${res.status})`)
+      this.chargeId = res.json().id
+      this.status = "paid"
+    }
+    if (!this.receiptSent) {
+      const mail = await fetch("https://api.mail.example/send", {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.idempotencyKey("receipt") },
+        body: JSON.stringify({ id: this.chargeId })
+      })
+      check(mail.ok, "receipt", `mail failed (${mail.status})`)
+      this.receiptSent = true
+    }
+    return this.chargeId
+  }
+
+  @allow("anyone") async dupAcrossAwait(): string {
+    const a = crypto.idempotencyKey("step")
+    await fetch("https://api.example.com/1", { headers: { "Idempotency-Key": a } })
+    return crypto.idempotencyKey("step")
+  }
+
+  @allow("anyone") adHocKey(): string {
+    return crypto.idempotencyKey("adhoc")
+  }
+
+  @allow("anyone") async tryCatchTransport(): string {
+    try {
+      await fetch("https://api.example.com/flaky")
+      return "ok"
+    } catch (e) {
+      return `caught:${e.message}`
+    }
+  }
+}
+"#;
+    let store = Shared::default();
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(1.0, 11) }).unwrap().0;
+
+    let first_http = |out: &[Output]| -> (u32, String, String) {
+        out.iter()
+            .find_map(|o| match o {
+                Output::Effect { id, effect: Effect::Http { url, headers, .. } } => Some((*id, url.clone(), headers["Idempotency-Key"].as_str().unwrap_or("").to_string())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected Http effect, got: {out:?}"))
+    };
+
+    // Start pay() as alice with call id "dev1-42" -> emits charge fetch with deterministic key.
+    let out1 = rt.handle(2.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(1), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (_, url1, key1) = first_http(&out1);
+    assert!(url1.contains("stripe"), "{url1}");
+    assert!(key1.starts_with("tj_") && key1.len() == 35, "{key1}");
+
+    // Simulate SERVER CRASH mid-await before charge completes! Restart from same store.
+    drop(rt);
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(3.0, 99) }).unwrap().0;
+
+    // Retry exact same call id as alice -> derives the EXACT same downstream Idempotency-Key!
+    let out2 = rt.handle(4.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(2), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff2, _, key2) = first_http(&out2);
+    assert_eq!(key1, key2, "same (object, method, caller, call_id, label) must derive identical key across crash");
+
+    // Cross-caller isolation: bob sending the SAME call id "dev1-42" on the SAME object `Order/o1`
+    // (on a restarted runtime sharing `tj:secret`) must derive a DIFFERENT downstream key!
+    let mut rt_iso = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(4.6, 7) }).unwrap().0;
+    let out_bob_same_obj = rt_iso.handle(4.7, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(100), call: Some("dev1-42".into()), caller: who("bob", &[]) });
+    let (_, _, key_bob_same_obj) = first_http(&out_bob_same_obj);
+    assert_ne!(key1, key_bob_same_obj, "different callers with same call_id on same object must derive different keys");
+
+    // Prerequisite #2: transient `fetch` transport failure (`unreachable: true`) returns 503 via
+    // `refuse_start` (NO cached 400 CallRecord!), so retrying "dev1-42" runs again with the SAME key!
+    let out_tr = rt.handle(5.0, Input::EffectDone { id: eff2, ok: None, error: Some("the request failed: ConnectionFailed".into()), field: None, unreachable: true });
+    assert!(out_tr.iter().any(|o| matches!(o, Output::Reply { reply: 2, status: Some(503), error: Some(_), .. })), "{out_tr:?}");
+
+    // Retry "dev1-42" again -> gets downstream HTTP 503 response -> app throws `{ retryable: true }`
+    // -> returns 503 WITHOUT caching CallRecord!
+    let out3 = rt.handle(6.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(3), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff3, _, key3) = first_http(&out3);
+    assert_eq!(key1, key3);
+    let out3_done = rt.handle(7.0, Input::EffectDone { id: eff3, ok: Some(json!({ "status": 503, "headers": {}, "body": "overloaded" })), error: None, field: None, unreachable: false });
+    assert!(out3_done.iter().any(|o| matches!(o, Output::Reply { reply: 3, status: Some(503), .. })), "{out3_done:?}");
+
+    // Retry "dev1-42" again -> Step 1 succeeds and checkpoints `chargeId` before Step 2 `await`,
+    // then SERVER CRASHES during Step 2 (mail)!
+    let out4 = rt.handle(8.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(4), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff4, _, key4) = first_http(&out4);
+    assert_eq!(key1, key4);
+    let out4_step2 = rt.handle(9.0, Input::EffectDone { id: eff4, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"id\":\"ch_123\"}" })), error: None, field: None, unreachable: false });
+    let (_, url_mail1, key_mail1) = first_http(&out4_step2);
+    assert!(url_mail1.contains("mail"), "{url_mail1}");
+    assert_ne!(key_mail1, key1, "different label derives different key");
+
+    // Crash during Step 2 & restart -> retry "dev1-42" -> SKIPS Step 1 (chargeId checkpointed!),
+    // goes straight to Step 2 with the EXACT same mail key, and completes!
+    drop(rt);
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(10.0, 55) }).unwrap().0;
+    let out5 = rt.handle(11.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(5), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff5, url_mail2, key_mail2) = first_http(&out5);
+    assert!(url_mail2.contains("mail"), "Step 1 must be skipped after checkpoint: {url_mail2}");
+    assert_eq!(key_mail1, key_mail2, "Step 2 must derive identical key across crash");
+    let out5_done = rt.handle(12.0, Input::EffectDone { id: eff5, ok: Some(json!({ "status": 200, "headers": {}, "body": "ok" })), error: None, field: None, unreachable: false });
+    assert!(out5_done.iter().any(|o| matches!(o, Output::Reply { reply: 5, ok: Some(v), .. } if *v == json!("ch_123"))), "{out5_done:?}");
+    // Subsequent replay of "dev1-42" returns cached CallRecord without issuing any HTTP effect!
+    let out6 = rt.handle(13.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(6), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    assert!(!out6.iter().any(|o| matches!(o, Output::Effect { .. })), "{out6:?}");
+    assert!(out6.iter().any(|o| matches!(o, Output::Reply { reply: 6, ok: Some(v), .. } if *v == json!("ch_123"))), "{out6:?}");
+
+    // Permanent 402 decline via `check(res.ok, ...)` IS cached as 400 in CallRecord!
+    let out_decl = rt.handle(14.0, Input::Call { object: "Order/o3".into(), method: "pay".into(), args: vec![json!(100)], reply: Some(7), call: Some("decl-1".into()), caller: who("alice", &[]) });
+    let (eff_decl, _, _) = first_http(&out_decl);
+    let out_decl_done = rt.handle(15.0, Input::EffectDone { id: eff_decl, ok: Some(json!({ "status": 402, "headers": {}, "body": "declined" })), error: None, field: None, unreachable: false });
+    assert!(out_decl_done.iter().any(|o| matches!(o, Output::Reply { reply: 7, error: Some(e), status: None, .. } if e.contains("declined"))), "{out_decl_done:?}");
+    let out_decl_replay = rt.handle(16.0, Input::Call { object: "Order/o3".into(), method: "pay".into(), args: vec![json!(100)], reply: Some(8), call: Some("decl-1".into()), caller: who("alice", &[]) });
+    assert!(!out_decl_replay.iter().any(|o| matches!(o, Output::Effect { .. })));
+    assert!(out_decl_replay.iter().any(|o| matches!(o, Output::Reply { reply: 8, error: Some(e), .. } if e.contains("declined"))));
+
+    // Duplicate label across `await` fails fast with fix hint!
+    let out_dup = rt.handle(17.0, Input::Call { object: "Order/o4".into(), method: "dupAcrossAwait".into(), args: vec![], reply: Some(9), call: Some("dup-1".into()), caller: who("alice", &[]) });
+    let (eff_dup, _, _) = first_http(&out_dup);
+    let out_dup_done = rt.handle(18.0, Input::EffectDone { id: eff_dup, ok: Some(json!({ "status": 200, "headers": {}, "body": "" })), error: None, field: None, unreachable: false });
+    assert!(out_dup_done.iter().any(|o| matches!(o, Output::Reply { reply: 9, error: Some(e), .. } if e.contains("already called in this call"))), "{out_dup_done:?}");
+
+    // Ad-hoc calls without `call_id` produce distinct keys per call.
+    let k_a = call_as(&mut rt, 19.0, "Order/o4", "adHocKey", json!([]), who("alice", &[])).unwrap();
+    let k_b = call_as(&mut rt, 20.0, "Order/o4", "adHocKey", json!([]), who("alice", &[])).unwrap();
+    assert_ne!(k_a, k_b);
+
+    // `try/catch` can still catch `unreachable: true` transport errors!
+    let out_tc = rt.handle(21.0, Input::Call { object: "Order/o4".into(), method: "tryCatchTransport".into(), args: vec![], reply: Some(10), call: None, caller: who("alice", &[]) });
+    let eff_tc = out_tc.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let out_tc_done = rt.handle(22.0, Input::EffectDone { id: eff_tc, ok: None, error: Some("timeout".into()), field: None, unreachable: true });
+    assert!(out_tc_done.iter().any(|o| matches!(o, Output::Reply { reply: 10, ok: Some(v), .. } if *v == json!("caught:timeout"))), "{out_tc_done:?}");
+
+    // 3. Prerequisite #1: disk-save failure on `Run::Await` aborts cleanly — drops Output::Effect,
+    //    releases `@exclusive` lock, returns 503 (no CallRecord), and next call works when disk recovers!
+    struct FlakySave {
+        inner: MemStore,
+        fail_save: StdRc<Cell<bool>>,
+    }
+    impl Store for FlakySave {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_save.get() && key.starts_with("Order/") {
+                return Err("disk full".into());
+            }
+            self.inner.save(key, value)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let fail_flag = StdRc::new(Cell::new(true));
+    let flaky = FlakySave { inner: MemStore::default(), fail_save: fail_flag.clone() };
+    let pre_await_src = r#"
+@server @read("anyone") object Order {
+  step: number = 0
+  @allow("anyone") @exclusive async go(): number {
+    this.step = 1
+    await fetch("https://api.example.com/do")
+    this.step = 2
+    return this.step
+  }
+}
+"#;
+    let mut frt = Runtime::boot(compile(pre_await_src).unwrap(), Box::new(flaky), Options { server: true, render: false, ..Options::new(1.0, 5) }).unwrap().0;
+    let fail_out = frt.handle(2.0, Input::Call { object: "Order/x".into(), method: "go".into(), args: vec![], reply: Some(1), call: Some("k-disk".into()), caller: who("alice", &[]) });
+    assert!(fail_out.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "flush failure on Run::Await must return 503: {fail_out:?}");
+    assert!(!fail_out.iter().any(|o| matches!(o, Output::Effect { .. })), "Output::Effect must be dropped on Run::Await flush failure: {fail_out:?}");
+    assert_eq!(state(&mut frt, 3.0, "Order/x")["step"], json!(0), "state must be reverted");
+
+    // Disk recovers: `@exclusive` lock was released and CallRecord was NOT cached, so retrying "k-disk" works!
+    fail_flag.set(false);
+    let ok_out = frt.handle(4.0, Input::Call { object: "Order/x".into(), method: "go".into(), args: vec![], reply: Some(2), call: Some("k-disk".into()), caller: who("alice", &[]) });
+    let eff_ok = ok_out.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).expect("retry after disk recovery must emit Effect");
+    let done_out = frt.handle(5.0, Input::EffectDone { id: eff_ok, ok: Some(json!({ "status": 200, "headers": {}, "body": "" })), error: None, field: None, unreachable: false });
+    assert!(done_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(v), .. } if *v == json!(2))), "{done_out:?}");
+}
