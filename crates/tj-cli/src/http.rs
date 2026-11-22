@@ -13,22 +13,30 @@
 //!   POST /api/events/ticket           body: {"objects": [...]} -> {"ok": {"ticket": t}}, for
 //!                                     browsers, whose EventSource cannot send Authorization:
 //!                                     then GET /api/events?ticket=t&since=N
-//!   GET  /_tj/inspect                 -> semantic tree + object states
-//!   POST /_tj/input                   body: one protocol Input
-//!   (`/_tj/*` needs the admin key on `tj serve`; see auth.rs)
+//!   GET  /_tj/manifest                -> canonical app contract + live health & leases (`observe`)
+//!   GET  /_tj/metrics                 -> OpenMetrics counters (`observe`)
+//!   GET  /_tj/inspect                 -> semantic tree + `@pii`-masked object states (`observe`)
+//!   GET  /_tj/leases                  -> active work leases (`observe`)
+//!   POST /_tj/leases                  -> acquire or renew a work lease (`observe`/`test`/`maintain`)
+//!   DELETE /_tj/leases/{id}           -> release own lease, or any lease with `maintain`
+//!   POST /_tj/input                   -> body: one protocol Input (`test` on dev; `maintain` on serve)
+//!   POST /_tj/privacy                 -> export or erase a person's data (`maintain`)
+//!   (`/_tj/*` needs a scoped `--ops` key in `TJ_KEYS` or `TJ_ADMIN_KEY` on `tj serve`; see auth.rs)
 //!
-//! The audit log (audit.rs) gets every API call, every refusal, and every admin request that
-//! can read objects or change them (`inspect`, `input`). Refusals and admin requests wait
-//! until they are on disk, and an admin request that cannot be written is refused.
+//! The audit log (audit.rs) gets every API call, every refusal, and every operational request
+//! that reads objects or changes state (`inspect`, `input`, `privacy`, `leases`). Refusals
+//! and operational security events wait until they are on disk, and one that cannot be
+//! written is refused.
 //!
 //! In dev mode it also serves the web host, the WASM runtime and the app source,
 //! plus `/_tj/reload` (SSE) for live reload, and answers only loopback `Host`s.
 
 use crate::audit::{Actor, Audit, Entry};
-use crate::auth::Automation;
+use crate::auth::{Automation, OpsAccess, OpsScope};
 use crate::engine::{CallFailure, Engine, Failure};
 use crate::bytes::{hex, random};
 use crate::identity::{sha256_hex, Identity};
+use crate::leases::Leases;
 use crate::mailbox::{Event, Mailbox};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
@@ -149,6 +157,7 @@ pub struct Front {
     pub automation: Automation,
     pub identity: Identity,
     pub audit: Audit,
+    pub leases: Leases,
     /// Refuse requests that carry credentials, as this server only speaks plain HTTP and
     /// nobody said a proxy in front of it terminates TLS (see [`credentials_need_tls`]).
     pub credentials_need_tls: bool,
@@ -159,9 +168,10 @@ pub struct Front {
 }
 
 impl Front {
-    pub fn new(engine: Engine, web: Option<Arc<Web>>, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, credentials_need_tls: bool) -> Front {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(engine: Engine, web: Option<Arc<Web>>, dev: Option<Arc<Dev>>, automation: Automation, identity: Identity, audit: Audit, leases: Leases, credentials_need_tls: bool) -> Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
-        Front { engine, web, dev, automation, identity, audit, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
+        Front { engine, web, dev, automation, identity, audit, leases, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default() }
     }
 }
 
@@ -281,23 +291,31 @@ fn handle(mut req: Request, front: &Front) {
     let segs: Vec<&str> = segs.iter().map(String::as_str).collect();
     let authorization = header_value(&req, "Authorization");
     let admin = segs.first() == Some(&"_tj");
+    let mut ops_access: Option<OpsAccess> = None;
     let early = if front.dev.is_some() && !trusted_host(&req) {
         Some(("host", 403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
     } else if front.credentials_need_tls && authorization.is_some() {
         Some(("plain http", 403, format!("credentials are refused over plain HTTP, where anyone on the way can read them; put this server behind a proxy that terminates TLS and set {TLS_TERMINATED_ENV}=1")))
     } else if admin {
-        front.automation.check(authorization.as_deref()).err().map(|(status, e)| ("admin", status, e))
+        match front.automation.authenticate(authorization.as_deref(), &front.identity) {
+            Ok(access) => {
+                ops_access = Some(access);
+                None
+            }
+            Err((status, e)) => Some(("admin", status, e)),
+        }
     } else {
         None
     };
     if let Some((asked, status, e)) = early {
-        refused(front, authorization.as_deref(), (asked, None, None), status);
+        refused(front, authorization.as_deref(), None, (asked, None, None), status);
         let _ = req.respond(json_response(status, &json!({ "error": e })));
         front.engine.stats().request(started.elapsed(), false);
         return;
     }
     let method = req.method().clone();
     let engine = &front.engine;
+    let dev_mode = front.dev.is_some();
     let mut asked: Option<Asked> = None;
     let response = match (&method, segs.as_slice()) {
         (Method::Get, ["api", "events"]) => return stream(req, front, authorization),
@@ -327,22 +345,82 @@ fn handle(mut req: Request, front: &Front) {
                 engine.request_with_field(Input::Call { object, method: name.to_string(), args, reply: None, call, caller: Some(caller) })
             }))
         }
+        // Canonical App Manifest + live health & active leases (`observe` scope).
+        (Method::Get, ["_tj", "manifest"]) => {
+            asked = Some(("manifest", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Observe, dev_mode, "/_tj/manifest").and_then(|()| {
+                let leases: Vec<Json> = front.leases.list().into_iter().map(|l| l.json()).collect();
+                engine.manifest(dev_mode, front.audit.dropped(), leases)
+            }))
+        }
         // A server's inspect also has its own counters: requests, latency, realtime fan-out.
         // Under `tj dev` the screen is in the browser tab, which answers when it is open; the
         // server's objects, which it holds for real, come from the server either way.
-        (Method::Get, ["_tj", "inspect"]) => result_response(front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", "inspect")).and_then(|()| {
-            let server = engine.request(Input::Inspect { reply: None })?;
-            match front.dev.as_ref().and_then(|d| d.ask("inspect", &Json::Null)) {
-                Some(screen) => screen.map(|mut s| {
-                    s["serverObjects"] = server["objects"].clone();
-                    s
-                }),
-                None => Ok(server),
-            }
-        }).map(|mut s| {
-            s["server"] = engine.stats().json();
-            s
-        })),
+        (Method::Get, ["_tj", "inspect"]) => {
+            asked = Some(("inspect", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Observe, dev_mode, "/_tj/inspect").and_then(|()| {
+                front.audit.security(Entry::new("admin").who(ops.actor()).text("request", "inspect"))?;
+                let server = engine.request(Input::Inspect { reply: None })?;
+                match front.dev.as_ref().and_then(|d| d.ask("inspect", &Json::Null)) {
+                    Some(screen) => screen.map(|mut s| {
+                        s["serverObjects"] = server["objects"].clone();
+                        s
+                    }),
+                    None => Ok(server),
+                }
+            }).map(|mut s| {
+                s["server"] = engine.stats().json();
+                s
+            }))
+        }
+        // Active work leases: who is currently observing, testing or maintaining the app.
+        (Method::Get, ["_tj", "leases"]) => {
+            asked = Some(("leases", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Observe, dev_mode, "/_tj/leases").map(|()| {
+                let leases: Vec<Json> = front.leases.list().into_iter().map(|l| l.json()).collect();
+                json!({ "leases": leases })
+            }))
+        }
+        (Method::Post, ["_tj", "leases"]) => {
+            asked = Some(("lease acquire", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(read_json(&mut req).and_then(|j| {
+                let role = match j.get("role").and_then(Json::as_str) {
+                    Some(r) => OpsScope::parse(r).map_err(|e| (400, e))?,
+                    None => match ops {
+                        OpsAccess::Admin => OpsScope::Maintain,
+                        OpsAccess::Scoped { scope, .. } => *scope,
+                    },
+                };
+                ops.require_lease_role(role)?;
+                let scope = j.get("scope").and_then(Json::as_str).unwrap_or("app").to_string();
+                let exclusive = j.get("exclusive").and_then(Json::as_bool);
+                let ttl_secs = j.get("ttlSecs").and_then(Json::as_u64);
+                let note = j.get("note").and_then(Json::as_str).unwrap_or("").to_string();
+                let holder = match (ops, j.get("holder").and_then(Json::as_str).filter(|s| !s.is_empty())) {
+                    (OpsAccess::Admin, Some(h)) => h.to_string(),
+                    _ => ops.holder(),
+                };
+                let lease = front.leases.acquire(holder.clone(), role, scope.clone(), exclusive, ttl_secs, note)?;
+                if let Err(e) = front.audit.security(Entry::new("lease").who(ops.actor()).text("request", "acquire").text("role", role.as_str()).text("scope", &scope)) {
+                    let _ = front.leases.release(&lease.id, &holder, true);
+                    return Err(e);
+                }
+                Ok(lease.json())
+            }))
+        }
+        (Method::Delete, ["_tj", "leases", id]) => {
+            asked = Some(("lease release", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Observe, dev_mode, "/_tj/leases").and_then(|()| {
+                let released = front.leases.release(id, &ops.holder(), ops.can_force_release())?;
+                front.audit.security(Entry::new("lease").who(ops.actor()).text("request", "release").text("scope", &released.scope))?;
+                Ok(json!({ "released": released.id }))
+            }))
+        }
         // Who the credentials (or their absence) say the caller is: the web host signs in
         // with it. Outside `/_tj/`, so a person's own key is enough.
         (Method::Get, ["api", "whoami"]) => result_response({
@@ -353,34 +431,46 @@ fn handle(mut req: Request, front: &Front) {
             Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
-        (Method::Get, ["_tj", "metrics"]) => match engine.core_stats() {
-            Ok(core) => Response::from_data(engine.stats().openmetrics(&core).into_bytes()).with_header(header("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")),
-            Err((status, e)) => json_response(status, &json!({ "error": e })),
-        },
+        (Method::Get, ["_tj", "metrics"]) => {
+            asked = Some(("metrics", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            match ops.require(OpsScope::Observe, dev_mode, "/_tj/metrics").and_then(|()| engine.core_stats()) {
+                Ok(core) => Response::from_data(engine.stats().openmetrics(&core).into_bytes()).with_header(header("Content-Type", "application/openmetrics-text; version=1.0.0; charset=utf-8")),
+                Err((status, e)) => json_response(status, &json!({ "error": e })),
+            }
+        }
         // A person's data, or erasing it (docs/privacy.md); written to the audit log first.
-        (Method::Post, ["_tj", "privacy"]) => result_response(read_json(&mut req).and_then(|j| {
-            let (Some(action @ ("export" | "erase")), Some(subject)) = (j["action"].as_str(), j["subject"].as_str().filter(|s| !s.is_empty())) else {
-                return Err((400, "send {\"action\": \"export\" or \"erase\", \"subject\": \"<person id>\"}".into()));
-            };
-            front.audit.security(Entry::new("admin").who(Actor::Admin).text("request", &format!("privacy {action}")).person("subject", subject))?;
-            engine.privacy(subject.to_string(), action == "erase")
-        })),
-        (Method::Post, ["_tj", "input"]) => result_response(read_json(&mut req).and_then(|j| {
-            let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
-            front.audit.security(admin_input(&input))?;
-            // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
-            // reads stay here, where the server's objects live.
-            if matches!(input, Input::Ui { .. } | Input::Layout { .. }) {
-                if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
-                    return r;
+        (Method::Post, ["_tj", "privacy"]) => {
+            asked = Some(("privacy", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Maintain, dev_mode, "/_tj/privacy").and_then(|()| read_json(&mut req)).and_then(|j| {
+                let (Some(action @ ("export" | "erase")), Some(subject)) = (j["action"].as_str(), j["subject"].as_str().filter(|s| !s.is_empty())) else {
+                    return Err((400, "send {\"action\": \"export\" or \"erase\", \"subject\": \"<person id>\"}".into()));
+                };
+                front.audit.security(Entry::new("admin").who(ops.actor()).text("request", &format!("privacy {action}")).person("subject", subject))?;
+                engine.privacy(subject.to_string(), action == "erase")
+            }))
+        }
+        (Method::Post, ["_tj", "input"]) => {
+            asked = Some(("input", None, None));
+            let ops = ops_access.as_ref().expect("authenticated");
+            result_response(ops.require(OpsScope::Test, dev_mode, "/_tj/input").and_then(|()| read_json(&mut req)).and_then(|j| {
+                let mut input = serde_json::from_value::<Input>(j.clone()).map_err(|e| (400, format!("not a protocol input: {e}")))?;
+                front.audit.security(admin_input(ops.actor(), &input))?;
+                // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
+                // reads stay here, where the server's objects live.
+                if matches!(input, Input::Ui { .. } | Input::Layout { .. }) {
+                    if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
+                        return r;
+                    }
                 }
-            }
-            // Automation is trusted (it already passed the admin key), so it says so explicitly.
-            if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
-                *c = Some(Caller::trusted());
-            }
-            engine.request(input)
-        })),
+                // Automation is trusted (it already passed the scope check), so it says so explicitly.
+                if let Input::Call { caller: c @ None, .. } | Input::Get { caller: c @ None, .. } = &mut input {
+                    *c = Some(Caller::trusted());
+                }
+                engine.request(input)
+            }))
+        }
         // A tab's answer to an agent's question (dev only; JSON only, so another site's form
         // cannot post one).
         (Method::Post, ["_tj", "answer", id]) if front.dev.is_some() => result_response(read_json(&mut req).and_then(|j| {
@@ -420,7 +510,7 @@ fn handle(mut req: Request, front: &Front) {
     };
     let status = response.status_code().0;
     if let Some(asked) = asked.filter(|_| matches!(status, 401 | 403)) {
-        refused(front, authorization.as_deref(), asked, status);
+        refused(front, authorization.as_deref(), ops_access.as_ref(), asked, status);
     }
     let _ = req.respond(response);
     engine.stats().request(started.elapsed(), status < 400);
@@ -430,8 +520,11 @@ fn handle(mut req: Request, front: &Front) {
 /// only refusals pay for it), what was asked, and the status. Never credentials, bodies or
 /// arguments. The request is refused either way, so a log that cannot be written changes
 /// nothing; the writer reports that itself.
-fn refused(front: &Front, authorization: Option<&str>, (asked, class, method): Asked, status: u16) {
-    let who = front.identity.verify(authorization).map_or(Actor::Invalid, |v| Actor::of(&v.caller));
+fn refused(front: &Front, authorization: Option<&str>, ops: Option<&OpsAccess>, (asked, class, method): Asked, status: u16) {
+    let who = match ops {
+        Some(o) => o.actor(),
+        None => front.identity.verify(authorization).map_or(Actor::Invalid, |v| Actor::of(&v.caller)),
+    };
     let mut e = Entry::new("refused").who(who).text("request", asked).num("status", status.into());
     if let Some(class) = class {
         e = e.text("class", class);
@@ -442,9 +535,9 @@ fn refused(front: &Front, authorization: Option<&str>, (asked, class, method): A
     let _ = front.audit.security(e);
 }
 
-/// An admin input, for the audit log: what it does and to which object, never its values.
-fn admin_input(input: &Input) -> Entry {
-    let e = Entry::new("admin").who(Actor::Admin);
+/// An operational input, for the audit log: what it does and to which object, never its values.
+fn admin_input(who: Actor, input: &Input) -> Entry {
+    let e = Entry::new("admin").who(who);
     match input {
         Input::Call { object, method, .. } => e.text("request", "call").object(object).text("method", method),
         Input::Get { object, .. } => e.text("request", "get").object(object),
@@ -538,8 +631,9 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
             None => {
                 let objects = query_values(req.url(), "object")?;
                 if objects.is_empty() {
-                    // Every object, unfiltered, is for the admin only.
-                    front.automation.check(authorization.as_deref()).map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
+                    // Every object, unfiltered, requires `maintain` or the admin key.
+                    let ops = front.automation.authenticate(authorization.as_deref(), &front.identity).map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
+                    ops.require(OpsScope::Maintain, front.dev.is_some(), "unfiltered /api/events").map_err(|_| (403, "list the objects to stream: ?object=Class/id".to_string()))?;
                     (None, objects, None)
                 } else {
                     (Some(front.identity.verify(authorization.as_deref())?.caller), objects, authorization.clone())
@@ -595,7 +689,7 @@ fn stream(req: Request, front: &Front, authorization: Option<String>) {
         }
         Err((status, e)) => {
             if matches!(status, 401 | 403) {
-                refused(front, authorization.as_deref(), ("stream", None, None), status);
+                refused(front, authorization.as_deref(), None, ("stream", None, None), status);
             }
             let _ = req.respond(json_response(status, &json!({ "error": e })));
         }
@@ -692,5 +786,124 @@ mod tests {
         assert_eq!(query_values("/api/events?object=Room%2Flobby&object=A/b", "object").unwrap(), ["Room/lobby", "A/b"]);
         assert_eq!(query_values("/api/events?object=%zz", "object").unwrap_err().0, 400);
         assert!(query_values("/api/events", "object").unwrap().is_empty());
+    }
+
+    #[test]
+    fn scoped_ops_keys_manifest_and_leases_work_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("tj-http-ops-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let keys_file = dir.join("keys.json");
+        let obs = crate::identity::new_key("critic", &[], Some(OpsScope::Observe), &keys_file).unwrap();
+        let tst = crate::identity::new_key("tester", &[], Some(OpsScope::Test), &keys_file).unwrap();
+        let mnt = crate::identity::new_key("maint", &[], Some(OpsScope::Maintain), &keys_file).unwrap();
+        let ana = crate::identity::new_key("ana", &[], None, &keys_file).unwrap();
+
+        let source = r#"
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") set(e: string) { this.email = e }
+}
+"#
+        .to_string();
+        let (audit, _) = Audit::start(&data).unwrap();
+        let engine = Engine::start(source, data.clone(), false, false, Arc::default(), audit.clone()).unwrap();
+        let identity = Identity::from_key_file(&keys_file).unwrap();
+        let front = Arc::new(Front::new(engine, None, None, Automation::Off, identity, audit, Leases::open(&data), false));
+
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let base = format!("http://127.0.0.1:{port}");
+        let srv_front = front.clone();
+        thread::spawn(move || {
+            for req in server.incoming_requests() {
+                handle(req, &srv_front);
+            }
+        });
+
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+        let call = |method: &str, path: &str, token: Option<&str>, body: Option<Json>| -> (u16, Json) {
+            let mut req = agent.request(method, &format!("{base}{path}"));
+            if let Some(t) = token {
+                req = req.set("Authorization", &format!("Bearer {t}"));
+            }
+            let resp = match body {
+                Some(j) => req.set("Content-Type", "application/json").send_string(&j.to_string()),
+                None => req.call(),
+            };
+            let (status, r) = match resp {
+                Ok(r) => (r.status(), r),
+                Err(ureq::Error::Status(s, r)) => (s, r),
+                Err(e) => panic!("request {method} {path} failed: {e}"),
+            };
+            (status, serde_json::from_str(&r.into_string().unwrap()).unwrap())
+        };
+
+        // Ana saves PII via the normal app API.
+        assert_eq!(call("POST", "/api/Account/key:ana/set", Some(&ana), Some(json!(["ana@example.com"]))).0, 200);
+
+        // Plain user key & unauthenticated requests are refused on /_tj/*.
+        assert_eq!(call("GET", "/_tj/manifest", None, None).0, 401);
+        assert_eq!(call("GET", "/_tj/manifest", Some(&ana), None).0, 403);
+
+        // `ops:observe` reads manifest, inspect (with @pii masked), metrics and leases; refused on input & privacy.
+        let (st, m) = call("GET", "/_tj/manifest", Some(&obs), None);
+        assert_eq!(st, 200);
+        assert_eq!(m["ok"]["objects"][0]["name"], json!("Account"));
+        assert_eq!(m["ok"]["health"]["mode"], json!("serve"));
+        assert_eq!(m["ok"]["health"]["objectsLoaded"], json!(1));
+
+        let (st, ins) = call("GET", "/_tj/inspect", Some(&obs), None);
+        assert_eq!(st, 200);
+        let acct = ins["ok"]["objects"].as_array().unwrap().iter().find(|o| o["object"] == "Account/key:ana").expect("Account loaded");
+        assert_eq!(acct["state"]["email"], json!("•••"), "PII is masked for ops:observe");
+
+        assert_eq!(call("POST", "/_tj/input", Some(&obs), Some(json!({ "type": "tick" }))).0, 403);
+        assert_eq!(call("POST", "/_tj/privacy", Some(&obs), Some(json!({ "action": "export", "subject": "key:ana" }))).0, 403);
+
+        // `ops:test` is refused on live `tj serve` /_tj/input and /_tj/privacy.
+        assert_eq!(call("POST", "/_tj/input", Some(&tst), Some(json!({ "type": "tick" }))).0, 403);
+        assert_eq!(call("POST", "/_tj/privacy", Some(&tst), Some(json!({ "action": "export", "subject": "key:ana" }))).0, 403);
+
+        // Leases: observer acquires observe lease, cannot acquire maintain lease; maintainer acquires exclusive lease and conflicts with admin.
+        let (st, l_obs) = call("POST", "/_tj/leases", Some(&obs), Some(json!({ "role": "observe", "scope": "app", "note": "review" })));
+        assert_eq!(st, 200);
+        assert_eq!(l_obs["ok"]["holder"], json!("ops:critic"));
+        assert_eq!(call("POST", "/_tj/leases", Some(&obs), Some(json!({ "role": "maintain", "scope": "app" }))).0, 403);
+
+        let (st, l_mnt) = call("POST", "/_tj/leases", Some(&mnt), Some(json!({ "role": "maintain", "scope": "Account", "note": "migration" })));
+        assert_eq!(st, 200);
+        let mnt_id = l_mnt["ok"]["id"].as_str().unwrap().to_string();
+        // Observer cannot release maintainer's lease; maintainer can release observer's lease.
+        assert_eq!(call("DELETE", &format!("/_tj/leases/{mnt_id}"), Some(&obs), None).0, 403);
+        let obs_id = l_obs["ok"]["id"].as_str().unwrap().to_string();
+        assert_eq!(call("DELETE", &format!("/_tj/leases/{obs_id}"), Some(&mnt), None).0, 200);
+
+        // Live manifest includes the active lease.
+        let (st, m2) = call("GET", "/_tj/manifest", Some(&obs), None);
+        assert_eq!(st, 200);
+        assert_eq!(m2["ok"]["health"]["activeLeases"], json!(1));
+        assert_eq!(m2["ok"]["leases"][0]["holder"], json!("ops:maint"));
+
+        // `ops:maintain` can run privacy export and /_tj/input.
+        let (st, exp) = call("POST", "/_tj/privacy", Some(&mnt), Some(json!({ "action": "export", "subject": "key:ana" })));
+        assert_eq!(st, 200);
+        assert_eq!(exp["ok"]["Account/key:ana"]["email"], json!("ana@example.com"));
+        assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
+
+        // Audit log records scoped operational actors by name (`ops:critic`, `ops:tester`, `ops:maint`).
+        let entries: String = std::fs::read_dir(data.join("audit"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl") && !e.path().ends_with("checkpoints.jsonl"))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect();
+        assert!(entries.contains("\"who\":\"ops:critic\""), "{entries}");
+        assert!(entries.contains("\"who\":\"ops:tester\""), "{entries}");
+        assert!(entries.contains("\"who\":\"ops:maint\""), "{entries}");
+        assert!(entries.contains("\"kind\":\"lease\""), "{entries}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

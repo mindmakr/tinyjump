@@ -178,6 +178,36 @@ impl Stats {
         self.dropped.fetch_add(1, Relaxed);
     }
 
+    /// Health summary for `GET /_tj/manifest` (aggregate counters only; zero user data).
+    pub fn health(&self, core: &Json, dev: bool, max_objects: usize, audit_dropped: u64, active_leases: usize) -> Json {
+        let empty = Map::new();
+        let sum = |section: &str, field: Option<&str>| -> u64 {
+            core[section]
+                .as_object()
+                .unwrap_or(&empty)
+                .values()
+                .map(|v| match field {
+                    Some(f) => v[f].as_u64().unwrap_or(0),
+                    None => v.as_u64().unwrap_or(0),
+                })
+                .sum()
+        };
+        json!({
+            "mode": if dev { "dev" } else { "serve" },
+            "uptimeSecs": self.started.elapsed().as_secs(),
+            "objectsLoaded": sum("objects", None),
+            "maxObjects": max_objects,
+            "requests": self.requests.load(Relaxed),
+            "requestErrors": self.errors.load(Relaxed),
+            "methodErrors": sum("methods", Some("errors")),
+            "methodRefused": sum("methods", Some("refused")),
+            "waitingExclusive": sum("waiting", None),
+            "realtimeClients": self.clients.load(Relaxed),
+            "auditDropped": audit_dropped,
+            "activeLeases": active_leases,
+        })
+    }
+
     pub fn json(&self) -> Json {
         let (requests, events) = (self.requests.load(Relaxed), self.events.load(Relaxed));
         json!({

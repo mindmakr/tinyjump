@@ -129,8 +129,10 @@ the goal; being in the market early, to gain momentum and contributors, is.
      extend, checked by `tj check --compliance`. No pack is built in; a sample GDPR pack is
      in `examples/members`.
    - Then the living-app steps (owner, 2026-11-20; see "Living, agentic-first apps"):
-     scoped agent keys and the manifest, `tj test`, `tj check --against` and `@invariant`,
-     shadow boot and rollback, size and AI-cost caps and `tj retro`.
+     scoped agent keys (`--ops observe|test|maintain`), canonical manifest (`tj check --manifest`
+     / `/_tj/manifest`) and work leases (`/_tj/leases`, `tj lease`) (done); next: `tj test`,
+     `tj check --against` and `@invariant`, shadow boot and rollback, size and AI-cost caps
+     and `tj retro`.
    - Then a design note on effects that already happened outside when a call is retried
      after a crash (durable effect records, or idempotency keys passed to `fetch`).
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)

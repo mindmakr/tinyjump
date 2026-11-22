@@ -208,11 +208,20 @@ don't count.
 
 ## Automation
 
-Automation can run any input, so `tj serve` guards it. `/_tj/*` needs
-`Authorization: Bearer <key>`, where the server reads the key (24 characters or more) from
-`TJ_ADMIN_KEY`. Without that variable, automation is off. `tj review` and `tj mcp` send
-`TJ_ADMIN_KEY` when it is set. `tj dev` and debug builds of the Android and iOS hosts stay
-open, because they are for your own machine.
+Automation can inspect or drive an app, so `tj serve` guards `/_tj/*` with `Authorization:
+Bearer <key>`:
+
+- **Scoped operational keys (recommended):** entries in `TJ_KEYS` created with
+  `tj key <name> --keys keys.json --ops observe|test|maintain` (audited as `ops:<name>`,
+  hot-reloaded on revocation). `observe` can read `/_tj/manifest`, `/_tj/metrics`,
+  `/_tj/inspect` (`@pii` masked) and `/_tj/leases`; `test` adds `/_tj/input` on `tj dev`
+  only (refused on live `tj serve`); `maintain` adds `/_tj/input`, `/_tj/privacy`,
+  unfiltered `/api/events` and force-releasing any lease.
+- **Admin key (`TJ_ADMIN_KEY`, 24+ characters):** grants full `maintain` access (audited as
+  `admin`). Without either `TJ_ADMIN_KEY` or `TJ_KEYS`, automation is off (`403`).
+- `tj review`, `tj stats`, `tj mcp`, `tj lease` and `tj privacy` send `TJ_OPS_KEY` when
+  set, falling back to `TJ_ADMIN_KEY`. `tj dev` and debug builds of the Android and iOS
+  hosts stay open when no key is sent, because they are for your own machine.
 
 Every host exposes the same surface: `inspect`, `act(target, event, value)`,
 `call(object, method, args)`, `get(object)` and `tick()`. The web host puts it on
@@ -252,9 +261,17 @@ Two tools build on this:
 - **`tj stats --target <url>`** prints the methods, slowest first and then the busiest. It
   shows calls, errors, refusals, steps per call and latency, plus the objects loaded and
   the effects.
-- **`/_tj/metrics`** on `tj serve` (admin key) serves the statistics as OpenMetrics text,
-  for Prometheus and Grafana. It is cheaper than `inspect`, and its labels are class, method
-  and effect names only, never object ids, which can identify people.
+- **`/_tj/manifest`** (`observe` scope) returns the canonical App Manifest (code hash,
+  files, objects, fields, access rules, personal data, retention, plugins, transfers and
+  warnings) plus aggregate `health` counters and active `leases`, with zero user data.
+  `tj check <app.tj> --manifest [--json]` emits the static contract offline.
+- **`/_tj/leases`** (`GET`, `POST`, `DELETE /_tj/leases/{id}`; CLI: `tj lease`) tracks who
+  is observing, testing or maintaining the app (`holder`, `role`, `scope`, `exclusive`,
+  `expiresAt`). Exclusive leases (`maintain`) reject collisions (`409`) and expire
+  automatically.
+- **`/_tj/metrics`** on `tj serve` (`observe` scope) serves the statistics as OpenMetrics
+  text, for Prometheus and Grafana. It is cheaper than `inspect`, and its labels are class,
+  method and effect names only, never object ids, which can identify people.
 - **`tj mcp --target <url>`** is an MCP server on stdio with the tools `language` (the
-  language reference, to load before writing code), `inspect`, `act`, `call`, `get`,
-  `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.
+  language reference, to load before writing code), `manifest`, `inspect`, `act`, `call`,
+  `get`, `screenshot`, `review` and `input`, so any coding agent can write, drive and test an app.

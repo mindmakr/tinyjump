@@ -56,6 +56,8 @@ pub enum Actor {
     System,
     /// Someone with the admin key (or anyone, on `tj dev`).
     Admin,
+    /// A named operational key (`ops:<name>`, scoped `observe`, `test` or `maintain`).
+    Ops(String),
     Anonymous,
     /// A credential was sent but did not verify.
     Invalid,
@@ -106,6 +108,7 @@ impl Entry {
         let f = match actor {
             Actor::System => Field::Text("system".into()),
             Actor::Admin => Field::Text("admin".into()),
+            Actor::Ops(name) => Field::Text(format!("ops:{name}")),
             Actor::Anonymous => Field::Text("anonymous".into()),
             Actor::Invalid => Field::Text("invalid credential".into()),
             Actor::Person(id) => Field::Subject(id),
@@ -186,6 +189,11 @@ impl Audit {
         if let Err(TrySendError::Full(_)) = self.tx.try_send(Job::Record(e)) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Entries dropped because the background writer's queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// Forgets `id`'s pseudonym, so the log no longer links to them; entries already

@@ -10,7 +10,9 @@ mod compliance;
 mod engine;
 mod http;
 mod identity;
+mod leases;
 mod mailbox;
+mod manifest;
 mod plugin_server;
 mod plugins;
 mod privacy;
@@ -36,11 +38,12 @@ tj: tinyjump
 
 USAGE:
   tj docs                        print the language reference: load it before writing app code
-  tj check <app.tj> [--access] [--privacy] [--compliance <pack.json>]
-                                 compile and report errors; --access prints who may read and call what,
-                                 --privacy the personal data the app holds and for what, and with
-                                 --record the record of processing (GDPR article 30) as Markdown;
-                                 --compliance checks the app against a compliance pack
+  tj check <app.tj> [--manifest [--json]] [--access] [--privacy] [--compliance <pack.json>]
+                                 compile and report errors; --manifest prints the canonical app contract
+                                 (hash, objects, rules, personal data, plugins, warnings; JSON with --json),
+                                 --access prints who may read and call what, --privacy the personal data
+                                 the app holds and for what (with --record: GDPR article 30 Markdown),
+                                 and --compliance checks the app against a compliance pack
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
@@ -49,10 +52,11 @@ USAGE:
   tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
   tj privacy export|erase <person id> [--target <url>]
                                  everything a running server holds about a person, or erase it
+  tj lease list|acquire|release  view, acquire or release operational work leases on a running server
   tj mcp    [--target <url>]     MCP server (stdio) so coding agents can inspect, drive and test an app
   tj plugin ai | fake <file.json>
                                  run a plugin that ships with tinyjump as an MCP server (tj serve starts them)
-  tj key <name> --keys <file> [--role <r>]...
+  tj key <name> --keys <file> [--role <r>]... [--ops observe|test|maintain]
                                  make an API key (printed once; only its hash is stored in the file)
   tj store rekey --data <dir>    with the server stopped: encrypt a folder's plain records, and re-wrap
                                  sealed ones under the newest key in TJ_KEY_FILE
@@ -77,8 +81,10 @@ OPTIONS:
 ENVIRONMENT (tj serve):
   TJ_ISSUER       sign-in provider (OpenID Connect issuer URL); TJ_AUDIENCE: the app's client id
   TJ_ROLES_CLAIM  where tokens carry roles, e.g. realm_access.roles (none by default)
-  TJ_KEYS         file of API key hashes (see `tj key`)
-  TJ_ADMIN_KEY    admin key for /_tj/* (tj review, tj mcp); at least 24 characters
+  TJ_KEYS         file of API key hashes (see `tj key`, including `--ops observe|test|maintain`)
+  TJ_ADMIN_KEY    full-access admin key for /_tj/* (24+ chars); prefer scoped `--ops` keys in TJ_KEYS
+  TJ_OPS_KEY      client key sent by `tj review`, `tj stats`, `tj mcp`, `tj lease`, `tj privacy`
+                  (takes precedence over TJ_ADMIN_KEY when set)
   TJ_MAX_OBJECTS  objects remote requests may load at once (default 100000)
   TJ_TRUST_PROXY  1 behind a proxy: per-caller limits use X-Forwarded-For
   TJ_ALLOW_PRIVATE_FETCH
@@ -105,6 +111,7 @@ struct Args {
     target: String,
     budget: Option<PathBuf>,
     json: bool,
+    manifest: bool,
     access: bool,
     privacy: bool,
     record: bool,
@@ -113,6 +120,7 @@ struct Args {
     as_user: Option<String>,
     keys: Option<PathBuf>,
     roles: Vec<String>,
+    ops: Option<auth::OpsScope>,
     plugins: Vec<String>,
     checkpoints: Option<PathBuf>,
 }
@@ -127,7 +135,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, access: false, privacy: false, record: false, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), plugins: Vec::new(), checkpoints: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, access: false, privacy: false, record: false, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -138,6 +146,7 @@ fn parse_args() -> Result<Args, String> {
             "--target" => args.target = value()?,
             "--budget" => args.budget = Some(PathBuf::from(value()?)),
             "--json" => args.json = true,
+            "--manifest" => args.manifest = true,
             "--access" => args.access = true,
             "--privacy" => args.privacy = true,
             "--record" => args.record = true,
@@ -146,6 +155,7 @@ fn parse_args() -> Result<Args, String> {
             "--as" => args.as_user = Some(value()?),
             "--keys" => args.keys = Some(PathBuf::from(value()?)),
             "--role" => args.roles.push(value()?),
+            "--ops" => args.ops = Some(auth::OpsScope::parse(&value()?)?),
             "--plugin" => args.plugins.push(value()?),
             "--checkpoints" => args.checkpoints = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option {other}")),
@@ -168,6 +178,15 @@ fn main() -> ExitCode {
     }
     if raw.get(1).map(String::as_str) == Some("privacy") {
         return match privacy::run(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("lease") {
+        return match leases::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
@@ -200,7 +219,7 @@ fn main() -> ExitCode {
             print!("{LANGUAGE}");
             Ok(())
         }
-        "check" => args.file().and_then(|f| check(f, args.access, args.privacy, args.record, args.compliance.as_deref())),
+        "check" => args.file().and_then(|f| check(f, args.manifest, args.json, args.access, args.privacy, args.record, args.compliance.as_deref())),
         "key" => new_key(&args),
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
@@ -270,12 +289,26 @@ fn read_source(file: &Path) -> Result<String, String> {
     app::read(file).map(|a| a.source)
 }
 
-fn check(file: &Path, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
+#[allow(clippy::too_many_arguments)]
+fn check(file: &Path, show_manifest: bool, as_json: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>) -> Result<(), String> {
     let src = read_source(file)?;
     let name = file.display().to_string();
     match tj_core::compile(&src) {
         Ok(program) => {
+            if show_manifest && as_json {
+                let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+                let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+                let m = manifest::Manifest::build(&src, &program, &refs);
+                println!("{}", serde_json::to_string_pretty(&m.json).expect("JSON serializes"));
+                return Ok(());
+            }
             println!("ok: {name}");
+            if show_manifest {
+                let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
+                let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+                let m = manifest::Manifest::build(&src, &program, &refs);
+                print!("{}", m.text());
+            }
             if access {
                 print!("{}", access::report(&src));
             }
@@ -318,10 +351,11 @@ fn audit_verify(args: &Args) -> Result<(), String> {
 }
 
 fn new_key(args: &Args) -> Result<(), String> {
-    let name = args.file.as_ref().map(|p| p.display().to_string()).ok_or("`tj key` needs a name: tj key <name> --keys keys.json --role staff")?;
+    let name = args.file.as_ref().map(|p| p.display().to_string()).ok_or("`tj key` needs a name: tj key <name> --keys keys.json [--role staff] [--ops observe|test|maintain]")?;
     let file = args.keys.as_deref().ok_or("`tj key` needs --keys <file>, the file TJ_KEYS will name")?;
-    let key = identity::new_key(&name, &args.roles, file)?;
-    eprintln!("Added key:{name} to {}. The key, shown only now:", file.display());
+    let key = identity::new_key(&name, &args.roles, args.ops, file)?;
+    let ops = args.ops.map(|s| format!(" (ops:{})", s.as_str())).unwrap_or_default();
+    eprintln!("Added key:{name}{ops} to {}. The key, shown only now:", file.display());
     println!("{key}");
     Ok(())
 }
@@ -384,15 +418,16 @@ not starting: some controls of the compliance pack are not met (above)"));
         watch(file.to_path_buf(), engine.clone(), dev.clone());
         dev
     });
+    let leases = leases::Leases::open(&data);
     let names = plugins.names();
     let plugins = if names.is_empty() { "none".to_string() } else { names.join(", ") };
-    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(), identity.describe());
+    eprintln!("tinyjump {} on http://{addr}  (data: {}; automation: {}; callers: {}; plugins: {plugins})", if dev_mode { "dev" } else { "server" }, data.display(), automation.describe(identity.has_keys()), identity.describe());
     let tls = http::credentials_need_tls(dev_mode, &args.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
     eprintln!("storage: {storage}\naudit log: {} (key: {audit_key})", data.join("audit").display());
     if tls {
         eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", args.host, http::TLS_TERMINATED_ENV);
     }
-    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, tls))
+    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls))
 }
 
 /// Polls the app's files; on a change, reloads the backend and tells browsers to reload.
