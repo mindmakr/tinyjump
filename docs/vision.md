@@ -135,7 +135,9 @@ the goal; being in the market early, to gain momentum and contributors, is.
      `@invariant` with atomic rollback, shadow boot with live reload and automatic rollback
      (`tj reload`, `tj rollback`), size/rate/fetch/AI-budget caps, and `tj retro`.
    - Then a design note on effects that already happened outside when a call is retried
-     after a crash (durable effect records, or idempotency keys passed to `fetch`).
+     after a crash ([docs/retried-effects.md](retried-effects.md): deterministic per-call
+     idempotency keys passed to `fetch`/`plugin` + checkpointed object state vs a VM replay
+     journal; design note written).
    - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
      follows.
 4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
