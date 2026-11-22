@@ -629,9 +629,9 @@ fn run(
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&prev_source, &data, render, explain, &refs) {
                     Ok((new_rt, out, new_manifest, new_snap, _)) => {
-                        let rolled_from_source = std::mem::replace(&mut current_source, prev_source.clone());
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
-                        previous = Some((rolled_from_source, rolled_from_sha.clone()));
+                        current_source = prev_source.clone();
+                        previous = None;
                         current_snap = new_snap;
                         if let Ok(mut s) = live_source.lock() {
                             *s = prev_source;
@@ -672,9 +672,9 @@ fn run(
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                     match boot(&w.prev_source, &data, render, explain, &refs) {
                         Ok((prev_rt, boot_out, prev_manifest, prev_snap, _)) => {
-                            let failed_source = std::mem::replace(&mut current_source, w.prev_source.clone());
-                            let failed_sha = std::mem::replace(&mut current_sha, w.prev_sha.clone());
-                            previous = Some((failed_source, failed_sha));
+                            current_source = w.prev_source.clone();
+                            current_sha = w.prev_sha.clone();
+                            previous = None;
                             current_snap = prev_snap;
                             if let Ok(mut s) = live_source.lock() {
                                 *s = w.prev_source;

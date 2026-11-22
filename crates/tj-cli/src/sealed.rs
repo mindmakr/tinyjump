@@ -595,6 +595,7 @@ mod tests {
         // Forgetting Ana in the overlay hides her in memory WITHOUT destroying her real own-key on disk!
         overlay.forget("Customer/user:ana").unwrap();
         assert_eq!(overlay.load("Customer/user:ana").unwrap(), None);
+        assert!(overlay.is_erased("Customer/user:ana").unwrap());
 
         let mut verify = Sealed::new(FileStore::open(&data).unwrap(), Box::new(FileStore::open(&own).unwrap()), keys(""), &personal);
         assert_eq!(verify.load("Customer/user:ana").unwrap().as_deref(), Some(r#"{"email":"ana@example.com"}"#), "real own-key untouched");

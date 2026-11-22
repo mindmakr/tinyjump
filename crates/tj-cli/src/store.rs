@@ -2,7 +2,7 @@
 //! renamed over the old one, and the folder is synced, so a crash leaves the old record or
 //! the new one, never a torn or lost write. Only the server's user can read the files.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -14,11 +14,12 @@ use tj_core::Store;
 pub struct OverlayStore {
     base: Box<dyn Store>,
     writes: HashMap<String, Option<String>>,
+    forgotten: HashSet<String>,
 }
 
 impl OverlayStore {
     pub fn new(base: Box<dyn Store>) -> OverlayStore {
-        OverlayStore { base, writes: HashMap::new() }
+        OverlayStore { base, writes: HashMap::new(), forgotten: HashSet::new() }
     }
 }
 
@@ -31,6 +32,7 @@ impl Store for OverlayStore {
     }
 
     fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+        self.forgotten.remove(key);
         self.writes.insert(key.to_string(), Some(value.to_string()));
         Ok(())
     }
@@ -41,11 +43,15 @@ impl Store for OverlayStore {
     }
 
     fn forget(&mut self, key: &str) -> Result<(), String> {
+        self.forgotten.insert(key.to_string());
         self.writes.insert(key.to_string(), None);
         Ok(())
     }
 
     fn is_erased(&mut self, key: &str) -> Result<bool, String> {
+        if self.forgotten.contains(key) {
+            return Ok(true);
+        }
         if self.writes.contains_key(key) {
             return Ok(false);
         }

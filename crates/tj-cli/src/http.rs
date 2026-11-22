@@ -528,6 +528,8 @@ fn handle(mut req: Request, front: &Front) {
                     None | Some(Json::Null) => 3,
                     Some(v) => v.as_u64().ok_or_else(|| (400, "\"errorThreshold\" must be a non-negative integer".to_string()))?,
                 };
+                // Pre-compile on the HTTP thread so syntax/type errors fail fast (400) without stalling `tj-runtime`.
+                tj_core::compile(&source).map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", &source)).collect::<Vec<_>>().join("\n\n")))?;
                 let res = engine.safe_reload(ReloadRequest {
                     source,
                     allow_breaking,
@@ -1233,8 +1235,10 @@ mod tests {
         assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
         assert_eq!(call("POST", "/api/Counter/c1/armBug", None, Some(json!([]))).0, 200);
         assert_eq!(call("POST", "/_tj/input", Some(&mnt), Some(json!({ "type": "tick" }))).0, 200);
-        // Auto-rollback restored v1!
+        // Auto-rollback restored v1, AND a subsequent manual `POST /_tj/rollback` returns 409
+        // rather than re-promoting the broken `v3-buggy` bundle (P3B-2)!
         assert_eq!(call("POST", "/api/Counter/c1/version", None, Some(json!([]))), (200, json!({ "ok": "v1" })));
+        assert_eq!(call("POST", "/_tj/rollback", Some(&mnt), Some(json!({}))).0, 409);
         let (st, m_after) = call("GET", "/_tj/manifest", Some(&obs), None);
         assert_eq!(st, 200);
         assert_eq!(m_after["ok"]["health"]["autoRollbacks"], json!(1));
