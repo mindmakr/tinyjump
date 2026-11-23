@@ -438,6 +438,11 @@ fn find_web_js() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn find_web_device_plugins_js() -> Option<PathBuf> {
+    let candidates = [workspace_dir().join("hosts/web/plugins/device.js"), PathBuf::from("hosts/web/plugins/device.js")];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Resolves the WASM runtime for `--web`. Returns `(path, used_aot, stale_aot_note)`.
 fn find_wasm(explicit: Option<&Path>, require_aot: bool) -> (Option<PathBuf>, bool, Option<String>) {
     if let Some(p) = explicit {
@@ -596,10 +601,21 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             } else {
                 notes.push("tj_wasm.wasm not found; run `cargo web` (or `cargo web-aot` for 36% smaller AOT WASM) and re-run `tj build --web`".into());
             }
+            let host_plugins = device_perms::bundled_host_plugins(&dev_perms);
+            let stale_plugins_js = dest.join("device-plugins.js");
+            if !host_plugins.is_empty() {
+                if let Some(pjs) = find_web_device_plugins_js() {
+                    fs::copy(&pjs, &stale_plugins_js).map_err(|e| format!("cannot copy {}: {e}", pjs.display()))?;
+                } else {
+                    notes.push("hosts/web/plugins/device.js not found in workspace; copy it as device-plugins.js into this folder".into());
+                }
+            } else if stale_plugins_js.exists() {
+                let _ = fs::remove_file(&stale_plugins_js);
+            }
             if has_server_objects && opts.server_url.is_none() {
                 notes.push("this app has @server objects; pass --server <url> (or '' for same-origin) so the web host knows where `tj serve` runs".into());
             }
-            let html = web_index_html(title, opts.server_url);
+            let html = web_index_html(title, opts.server_url, &host_plugins);
             fs::write(dest.join("index.html"), html).map_err(|e| format!("cannot write index.html: {e}"))?;
             let manifest = json!({
                 "target": "web",
@@ -871,13 +887,34 @@ fn generate_android_project(
     fs::write(app_mod.join("src/main/AndroidManifest.xml"), manifest_xml)
         .map_err(|e| format!("cannot write AndroidManifest.xml: {e}"))?;
 
+    let host_plugins = device_perms::bundled_host_plugins(dev_perms);
+    let has_host_plugins = !host_plugins.is_empty();
+    if has_host_plugins {
+        let plugin_src = ws_android.join("plugins/DevicePlugins.java");
+        if plugin_src.is_file() {
+            let plugin_dir = java_root.join("com/mindmakr/tinyjump/plugins");
+            fs::create_dir_all(&plugin_dir).map_err(|e| format!("cannot create {}: {e}", plugin_dir.display()))?;
+            fs::copy(&plugin_src, plugin_dir.join("DevicePlugins.java"))
+                .map_err(|e| format!("cannot copy {}: {e}", plugin_src.display()))?;
+        } else {
+            notes.push("hosts/android/plugins/DevicePlugins.java not found in workspace; set TJ_HOME to your tinyjump checkout".into());
+        }
+    }
+
     let default_server_expr = match server_url {
         Some(u) => format!("\"{}\"", escape_c_string(u)),
         None => "null".to_string(),
     };
-    let main_java = format!(
-        "package {app_id};\n\nimport android.app.Activity;\nimport android.content.pm.ApplicationInfo;\nimport android.os.Bundle;\nimport android.view.View;\nimport android.widget.FrameLayout;\nimport com.mindmakr.tinyjump.TinyJump;\nimport java.io.ByteArrayOutputStream;\nimport java.io.IOException;\nimport java.io.InputStream;\n\npublic final class MainActivity extends Activity {{\n    private static final String DEFAULT_SERVER = {default_server_expr};\n    private static final int AUTOMATION_PORT = 4701;\n    private TinyJump app;\n\n    @Override\n    protected void onCreate(Bundle state) {{\n        super.onCreate(state);\n        FrameLayout root = new FrameLayout(this);\n        root.setFitsSystemWindows(true);\n        boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;\n        if (debuggable) {{\n            String dir = getIntent().getStringExtra(\"dir\");\n            if (\"rtl\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);\n            if (\"ltr\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);\n        }}\n        setContentView(root);\n        String source = loadBundle();\n        String server = DEFAULT_SERVER;\n        if (debuggable) {{\n            String overrideServer = getIntent().getStringExtra(\"server\");\n            if (overrideServer != null) server = overrideServer;\n        }}\n        app = TinyJump.start(this, root, source, server);\n        if (debuggable) app.enableAutomation(AUTOMATION_PORT);\n    }}\n\n    @Override\n    protected void onDestroy() {{\n        if (app != null) app.stop();\n        super.onDestroy();\n    }}\n\n    private String loadBundle() {{\n        try (InputStream in = getAssets().open(\"app.tjb\")) {{\n            ByteArrayOutputStream out = new ByteArrayOutputStream();\n            byte[] buf = new byte[8192];\n            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);\n            return out.toString(\"UTF-8\");\n        }} catch (IOException e) {{\n            throw new IllegalStateException(\"missing assets/app.tjb\", e);\n        }}\n    }}\n}}\n"
-    );
+    let main_java = if has_host_plugins {
+        let caps_list: String = host_plugins.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+        format!(
+            "package {app_id};\n\nimport android.app.Activity;\nimport android.content.Intent;\nimport android.content.pm.ApplicationInfo;\nimport android.os.Bundle;\nimport android.view.View;\nimport android.widget.FrameLayout;\nimport com.mindmakr.tinyjump.TinyJump;\nimport com.mindmakr.tinyjump.plugins.DevicePlugins;\nimport java.io.ByteArrayOutputStream;\nimport java.io.IOException;\nimport java.io.InputStream;\nimport java.util.Arrays;\nimport java.util.HashSet;\n\npublic final class MainActivity extends Activity {{\n    private static final String DEFAULT_SERVER = {default_server_expr};\n    private static final int AUTOMATION_PORT = 4701;\n    private TinyJump app;\n\n    @Override\n    protected void onCreate(Bundle state) {{\n        super.onCreate(state);\n        FrameLayout root = new FrameLayout(this);\n        root.setFitsSystemWindows(true);\n        boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;\n        if (debuggable) {{\n            String dir = getIntent().getStringExtra(\"dir\");\n            if (\"rtl\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);\n            if (\"ltr\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);\n        }}\n        setContentView(root);\n        DevicePlugins.install(this, new HashSet<>(Arrays.asList({caps_list})));\n        String source = loadBundle();\n        String server = DEFAULT_SERVER;\n        if (debuggable) {{\n            String overrideServer = getIntent().getStringExtra(\"server\");\n            if (overrideServer != null) server = overrideServer;\n        }}\n        app = TinyJump.start(this, root, source, server);\n        if (debuggable) app.enableAutomation(AUTOMATION_PORT);\n    }}\n\n    @Override\n    protected void onActivityResult(int requestCode, int resultCode, Intent data) {{\n        if (DevicePlugins.onActivityResult(this, requestCode, resultCode, data)) return;\n        super.onActivityResult(requestCode, resultCode, data);\n    }}\n\n    @Override\n    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {{\n        if (DevicePlugins.onRequestPermissionsResult(this, requestCode, permissions, grantResults)) return;\n        super.onRequestPermissionsResult(requestCode, permissions, grantResults);\n    }}\n\n    @Override\n    protected void onDestroy() {{\n        DevicePlugins.uninstall(this);\n        if (app != null) app.stop();\n        super.onDestroy();\n    }}\n\n    private String loadBundle() {{\n        try (InputStream in = getAssets().open(\"app.tjb\")) {{\n            ByteArrayOutputStream out = new ByteArrayOutputStream();\n            byte[] buf = new byte[8192];\n            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);\n            return out.toString(\"UTF-8\");\n        }} catch (IOException e) {{\n            throw new IllegalStateException(\"missing assets/app.tjb\", e);\n        }}\n    }}\n}}\n"
+        )
+    } else {
+        format!(
+            "package {app_id};\n\nimport android.app.Activity;\nimport android.content.pm.ApplicationInfo;\nimport android.os.Bundle;\nimport android.view.View;\nimport android.widget.FrameLayout;\nimport com.mindmakr.tinyjump.TinyJump;\nimport java.io.ByteArrayOutputStream;\nimport java.io.IOException;\nimport java.io.InputStream;\n\npublic final class MainActivity extends Activity {{\n    private static final String DEFAULT_SERVER = {default_server_expr};\n    private static final int AUTOMATION_PORT = 4701;\n    private TinyJump app;\n\n    @Override\n    protected void onCreate(Bundle state) {{\n        super.onCreate(state);\n        FrameLayout root = new FrameLayout(this);\n        root.setFitsSystemWindows(true);\n        boolean debuggable = (getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;\n        if (debuggable) {{\n            String dir = getIntent().getStringExtra(\"dir\");\n            if (\"rtl\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_RTL);\n            if (\"ltr\".equals(dir)) root.setLayoutDirection(View.LAYOUT_DIRECTION_LTR);\n        }}\n        setContentView(root);\n        String source = loadBundle();\n        String server = DEFAULT_SERVER;\n        if (debuggable) {{\n            String overrideServer = getIntent().getStringExtra(\"server\");\n            if (overrideServer != null) server = overrideServer;\n        }}\n        app = TinyJump.start(this, root, source, server);\n        if (debuggable) app.enableAutomation(AUTOMATION_PORT);\n    }}\n\n    @Override\n    protected void onDestroy() {{\n        if (app != null) app.stop();\n        super.onDestroy();\n    }}\n\n    private String loadBundle() {{\n        try (InputStream in = getAssets().open(\"app.tjb\")) {{\n            ByteArrayOutputStream out = new ByteArrayOutputStream();\n            byte[] buf = new byte[8192];\n            for (int n; (n = in.read(buf)) > 0; ) out.write(buf, 0, n);\n            return out.toString(\"UTF-8\");\n        }} catch (IOException e) {{\n            throw new IllegalStateException(\"missing assets/app.tjb\", e);\n        }}\n    }}\n}}\n"
+        )
+    };
     fs::write(pkg_dir.join("MainActivity.java"), main_java).map_err(|e| format!("cannot write MainActivity.java: {e}"))?;
 
     fs::write(
@@ -1017,25 +1054,51 @@ fn generate_ios_project(
     );
     fs::write(dest.join("Info.plist"), plist).map_err(|e| format!("cannot write Info.plist: {e}"))?;
 
-    let default_server_swift = match server_url {
-        Some(u) => format!("\"{}\"", escape_c_string(u)),
-        None => "nil".to_string(),
-    };
-    let app_delegate = format!(
-        "import UIKit\n\n@main\nfinal class AppDelegate: UIResponder, UIApplicationDelegate {{\n    var window: UIWindow?\n    private var app: TinyJump?\n    private static let defaultServer: String? = {default_server_swift}\n\n    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {{\n        let controller = UIViewController()\n        controller.view.backgroundColor = .systemBackground\n        let window = UIWindow(frame: UIScreen.main.bounds)\n        window.rootViewController = controller\n        window.makeKeyAndVisible()\n        self.window = window\n\n        var server = AppDelegate.defaultServer\n        #if DEBUG\n        let defaults = UserDefaults.standard\n        switch defaults.string(forKey: \"dir\") {{\n        case \"rtl\": controller.view.semanticContentAttribute = .forceRightToLeft\n        case \"ltr\": controller.view.semanticContentAttribute = .forceLeftToRight\n        default: break\n        }}\n        if let overrideServer = defaults.string(forKey: \"server\") {{ server = overrideServer }}\n        #endif\n\n        let url = Bundle.main.url(forResource: \"app\", withExtension: \"tjb\", subdirectory: \"Resources\")\n            ?? Bundle.main.url(forResource: \"app\", withExtension: \"tjb\")\n        guard let bundleUrl = url, let source = try? String(contentsOf: bundleUrl, encoding: .utf8) else {{\n            fatalError(\"missing Resources/app.tjb\")\n        }}\n        do {{\n            app = try TinyJump.start(root: controller.view, source: source, server: server)\n        }} catch {{\n            fatalError(\"\\(error)\")\n        }}\n        #if DEBUG\n        app?.enableAutomation(port: 4701)\n        #endif\n        return true\n    }}\n}}\n"
-    );
-    fs::write(dest.join("AppDelegate.swift"), app_delegate).map_err(|e| format!("cannot write AppDelegate.swift: {e}"))?;
-
     let ws = workspace_dir();
     if !ws.join("hosts/ios/Sources/TinyJump").is_dir() {
         notes.push("hosts/ios/Sources/TinyJump not found; set TJ_HOME to your tinyjump checkout before running build.sh".into());
     }
+    let host_plugins = device_perms::bundled_host_plugins(dev_perms);
+    let has_host_plugins = !host_plugins.is_empty();
+    let dst_ios_plugins = dest.join("DevicePlugins.swift");
+    if has_host_plugins {
+        let src_ios_plugins = ws.join("hosts/ios/Plugins/DevicePlugins.swift");
+        if src_ios_plugins.is_file() {
+            fs::copy(&src_ios_plugins, &dst_ios_plugins)
+                .map_err(|e| format!("cannot copy {}: {e}", src_ios_plugins.display()))?;
+        } else {
+            notes.push("hosts/ios/Plugins/DevicePlugins.swift not found in workspace; set TJ_HOME to your tinyjump checkout".into());
+        }
+    } else if dst_ios_plugins.exists() {
+        let _ = fs::remove_file(&dst_ios_plugins);
+    }
+
+    let default_server_swift = match server_url {
+        Some(u) => format!("\"{}\"", escape_c_string(u)),
+        None => "nil".to_string(),
+    };
+    let ios_plugin_register = if has_host_plugins {
+        let caps_list: String = host_plugins.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+        format!("        DevicePlugins.register(presenter: controller, capabilities: Set([{caps_list}]))\n")
+    } else {
+        String::new()
+    };
+    let ios_plugin_terminate = if has_host_plugins {
+        "\n    func applicationWillTerminate(_ application: UIApplication) {\n        DevicePlugins.unregister()\n        app?.stop()\n    }\n"
+    } else {
+        ""
+    };
+    let app_delegate = format!(
+        "import UIKit\n\n@main\nfinal class AppDelegate: UIResponder, UIApplicationDelegate {{\n    var window: UIWindow?\n    private var app: TinyJump?\n    private static let defaultServer: String? = {default_server_swift}\n\n    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {{\n        let controller = UIViewController()\n        controller.view.backgroundColor = .systemBackground\n        let window = UIWindow(frame: UIScreen.main.bounds)\n        window.rootViewController = controller\n        window.makeKeyAndVisible()\n        self.window = window\n\n{ios_plugin_register}        var server = AppDelegate.defaultServer\n        #if DEBUG\n        let defaults = UserDefaults.standard\n        switch defaults.string(forKey: \"dir\") {{\n        case \"rtl\": controller.view.semanticContentAttribute = .forceRightToLeft\n        case \"ltr\": controller.view.semanticContentAttribute = .forceLeftToRight\n        default: break\n        }}\n        if let overrideServer = defaults.string(forKey: \"server\") {{ server = overrideServer }}\n        #endif\n\n        let url = Bundle.main.url(forResource: \"app\", withExtension: \"tjb\", subdirectory: \"Resources\")\n            ?? Bundle.main.url(forResource: \"app\", withExtension: \"tjb\")\n        guard let bundleUrl = url, let source = try? String(contentsOf: bundleUrl, encoding: .utf8) else {{\n            fatalError(\"missing Resources/app.tjb\")\n        }}\n        do {{\n            app = try TinyJump.start(root: controller.view, source: source, server: server)\n        }} catch {{\n            fatalError(\"\\(error)\")\n        }}\n        #if DEBUG\n        app?.enableAutomation(port: 4701)\n        #endif\n        return true\n    }}{ios_plugin_terminate}}}\n"
+    );
+    fs::write(dest.join("AppDelegate.swift"), app_delegate).map_err(|e| format!("cannot write AppDelegate.swift: {e}"))?;
     let aot_block = if aot {
         "CARGO_ARGS+=(--no-default-features)\nTARGET_SUB=target/aot"
     } else {
         "TARGET_SUB=target"
     };
     let swift_debug = if release { "" } else { "SWIFT_ARGS+=(-D DEBUG)\n" };
+    let extra_swift = if has_host_plugins { " \"$PWD/DevicePlugins.swift\"" } else { "" };
     let ws_default = escape_shell_single(&strip_win_unc(&ws));
     let build_sh = format!(
         "#!/usr/bin/env bash\n\
@@ -1080,7 +1143,7 @@ fn generate_ios_project(
          xcrun --sdk \"$SDK\" swiftc \"${{SWIFT_ARGS[@]}}\" \\\n\
            -import-objc-header \"$TJ_HOME/crates/tj-ffi/include/tinyjump.h\" \\\n\
            -L \"$TJ_HOME/$TARGET_SUB/$RUST_TARGET/small\" -ltj_ffi \\\n\
-           \"$TJ_HOME\"/hosts/ios/Sources/TinyJump/*.swift \"$PWD/AppDelegate.swift\" \\\n\
+           \"$TJ_HOME\"/hosts/ios/Sources/TinyJump/*.swift \"$PWD/AppDelegate.swift\"{extra_swift} \\\n\
            -o \"$APP/{exec_name}\"\n\
          cp \"$PWD/Resources/app.tjb\" \"$APP/app.tjb\"\n\
          cp \"$PWD/Info.plist\" \"$APP/Info.plist\"\n\
@@ -1143,7 +1206,7 @@ fn strip_win_unc(p: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
 }
 
-fn web_index_html(title: &str, server: Option<&str>) -> String {
+fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str]) -> String {
     let escaped = escape_xml(title);
     let server_opt = match server {
         Some(url) => {
@@ -1156,8 +1219,17 @@ fn web_index_html(title: &str, server: Option<&str>) -> String {
         }
         None => String::new(),
     };
+    let (plugin_import, plugin_opt) = if host_plugins.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let caps = serde_json::to_string(host_plugins).expect("json array");
+        (
+            "import { createDevicePlugins } from './device-plugins.js';\n".to_string(),
+            format!(", plugins: createDevicePlugins({caps})"),
+        )
+    };
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\nfetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt} }}));\n</script>\n</body>\n</html>\n"
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt} }}));\n</script>\n</body>\n</html>\n"
     )
 }
 
@@ -1461,5 +1533,76 @@ function App() {
         assert_eq!(sanitize_android_segment("durable-cart"), "durable_cart");
         assert_eq!(sanitize_android_segment("class"), "class_app");
         assert_eq!(pascal_exec_name("durable-cart"), "DurableCart");
+    }
+
+    #[test]
+    fn bundles_opt_in_host_device_plugins_only_when_declared() {
+        let dir = tmp("opt-in-plugins");
+        let app_file = dir.join("app.tj");
+        fs::write(&app_file, "function App() { return <Column><Text>hi</Text></Column> }\n").unwrap();
+
+        // 1. Without device permissions: 0 extra plugin files or hooks on Web, Android, iOS.
+        let web_plain = dir.join("web-plain");
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_plain), ..Default::default() }).unwrap();
+        assert!(!web_plain.join("device-plugins.js").exists());
+        assert!(!fs::read_to_string(web_plain.join("index.html")).unwrap().contains("device-plugins.js"));
+
+        let and_plain = dir.join("and-plain");
+        build_app(&app_file, Target::Android, &BuildOpts { out: Some(&and_plain), app_id: Some("com.example.plain"), ..Default::default() }).unwrap();
+        assert!(!and_plain.join("app/src/main/java/com/mindmakr/tinyjump/plugins/DevicePlugins.java").exists());
+        assert!(!fs::read_to_string(and_plain.join("app/src/main/java/com/example/plain/MainActivity.java")).unwrap().contains("DevicePlugins"));
+
+        let ios_plain = dir.join("ios-plain");
+        build_app(&app_file, Target::Ios, &BuildOpts { out: Some(&ios_plain), app_id: Some("com.example.plain"), ..Default::default() }).unwrap();
+        assert!(!ios_plain.join("DevicePlugins.swift").exists());
+        assert!(!fs::read_to_string(ios_plain.join("AppDelegate.swift")).unwrap().contains("DevicePlugins"));
+        assert!(!fs::read_to_string(ios_plain.join("build.sh")).unwrap().contains("DevicePlugins.swift"));
+
+        // 2. With permissions.json declaring files, notifications, location, camera: opt-in plugins are wired across all 3 platforms.
+        fs::write(
+            dir.join("permissions.json"),
+            r#"{ "device": { "files": "Pick documents", "notifications": "Remind users", "location": "Find nearby stores", "camera": "Capture receipt" } }"#,
+        )
+        .unwrap();
+
+        let web_dev = dir.join("web-dev");
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
+        assert!(web_dev.join("device-plugins.js").exists());
+        let html = fs::read_to_string(web_dev.join("index.html")).unwrap();
+        assert!(html.contains("import { createDevicePlugins } from './device-plugins.js';"));
+        assert!(html.contains("createDevicePlugins([\"files\",\"notifications\",\"location\",\"camera\"])"));
+
+        let and_dev = dir.join("and-dev");
+        build_app(&app_file, Target::Android, &BuildOpts { out: Some(&and_dev), app_id: Some("com.example.devcaps"), ..Default::default() }).unwrap();
+        assert!(and_dev.join("app/src/main/java/com/mindmakr/tinyjump/plugins/DevicePlugins.java").exists());
+        let main_java = fs::read_to_string(and_dev.join("app/src/main/java/com/example/devcaps/MainActivity.java")).unwrap();
+        assert!(main_java.contains("DevicePlugins.install(this, new HashSet<>(Arrays.asList(\"files\", \"notifications\", \"location\", \"camera\")))"));
+        assert!(main_java.contains("DevicePlugins.onActivityResult("));
+        assert!(main_java.contains("DevicePlugins.onRequestPermissionsResult("));
+        assert!(main_java.contains("DevicePlugins.uninstall(this)"));
+
+        let ios_dev = dir.join("ios-dev");
+        build_app(&app_file, Target::Ios, &BuildOpts { out: Some(&ios_dev), app_id: Some("com.example.devcaps"), ..Default::default() }).unwrap();
+        assert!(ios_dev.join("DevicePlugins.swift").exists());
+        let swift = fs::read_to_string(ios_dev.join("AppDelegate.swift")).unwrap();
+        assert!(swift.contains("DevicePlugins.register(presenter: controller, capabilities: Set([\"files\", \"notifications\", \"location\", \"camera\"]))"));
+        assert!(fs::read_to_string(ios_dev.join("build.sh")).unwrap().contains("\"$PWD/DevicePlugins.swift\""));
+
+        // 3. Rebuilding in-place after removing permissions.json cleans stale plugin files and hooks.
+        fs::remove_file(dir.join("permissions.json")).unwrap();
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
+        assert!(!web_dev.join("device-plugins.js").exists());
+        assert!(!fs::read_to_string(web_dev.join("index.html")).unwrap().contains("device-plugins.js"));
+
+        build_app(&app_file, Target::Android, &BuildOpts { out: Some(&and_dev), app_id: Some("com.example.devcaps"), ..Default::default() }).unwrap();
+        assert!(!and_dev.join("app/src/main/java/com/mindmakr/tinyjump/plugins/DevicePlugins.java").exists());
+        assert!(!fs::read_to_string(and_dev.join("app/src/main/java/com/example/devcaps/MainActivity.java")).unwrap().contains("DevicePlugins"));
+
+        build_app(&app_file, Target::Ios, &BuildOpts { out: Some(&ios_dev), app_id: Some("com.example.devcaps"), ..Default::default() }).unwrap();
+        assert!(!ios_dev.join("DevicePlugins.swift").exists());
+        assert!(!fs::read_to_string(ios_dev.join("AppDelegate.swift")).unwrap().contains("DevicePlugins"));
+        assert!(!fs::read_to_string(ios_dev.join("build.sh")).unwrap().contains("DevicePlugins.swift"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

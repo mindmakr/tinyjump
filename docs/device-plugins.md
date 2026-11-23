@@ -115,6 +115,35 @@ Device permissions use one fixed vocabulary shared by `tj registry check`, `tj.l
   `AndroidManifest.xml`, and `tj build --ios` injects the exact `NS*UsageDescription` keys
   into `Info.plist`.
 
+## Built-in opt-in host device plugins (`files`, `notifications`, `location`, `camera`)
+
+TinyJump ships four opt-in host implementations outside `tj-core`:
+
+- Web: `hosts/web/plugins/device.js` (plain ES2017, zero dependencies)
+- Android: `hosts/android/plugins/DevicePlugins.java` (plain Java 11, `minSdk 21`, zero AndroidX/Kotlin)
+- iOS: `hosts/ios/Plugins/DevicePlugins.swift` (pure Apple system frameworks, iOS 13+)
+
+**Zero-cost opt-in:** `tj build` (`--web`, `--android`, `--ios`) copies and wires these files
+**only** when the app's resolved `devicePermissions` (from `tj.lock` or `permissions.json`)
+includes one of them. Apps that do not declare device permissions pay **0 bytes**. On
+`tj dev` and `tj serve --web`, `/device-plugins.js` serves a 48-byte empty stub when no
+device plugins are declared, and reloads live if `permissions.json` or `tj.lock` changes.
+
+| Plugin | Permission | Methods | Return shape |
+|---|---|---|---|
+| `files` | `files` | `pick({ accept?, multiple?, readAs?: "text" \| "base64", maxBytes? })` | `{ cancelled, files: [{ name, mime, size, text?, base64? }] }` (10 MiB aggregate cap) |
+| `files` | `files` | `save({ name, mime?, text?, base64? })` | `{ saved, cancelled, name }` |
+| `notifications` | `notifications` | `requestPermission({})` | `{ granted, status }` |
+| `notifications` | `notifications` | `notify({ id?, title, body? })` | `{ delivered, id }` |
+| `location` | `location` / `location-background` | `currentPosition({ highAccuracy?, timeoutMs? })` | `{ lat, lng, accuracy, altitude, timestamp }` |
+| `camera` | `camera` | `capture({ facing?: "back" \| "front", maxDimension?, quality? })` | `{ cancelled, mime, width, height, base64 }` *(Note: Android uses zero-dependency `ACTION_IMAGE_CAPTURE` without `FileProvider`, returning a compact camera thumbnail; apps needing full-sensor capture can register a custom `camera` plugin.)* |
+
+Install the typed `.tj` wrapper modules from the official registry via:
+
+```sh
+tj add files notifications location camera
+```
+
 ## Calls and media streaming (WebRTC, planned in 3c)
 
 Voice and video calls build directly on the same primitives:

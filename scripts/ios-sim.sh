@@ -208,4 +208,27 @@ wait_up
 expect "$api/_tj/inspect" 'Add'
 "$tj" review --target "$api"
 xcrun simctl terminate "$udid" "$pkg_bundle" 2>/dev/null || true
+
+echo "== device plugins: tj build --ios --aot --assemble compiles opt-in DevicePlugins.swift"
+rm -rf "$out/device-caps-src" "$out/device-caps-ios"
+mkdir -p "$out/device-caps-src"
+cat >"$out/device-caps-src/app.tj" <<'EOF'
+function App() {
+  return <Column><Text id="ok">Device Caps Ready</Text></Column>
+}
+EOF
+cat >"$out/device-caps-src/permissions.json" <<'EOF'
+{
+  "device": {
+    "files": "Import and export documents",
+    "notifications": "Deliver local reminders",
+    "location": "Show nearby locations",
+    "camera": "Capture photos"
+  }
+}
+EOF
+"$tj" build "$out/device-caps-src/app.tj" --ios --aot --out "$out/device-caps-ios" --assemble
+test -x "$out/device-caps-ios/DeviceCapsSrc.app/DeviceCapsSrc"
+grep -q "NSCameraUsageDescription" "$out/device-caps-ios/DeviceCapsSrc.app/Info.plist"
+grep -q "NSLocationWhenInUseUsageDescription" "$out/device-caps-ios/DeviceCapsSrc.app/Info.plist"
 echo "iOS tests passed"

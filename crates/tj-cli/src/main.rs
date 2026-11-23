@@ -1055,13 +1055,24 @@ fn post_ops(target: &str, path: &str, body: serde_json::Value) -> Result<serde_j
     Ok(reply["ok"].clone())
 }
 
-/// Polls the app's files; on a change, reloads the backend and tells browsers to reload.
+/// Polls the app's files (plus `permissions.json` and `tj.lock`); on a change, reloads the
+/// backend and tells browsers to reload.
 fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
+    let app_dir = file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
     let stamps = |files: &[PathBuf]| -> Vec<Option<SystemTime>> { files.iter().map(|f| std::fs::metadata(f).and_then(|m| m.modified()).ok()).collect() };
     let spawned = thread::Builder::new().name("tj-watch".into()).spawn(move || {
+        let with_sidecars = |mut files: Vec<PathBuf>| -> Vec<PathBuf> {
+            for name in ["permissions.json", "tj.lock"] {
+                let p = app_dir.join(name);
+                if !files.contains(&p) {
+                    files.push(p);
+                }
+            }
+            files
+        };
         let initial = app::read(&file).ok();
         let mut prev_snap = initial.as_ref().and_then(|a| tj_core::compile(&a.source).ok().map(|p| compat::Snapshot::build(&a.source, &p)));
-        let mut files = initial.map(|a| a.files).unwrap_or_else(|| vec![file.clone()]);
+        let mut files = with_sidecars(initial.map(|a| a.files).unwrap_or_else(|| vec![file.clone()]));
         let mut last = stamps(&files);
         loop {
             thread::sleep(Duration::from_millis(300));
@@ -1081,11 +1092,17 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
                                 }
                             }
                             prev_snap = Some(new_snap);
-                            engine.reload(app.source);
+                            match device_perms::load_app_device_permissions(&app_dir) {
+                                Ok(perms) => engine.reload_with_device_perms(app.source, perms),
+                                Err(e) => {
+                                    eprintln!("[tj] device permissions error, keeping previous permissions: {e}");
+                                    engine.reload(app.source);
+                                }
+                            }
                         }
                         Err(errs) => eprintln!("{}", errs.iter().map(|d| d.render(&file.display().to_string(), &app.source)).collect::<Vec<_>>().join("\n\n")),
                     }
-                    files = app.files; // imports may have changed
+                    files = with_sidecars(app.files); // imports may have changed
                 }
                 Err(e) => eprintln!("[tj] {e}"),
             }
