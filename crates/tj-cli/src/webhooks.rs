@@ -342,7 +342,15 @@ impl Webhooks {
         out
     }
 
-    pub fn verify_incoming(&self, name: &str, timestamp: Option<&str>, signature: Option<&str>, raw_body: &[u8], now_secs: i64) -> Result<&IncomingWebhook, (u16, String)> {
+    /// Validates incoming webhook name, timestamp replay window, and `v1=<64 hex>` signature
+    /// syntax BEFORE reading the HTTP request body (`RW-2`).
+    pub fn parse_incoming_headers<'a, 'b>(
+        &'a self,
+        name: &str,
+        timestamp: Option<&'b str>,
+        signature: Option<&str>,
+        now_secs: i64,
+    ) -> Result<(&'a IncomingWebhook, &'b str, Vec<u8>), (u16, String)> {
         let Some(hook) = self.incoming.get(name) else {
             return Err((404, "unknown webhook".into()));
         };
@@ -365,13 +373,24 @@ impl Webhooks {
         let Some(tag) = decode_hex(hex_sig).filter(|b| b.len() == 32) else {
             return Err((401, "malformed X-TinyJump-Signature".into()));
         };
+        Ok((hook, ts_str, tag))
+    }
+
+    /// Constant-time HMAC-SHA256 verification over `"{timestamp}.{raw_body}"`.
+    pub fn verify_incoming_body<'a>(hook: &'a IncomingWebhook, ts_str: &str, tag: &[u8], raw_body: &[u8]) -> Result<&'a IncomingWebhook, (u16, String)> {
         let mut msg = Vec::with_capacity(ts_str.len() + 1 + raw_body.len());
         msg.extend_from_slice(ts_str.as_bytes());
         msg.push(b'.');
         msg.extend_from_slice(raw_body);
         let key = hmac::Key::new(hmac::HMAC_SHA256, &hook.secret);
-        hmac::verify(&key, &msg, &tag).map_err(|_| (401, "invalid webhook signature".into()))?;
+        hmac::verify(&key, &msg, tag).map_err(|_| (401, "invalid webhook signature".into()))?;
         Ok(hook)
+    }
+
+    #[cfg(test)]
+    pub fn verify_incoming(&self, name: &str, timestamp: Option<&str>, signature: Option<&str>, raw_body: &[u8], now_secs: i64) -> Result<&IncomingWebhook, (u16, String)> {
+        let (hook, ts_str, tag) = self.parse_incoming_headers(name, timestamp, signature, now_secs)?;
+        Self::verify_incoming_body(hook, ts_str, &tag, raw_body)
     }
 }
 
