@@ -777,7 +777,7 @@ fn handle(mut req: Request, front: &Front) {
                 front.audit.security(admin_input(ops.actor(), &input))?;
                 // Under `tj dev`, what a person does on the screen goes to the open tab. Calls and
                 // reads stay here, where the server's objects live.
-                if matches!(input, Input::Ui { .. } | Input::Layout { .. }) {
+                if matches!(input, Input::Ui { .. } | Input::Layout { .. } | Input::Locale { .. }) {
                     if let Some(r) = front.dev.as_ref().and_then(|d| d.ask("input", &j)) {
                         return r;
                     }

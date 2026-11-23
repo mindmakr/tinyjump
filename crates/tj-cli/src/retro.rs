@@ -240,6 +240,9 @@ pub(crate) fn check_dead_methods(source: &str, out: &mut Vec<RetroFinding>) {
     let mut class_method_refs: HashMap<String, MemberRefs> = HashMap::new();
     let mut invoke_refs: HashSet<String> = HashSet::new();
     for f in modules::files(source) {
+        if tj_core::i18n::is_locale_file(&f.name) {
+            continue;
+        }
         let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
         for item in &parsed.items {
             match item {

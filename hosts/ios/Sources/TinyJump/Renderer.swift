@@ -72,6 +72,11 @@ final class TabsView: UIView {
         }
     }
 
+    func setMutedColor(_ color: UIColor?) {
+        let attrs: [NSAttributedString.Key: Any] = color.map { [.foregroundColor: $0] } ?? [:]
+        control.setTitleTextAttributes(attrs, for: .normal)
+    }
+
     @objc private func changed() {
         let idx = control.selectedSegmentIndex
         if idx >= 0 && idx < values.count {
@@ -216,6 +221,9 @@ final class Renderer {
         var target: EventTarget?
         var nativeComponent: NativeComponent?
         var lastScrollExtent: CGFloat = -1
+        var children: [Node] = []
+        var parentMuted: UIColor?
+        var mutedColor: UIColor?
         var props: [String: Any] = [:]
         var events: [String] = []
         /// True while the renderer itself changes a control, so its events stay quiet.
@@ -232,6 +240,51 @@ final class Renderer {
     weak var tj: TinyJump?
     let root = RootView()
     private var nodes: [Int: Node] = [:]
+    var localeId: String = Locale.current.identifier.replacingOccurrences(of: "_", with: "-")
+
+    func setLocale(_ tag: String) {
+        let trimmed = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+        localeId = trimmed.isEmpty ? Locale.current.identifier.replacingOccurrences(of: "_", with: "-") : trimmed
+        let rtl = Renderer.isRtlLocale(localeId)
+        root.semanticContentAttribute = rtl ? .forceRightToLeft : .forceLeftToRight
+        inheritDirection(root)
+        for n in nodes.values {
+            if n.kind == "Format" {
+                (n.view as? UILabel)?.text = formatNumber(n.props)
+            } else if n.kind == "Time" {
+                (n.view as? UILabel)?.text = Times.show(n.props, locale: localeId)
+            }
+        }
+    }
+
+    private static func isRtlLocale(_ tag: String) -> Bool {
+        let lang = tag.lowercased().split { $0 == "-" || $0 == "_" }.first.map(String.init) ?? ""
+        return ["ar", "he", "fa", "ur", "ps", "sd", "ug", "yi", "dv", "ku"].contains(lang)
+    }
+
+    private func formatNumber(_ props: [String: Any]) -> String {
+        guard let num = props["value"] as? NSNumber, num.doubleValue.isFinite else { return "" }
+        let rawLoc = (props["locale"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? localeId
+        let tag = rawLoc.lowercased() == "pseudo" ? "en-US" : rawLoc
+        let kind = props["kind"] as? String ?? "number"
+        let nf = NumberFormatter()
+        nf.locale = Locale(identifier: tag)
+        switch kind {
+        case "currency":
+            nf.numberStyle = .currency
+            nf.currencyCode = (props["currency"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "USD"
+        case "percent":
+            nf.numberStyle = .percent
+        default:
+            nf.numberStyle = .decimal
+        }
+        if let dec = props["decimals"] as? NSNumber {
+            let d = max(0, min(20, dec.intValue))
+            nf.minimumFractionDigits = d
+            nf.maximumFractionDigits = d
+        }
+        return nf.string(from: num) ?? "\(num)"
+    }
 
     /// The root follows `host`'s direction: set `host.semanticContentAttribute` to
     /// `.forceRightToLeft` (or `.forceLeftToRight`) to override the app's language.
@@ -267,10 +320,15 @@ final class Renderer {
                 setProps(n, op["props"] as? [String: Any] ?? [:], isCreate: false)
             case "children":
                 guard let parent = nodes[id], let box = parent.container else { continue }
-                let views = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0]?.view }
+                let childNodes = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0] }
+                let views = childNodes.map { $0.view }
                 if parent.kind == "List", views.count < box.subviews.count { parent.lastScrollExtent = -1 }
+                parent.children = childNodes
                 for v in box.subviews where !views.contains(v) { v.removeFromSuperview() }
                 for (i, v) in views.enumerated() where box.subviews.firstIndex(of: v) != i { box.insertSubview(v, at: i) }
+                for c in childNodes where parent.mutedColor != nil || c.parentMuted != nil {
+                    propagateMuted(c, inherited: parent.mutedColor)
+                }
             case "remove":
                 if let n = nodes.removeValue(forKey: id) {
                     n.nativeComponent?.destroy?(n.view)
@@ -397,7 +455,7 @@ final class Renderer {
             img.contentMode = .scaleAspectFit
             img.clipsToBounds = true
             return Node(id: id, kind: kind, view: img, container: nil)
-        case "Text", "Time":
+        case "Text", "Time", "Format":
             let label = PaddedLabel()
             label.numberOfLines = 0
             label.textAlignment = .natural
@@ -463,9 +521,29 @@ final class Renderer {
                 tabs.setSelected(selected)
             }
         }
-        if props.keys.contains(where: { ["background", "radius", "border", "surface", "mode"].contains($0) }) { restyle(n) }
-        if n.kind == "Theme", props.keys.contains(where: { ["mode", "accent"].contains($0) }) { applyTheme(n) }
+        if props.keys.contains(where: { ["background", "radius", "border"].contains($0) || (n.kind == "Theme" && ["surface", "mode"].contains($0)) }) { restyle(n) }
+        if n.kind == "Theme", props.keys.contains(where: { ["mode", "accent", "muted"].contains($0) }) { applyTheme(n) }
         if n.nativeComponent == nil, props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
+    }
+
+    private func resolveMuted(_ n: Node) -> UIColor? {
+        if let custom = (n.props["muted"] as? String).flatMap(Renderer.color) { return custom }
+        guard let mode = n.props["mode"] as? String else { return nil }
+        let dark = mode == "dark" || (mode == "system" && root.traitCollection.userInterfaceStyle == .dark)
+        return Renderer.color(dark ? "#9ca3af" : "#6b7280")
+    }
+
+    private func propagateMuted(_ n: Node, inherited: UIColor?) {
+        n.parentMuted = inherited
+        let own = n.kind == "Theme" ? resolveMuted(n) : nil
+        let effective = own ?? inherited
+        n.mutedColor = effective
+        if let tabs = n.view as? TabsView {
+            tabs.setMutedColor(effective)
+        }
+        for c in n.children {
+            propagateMuted(c, inherited: effective)
+        }
     }
 
     private func applyTheme(_ n: Node) {
@@ -475,6 +553,7 @@ final class Renderer {
             n.view.overrideUserInterfaceStyle = .unspecified
         }
         n.view.tintColor = (n.props["accent"] as? String).flatMap(Renderer.color)
+        propagateMuted(n, inherited: n.parentMuted)
     }
 
     /// Visual props. Layout props (width, gap, align, grow, ...) are the core's job.
@@ -487,7 +566,11 @@ final class Renderer {
             if k == "color" { icon.tintColor = v.flatMap { Renderer.color("\($0)") } ?? .label; return }
         }
         if n.kind == "Time", ["value", "show", "style", "zone"].contains(k) {
-            label?.text = Times.show(n.props)
+            label?.text = Times.show(n.props, locale: localeId)
+            return
+        }
+        if n.kind == "Format", ["value", "kind", "currency", "decimals", "locale"].contains(k) {
+            label?.text = formatNumber(n.props)
             return
         }
         if let f = view as? UITextField, k == "type" || k == "zone" || (k == "value" && Times.typed(n.props["type"] as? String)) {
@@ -561,7 +644,9 @@ final class Renderer {
                 bg = .systemBackground
             }
         }
-        n.view.backgroundColor = bg
+        if n.nativeComponent == nil || n.props["background"] != nil {
+            n.view.backgroundColor = bg
+        }
         let radius = CGFloat((n.props["radius"] as? Double) ?? 0)
         n.view.layer.cornerRadius = radius
         n.view.clipsToBounds = radius > 0 || n.view is UIImageView
@@ -646,8 +731,8 @@ final class Renderer {
     func addBounds(_ tree: [[String: Any]]) -> [[String: Any]] {
         tree.map { node in
             var n = node
-            // A time shows what the platform made of it, so agents read what people see.
-            if let id = n["id"] as? Int, let shown = nodes[id], shown.kind == "Time", var props = n["props"] as? [String: Any] {
+            // A time or formatted number shows what the platform made of it, so agents read what people see.
+            if let id = n["id"] as? Int, let shown = nodes[id], shown.kind == "Time" || shown.kind == "Format", var props = n["props"] as? [String: Any] {
                 props["text"] = (shown.view as? UILabel)?.text ?? ""
                 n["props"] = props
             }

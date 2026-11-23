@@ -9,6 +9,7 @@ pub mod crypto;
 #[cfg(feature = "check")]
 pub mod flow;
 pub mod host;
+pub mod i18n;
 pub mod modules;
 #[cfg(feature = "check")]
 pub mod lawful_basis;

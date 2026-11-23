@@ -36,10 +36,13 @@ import android.widget.TextView;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.net.URL;
+import java.text.NumberFormat;
 import java.util.ArrayList;
+import java.util.Currency;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -275,11 +278,13 @@ final class Renderer {
         final boolean dark;
         final int fg;
         final int accent;
+        final int muted;
 
-        ThemeStyle(boolean dark, int fg, int accent) {
+        ThemeStyle(boolean dark, int fg, int accent, int muted) {
             this.dark = dark;
             this.fg = fg;
             this.accent = accent;
+            this.muted = muted;
         }
     }
 
@@ -323,6 +328,65 @@ final class Renderer {
     private final float density;
     private final Map<Integer, Node> nodes = new HashMap<>();
     final FrameBox root;
+    private String locale = Locale.getDefault().toLanguageTag();
+
+    String locale() {
+        return locale;
+    }
+
+    void setLocale(String tag) {
+        this.locale = (tag == null || tag.trim().isEmpty()) ? Locale.getDefault().toLanguageTag() : tag.trim();
+        root.setLayoutDirection(isRtlLocale(this.locale) ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        for (Node n : nodes.values()) {
+            if ("Format".equals(n.kind) && n.view instanceof TextView) {
+                ((TextView) n.view).setText(formatNumber(n.props));
+            } else if ("Time".equals(n.kind) && n.view instanceof TextView) {
+                ((TextView) n.view).setText(Times.show(n.props, this.locale));
+            }
+        }
+    }
+
+    private static boolean isRtlLocale(String tag) {
+        if (tag == null) return false;
+        String lang = tag.trim().toLowerCase(Locale.ROOT);
+        int sep = lang.indexOf('-');
+        int under = lang.indexOf('_');
+        if (sep < 0 || (under >= 0 && under < sep)) sep = under;
+        if (sep >= 0) lang = lang.substring(0, sep);
+        return "ar".equals(lang) || "he".equals(lang) || "fa".equals(lang) || "ur".equals(lang)
+                || "ps".equals(lang) || "sd".equals(lang) || "ug".equals(lang) || "yi".equals(lang)
+                || "dv".equals(lang) || "ku".equals(lang);
+    }
+
+    private String formatNumber(JSONObject props) {
+        if (!props.has("value") || props.isNull("value")) return "";
+        double v = props.optDouble("value", Double.NaN);
+        if (Double.isNaN(v) || Double.isInfinite(v)) return "";
+        String rawLoc = props.isNull("locale") ? "" : props.optString("locale", "");
+        String tag = rawLoc.isEmpty() ? this.locale : rawLoc;
+        Locale loc = "pseudo".equalsIgnoreCase(tag) ? Locale.US : Locale.forLanguageTag(tag.replace('_', '-'));
+        String kind = props.optString("kind", "number");
+        try {
+            NumberFormat nf;
+            if ("currency".equals(kind)) {
+                nf = NumberFormat.getCurrencyInstance(loc);
+                String code = props.optString("currency", "USD");
+                if (code != null && !code.isEmpty()) nf.setCurrency(Currency.getInstance(code));
+            } else if ("percent".equals(kind)) {
+                nf = NumberFormat.getPercentInstance(loc);
+            } else {
+                nf = NumberFormat.getNumberInstance(loc);
+            }
+            if (props.has("decimals") && !props.isNull("decimals")) {
+                int d = Math.max(0, Math.min(20, props.optInt("decimals", 0)));
+                nf.setMinimumFractionDigits(d);
+                nf.setMaximumFractionDigits(d);
+            }
+            return nf.format(v);
+        } catch (Exception e) {
+            return String.valueOf(v);
+        }
+    }
 
     Renderer(Context ctx, ViewGroup host, TinyJump tj) {
         this.ctx = ctx;
@@ -557,6 +621,7 @@ final class Renderer {
                 return new Node(id, kind, img, null);
             }
             case "Time":
+            case "Format":
             case "Text": {
                 TextView t = new TextView(ctx);
                 // Align to the layout's start (right in RTL), like the web, not to the text's own direction.
@@ -670,7 +735,7 @@ final class Renderer {
         int minH = px(44);
         int padH = px(14);
         int activeColor = n.theme != null ? n.theme.accent : 0xFF2563EB;
-        int inactiveColor = n.theme != null ? n.theme.fg : 0xFF374151;
+        int inactiveColor = n.theme != null ? n.theme.muted : 0xFF374151;
         for (int i = 0; i < items.length(); i++) {
             Object raw = items.opt(i);
             final String val;
@@ -715,7 +780,7 @@ final class Renderer {
         if (row == null) return;
         String current = n.props.isNull("value") ? null : n.props.optString("value", null);
         int activeColor = n.theme != null ? n.theme.accent : 0xFF2563EB;
-        int inactiveColor = n.theme != null ? n.theme.fg : 0xFF374151;
+        int inactiveColor = n.theme != null ? n.theme.muted : 0xFF374151;
         for (int i = 0; i < row.getChildCount(); i++) {
             View child = row.getChildAt(i);
             if (!(child instanceof Button)) continue;
@@ -728,16 +793,18 @@ final class Renderer {
     }
 
     private ThemeStyle resolveTheme(Node n) {
-        boolean hasAny = n.props.has("mode") || n.props.has("accent") || n.props.has("color") || n.props.has("surface");
+        boolean hasAny = n.props.has("mode") || n.props.has("accent") || n.props.has("color") || n.props.has("surface") || n.props.has("muted");
         if (!hasAny) return null;
         String mode = n.props.optString("mode", "");
         boolean dark = "dark".equals(mode)
                 || ("system".equals(mode) && (ctx.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES);
         Integer customFg = n.props.has("color") ? color(n.props.optString("color", "")) : null;
         Integer customAccent = n.props.has("accent") ? color(n.props.optString("accent", "")) : null;
+        Integer customMuted = n.props.has("muted") ? color(n.props.optString("muted", "")) : null;
         int fg = customFg != null ? customFg : (dark ? 0xFFF9FAFB : 0xFF111827);
         int accent = customAccent != null ? customAccent : (dark ? 0xFF60A5FA : 0xFF2563EB);
-        return new ThemeStyle(dark, fg, accent);
+        int muted = customMuted != null ? customMuted : (dark ? 0xFF9CA3AF : 0xFF6B7280);
+        return new ThemeStyle(dark, fg, accent, muted);
     }
 
     private void propagateTheme(Node n, ThemeStyle inherited) {
@@ -758,7 +825,7 @@ final class Renderer {
             ((IconView) n.view).setIconColor(t != null ? t.fg : 0xFF111827);
             return;
         }
-        if (("Text".equals(n.kind) || "Time".equals(n.kind)) && n.view instanceof TextView && !n.props.has("color")) {
+        if (("Text".equals(n.kind) || "Time".equals(n.kind) || "Format".equals(n.kind)) && n.view instanceof TextView && !n.props.has("color")) {
             TextView tv = (TextView) n.view;
             if (n.defaultTextColor == null) n.defaultTextColor = tv.getCurrentTextColor();
             tv.setTextColor(t != null ? t.fg : n.defaultTextColor);
@@ -789,7 +856,7 @@ final class Renderer {
             if ("Tabs".equals(n.kind) && "items".equals(k)) tabsItemsChanged = true;
             if ("Tabs".equals(n.kind) && "value".equals(k)) tabsValueChanged = true;
             if ("List".equals(n.kind) && "horizontal".equals(k)) listAxisChanged = true;
-            if ("Theme".equals(n.kind) && ("mode".equals(k) || "surface".equals(k) || "accent".equals(k) || "color".equals(k) || "background".equals(k))) {
+            if ("Theme".equals(n.kind) && ("mode".equals(k) || "surface".equals(k) || "accent".equals(k) || "muted".equals(k) || "color".equals(k) || "background".equals(k))) {
                 themeChanged = true;
                 box = true;
             }
@@ -832,7 +899,11 @@ final class Renderer {
                 }
             }
             if ("Time".equals(n.kind) && ("value".equals(k) || "show".equals(k) || "style".equals(k) || "zone".equals(k))) {
-                if (text != null) text.setText(Times.show(n.props));
+                if (text != null) text.setText(Times.show(n.props, this.locale));
+                return;
+            }
+            if ("Format".equals(n.kind) && ("value".equals(k) || "kind".equals(k) || "currency".equals(k) || "decimals".equals(k) || "locale".equals(k))) {
+                if (text != null) text.setText(formatNumber(n.props));
                 return;
             }
             String type = n.props.optString("type", "");
@@ -1085,7 +1156,7 @@ final class Renderer {
         for (int i = 0; i < tree.length(); i++) {
             JSONObject n = tree.getJSONObject(i);
             Node node = nodes.get(n.getInt("id"));
-            if (node != null && "Time".equals(node.kind)) {
+            if (node != null && ("Time".equals(node.kind) || "Format".equals(node.kind))) {
                 // What the platform made of it, so agents read what people see.
                 n.getJSONObject("props").put("text", ((TextView) node.view).getText().toString());
             }

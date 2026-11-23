@@ -132,6 +132,12 @@ fn fingerprint(props: &Map<String, Json>) -> u64 {
 }
 
 impl Layout {
+    /// Drops cached leaf measurements (e.g. when the active locale changes and host-formatted
+    /// `<Format>` / `<Time>` widgets change width without changing props).
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+    }
+
     /// Lays the tree out in a `width` x `height` viewport and returns the frames that changed.
     /// Right-to-left locales (`rtl`) mirror it: rows run from the right, start and end swap.
     pub fn compute(&mut self, tree: &Tree, width: f32, height: f32, rtl: bool, measure: &mut dyn Measure) -> Vec<Frame> {

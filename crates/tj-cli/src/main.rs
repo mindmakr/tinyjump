@@ -68,7 +68,9 @@ USAGE:
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
-  tj review [--target <url>]     check a running app for layout, accessibility and contrast problems
+  tj review [<app.tj> [--locale <tag>]... [--width <n>] [--height <n>] | --target <url>]
+                                 check a running app (with --target) or an app file offline across every
+                                 locale in `locales/*.json` + pseudo-locale (RTL, overflow, a11y, contrast)
   tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
   tj privacy export|erase <person id> [--target <url>]
                                  everything a running server holds about a person, or erase it
@@ -167,6 +169,10 @@ struct Args {
     plugins: Vec<String>,
     checkpoints: Option<PathBuf>,
     min_trust: Option<registry::Trust>,
+    review_locales: Vec<String>,
+    review_pseudo: bool,
+    width: Option<f32>,
+    height: Option<f32>,
 }
 
 impl Args {
@@ -179,7 +185,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None, review_locales: Vec::new(), review_pseudo: false, width: None, height: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -211,6 +217,22 @@ fn parse_args() -> Result<Args, String> {
             "--plugin" => args.plugins.push(value()?),
             "--checkpoints" => args.checkpoints = Some(PathBuf::from(value()?)),
             "--min-trust" => args.min_trust = Some(registry::Trust::parse(&value()?)?),
+            "--locale" => args.review_locales.push(value()?),
+            "--pseudo" => args.review_pseudo = true,
+            "--width" => {
+                let w: f32 = value()?.parse().map_err(|_| "--width must be a positive number")?;
+                if !w.is_finite() || w <= 0.0 {
+                    return Err("--width must be a finite positive number".into());
+                }
+                args.width = Some(w);
+            }
+            "--height" => {
+                let h: f32 = value()?.parse().map_err(|_| "--height must be a positive number")?;
+                if !h.is_finite() || h <= 0.0 {
+                    return Err("--height must be a finite positive number".into());
+                }
+                args.height = Some(h);
+            }
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -356,7 +378,7 @@ fn main() -> ExitCode {
         "bench" => run_bench(&args),
         "serve" => serve(&args, false),
         "dev" => serve(&args, true),
-        "review" => review(&args.target),
+        "review" => review_cmd(&args),
         "stats" => inspect(&args.target).map(|s| print!("{}", stats::report(&s))),
         "audit" => audit_verify(&args),
         "store" => store_rekey(&args),
@@ -370,6 +392,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Prints the review of a running app or runs an offline multi-locale + pseudo-locale sweep.
+fn review_cmd(args: &Args) -> Result<(), String> {
+    if let Some(file) = &args.file {
+        let width = args.width.unwrap_or(390.0);
+        let height = args.height.unwrap_or(844.0);
+        let src = read_source(file)?;
+        let name = file.display().to_string();
+        let program = tj_core::load(&src).map_err(|errs| errs.iter().map(|d| d.render(&name, &src)).collect::<Vec<_>>().join("\n\n"))?;
+        let mut locales = args.review_locales.clone();
+        if locales.is_empty() {
+            if program.locales.is_empty() {
+                locales.push("en".into());
+            } else {
+                locales.extend(program.locales.tags().map(str::to_string));
+            }
+            locales.push("pseudo".into());
+        } else if args.review_pseudo && !locales.iter().any(|l| l.eq_ignore_ascii_case("pseudo")) {
+            locales.push("pseudo".into());
+        }
+        for w in program.locales.warnings() {
+            eprintln!("warning: {w}");
+        }
+        let runs = test_runner::review_locales(&src, &locales, width, height)?;
+        let mut any_error = false;
+        for run in &runs {
+            let dir = if run.rtl { "rtl" } else { "ltr" };
+            println!("=== locale: {} ({dir}, {:.0}x{:.0}) ===", run.locale, width, height);
+            print!("{}", review::report(&run.snapshot, &run.findings));
+            if run.findings.iter().any(|f| f.severity == review::Severity::Error) {
+                any_error = true;
+            }
+        }
+        if any_error {
+            return Err("review found errors".into());
+        }
+        return Ok(());
+    }
+    if !args.review_locales.is_empty() || args.review_pseudo || args.width.is_some() || args.height.is_some() {
+        return Err("offline review flags (--locale, --pseudo, --width, --height) require an <app.tj> file".into());
+    }
+    review(&args.target)
 }
 
 /// Prints the review of a running app; fails if it found errors, so CI can gate on it.
@@ -432,6 +497,9 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
     match tj_core::compile(&src) {
         Ok(program) => {
             if show_manifest && as_json {
+                for w in program.locales.warnings() {
+                    eprintln!("warning: {w}");
+                }
                 let (_, warnings) = registry::check_lockfile(app_dir, min_trust)?;
                 for w in warnings {
                     eprintln!("warning: {w}");
@@ -457,6 +525,9 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 };
                 if as_json {
                     let mut failures = Vec::new();
+                    for w in program.locales.warnings() {
+                        eprintln!("warning: {w}");
+                    }
                     match registry::check_lockfile(app_dir, min_trust) {
                         Ok((_, warnings)) => {
                             for w in warnings {
@@ -496,6 +567,9 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
 #[allow(clippy::too_many_arguments)]
 fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core::vm::program::Program, show_manifest: bool, access: bool, privacy: bool, record: bool, pack: Option<&Path>, min_trust: Option<registry::Trust>) -> Result<(), String> {
     let mut failures = Vec::new();
+    for w in program.locales.warnings() {
+        eprintln!("warning: {w}");
+    }
     match registry::check_lockfile(app_dir, min_trust) {
         Ok((lines, warnings)) => {
             if !lines.is_empty() {

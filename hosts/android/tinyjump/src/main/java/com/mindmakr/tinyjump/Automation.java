@@ -126,7 +126,11 @@ final class Automation {
                     throw new IllegalStateException(e);
                 }
                 if (!replies) {
-                    tj.send(input);
+                    if ("locale".equals(input.optString("type"))) {
+                        tj.setLocale(input.optString("locale", ""));
+                    } else {
+                        tj.send(input);
+                    }
                     out.set(ok(JSONObject.NULL));
                     done.countDown();
                     return;

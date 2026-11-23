@@ -17,6 +17,9 @@ const IDENTITY_NAMES: &[&str] = &["author", "by", "user", "userId", "owner", "wh
 pub fn warnings(source: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     for f in modules::files(source) {
+        if tj_core::i18n::is_locale_file(&f.name) {
+            continue;
+        }
         let Ok(program) = parse_range(source, f.start, f.end) else { continue };
         for item in &program.items {
             let Item::Object(o) = item else { continue };
@@ -47,6 +50,9 @@ pub fn warnings(source: &str) -> Vec<String> {
 pub fn report(source: &str) -> String {
     let mut table = String::new();
     for f in modules::files(source) {
+        if tj_core::i18n::is_locale_file(&f.name) {
+            continue;
+        }
         let Ok(program) = parse_range(source, f.start, f.end) else { continue };
         for item in &program.items {
             let Item::Object(o) = item else { continue };

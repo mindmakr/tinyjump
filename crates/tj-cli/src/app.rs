@@ -16,7 +16,7 @@ pub fn read(entry: &Path) -> Result<App, String> {
     // Precompiled binary `.tjb` bytecode: wrap into the UTF-8 bundle format so every command
     // (`tj serve`, `tj bench`, `tj reload`) loads it without invoking the compiler.
     if let Ok(raw) = std::fs::read(entry) {
-        if raw.starts_with(tj_core::vm::bytecode::MAGIC) {
+        if raw.starts_with(b"TJB") {
             return Ok(App { source: tj_core::vm::bytecode::bundle_from_bytes(&raw), files: vec![entry.to_path_buf()] });
         }
     }
@@ -78,6 +78,29 @@ pub fn read(entry: &Path) -> Result<App, String> {
         }
         i += 1;
     }
+    // Auto-discover `locales/<tag>.json` next to the entry file (sorted for deterministic builds).
+    let locales_dir = dir.join("locales");
+    if let Ok(entries) = std::fs::read_dir(&locales_dir) {
+        watched.push(locales_dir.clone());
+        let mut json_files: Vec<(String, PathBuf)> = entries
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let path = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if path.is_file() && name.ends_with(".json") {
+                    Some((format!("locales/{name}"), path))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        json_files.sort_by(|a, b| a.0.cmp(&b.0));
+        for (bundle_name, path) in json_files {
+            watched.push(path.clone());
+            let content = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            sources.push((bundle_name, content));
+        }
+    }
     Ok(App { source: modules::bundle(&sources), files: watched })
 }
 
@@ -99,6 +122,13 @@ mod tests {
         assert_eq!(app.files.len(), 4, "watches the missing file too, so creating it reloads");
         let one = read(&dir.join("b.tj")).expect("reads");
         assert_eq!(one.source, "export const b = 2\n", "a one-file app is its source");
+        // Auto-discovers locales/*.json sorted next to the entry file.
+        std::fs::create_dir_all(dir.join("locales")).expect("locales dir");
+        std::fs::write(dir.join("locales/en.json"), r#"{"hi":"Hello"}"#).expect("write en");
+        std::fs::write(dir.join("locales/ar.json"), r#"{"hi":"مرحبا"}"#).expect("write ar");
+        let with_loc = read(&dir.join("b.tj")).expect("reads with locales");
+        let loc_names: Vec<String> = modules::files(&with_loc.source).into_iter().map(|f| f.name).collect();
+        assert_eq!(loc_names, ["b.tj", "locales/ar.json", "locales/en.json"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

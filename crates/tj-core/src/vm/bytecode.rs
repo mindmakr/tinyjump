@@ -1,4 +1,4 @@
-//! Ahead-of-time bytecode serialization (`TJB\x01`) and validation.
+//! Ahead-of-time bytecode serialization (`TJB\x02`) and validation.
 //!
 //! `tj build` compiles a `.tj` app once into compact binary bytecode (`.tjb`) or a
 //! UTF-8 bundle (`//# tjb:1:<base64>`) that every host (`tj-wasm`, `tj-android`, `tj-ffi`,
@@ -12,8 +12,8 @@ use super::value::Value;
 use indexmap::IndexMap;
 use std::rc::Rc;
 
-/// Binary `.tjb` file header: magic `TJB` + format version `1`.
-pub const MAGIC: &[u8; 4] = b"TJB\x01";
+/// Binary `.tjb` file header: magic `TJB` + format version `2`.
+pub const MAGIC: &[u8; 4] = b"TJB\x02";
 
 /// UTF-8 transport prefix accepted by `JsonHost::boot` and `tj serve` alongside `.tj` source.
 pub const BUNDLE_PREFIX: &str = "//# tjb:1:";
@@ -351,7 +351,7 @@ pub fn decode(bytes: &[u8]) -> Result<Program, String> {
 fn decode_inner(bytes: &[u8]) -> Res<Program> {
     let mut r = Reader { bytes, pos: 0 };
     if r.take(4)? != MAGIC {
-        return Err("invalid bytecode header (expected TJB v1)");
+        return Err("invalid bytecode header (expected TJB v2)");
     }
     if r.u16()? as usize != builtins::GLOBALS.len() {
         return Err("bytecode builtin count mismatch; rebuild with this tj version");
@@ -485,6 +485,48 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
         main.push(r.u32()?);
     }
     let app = if r.bool()? { Some(r.u32()?) } else { None };
+    let locale_base = r.str()?;
+    let n_locales = r.count(8)?;
+    let mut locale_tables = Vec::with_capacity(n_locales);
+    for _ in 0..n_locales {
+        let tag = r.str()?;
+        let n_msgs = r.count(5)?;
+        let mut entries = Vec::with_capacity(n_msgs);
+        for _ in 0..n_msgs {
+            let key = r.str()?;
+            let msg = match r.u8()? {
+                0 => crate::i18n::Message::Text(r.str()?),
+                1 => {
+                    let mask = r.u8()?;
+                    if mask & !0x3f != 0 || mask & (1 << crate::i18n::PLURAL_OTHER) == 0 {
+                        return Err("bytecode invalid plural mask");
+                    }
+                    let mut forms: [Option<Rc<str>>; 6] = Default::default();
+                    for (bit, slot) in forms.iter_mut().enumerate() {
+                        if mask & (1 << bit) != 0 {
+                            *slot = Some(r.str()?);
+                        }
+                    }
+                    crate::i18n::Message::Plural(Box::new(forms))
+                }
+                _ => return Err("bytecode invalid message tag"),
+            };
+            if entries.iter().any(|(k, _)| *k == key) {
+                return Err("bytecode duplicate translation key");
+            }
+            entries.push((key, msg));
+        }
+        if locale_tables.iter().any(|t: &crate::i18n::LocaleTable| t.tag == tag) {
+            return Err("bytecode duplicate locale tag");
+        }
+        locale_tables.push(crate::i18n::LocaleTable { tag, entries });
+    }
+    let locales = crate::i18n::Locales { base: locale_base, tables: locale_tables };
+    if (locales.base.is_empty() && !locales.tables.is_empty())
+        || (!locales.base.is_empty() && locales.table(&locales.base).is_none())
+    {
+        return Err("bytecode base locale missing from locale tables");
+    }
     if r.pos != bytes.len() {
         return Err("unexpected trailing bytes in bytecode");
     }
@@ -495,7 +537,7 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
             }
         }
     }
-    let program = Program { protos, consts, elems, objects, globals, main, app, user_source: Rc::from("") };
+    let program = Program { protos, consts, elems, objects, globals, main, app, locales, user_source: Rc::from("") };
     validate(&program)?;
     Ok(program)
 }
@@ -829,6 +871,34 @@ mod enc {
         match p.app {
             Some(slot) => { w.bool(true); w.u32(slot); }
             None => w.bool(false),
+        }
+        w.str(&p.locales.base)?;
+        w.len(p.locales.tables.len())?;
+        for table in &p.locales.tables {
+            w.str(&table.tag)?;
+            w.len(table.entries.len())?;
+            for (key, msg) in &table.entries {
+                w.str(key)?;
+                match msg {
+                    crate::i18n::Message::Text(s) => {
+                        w.u8(0);
+                        w.str(s)?;
+                    }
+                    crate::i18n::Message::Plural(forms) => {
+                        w.u8(1);
+                        let mut mask = 0u8;
+                        for (bit, slot) in forms.iter().enumerate() {
+                            if slot.is_some() {
+                                mask |= 1 << bit;
+                            }
+                        }
+                        w.u8(mask);
+                        for slot in forms.iter().flatten() {
+                            w.str(slot)?;
+                        }
+                    }
+                }
+            }
         }
         Ok(w.0)
     }

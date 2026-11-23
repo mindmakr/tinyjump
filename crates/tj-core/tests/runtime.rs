@@ -4232,3 +4232,139 @@ function App() {
     let (_, bad_out) = Runtime::boot(compile(dyn_bad).unwrap(), Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
     assert!(bad_out.iter().any(|o| matches!(o, Output::Error { message, .. } if message.contains("invalid component name"))), "{bad_out:?}");
 }
+
+#[test]
+fn translations_locales_plurals_format_and_aot_roundtrip() {
+    let en = r#"{
+  "title": "Tasks",
+  "hello": "Hello {name}",
+  "tasks.remaining": {
+    "zero": "All done",
+    "one": "1 task left",
+    "other": "{count} tasks left"
+  }
+}"#;
+    let ar = r#"{
+  "title": "المهام",
+  "tasks.remaining": {
+    "zero": "لا مهام",
+    "one": "مهمة واحدة",
+    "two": "مهمتان",
+    "few": "{count} مهام",
+    "many": "{count} مهمة",
+    "other": "{count} مهمة"
+  }
+}"#;
+    let app = r#"
+object Board {
+  n: number = 2
+  set(v: number) { this.n = v }
+}
+function App() {
+  const b = Board.get("main")
+  return (
+    <Column padding={16} gap={8}>
+      <Text id="title">{t("title")}</Text>
+      <Text id="hi">{t("hello", { name: "Ana" })}</Text>
+      <Text id="rem">{t("tasks.remaining", { count: b.n })}</Text>
+      <Format id="price" value={19.99} kind="currency" currency="USD" />
+    </Column>
+  )
+}
+"#;
+    let bundle = tj_core::modules::bundle(&[
+        ("app.tj".into(), app.into()),
+        ("locales/en.json".into(), en.into()),
+        ("locales/ar.json".into(), ar.into()),
+    ]);
+
+    // Compile + round-trip through AOT bytecode to confirm locales survive `tj build`.
+    let prog = compile(&bundle).expect("valid i18n app compiles");
+    let warnings = prog.locales.warnings();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("missing key 'hello'"));
+
+    let tjb = tj_core::vm::bytecode::encode_bundle(&prog).expect("encodes to .tjb");
+    let loaded = tj_core::load(&tjb).expect("decodes .tjb with locales");
+    let (mut rt, _) = Runtime::boot(loaded, Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+
+    // Default English locale
+    let snap = rt.inspect();
+    assert_eq!(snap["locale"], json!("en"));
+    let tree_str = snap["tree"].to_string();
+    assert!(tree_str.contains("Tasks") && tree_str.contains("Hello Ana") && tree_str.contains("2 tasks left"), "{tree_str}");
+    assert!(tree_str.contains("\"kind\":\"Format\"") && tree_str.contains("\"currency\":\"USD\""), "{tree_str}");
+
+    // Switch to Arabic (ar-SA falls back to ar, missing "hello" falls back to base "en")
+    let out = rt.handle(2.0, Input::Locale { locale: "ar-SA".into() });
+    assert!(out.iter().any(|o| matches!(o, Output::Patch { .. })), "switching locale must re-render");
+    let snap = rt.inspect();
+    assert_eq!(snap["locale"], json!("ar-SA"));
+    let tree_str = snap["tree"].to_string();
+    assert!(tree_str.contains("المهام") && tree_str.contains("Hello Ana") && tree_str.contains("مهمتان"), "{tree_str}");
+
+    // Switch to pseudo-locale
+    rt.handle(3.0, Input::Locale { locale: "pseudo".into() });
+    let pseudo_tree = rt.inspect()["tree"].to_string();
+    assert!(pseudo_tree.contains("Ana") && pseudo_tree.contains('['), "{pseudo_tree}");
+
+    // Compile-time checks: unknown key, missing placeholder, unknown placeholder, non-numeric count, extra params
+    let bad = |code: &str| {
+        let b = tj_core::modules::bundle(&[("app.tj".into(), code.into()), ("locales/en.json".into(), en.into())]);
+        errors(&b)
+    };
+    assert!(bad(r#"function App() { return <Text>{t("titel")}</Text> }"#).contains("unknown translation key 'titel'"));
+    assert!(bad(r#"function App() { return <Text>{t("hello")}</Text> }"#).contains("requires parameters: name"));
+    assert!(bad(r#"function App() { return <Text>{t("hello", { who: "Ana" })}</Text> }"#).contains("missing placeholder 'name'"));
+    assert!(bad(r#"function App() { return <Text>{t("hello", { name: "Ana", extra: 1 })}</Text> }"#).contains("unknown placeholder 'extra'"));
+    assert!(bad(r#"function App() { return <Text>{t("tasks.remaining", { count: "two" })}</Text> }"#).contains("numeric 'count'"));
+    assert!(bad(r#"function App() { return <Text>{t("title", { x: 1 })}</Text> }"#).contains("takes no placeholders"));
+
+    // Critic 053 carryover (NC-2) + Critic 056 (C-056.7): @pii passed into any <Native> prop
+    // including `id` requires reveal() with a declared purpose.
+    let native_pii = r#"
+@server @read("owner") object Profile {
+  @pii("contact", "support") email: string = ""
+}
+function App() {
+  const p = Profile.get(caller.id)
+  return <Native name="MapView" userEmail={p.email} />
+}
+"#;
+    assert!(errors(native_pii).contains("custom <Native> view"));
+    let native_id_pii = r#"
+@server @read("owner") object Profile {
+  @pii("contact", "support") email: string = ""
+}
+function App() {
+  const p = Profile.get(caller.id)
+  return <Native name="MapView" id={p.email} />
+}
+"#;
+    assert!(errors(native_id_pii).contains("custom <Native> view"));
+
+    // Critic 056 (C-056.2): Input::Locale invalidates Taffy's leaf measurement cache so `<Format>`
+    // is re-measured on Android/iOS even when node id & props are unchanged.
+    struct CountingMeasure(std::rc::Rc<std::cell::Cell<usize>>);
+    impl tj_core::ui::layout::Measure for CountingMeasure {
+        fn measure(&mut self, _node: u32, _max_width: Option<f32>) -> (f32, f32) {
+            let n = self.0.get() + 1;
+            self.0.set(n);
+            (60.0 + (n as f32) * 10.0, 20.0)
+        }
+    }
+    let fmt_src = r#"function App() { return <Column><Format id="p" value={1234.5} kind="currency" currency="USD" /></Column> }"#;
+    let (mut lrt, _) = Runtime::boot(compile(fmt_src).unwrap(), Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    lrt.set_measure(Box::new(CountingMeasure(calls.clone())));
+    let _ = lrt.handle(1.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    let after_first = calls.get();
+    assert!(after_first > 0);
+    // Same locale -> cached (no new measure calls).
+    let _ = lrt.handle(2.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    assert_eq!(calls.get(), after_first);
+    // Switching locale invalidates cache -> `<Format>` is re-measured.
+    let _ = lrt.handle(3.0, Input::Locale { locale: "de-DE".into() });
+    let _ = lrt.handle(4.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    assert!(calls.get() > after_first, "locale change must invalidate layout measurement cache");
+}

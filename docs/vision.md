@@ -189,26 +189,27 @@ and apply the frames, and the web host uses the browser's own flexbox, which fol
 same rules. Layout is identical everywhere and testable without a device
 (`ui/layout.rs` tests).
 
-## Languages and locales (planned)
+## Languages and locales (done)
 
-Apps must work in any language, including Chinese, Arabic, Urdu and the European
-languages, with local time, number and currency formats.
+Apps work in any language, including Chinese, Arabic, Urdu and the European languages, with
+local time, number and currency formats.
 
 - **Scripts and input** come from the platform: native widgets shape and render complex
   scripts (Urdu Nastaliq, Arabic, CJK) and handle input methods. Hosts measure text, so
   layout stays correct.
 - **Right-to-left (done):** the shared layout engine mirrors layout for RTL locales (rows
   reverse, start and end swap), so every host mirrors identically. The web host sets `dir`.
-- **Translations:** a built-in `t("key", { count })` with per-locale message files, plural
-  rules and fallback to a base locale. Keys are type-checked, so a missing key is a compile
-  error.
-- **Dates, numbers and currencies** are formatted by the host (Intl on the web, system
-  formatters on iOS and Android, ICU on servers). The data stays accurate and the core stays
-  tiny; bundling ICU data would add megabytes. Tests use a fixed formatter, so results are
-  deterministic. Time zones come from the host, and timestamps stay UTC milliseconds.
-- **Testing:** `tj review` checks for truncation and overflow in every locale, missing
-  translations and RTL mirroring, and runs a pseudo-locale (long, accented text) to catch
-  layout breaks early.
+- **Translations (done):** built-in `t("key", { count })` with `locales/*.json` message
+  files, CLDR plural rules (`zero`, `one`, `two`, `few`, `many`, `other`) and base-locale
+  fallback. Keys, placeholders and numeric plural counts are checked at compile time;
+  `tj check` warns on missing or mismatched translations across locales.
+- **Dates, numbers and currencies (done):** `<Time>` and `<Format>` format dates, numbers,
+  currencies and percentages with the host's own formatter (`Intl` on the web, `NumberFormat`
+  on Android, `NumberFormatter` on iOS). The core ships zero ICU data. Offline tests and
+  reviews use a fixed deterministic formatter.
+- **Testing (done):** `tj review <app.tj>` sweeps every locale in `locales/*.json` plus a
+  built-in `"pseudo"` locale (accented text expanded ~35%) with automatic RTL mirroring to
+  catch truncation, overflow, overlap and missing translations before release.
 
 ## Modules and app builds
 

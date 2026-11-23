@@ -42,22 +42,25 @@ final class Times {
         return f;
     }
 
-    /** What a `<Time>` shows. */
-    static String show(JSONObject props) {
+    /** What a `<Time>` shows in the viewer's active locale. */
+    static String show(JSONObject props, String localeTag) {
         Object v = props.opt("value");
         if (!(v instanceof Number)) return "";
         Date at = new Date(((Number) v).longValue());
         String show = props.optString("show", "datetime");
         TimeZone tz = zone(props.optString("zone", ""));
+        Locale loc = (localeTag == null || localeTag.isEmpty())
+                ? Locale.getDefault()
+                : ("pseudo".equalsIgnoreCase(localeTag) ? Locale.US : Locale.forLanguageTag(localeTag.replace('_', '-')));
         DateFormat f;
         if ("iso".equals(props.optString("style", ""))) {
             f = iso("date".equals(show) ? "yyyy-MM-dd" : "time".equals(show) ? "HH:mm" : "yyyy-MM-dd HH:mm", tz);
         } else if ("date".equals(show)) {
-            f = DateFormat.getDateInstance(DateFormat.MEDIUM);
+            f = DateFormat.getDateInstance(DateFormat.MEDIUM, loc);
         } else if ("time".equals(show)) {
-            f = DateFormat.getTimeInstance(DateFormat.SHORT);
+            f = DateFormat.getTimeInstance(DateFormat.SHORT, loc);
         } else {
-            f = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT);
+            f = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT, loc);
         }
         f.setTimeZone(tz);
         return f.format(at);

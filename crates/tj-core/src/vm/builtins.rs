@@ -32,6 +32,8 @@ pub const GLOBALS: &[Global] = &[
     ("Error", || native("Error", |_, a| Ok(error_record(&arg(a, 0).display())))),
     // `check(ok, field, message)`: a rule on input, the same in UI code and on the server.
     ("check", || native("check", check)),
+    // `t(key, params?)`: localized message lookup from `locales/*.json` (i18n.rs).
+    ("t", || native("t", translate)),
     ("__fetch", || native("fetch", fetch)),
     // Only plugin modules (`tj:<name>`) may call these; apps import their typed functions.
     ("plugin", || native("plugin", plugin)),
@@ -89,6 +91,19 @@ fn console_warn(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
 fn console_error(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
     rt.log("error", log_line(a));
     Ok(Value::Null)
+}
+
+fn translate(rt: &mut Runtime, a: &[Value]) -> Result<Value, Exc> {
+    let key = text(a, 0, "t")?;
+    let out = match arg(a, 1) {
+        Value::Null => rt.program.locales.translate(&rt.locale, &key, None),
+        Value::Rec(r) => {
+            let borrowed = r.borrow();
+            rt.program.locales.translate(&rt.locale, &key, Some(&borrowed))
+        }
+        v => return Err(Exc::msg(format!("t expects a record of parameters, got {}", v.type_name()))),
+    };
+    Ok(Value::str(&out))
 }
 
 fn math() -> Value {

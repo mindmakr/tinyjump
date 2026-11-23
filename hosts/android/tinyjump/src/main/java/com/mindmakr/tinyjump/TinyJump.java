@@ -103,10 +103,26 @@ public final class TinyJump {
         for (byte b : bytes) hex.append(String.format("%02x", b & 0xff));
         try {
             tj.send(input("entropy").put("bytes", hex.toString()));
+            String loc = tj.renderer.locale();
+            if (loc != null && !loc.isEmpty() && !"en".equalsIgnoreCase(loc)) {
+                tj.send(input("locale").put("locale", loc));
+            }
         } catch (JSONException e) {
             throw new IllegalStateException(e);
         }
         return tj;
+    }
+
+    /** Switches the active BCP-47 locale (or "pseudo") and re-renders translations and formatters. */
+    public void setLocale(String locale) {
+        assertMain();
+        renderer.setLocale(locale);
+        try {
+            send(input("locale").put("locale", renderer.locale()));
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        layout();
     }
 
     /**

@@ -227,8 +227,10 @@ impl Runtime {
                     }
                     Op::MakeCell(s) => {
                         let slot = &mut f.stack[base + s as usize];
-                        let v = std::mem::replace(slot, Value::Null);
-                        *slot = Value::Cell(Rc::new(RefCell::new(v)));
+                        if !matches!(slot, Value::Cell(_)) {
+                            let v = std::mem::replace(slot, Value::Null);
+                            *slot = Value::Cell(Rc::new(RefCell::new(v)));
+                        }
                     }
                     Op::LoadCell(s) => {
                         let v = match &f.stack[base + s as usize] {
