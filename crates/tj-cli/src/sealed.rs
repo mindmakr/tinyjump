@@ -362,15 +362,19 @@ fn is_sealed_name(name: &str) -> bool {
 /// missing setting never writes plain records next to sealed ones. Also returns a line for
 /// the startup banner.
 pub fn open_store(data: &Path, personal: &[String]) -> Result<(Box<dyn Store>, String), String> {
+    let key_file = std::env::var_os(KEY_FILE_ENV).filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+    open_store_at(data, personal, key_file.as_deref())
+}
+
+/// Like [`open_store`], using an explicit optional key file path instead of reading `TJ_KEY_FILE`.
+pub fn open_store_at(data: &Path, personal: &[String], key_file: Option<&Path>) -> Result<(Box<dyn Store>, String), String> {
     let mut files = FileStore::open(data).map_err(|e| format!("cannot open data dir {}: {e}", data.display()))?;
     let names = files.keys("")?;
-    let key_file = std::env::var_os(KEY_FILE_ENV).filter(|v| !v.is_empty());
     match key_file {
         Some(path) => {
             if names.iter().any(|n| !is_sealed_name(n)) {
                 return Err(format!("{} holds records that are not encrypted; with the server stopped, run `tj store rekey --data {}` to encrypt them", data.display(), data.display()));
             }
-            let path = Path::new(&path);
             let (keys, created) = Keyring::load(path)?;
             let own = own_keys_dir(path);
             let own_store = FileStore::open(&own).map_err(|e| format!("cannot open {}: {e}", own.display()))?;
@@ -407,6 +411,19 @@ pub fn rekey(data: &Path) -> Result<String, String> {
     let own = own_keys_dir(Path::new(&path));
     let mut own_files = FileStore::open(&own).map_err(|e| format!("cannot open {}: {e}", own.display()))?;
     rewrapped += rekey_with(&keys, &mut own_files)?.1;
+    let webhooks_dir = data.join("webhooks");
+    if webhooks_dir.exists() {
+        let mut wh_files = FileStore::open(&webhooks_dir).map_err(|e| format!("cannot open {}: {e}", webhooks_dir.display()))?;
+        let (ws, wr) = rekey_with(&keys, &mut wh_files)?;
+        rewrapped += wr;
+        if ws > 0 {
+            return Ok(format!(
+                "{} record(s) encrypted ({ws} webhook queue), {rewrapped} re-wrapped under key {}\n",
+                sealed + ws,
+                keys.current().0
+            ));
+        }
+    }
     let mut report = format!("{sealed} record(s) encrypted, {rewrapped} re-wrapped under key {}\n", keys.current().0);
     if sealed > 0 {
         report += "records of objects that belong to a person get a key of their own when the server next saves them; until then, erasing them does not reach backups\n";

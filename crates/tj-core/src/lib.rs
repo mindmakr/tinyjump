@@ -21,7 +21,7 @@ pub mod vm;
 pub use compile::compile;
 #[cfg(feature = "check")]
 pub use {
-    compile::{facts, Facts},
+    compile::{check_remote_flows, facts, facts_with_remotes, Facts},
     flow::{Destination, Reveal, Transfer},
 };
 pub use runtime::protocol::{Input, Output, PatchOp, Target};

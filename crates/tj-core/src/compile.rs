@@ -37,6 +37,11 @@ pub struct Facts {
 
 #[cfg(feature = "check")]
 pub fn facts(src: &str) -> Facts {
+    facts_with_remotes(src, &HashMap::new())
+}
+
+#[cfg(feature = "check")]
+pub fn facts_with_remotes(src: &str, remote_dests: &HashMap<String, crate::flow::Destination>) -> Facts {
     let src = &*modules::with_built_ins(src);
     let files = modules::files(src);
     let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
@@ -44,8 +49,29 @@ pub fn facts(src: &str) -> Facts {
         return Facts::default();
     }
     let named: Vec<(&str, &crate::syntax::ast::Program)> = files.iter().map(|f| f.name.as_str()).zip(&parsed).collect();
-    let (reveals, transfers) = crate::flow::reveals_and_transfers(&named);
+    let (reveals, transfers) = crate::flow::reveals_and_transfers_with_remotes(&named, remote_dests);
     Facts { reveals, transfers, lawful_basis: crate::lawful_basis::declared(&named) }
+}
+
+/// Checks personal-data flows in `src` treating `remote_dests` (`remotes.json`) as external sinks.
+#[cfg(feature = "check")]
+pub fn check_remote_flows(src: &str, remote_dests: &HashMap<String, crate::flow::Destination>) -> Vec<Diagnostic> {
+    if remote_dests.is_empty() {
+        return Vec::new();
+    }
+    let src = &*modules::with_built_ins(src);
+    let files = modules::files(src);
+    let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
+    if parsed.len() != files.len() {
+        return Vec::new();
+    }
+    let mut errors = Vec::new();
+    let linked = modules::link(&files, &parsed, &mut errors);
+    if !errors.is_empty() {
+        return errors;
+    }
+    let named: Vec<(&str, &crate::syntax::ast::Program)> = linked.order.iter().map(|&i| (files[i].name.as_str(), &parsed[i])).collect();
+    crate::flow::check_with_remotes(&named, remote_dests)
 }
 
 /// Compiles a source file (plus the prelude) to a program.

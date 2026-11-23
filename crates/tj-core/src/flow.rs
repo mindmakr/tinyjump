@@ -147,6 +147,9 @@ struct Checker {
     needs_of: HashMap<*const FnDecl, Vec<String>>,
     /// The consents checked in the code being followed: the method's, and its closures'.
     needs: Vec<Vec<String>>,
+    /// Remote `@server` classes configured via `remotes.json`: calling a method on them sends
+    /// arguments over HTTP to another server, so they are treated as external sinks + transfers.
+    remote_dests: HashMap<String, Destination>,
 }
 
 /// Where personal data goes when it leaves the server.
@@ -236,13 +239,23 @@ fn has_pii(p: &Program) -> bool {
 
 /// Checks the files of an app (name and parsed file, plugin modules included).
 pub fn check(files: &[(&str, &Program)]) -> Vec<Diagnostic> {
-    analyze(files).map(|c| c.errors).unwrap_or_default()
+    check_with_remotes(files, &HashMap::new())
+}
+
+/// Checks the files of an app, treating methods on `remote_dests` (`remotes.json` classes)
+/// as external network sinks requiring `reveal()` and recording transfers.
+pub fn check_with_remotes(files: &[(&str, &Program)], remote_dests: &HashMap<String, Destination>) -> Vec<Diagnostic> {
+    analyze(files, remote_dests).map(|c| c.errors).unwrap_or_default()
 }
 
 /// Every `reveal` in the app, and every place revealed personal data leaves the server,
 /// in source order.
 pub fn reveals_and_transfers(files: &[(&str, &Program)]) -> (Vec<Reveal>, Vec<Transfer>) {
-    let Some(c) = analyze(files) else { return Default::default() };
+    reveals_and_transfers_with_remotes(files, &HashMap::new())
+}
+
+pub fn reveals_and_transfers_with_remotes(files: &[(&str, &Program)], remote_dests: &HashMap<String, Destination>) -> (Vec<Reveal>, Vec<Transfer>) {
+    let Some(c) = analyze(files, remote_dests) else { return Default::default() };
     // The check follows each path through the code, so one place is seen many times: one
     // entry per place (and purpose or destination), with every field it lets out.
     let mut reveals: Vec<Reveal> = Vec::new();
@@ -268,11 +281,11 @@ pub fn reveals_and_transfers(files: &[(&str, &Program)]) -> (Vec<Reveal>, Vec<Tr
     (reveals, transfers)
 }
 
-fn analyze(files: &[(&str, &Program)]) -> Option<Checker> {
+fn analyze(files: &[(&str, &Program)], remote_dests: &HashMap<String, Destination>) -> Option<Checker> {
     if !files.iter().any(|(_, p)| has_pii(p)) {
         return None;
     }
-    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), field_taint: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new() };
+    let mut c = Checker { classes: HashMap::new(), functions: HashMap::new(), plugin_fns: HashMap::new(), globals: HashSet::new(), global_vals: HashMap::new(), errors: Vec::new(), seen: HashSet::new(), memo: HashMap::new(), active: HashSet::new(), reveals: Vec::new(), transfers: Vec::new(), field_revealed: HashMap::new(), field_taint: HashMap::new(), consent_purposes: HashSet::new(), needs_of: HashMap::new(), needs: Vec::new(), remote_dests: remote_dests.clone() };
     c.consent_purposes = crate::lawful_basis::declared(files).unwrap_or_default().into_iter().filter(|(_, b)| b == "consent").map(|(p, _)| p).collect();
     // Readers a field's own @read adds see it whenever they look, consent or not: data held
     // for a purpose that rests on consent is shown to others only through `reveal`, in a
@@ -1103,6 +1116,15 @@ impl Checker {
         }
         let recv = self.expr(obj, fr);
         if let Val::Handle { class, other } = &recv {
+            if let Some(to) = self.remote_dests.get(&**class).cloned() {
+                let what = format!("the remote server `{class}.{name}()`");
+                for a in args {
+                    let v = self.expr(a, fr);
+                    self.sink(&v, a.span, &what);
+                    self.transfer(&v, a.span, &to);
+                }
+                return clean();
+            }
             let method = self.classes.get(class).and_then(|c| c.methods.get(name)).map(|(d, _)| d.clone());
             if let Some(m) = method {
                 let vals: Vec<Val> = args.iter().map(|a| self.expr(a, fr)).collect();

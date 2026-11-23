@@ -3993,3 +3993,148 @@ export async function callInner(obj: string, m: string, args: any[]): any {
     let c_dup = crt.handle(5.0, Input::Call { object: "Cart/c1".into(), method: "dupSameItem".into(), args: vec![], reply: Some(2), call: Some("co-2".into()), caller: who("alice", &[]) });
     assert!(c_dup.iter().any(|o| matches!(o, Output::Reply { reply: 2, error: Some(e), .. } if e.contains("already called in this call"))), "{c_dup:?}");
 }
+
+#[test]
+fn server_to_server_replicas_use_outbox_sync_and_skip_local_privacy() {
+    let src = r#"
+@server @read("anyone") object Stock {
+  @pii("other", "ops") note: string = ""
+  count: number = 0
+  @allow("anyone") reserve(n: number): number {
+    this.count -= n
+    return this.count
+  }
+}
+@server @read("anyone") object Order {
+  bought: number = 0
+  @allow("anyone") async buy(sku: string, n: number): number {
+    const left = await Stock.get(sku).reserve(n)
+    this.bought += n
+    return left
+  }
+  @allow("anyone") stockCount(sku: string): number {
+    return Stock.get(sku).count
+  }
+  @allow("anyone") stockIds(): string[] {
+    return Stock.all().map((s) => s.id)
+  }
+}
+object LocalOnly { x: number = 0 }
+"#;
+    // Unknown or non-@server remote_classes fail closed at boot.
+    assert!(Runtime::boot(compile(src).unwrap(), Box::new(MemStore::default()), Options { server: true, render: false, remote_classes: vec!["NoSuch".into()], ..Options::new(1.0, 7) }).is_err());
+    assert!(Runtime::boot(compile(src).unwrap(), Box::new(MemStore::default()), Options { server: true, render: false, remote_classes: vec!["LocalOnly".into()], ..Options::new(1.0, 7) }).is_err());
+
+    let store = Shared::default();
+    let boot_b = |now: f64| {
+        let mut rt = Runtime::boot(
+            compile(src).unwrap(),
+            Box::new(store.clone()),
+            Options { server: true, render: false, remote_classes: vec!["Stock".into()], ..Options::new(now, 7) },
+        )
+        .unwrap()
+        .0;
+        let ent = rt.handle(now, Input::Entropy { bytes: "aa".repeat(32) });
+        (rt, ent)
+    };
+    let (mut rt, _) = boot_b(10.0);
+
+    // Direct call to a remote class on Server B is refused (with or without Idempotency-Key).
+    let ref_direct = rt.handle(11.0, Input::Call { object: "Stock/sku-1".into(), method: "reserve".into(), args: vec![json!(1)], reply: Some(1), call: Some("k-rem".into()), caller: who("alice", &[]) });
+    assert!(ref_direct.iter().any(|o| matches!(o, Output::Reply { reply: 1, error: Some(e), .. } if e.contains("lives on another server"))), "{ref_direct:?}");
+
+    // Calling Stock.get("sku-1").reserve(2) from local Order/o1 emits Subscribe + Effect::Call with Idempotency-Key.
+    let out1 = rt.handle(12.0, Input::Call { object: "Order/o1".into(), method: "buy".into(), args: vec![json!("sku-1"), json!(2)], reply: Some(2), call: None, caller: who("alice", &[]) });
+    assert!(out1.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Stock/sku-1")), "{out1:?}");
+    let (eff1, call_id1) = out1
+        .iter()
+        .find_map(|o| match o {
+            Output::Effect { id, effect: Effect::Call { object, method, args, call } } if object == "Stock/sku-1" && method == "reserve" && *args == vec![json!(2)] => Some((*id, call.clone())),
+            _ => None,
+        })
+        .expect("expected Effect::Call to Stock/sku-1.reserve");
+
+    // Transient failure (`unreachable: true`) stays in outbox; `Input::Online` retries with the SAME call id!
+    let _ = rt.handle(13.0, Input::EffectDone { id: eff1, ok: None, error: Some("down".into()), field: None, unreachable: true });
+    let retry_out = rt.handle(14.0, Input::Online);
+    let (eff2, call_id2) = retry_out
+        .iter()
+        .find_map(|o| match o {
+            Output::Effect { id, effect: Effect::Call { call, .. } } => Some((*id, call.clone())),
+            _ => None,
+        })
+        .expect("Online must retry pending remote call");
+    assert_eq!(call_id1, call_id2, "retries must reuse the exact Idempotency-Key");
+
+    // Complete remote call -> Order/o1 finishes and persists bought = 2.
+    let done_out = rt.handle(15.0, Input::EffectDone { id: eff2, ok: Some(json!(3)), error: None, field: None, unreachable: false });
+    assert!(done_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(v), .. } if *v == json!(3))), "{done_out:?}");
+
+    // `Input::Sync` updates replica state without emitting local `Output::Changed` (no foreign seq leakage!).
+    let sync_out = rt.handle(16.0, Input::Sync { object: "Stock/sku-1".into(), state: json!({ "count": 3, "note": "secret" }), seq: Some(999) });
+    assert!(!sync_out.iter().any(|o| matches!(o, Output::Changed { .. })), "remote replica sync must not emit local server Output::Changed: {sync_out:?}");
+    assert_eq!(call_as(&mut rt, 17.0, "Order/o1", "stockCount", json!(["sku-1"]), who("alice", &[])).unwrap(), json!(3));
+
+    // `Stock.all()` subscribes to `Stock/*` and returns synced replicas.
+    let all_out = rt.handle(18.0, Input::Call { object: "Order/o1".into(), method: "stockIds".into(), args: vec![], reply: Some(3), call: None, caller: who("alice", &[]) });
+    assert!(all_out.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Stock/*")), "{all_out:?}");
+    assert!(all_out.iter().any(|o| matches!(o, Output::Reply { reply: 3, ok: Some(v), .. } if *v == json!(["sku-1"]))), "{all_out:?}");
+
+    // Server privacy export/erase skips remote replicas owned by another server.
+    let _ = rt.handle(19.0, Input::Sync { object: "Stock/user:alice".into(), state: json!({ "count": 1, "note": "from-remote" }), seq: Some(1000) });
+    assert_eq!(rt.export_subject("user:alice").unwrap(), json!({}));
+
+    // Durable outbox survives server restart and releases automatically on boot Entropy!
+    let out_pending = rt.handle(20.0, Input::Call { object: "Order/o1".into(), method: "buy".into(), args: vec![json!("sku-1"), json!(1)], reply: Some(4), call: None, caller: who("alice", &[]) });
+    let pending_call_id = out_pending.iter().find_map(|o| match o { Output::Effect { effect: Effect::Call { call, .. }, .. } => Some(call.clone()), _ => None }).unwrap();
+    drop(rt);
+    let (mut rt2, boot_ent_out) = boot_b(25.0);
+    assert!(boot_ent_out.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { call, .. }, .. } if *call == pending_call_id)), "server restart must resume pending remote outbox calls on boot: {boot_ent_out:?}");
+
+    // C-050.2: external `Input::Get`, `may_read`, `changed_since`, and `invoke()` refuse remote
+    // classes BEFORE `resolve_object` (never emitting `Output::Subscribe` for attacker-chosen IDs).
+    let get_ref = rt2.handle(26.0, Input::Get { object: "Stock/attacker-99".into(), reply: Some(5), caller: who("alice", &[]) });
+    assert!(get_ref.iter().any(|o| matches!(o, Output::Reply { reply: 5, status: Some(400), error: Some(e), .. } if e.contains("lives on another server"))), "{get_ref:?}");
+    assert!(!get_ref.iter().any(|o| matches!(o, Output::Subscribe { .. })), "rejected Get must never emit Subscribe: {get_ref:?}");
+    assert!(rt2.may_read("Stock/attacker-99", &Caller::Remote { id: "alice".into(), roles: vec![] }).is_err());
+    assert!(rt2.changed_since(&["Stock/sku-1".into(), "Stock/*".into()], 0).is_empty());
+
+    // C-050.10: `check_invariants()` skips remote replicas during shadow-boot reload.
+    let inv_src = r#"
+@server @read("anyone") object RemoteInv {
+  n: number = 0
+  @invariant mustBePositive(): boolean { return this.n > 0 }
+}
+"#;
+    let mut irt = Runtime::boot(
+        compile(inv_src).unwrap(),
+        Box::new(MemStore::default()),
+        Options { server: true, render: false, remote_classes: vec!["RemoteInv".into()], ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let _ = irt.handle(2.0, Input::Sync { object: "RemoteInv/r1".into(), state: json!({ "n": 0 }), seq: Some(1) });
+    assert_eq!(irt.check_invariants().unwrap(), 0, "check_invariants must skip remote replicas");
+
+    // C-050.6: `check_remote_flows` blocks unrevealed `@pii` passed to a remote class stub,
+    // and `facts_with_remotes` records a Transfer to the remote host when `reveal()` is used!
+    let pii_remote_bad = r#"
+@server @read("service") object RemoteBilling {
+  @allow("service") charge(email: string): boolean { return true }
+}
+@server @read("owner") object Account {
+  @pii("contact", "billing") email: string = ""
+  @allow("owner") async bill(): boolean {
+    return await RemoteBilling.get("b1").charge(this.email)
+  }
+}
+"#;
+    let mut rem_dests = std::collections::HashMap::new();
+    rem_dests.insert("RemoteBilling".to_string(), tj_core::Destination::Host("billing.example.com".into()));
+    let errs = tj_core::check_remote_flows(pii_remote_bad, &rem_dests);
+    assert!(!errs.is_empty(), "unrevealed @pii passed to remote stub must be caught");
+    let pii_remote_ok = pii_remote_bad.replace("this.email", "reveal(this.email, \"billing\")");
+    assert!(tj_core::check_remote_flows(&pii_remote_ok, &rem_dests).is_empty());
+    let f = tj_core::facts_with_remotes(&pii_remote_ok, &rem_dests);
+    assert!(f.transfers.iter().any(|t| t.to == tj_core::Destination::Host("billing.example.com".into()) && t.fields.contains(&"Account.email".to_string())), "remote transfer must be recorded: {:?}", f.transfers);
+}

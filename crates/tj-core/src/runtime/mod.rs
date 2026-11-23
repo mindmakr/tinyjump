@@ -48,12 +48,27 @@ pub struct Options {
     pub max_objects: usize,
     /// Maximum serialized byte size of a single stored object record (0: no limit).
     pub max_object_bytes: usize,
+    /// On a server: `@server` class names owned by another server (`remotes.json`). Instances of
+    /// these classes behave as replicas (synced via `Input::Sync`, calls queued in `tj:outbox`
+    /// and emitted as `Effect::Call` with `Idempotency-Key`).
+    #[cfg(feature = "server")]
+    pub remote_classes: Vec<String>,
 }
 
 impl Options {
     /// A device or test runtime at time `now`.
     pub fn new(now: f64, seed: u64) -> Options {
-        Options { now, seed, render: true, server: false, explain: true, max_objects: 0, max_object_bytes: 0 }
+        Options {
+            now,
+            seed,
+            render: true,
+            server: false,
+            explain: true,
+            max_objects: 0,
+            max_object_bytes: 0,
+            #[cfg(feature = "server")]
+            remote_classes: Vec::new(),
+        }
     }
 }
 
@@ -238,6 +253,8 @@ pub struct Runtime {
     measure: Option<Box<dyn Measure>>,
     render: bool,
     pub(crate) server: bool,
+    #[cfg(feature = "server")]
+    pub(crate) remote_classes: std::collections::HashSet<u16>,
     explain: bool,
     max_objects: usize,
     #[cfg(feature = "server")]
@@ -287,6 +304,20 @@ impl Runtime {
             .iter()
             .map(|o| o.methods.values().map(|m| Rc::new(Closure { proto: m.proto, upvals: Vec::new(), this: None })).collect())
             .collect();
+        #[cfg(feature = "server")]
+        let mut remote_classes = std::collections::HashSet::new();
+        #[cfg(feature = "server")]
+        if opts.server {
+            for name in &opts.remote_classes {
+                let Some(c) = program.object(name) else {
+                    return Err(BootError { message: format!("remotes.json names {name:?}, which is not declared in this app"), trace: Vec::new() });
+                };
+                if !program.objects[c as usize].server {
+                    return Err(BootError { message: format!("remotes.json names {name:?}, which must be declared with @server"), trace: Vec::new() });
+                }
+                remote_classes.insert(c);
+            }
+        }
         let mut rt = Runtime {
             program: program.clone(),
             globals,
@@ -326,6 +357,8 @@ impl Runtime {
             measure: None,
             render: opts.render,
             server: opts.server,
+            #[cfg(feature = "server")]
+            remote_classes,
             explain: opts.explain,
             max_objects: opts.max_objects,
             #[cfg(feature = "server")]
@@ -360,6 +393,10 @@ impl Runtime {
         if !rt.server {
             rt.load_outbox();
         }
+        #[cfg(feature = "server")]
+        if rt.server && !rt.remote_classes.is_empty() {
+            rt.load_outbox();
+        }
         if rt.render {
             rt.render_app();
         }
@@ -379,53 +416,77 @@ impl Runtime {
             self.release_outbox();
         }
         match input {
-            Input::Call { object, method, args, reply, call, caller } => match self.admit(&object, Some(&method), caller) {
-                Err((status, why)) => {
-                    if status == 403 {
-                        self.count_refused(&object, &method);
-                    }
-                    self.reply_status(reply, status, why)
-                }
-                // A call from outside gives JSON: it must fit the method's declared types, or it
-                // is refused before the method runs, naming the parameter.
-                Ok(who) => match (matches!(who, Who::Remote { .. }).then(|| self.bad_args(&object, &method, &args)).flatten(), self.resolve_object(&object), call) {
-                    (Some(why), _, _) => self.reply_status(reply, 400, why),
-                    (None, Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
-                    (None, Ok(obj), None) => {
-                        let args = args.iter().map(Value::from_json).collect();
-                        self.invoke(obj, &method, args, true, reply, Entry::new(who))
-                    }
-                    // The rules already admitted the class, so this is the store failing.
-                    (None, Err(e), _) => self.reply_status(reply, 503, e),
-                },
-            },
-            Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
-                Err((status, why)) => self.reply_status(reply, status, why),
-                Ok(who) => {
-                    // Each field reaches the readers its rule names; tools see personal data masked.
-                    let state = self.resolve_object(&object).and_then(|o| {
-                        let mut s = self.object_state(&o)?;
-                        let hidden = self.hidden(o.class, &o.id, &s, &who);
-                        self.hide(o.class, &mut s, &hidden);
-                        Ok(s)
-                    });
-                    match state {
-                        Ok(s) => {
-                            // Reading is an event too: subscribers learn who is looking. It never
-                            // changes state, so a replica fetching state cannot start a loop.
-                            self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
-                            self.reply(reply, Ok(s));
+            Input::Call { object, method, args, reply, call, caller } => {
+                #[cfg(feature = "server")]
+                let remote_target = self.is_remote_key(&object);
+                #[cfg(not(feature = "server"))]
+                let remote_target = false;
+                if remote_target {
+                    self.reply_status(reply, 400, format!("{object} lives on another server; call it there"));
+                } else {
+                    match self.admit(&object, Some(&method), caller) {
+                        Err((status, why)) => {
+                            if status == 403 {
+                                self.count_refused(&object, &method);
+                            }
+                            self.reply_status(reply, status, why)
                         }
-                        // The rules admitted it, so this is the store failing.
-                        Err(e) => self.reply_status(reply, 503, e),
+                        // A call from outside gives JSON: it must fit the method's declared types, or it
+                        // is refused before the method runs, naming the parameter.
+                        Ok(who) => match (matches!(who, Who::Remote { .. }).then(|| self.bad_args(&object, &method, &args)).flatten(), self.resolve_object(&object), call) {
+                            (Some(why), _, _) => self.reply_status(reply, 400, why),
+                            (None, Ok(obj), Some(call)) => self.call_once(obj, &method, &args, reply, call, who),
+                            (None, Ok(obj), None) => {
+                                let args = args.iter().map(Value::from_json).collect();
+                                self.invoke(obj, &method, args, true, reply, Entry::new(who))
+                            }
+                            // The rules already admitted the class, so this is the store failing.
+                            (None, Err(e), _) => self.reply_status(reply, 503, e),
+                        },
                     }
                 }
-            },
+            }
+            Input::Get { object, reply, caller } => {
+                #[cfg(feature = "server")]
+                let remote_target = self.is_remote_key(&object);
+                #[cfg(not(feature = "server"))]
+                let remote_target = false;
+                if remote_target {
+                    self.reply_status(reply, 400, format!("{object} lives on another server; read it there"));
+                } else {
+                    match self.admit(&object, None, caller) {
+                        Err((status, why)) => self.reply_status(reply, status, why),
+                        Ok(who) => {
+                            // Each field reaches the readers its rule names; tools see personal data masked.
+                            let state = self.resolve_object(&object).and_then(|o| {
+                                let mut s = self.object_state(&o)?;
+                                let hidden = self.hidden(o.class, &o.id, &s, &who);
+                                self.hide(o.class, &mut s, &hidden);
+                                Ok(s)
+                            });
+                            match state {
+                                Ok(s) => {
+                                    // Reading is an event too: subscribers learn who is looking. It never
+                                    // changes state, so a replica fetching state cannot start a loop.
+                                    self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                                    self.reply(reply, Ok(s));
+                                }
+                                // The rules admitted it, so this is the store failing.
+                                Err(e) => self.reply_status(reply, 503, e),
+                            }
+                        }
+                    }
+                }
+            }
             Input::Identity { user, roles } => self.set_identity(user, roles),
             Input::Entropy { bytes } => match crate::crypto::unhex(&bytes).filter(|b| b.len() >= 32) {
                 Some(b) => {
                     self.drbg.reseed(&b);
                     self.strong = true;
+                    #[cfg(feature = "server")]
+                    if self.server && !self.remote_classes.is_empty() {
+                        self.release_outbox();
+                    }
                 }
                 None => self.reply(None, Err(("entropy needs at least 32 bytes, as hex".into(), None))),
             },

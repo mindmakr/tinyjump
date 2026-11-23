@@ -267,6 +267,11 @@ impl Runtime {
         while let Some(i) = self.invocations.pop_front() {
             ran = true;
             let reply = Some(INVOKE_REPLY_BASE + u64::from(i.promise));
+            #[cfg(feature = "server")]
+            if self.is_remote_key(&i.object) {
+                self.reply_status(reply, 400, format!("{} lives on another server; call it there", i.object));
+                continue;
+            }
             if let Some(why) = self.refusal(&i.object, Some(&i.method), &i.who) {
                 self.count_refused(&i.object, &i.method);
                 self.reply_status(reply, 403, why);
@@ -322,6 +327,11 @@ impl Runtime {
 
     /// Runs a call that carries an id at most once (see the module docs).
     pub(crate) fn call_once(&mut self, obj: Rc<ObjRef>, method: &str, args: &[Json], reply: Option<u64>, call: String, who: Who) {
+        #[cfg(feature = "server")]
+        if self.is_remote(&obj) {
+            self.reply_status(reply, 400, format!("{} lives on another server; call it there", obj.key()));
+            return;
+        }
         if call.is_empty() || call.len() > MAX_CALL_ID {
             self.reply_status(reply, 400, format!("a call id must be 1-{MAX_CALL_ID} characters"));
             return;

@@ -119,6 +119,9 @@ impl Runtime {
     fn subject_objects(&mut self, subject: &str) -> Result<Vec<(u16, String)>, String> {
         let mut held = Vec::new();
         for class in 0..self.program.objects.len() as u16 {
+            if self.is_remote_class(class) {
+                continue;
+            }
             let def = &self.program.objects[class as usize];
             if !def.belongs_to_a_person() {
                 continue;
@@ -162,6 +165,9 @@ impl Runtime {
     fn shared_lists(&self) -> Vec<SharedList> {
         let mut out = Vec::new();
         for (class, def) in self.program.objects.iter().enumerate() {
+            if self.is_remote_class(class as u16) {
+                continue;
+            }
             for p in &def.pii {
                 if let Some((by, at)) = &p.by {
                     out.push((class as u16, p.field.clone(), by.clone(), at.clone()));
@@ -176,6 +182,9 @@ impl Runtime {
     fn take_named(&mut self, subject: &str, clear: bool) -> Result<Vec<Named>, String> {
         let mut found = Vec::new();
         for class in 0..self.program.objects.len() as u16 {
+            if self.is_remote_class(class) {
+                continue;
+            }
             let fields: Vec<Rc<str>> = self.program.objects[class as usize].guards.iter().filter(|g| g.names_a_person()).map(|g| g.field.clone()).collect();
             if fields.is_empty() {
                 continue;
@@ -378,7 +387,14 @@ impl Runtime {
         }
         if self.retain_queue.is_empty() {
             // Whole objects that are one person's; lists of several people's are swept above.
-            let classes: Vec<String> = self.program.objects.iter().filter(|d| d.retain.is_some() && d.belongs_to_a_person()).map(|d| format!("{}/", d.name)).collect();
+            let classes: Vec<String> = self
+                .program
+                .objects
+                .iter()
+                .enumerate()
+                .filter(|(c, d)| !self.is_remote_class(*c as u16) && d.retain.is_some() && d.belongs_to_a_person())
+                .map(|(_, d)| format!("{}/", d.name))
+                .collect();
             let mut keys: Vec<String> = self.erasures.keys().cloned().collect();
             for prefix in classes {
                 match self.store.keys(&prefix) {
@@ -407,6 +423,9 @@ impl Runtime {
     /// written as records, without loading them.
     fn retain_check(&mut self, key: &str) -> Result<(), String> {
         let Some((class, id)) = key.split_once('/').and_then(|(c, id)| Some((self.program.object(c)?, id))) else { return Ok(()) };
+        if self.is_remote_class(class) {
+            return Ok(());
+        }
         let def = &self.program.objects[class as usize];
         let (retain, hold) = (def.retain, def.hold);
         let defaults = Value::Rec(self.defaults(class).map_err(|e| e.message())?.into()).to_json()?;

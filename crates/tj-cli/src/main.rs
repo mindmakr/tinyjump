@@ -18,6 +18,7 @@ mod plugin_server;
 mod plugins;
 mod privacy;
 mod registry;
+mod remotes;
 mod retro;
 mod stats;
 mod mcp;
@@ -25,6 +26,7 @@ mod review;
 mod sealed;
 mod store;
 mod test_runner;
+mod webhooks;
 
 use engine::Engine;
 
@@ -488,14 +490,41 @@ fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core
     if access {
         print!("{}", access::report(src));
     }
+    let private_fetch = std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let fetch_allow = engine::fetch_allow_from_env()?;
+    let remotes = match remotes::Remotes::load(file, program, false, private_fetch, &fetch_allow) {
+        Ok(r) => r,
+        Err(e) => {
+            failures.push(e);
+            remotes::Remotes::default()
+        }
+    };
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(src, &remote_dests);
+    if !flow_errs.is_empty() {
+        let name = file.display().to_string();
+        for d in &flow_errs {
+            failures.push(d.render(&name, src));
+        }
+    }
+    let webhooks = match webhooks::Webhooks::load(file, program, &remote_classes, false, private_fetch, &fetch_allow) {
+        Ok(w) => w,
+        Err(e) => {
+            failures.push(e);
+            webhooks::Webhooks::default()
+        }
+    };
+    let src_facts = tj_core::facts_with_remotes(src, &remote_dests);
+    let wh_transfers = webhooks.pii_transfers(program, &src_facts.reveals);
     if privacy && record {
-        print!("{}", privacy::record(src, program));
+        print!("{}", privacy::record_with_transfers(src, program, &remote_dests, &wh_transfers));
     } else if privacy {
         print!("{}", privacy::report(program));
     }
     if let Some(pack) = pack {
         let pack = compliance::Pack::load(pack)?;
-        let (report, ok) = pack.report(&pack.evaluate(src, program, None));
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(src, program, None, &remote_dests, &wh_transfers));
         print!("{report}");
         if !ok {
             failures.push("some controls are not met (above)".into());
@@ -558,9 +587,19 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // Checked before anything starts: a folder that mixes plain and sealed records, or a key
     // file that cannot be read, stops the server here.
     let (_, storage) = sealed::open_store(&data, &[])?;
+    let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"))?;
+    let private_fetch = dev_mode || std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let fetch_allow = engine::fetch_allow_from_env()?;
+    let remotes = Arc::new(remotes::Remotes::load(file, &program, true, private_fetch, &fetch_allow)?);
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(&source, &remote_dests);
+    if !flow_errs.is_empty() {
+        return Err(flow_errs.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"));
+    }
+    let webhooks = Arc::new(webhooks::Webhooks::load(file, &program, &remote_classes, true, private_fetch, &fetch_allow)?);
     let compliance_gate = if let Some(pack) = &args.compliance {
         let pack = compliance::Pack::load(pack)?;
-        let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"))?;
         let key_file = std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
         let server = compliance::Server {
             encrypted: key_file.is_some(),
@@ -568,7 +607,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
             audit_key_apart: audit::kept_apart(&audit::key_path(&data), &data),
             tls: !http::credentials_need_tls(dev_mode, &args.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref()),
         };
-        let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(&server)));
+        let facts = tj_core::facts_with_remotes(&source, &remote_dests);
+        let wh_transfers = webhooks.pii_transfers(&program, &facts.reveals);
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(&source, &program, Some(&server), &remote_dests, &wh_transfers));
         if !ok {
             return Err(format!("{report}\nnot starting: some controls of the compliance pack are not met (above)"));
         }
@@ -578,7 +619,17 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         None
     };
     let (audit, audit_key) = audit::Audit::start(&data)?;
-    let engine = Engine::start_with_compliance(source, data.clone(), false, dev_mode, plugins.clone(), audit.clone(), compliance_gate)?;
+    let engine = Engine::start_with_integrations(
+        source,
+        data.clone(),
+        false,
+        dev_mode,
+        plugins.clone(),
+        audit.clone(),
+        compliance_gate,
+        remotes.clone(),
+        webhooks.clone(),
+    )?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
     // The web app: always under `tj dev`, and under `tj serve` with --web.
@@ -607,7 +658,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     } else if !dev_mode && std::env::var(http::TLS_TERMINATED_ENV).is_ok_and(|v| v == "1") && std::env::var("TJ_TRUST_PROXY").ok().as_deref() != Some("1") {
         eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
     }
-    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()))
+    http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()).with_webhooks(webhooks))
 }
 
 fn reload_cmd(args: &[String]) -> Result<(), String> {

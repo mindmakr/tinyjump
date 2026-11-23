@@ -320,3 +320,79 @@ Three tools build on this:
   (`assertScreen`), Taffy flexbox layout + `tj review` (`assertLayout`), and work-counter
   ceilings (`assertMetrics`). When no trace files are listed, `tj test` runs every
   `*.trace.jsonl` next to the app and in its `tests/` folder.
+
+## Server-to-server replicas (`remotes.json`)
+
+A server can hold replicas of another tinyjump server's `@server` objects and call their
+methods through the same durable outbox (`tj:outbox`), `Idempotency-Key` once-only calls, and
+resumable `/api/events` SSE change streams that devices use, authenticated with API keys.
+Place `remotes.json` next to `<app.tj>`:
+
+```json
+{
+  "Stock": { "url": "https://inventory.example.com", "keyEnv": "INVENTORY_API_KEY" }
+}
+```
+
+- Every key must name an `@server` class declared in the app. Raw keys are rejected; pass an
+  environment variable name via `keyEnv`.
+- URLs must use `https://` (loopback or plain `http://` URLs require `TJ_ALLOW_PRIVATE_FETCH=1`
+  or `tj dev`), obey `TJ_FETCH_ALLOW`, and disable HTTP redirects so API keys never leak across
+  hosts.
+- Remote replicas reject direct external `GET`/`POST`/SSE requests on the consuming server
+  (read/call them on the owning server), do not run local `@every` timers or shadow-reload
+  `@invariant` checks, do not emit local `Output::Changed` events (preventing foreign sequence
+  numbers or webhook echo loops), and are excluded from local retention/erasure sweeps.
+- Passing `@pii` into a remote class method requires `reveal()` (and `@needs("consent:...")`
+  when applicable) and is recorded as a transfer to the remote host for `--compliance` and
+  `tj check --privacy --record`.
+
+## Webhooks (`webhooks.json`)
+
+Webhooks connect non-tinyjump systems to a server (`webhooks.json` next to `<app.tj>`):
+
+```json
+{
+  "incoming": {
+    "stripe": {
+      "secretEnv": "STRIPE_WEBHOOK_SECRET",
+      "object": "Billing/main",
+      "method": "onWebhook",
+      "caller": "webhook:stripe",
+      "roles": ["webhook"],
+      "maxAgeSecs": 300
+    }
+  },
+  "outgoing": {
+    "fulfillment": {
+      "url": "https://fulfillment.example.com/hooks/tinyjump",
+      "secretEnv": "FULFILLMENT_WEBHOOK_SECRET",
+      "objects": ["Order/*"],
+      "events": ["changed"],
+      "roles": ["webhook"],
+      "maxRetries": 5
+    }
+  }
+}
+```
+
+- **Signature scheme (both incoming and outgoing):** `X-TinyJump-Timestamp` (Unix seconds) and
+  `X-TinyJump-Signature: v1=<hex(HMAC-SHA256(secret, "{timestamp}.{raw_body}"))>`, verified in
+  constant time within `maxAgeSecs` (default 300 s, max 3600 s). Secrets come strictly from
+  `secretEnv` (at least 16 bytes), never from `webhooks.json`.
+- **Incoming (`POST /webhooks/{name}`):** requires TLS on non-loopback servers
+  (`TJ_TLS_TERMINATED=1`), `Content-Type: application/json`, and rate limits invalid attempts.
+  Optional `X-TinyJump-Delivery` (or `Idempotency-Key`) runs the method at-most-once via
+  `call_once`. Because the Stripe-compatible signature covers `"{timestamp}.{raw_body}"` (not
+  `X-TinyJump-Delivery`), methods requiring strict deduplication against header-stripping
+  replays within `maxAgeSecs` should also deduplicate on an event ID inside the signed JSON
+  body. The method runs as the configured `caller` and `roles` under `@allow` rules (never
+  `trusted`).
+- **Outgoing:** subscribes to owned objects (never remote replicas) matching `objects`
+  (`Class/id` or `Class/*`) and `events` (`changed` and/or `emit`). Every payload is checked
+  against `@read` and `@pii`-masked as the webhook's `caller`/`roles` before entering the
+  durable disk queue (`<data>/webhooks/`, encrypted when `TJ_KEY_FILE` is set and migrated by
+  `tj store rekey`), and delivered per-target FIFO with `X-TinyJump-Delivery` and bounded
+  exponential-backoff retries (`redirects(0)`, `public_only`, and `TJ_FETCH_ALLOW` enforced).
+  Outgoing webhooks whose roles can read `@pii` (or `emit` revealed data) are checked against
+  compliance `transfers` and listed in `tj check --privacy --record`.

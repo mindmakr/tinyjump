@@ -279,7 +279,16 @@ impl Harness {
         self.nodes.borrow_mut().clear();
         self.frames.clear();
         let program: Program = compile(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
-        let opts = Options { now: self.now, seed: self.seed, render: self.render, server: self.server, explain: true, max_objects: 100_000, max_object_bytes: self.max_object_bytes };
+        let opts = Options {
+            now: self.now,
+            seed: self.seed,
+            render: self.render,
+            server: self.server,
+            explain: true,
+            max_objects: 100_000,
+            max_object_bytes: self.max_object_bytes,
+            remote_classes: Vec::new(),
+        };
         let (mut rt, mut out) = Runtime::boot(program, Box::new(self.store.clone()), opts).map_err(|e| format!("boot failed: {e}"))?;
         rt.set_measure(Box::new(TestMeasure(self.nodes.clone())));
         out.extend(rt.handle(self.now, Input::Entropy { bytes: DEFAULT_ENTROPY.into() }));

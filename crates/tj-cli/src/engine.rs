@@ -8,9 +8,11 @@ use crate::identity::sha256_hex;
 use crate::mailbox::{Event, Mailbox};
 use crate::manifest::Manifest;
 use crate::plugins::Plugins;
+use crate::remotes::{strict_agent, RemoteHub, Remotes, SyncSink};
 use crate::stats::Stats;
 use crate::store::OverlayStore;
 use crate::test_runner;
+use crate::webhooks::{WebhookSender, Webhooks};
 use serde_json::{json, Value as Json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -62,9 +64,9 @@ enum Msg {
     /// An input, who waits for its reply, and when it was sent (for latency).
     Input(Input, Option<Reply>, Instant),
     /// `(generation, effect_id, result)`: mismatched generations from a pre-reload runtime are dropped.
-    /// Error tuple carries `(message, unreachable)` so transient transport failures return 503
-    /// without caching a permanent 400 `CallRecord`.
-    EffectDone(u64, u32, Result<Json, (String, bool)>),
+    /// Error tuple carries `(message, field, unreachable)` so transient transport failures return 503
+    /// without caching a permanent 400 `CallRecord`, and remote `check(ok, field, msg)` preserves `field`.
+    EffectDone(u64, u32, Result<Json, (String, Option<String>, bool)>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
     /// Which of `objects` `caller` may read (for stream tickets).
@@ -131,7 +133,7 @@ pub(crate) fn parse_fetch_allow(spec: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn fetch_allow_from_env() -> Result<Vec<String>, String> {
+pub(crate) fn fetch_allow_from_env() -> Result<Vec<String>, String> {
     match std::env::var(FETCH_ALLOW_ENV) {
         Ok(s) if !s.is_empty() => parse_fetch_allow(&s),
         _ => Ok(Vec::new()),
@@ -149,32 +151,69 @@ struct Booted {
 
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
-fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str]) -> Result<Booted, String> {
+fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str], remote_classes: &[String]) -> Result<Booted, String> {
     let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let manifest = Manifest::build(source, &program, configured_plugins);
     let snap = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
-    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    // Remote replicas are owned by another server and skipped by local erasure (C-050.13).
+    let personal: Vec<String> = program
+        .objects
+        .iter()
+        .filter(|d| d.belongs_to_a_person() && !remote_classes.iter().any(|r| r == &*d.name))
+        .map(|d| d.name.to_string())
+        .collect();
     let (store, _) = crate::sealed::open_store(data, &personal)?;
     let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let max_object_bytes = max_object_bytes_from_env();
-    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render, server: true, explain, max_objects, max_object_bytes };
+    let opts = Options {
+        now: now_ms(),
+        seed: u64::from_le_bytes(seed),
+        render,
+        server: true,
+        explain,
+        max_objects,
+        max_object_bytes,
+        remote_classes: remote_classes.to_vec(),
+    };
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
     Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes })
 }
 
+struct EngineSyncSink(Sender<Msg>);
+
+impl SyncSink for EngineSyncSink {
+    fn on_sync(&self, object: String, state: Json, seq: u64) {
+        let _ = self.0.send(Msg::Input(Input::Sync { object, state, seq: Some(seq) }, None, Instant::now()));
+    }
+    fn on_online(&self) {
+        let _ = self.0.send(Msg::Input(Input::Online, None, Instant::now()));
+    }
+}
+
 impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
     #[cfg(test)]
     pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit) -> Result<Engine, String> {
-        Self::start_with_compliance(source, data, render, explain, plugins, audit, None)
+        Self::start_with_integrations(source, data, render, explain, plugins, audit, None, Arc::default(), Arc::default())
     }
 
-    /// Starts the runtime thread with an optional compliance pack enforced on every live reload.
-    pub fn start_with_compliance(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit, compliance: Option<ComplianceGate>) -> Result<Engine, String> {
+    /// Starts the runtime thread with compliance, server-to-server remotes, and webhooks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_integrations(
+        source: String,
+        data: PathBuf,
+        render: bool,
+        explain: bool,
+        plugins: Arc<Plugins>,
+        audit: Audit,
+        compliance: Option<ComplianceGate>,
+        remotes: Arc<Remotes>,
+        webhooks: Arc<Webhooks>,
+    ) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
         let back = tx.clone();
@@ -187,11 +226,15 @@ impl Engine {
         let live_source_ref = live_source.clone();
         let fetch_allow = fetch_allow_from_env()?;
         let fetch_allowlist = !fetch_allow.is_empty();
+        let remote_classes = remotes.classes();
+        let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+        let fetch_allow_arc = Arc::new(fetch_allow);
+        let webhook_sender = WebhookSender::start(webhooks.outgoing.clone(), &data, audit.clone(), private_fetch, fetch_allow_arc.clone())?;
         thread::Builder::new()
             .name("tj-runtime".into())
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&source, &data, render, explain, &refs) {
+                match boot(&source, &data, render, explain, &refs, &remote_classes) {
                     Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes }) => {
                         let shared = Arc::new(Mutex::new(manifest));
                         if let Ok(mut r) = shared_ref.lock() {
@@ -199,7 +242,7 @@ impl Engine {
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -355,6 +398,10 @@ struct Dispatch {
     turn_errors: u64,
     /// Monotonic runtime generation: incremented on every swap so stale `EffectDone`s are ignored.
     generation: u64,
+    /// Persistent SSE subscriptions to remote tinyjump servers (`remotes.json`).
+    remote_hub: Option<RemoteHub>,
+    /// Durable outgoing webhook delivery worker (`webhooks.json`).
+    webhooks: WebhookSender,
 }
 
 /// Post-reload health watch window: if uncaught errors or 503s reach `threshold` before `until`,
@@ -369,6 +416,7 @@ struct WatchWindow {
 
 /// Validates `req.source` offline against `current_snap`, `compliance`, and a copy-on-write
 /// overlay over `data` (checking every stored object's `@invariant` and running `smoke_traces`).
+#[allow(clippy::too_many_arguments)]
 fn shadow_validate(
     source: &str,
     allow_breaking: bool,
@@ -377,14 +425,25 @@ fn shadow_validate(
     data: &Path,
     explain: bool,
     compliance: Option<&ComplianceGate>,
+    remotes: &Remotes,
+    webhooks: &Webhooks,
 ) -> Result<(Vec<compat::Finding>, Snapshot), Failure> {
     if smoke_traces.len() > MAX_SMOKE_TRACES {
         return Err((400, format!("at most {MAX_SMOKE_TRACES} smoke traces per reload")));
     }
     let program = compile(source)
         .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")))?;
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(source, &remote_dests);
+    if !flow_errs.is_empty() {
+        return Err((400, flow_errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")));
+    }
+    webhooks.validate_against(&program, &remote_classes).map_err(|e| (409, e))?;
     if let Some((pack, server)) = compliance {
-        let (report, ok) = pack.report(&pack.evaluate(source, &program, Some(server)));
+        let facts = tj_core::facts_with_remotes(source, &remote_dests);
+        let wh_transfers = webhooks.pii_transfers(&program, &facts.reveals);
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(source, &program, Some(server), &remote_dests, &wh_transfers));
         if !ok {
             return Err((409, format!("compliance pack {} not met:\n{report}", pack.title)));
         }
@@ -395,13 +454,27 @@ fn shadow_validate(
         return Err((409, format!("breaking upgrade changes found; pass allowBreaking: true if intentional\n{}", compat::report(&findings))));
     }
     // Shadow boot against a copy-on-write overlay over the real data dir (never mutates disk).
-    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    let personal: Vec<String> = program
+        .objects
+        .iter()
+        .filter(|d| d.belongs_to_a_person() && !remote_classes.iter().any(|r| r == &*d.name))
+        .map(|d| d.name.to_string())
+        .collect();
     let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
     let overlay = OverlayStore::new(base);
     let seed = crate::bytes::random::<8>().map_err(|e| (500, e))?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
     let max_object_bytes = max_object_bytes_from_env();
-    let opts = Options { now: now_ms(), seed: u64::from_le_bytes(seed), render: false, server: true, explain, max_objects, max_object_bytes };
+    let opts = Options {
+        now: now_ms(),
+        seed: u64::from_le_bytes(seed),
+        render: false,
+        server: true,
+        explain,
+        max_objects,
+        max_object_bytes,
+        remote_classes: remote_classes.to_vec(),
+    };
     let (mut shadow_rt, boot_out) = Runtime::boot(program, Box::new(overlay), opts).map_err(|e| (422, format!("shadow boot failed: {e}")))?;
     let entropy = crate::bytes::hex(&crate::bytes::random::<32>().map_err(|e| (500, e))?);
     let entropy_out = shadow_rt.handle(now_ms(), Input::Entropy { bytes: entropy });
@@ -433,11 +506,11 @@ fn drain_inflight(rt: &mut Runtime, d: &mut Dispatch, rx: &Receiver<Msg>, pendin
                 if gen != d.generation {
                     continue;
                 }
-                let (ok, error, unreachable) = match result {
-                    Ok(v) => (Some(v), None, false),
-                    Err((e, u)) => (None, Some(e), u),
+                let (ok, error, field, unreachable) = match result {
+                    Ok(v) => (Some(v), None, None, false),
+                    Err((e, f, u)) => (None, Some(e), f, u),
                 };
-                let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable });
+                let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field, unreachable });
                 d.outputs(rt, out);
                 privacy_effects(rt, d);
             }
@@ -482,13 +555,31 @@ fn run(
     mut current_source: String,
     mut current_snap: Snapshot,
     compliance: Option<ComplianceGate>,
-    fetch_allow: Vec<String>,
+    fetch_allow: Arc<Vec<String>>,
+    remotes: Arc<Remotes>,
+    webhook_cfg: Arc<Webhooks>,
+    webhooks: WebhookSender,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
-    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch, Arc::new(fetch_allow));
-    let mut d = Dispatch { replies: HashMap::new(), next_reply: 0, subscribers: Vec::new(), effects, stats, audit, privacy: Vec::new(), forget_after: Vec::new(), turn_errors: 0, generation: 1 };
+    let remote_classes = remotes.classes();
+    let remote_hub = (!remotes.is_empty()).then(|| RemoteHub::new(remotes.clone(), Arc::new(EngineSyncSink(back.clone())), private_fetch, fetch_allow.clone()));
+    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch, fetch_allow, remotes.clone());
+    let mut d = Dispatch {
+        replies: HashMap::new(),
+        next_reply: 0,
+        subscribers: Vec::new(),
+        effects,
+        stats,
+        audit,
+        privacy: Vec::new(),
+        forget_after: Vec::new(),
+        turn_errors: 0,
+        generation: 1,
+        remote_hub,
+        webhooks,
+    };
     let mut current_sha = sha256_hex(&current_source);
     let mut previous: Option<(String, String)> = None;
     let mut watch: Option<WatchWindow> = None;
@@ -553,11 +644,11 @@ fn run(
                 if gen != d.generation {
                     continue;
                 }
-                let (ok, error, unreachable) = match result {
-                    Ok(v) => (Some(v), None, false),
-                    Err((e, u)) => (None, Some(e), u),
+                let (ok, error, field, unreachable) = match result {
+                    Ok(v) => (Some(v), None, None, false),
+                    Err((e, f, u)) => (None, Some(e), f, u),
                 };
-                rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable })
+                rt.handle(now_ms(), Input::EffectDone { id, ok, error, field, unreachable })
             }
             Ok(Msg::MayRead { objects, caller, done }) => {
                 let _ = done.send(may_read(&rt, &objects, &caller));
@@ -589,7 +680,7 @@ fn run(
             }
             Ok(Msg::Reload(source)) => {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&source, &data, render, explain, &refs) {
+                match boot(&source, &data, render, explain, &refs, &remote_classes) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let new_sha = sha256_hex(&source);
                         previous = Some((current_source, current_sha));
@@ -628,7 +719,7 @@ fn run(
                 // Drain in-flight effects BEFORE shadow_validate so all pending writes are on disk
                 // and validated against the new bundle's `@invariant`s and smoke traces (T1-5).
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
-                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref()) {
+                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref(), &remotes, &webhook_cfg) {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = done.send(Err(e));
@@ -637,7 +728,7 @@ fn run(
                 };
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&req.source, &data, render, explain, &refs) {
+                match boot(&req.source, &data, render, explain, &refs, &remote_classes) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, .. }) => {
                         let prev_source = std::mem::replace(&mut current_source, req.source.clone());
                         let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
@@ -696,7 +787,7 @@ fn run(
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&prev_source, &data, render, explain, &refs) {
+                match boot(&prev_source, &data, render, explain, &refs, &remote_classes) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
                         current_source = prev_source.clone();
@@ -740,7 +831,7 @@ fn run(
                     let w = watch.take().expect("checked");
                     d.stats.set_watch_until(0);
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                    match boot(&w.prev_source, &data, render, explain, &refs) {
+                    match boot(&w.prev_source, &data, render, explain, &refs, &remote_classes) {
                         Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, .. }) => {
                             current_source = w.prev_source.clone();
                             current_sha = w.prev_sha.clone();
@@ -878,12 +969,29 @@ impl Dispatch {
                     let _ = self.effects.send((self.generation, id, effect));
                 }
                 Output::Emit { object, name, data } => {
+                    if name != "read" {
+                        for hook in self.webhooks.targets() {
+                            if hook.matches(&object, "emit") && rt.may_read(&object, &hook.reader()).is_ok() {
+                                self.webhooks.enqueue(&hook.name, &json!({ "event": "emit", "object": object, "name": name, "data": data }));
+                            }
+                        }
+                    }
                     let text = format!("event: emit\ndata: {}\n\n", json!({ "object": object, "name": name, "data": data }));
                     // A slow client gets one `read` per object, not one per request.
                     let merge = (name == "read").then_some("read");
                     self.broadcast(Event::new(object, merge, text));
                 }
                 Output::Changed { object, state, seq } => {
+                    for hook in self.webhooks.targets() {
+                        if hook.matches(&object, "changed") {
+                            let reader = hook.reader();
+                            if rt.may_read(&object, &reader).is_ok() {
+                                let hidden = rt.hidden_from(&object, &state, Some(&reader));
+                                let masked = rt.without(&object, &state, &hidden);
+                                self.webhooks.enqueue(&hook.name, &json!({ "event": "changed", "object": object, "seq": seq, "state": masked }));
+                            }
+                        }
+                    }
                     // Each reader gets the fields their rules let them see: one event for
                     // each set of hidden fields, shared by every reader who has it.
                     let mut events: Vec<(Vec<usize>, Event)> = Vec::new();
@@ -924,8 +1032,13 @@ impl Dispatch {
                         eprintln!("    {t}");
                     }
                 }
-                // The server owns its objects, so it never subscribes to replicas or draws UI.
-                Output::Patch { .. } | Output::Frames { .. } | Output::Wake { .. } | Output::Subscribe { .. } => {}
+                Output::Subscribe { object, seq } => {
+                    if let Some(hub) = &self.remote_hub {
+                        hub.subscribe(object, seq);
+                    }
+                }
+                // Servers do not draw UI.
+                Output::Patch { .. } | Output::Frames { .. } | Output::Wake { .. } => {}
             }
         }
     }
@@ -944,7 +1057,15 @@ fn changed_event(object: &str, state: &Json, seq: u64) -> Event {
 }
 
 /// A small pool of threads that perform effects and post the results back.
-fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audit: Audit, private_fetch: bool, fetch_allow: Arc<Vec<String>>) -> Sender<(u64, u32, Effect)> {
+fn effect_pool(
+    back: Sender<Msg>,
+    plugins: Arc<Plugins>,
+    stats: Arc<Stats>,
+    audit: Audit,
+    private_fetch: bool,
+    fetch_allow: Arc<Vec<String>>,
+    remotes: Arc<Remotes>,
+) -> Sender<(u64, u32, Effect)> {
     let (tx, rx) = channel::<(u64, u32, Effect)>();
     let rx = Arc::new(Mutex::new(rx));
     let mut agent = ureq::AgentBuilder::new().timeout(HTTP_TIMEOUT);
@@ -968,8 +1089,10 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
         });
     }
     let agent = agent.build();
+    let remote_agent = strict_agent(HTTP_TIMEOUT, private_fetch, fetch_allow.clone());
     for i in 0..EFFECT_WORKERS {
-        let (rx, back, agent, plugins, stats, audit, fetch_allow) = (rx.clone(), back.clone(), agent.clone(), plugins.clone(), stats.clone(), audit.clone(), fetch_allow.clone());
+        let (rx, back, agent, remote_agent, plugins, stats, audit, fetch_allow, remotes) =
+            (rx.clone(), back.clone(), agent.clone(), remote_agent.clone(), plugins.clone(), stats.clone(), audit.clone(), fetch_allow.clone(), remotes.clone());
         let spawned = thread::Builder::new().name(format!("tj-effects-{i}")).spawn(move || loop {
             let job = rx.lock().map_err(|_| ()).and_then(|r| r.recv().map_err(|_| ()));
             let Ok((gen, id, effect)) = job else { return };
@@ -984,7 +1107,7 @@ fn effect_pool(back: Sender<Msg>, plugins: Arc<Plugins>, stats: Arc<Stats>, audi
                 _ => None,
             };
             let started = Instant::now();
-            let result = perform(&agent, &plugins, &fetch_allow, effect);
+            let result = perform(&agent, &remote_agent, &plugins, &fetch_allow, &remotes, effect);
             stats.effect(&kind, started.elapsed(), result.is_ok());
             if let Some((plugin, method)) = plugin_call {
                 audit.record(Entry::new("plugin").text("plugin", &plugin).text("method", &method).ok(result.is_ok()).num("ms", started.elapsed().as_millis() as u64));
@@ -1054,17 +1177,24 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effect: Effect) -> Result<Json, (String, bool)> {
+fn perform(
+    agent: &ureq::Agent,
+    remote_agent: &ureq::Agent,
+    plugins: &Plugins,
+    fetch_allow: &[String],
+    remotes: &Remotes,
+    effect: Effect,
+) -> Result<Json, (String, Option<String>, bool)> {
     let (url, method, headers, body) = match effect {
         Effect::Http { url, method, headers, body } => (url, method, headers, body),
-        Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args).map_err(|e| (e, false)),
-        Effect::Call { .. } => return Err(("server objects live here; there is no server to call".into(), false)),
+        Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args).map_err(|e| (e, None, false)),
+        Effect::Call { object, method, args, call } => return remotes.call(remote_agent, &object, &method, &args, &call),
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(("only http and https addresses can be fetched".into(), false));
+        return Err(("only http and https addresses can be fetched".into(), None, false));
     }
     if !fetch_allow.is_empty() && !url_host_allowed(&url, fetch_allow) {
-        return Err((format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"), false));
+        return Err((format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"), None, false));
     }
     let mut req = agent.request(&method, &url);
     if let Json::Object(h) = &headers {
@@ -1097,12 +1227,12 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effec
                     | ureq::ErrorKind::InsecureRequestHttpsOnly
                     | ureq::ErrorKind::InvalidProxyUrl
             );
-            return Err((format!("the request failed: {}", t.kind()), !policy && !deterministic));
+            return Err((format!("the request failed: {}", t.kind()), None, !policy && !deterministic));
         }
     };
     let status = resp.status();
     let headers: serde_json::Map<String, Json> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.clone(), Json::String(v.to_string())))).collect();
-    let body = resp.into_string().map_err(|e| (e.to_string(), true))?;
+    let body = resp.into_string().map_err(|e| (e.to_string(), None, true))?;
     Ok(json!({ "status": status, "headers": headers, "body": body }))
 }
 
@@ -1286,18 +1416,18 @@ mod tests {
         // The address may be private (a webhook with a token in it), and apps show errors.
         let agent = ureq::AgentBuilder::new().resolver(public_only).timeout(Duration::from_secs(2)).build();
         let url = "http://127.0.0.1:9/hook?token=secret123";
-        let (e, unreachable) = perform(&agent, &Plugins::default(), &[], Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        let (e, _, unreachable) = perform(&agent, &agent, &Plugins::default(), &[], &Remotes::default(), Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e.starts_with("the request failed") && !e.contains("secret123") && !e.contains("127.0.0.1"), "{e}");
         assert!(!unreachable, "public_only PermissionDenied policy refusal must not mark unreachable");
 
         // Real TCP connection refusal on an allowed loopback address marks `unreachable = true` (503 retriable).
         let open_agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
-        let (e2, unreachable2) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "http://127.0.0.1:1/".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        let (e2, _, unreachable2) = perform(&open_agent, &open_agent, &Plugins::default(), &[], &Remotes::default(), Effect::Http { url: "http://127.0.0.1:1/".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e2.starts_with("the request failed"), "{e2}");
         assert!(unreachable2, "real transport failure must mark unreachable=true");
 
         // IK-4: deterministic URL parse errors (`InvalidUrl`) must NOT mark `unreachable = true`.
-        let (e3, unreachable3) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "https://[bad url".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        let (e3, _, unreachable3) = perform(&open_agent, &open_agent, &Plugins::default(), &[], &Remotes::default(), Effect::Http { url: "https://[bad url".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e3.starts_with("the request failed"), "{e3}");
         assert!(!unreachable3, "InvalidUrl must not trigger infinite 503 retries");
     }
@@ -1402,10 +1532,12 @@ import { erase, exportData } from "tj:privacy"
         assert!(!url_host_allowed("https://evil.com/steal", &allow));
         // `perform` refuses disallowed hosts without leaking the URL.
         let agent = ureq::AgentBuilder::new().build();
-        let (err, unreachable) = perform(
+        let (err, _, unreachable) = perform(
+            &agent,
             &agent,
             &Plugins::default(),
             &allow,
+            &Remotes::default(),
             Effect::Http {
                 url: "https://secret-token.evil.com/hook?key=TOPSECRET".into(),
                 method: "GET".into(),
@@ -1440,10 +1572,12 @@ import { erase, exportData } from "tj:privacy"
                 Ok(netloc.to_socket_addrs()?.collect())
             })
             .build();
-        let (redir_err, redir_unreachable) = perform(
+        let (redir_err, _, redir_unreachable) = perform(
+            &redirect_agent,
             &redirect_agent,
             &Plugins::default(),
             &local_allow,
+            &Remotes::default(),
             Effect::Http {
                 url: format!("http://127.0.0.1:{port}/start"),
                 method: "GET".into(),

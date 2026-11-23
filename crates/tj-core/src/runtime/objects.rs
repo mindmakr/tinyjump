@@ -190,7 +190,7 @@ impl Runtime {
                 (created, changed, dated) = (0.0, 0.0, true);
             }
         }
-        let remote = def.server && !self.server;
+        let remote = self.is_remote_class(class);
         if remote {
             // Timers and alarms of a replica run on the server, not here.
             alarms.clear();
@@ -289,6 +289,29 @@ impl Runtime {
         }
     }
 
+    pub(crate) fn is_remote_class(&self, class: u16) -> bool {
+        let def = &self.program.objects[class as usize];
+        if !def.server {
+            return false;
+        }
+        if !self.server {
+            return true;
+        }
+        #[cfg(feature = "server")]
+        {
+            self.remote_classes.contains(&class)
+        }
+        #[cfg(not(feature = "server"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "server")]
+    pub(crate) fn is_remote_key(&self, key: &str) -> bool {
+        self.server && key.split('/').next().and_then(|c| self.program.object(c)).is_some_and(|c| self.is_remote_class(c))
+    }
+
     pub(crate) fn is_remote(&self, o: &ObjRef) -> bool {
         self.inst(o).remote
     }
@@ -326,7 +349,7 @@ impl Runtime {
     pub(crate) fn sync(&mut self, key: &str, state: &Json, seq: Option<u64>) -> Result<(), String> {
         // A deletion of something this device never held (a class stream catching up): there
         // is nothing to load, only a stored copy to forget, if any.
-        let replica = key.split_once('/').and_then(|(c, _)| self.program.object(c)).is_some_and(|c| self.program.objects[c as usize].server && !self.server);
+        let replica = key.split_once('/').and_then(|(c, _)| self.program.object(c)).is_some_and(|c| self.is_remote_class(c));
         if state.is_null() && replica && !self.is_loaded(key) {
             let _ = self.store.remove(key);
             return Ok(());
@@ -618,6 +641,10 @@ impl Runtime {
         let mut keys: Vec<String> = Vec::new();
         let mut streamed: Vec<String> = Vec::new();
         for key in objects {
+            #[cfg(feature = "server")]
+            if self.is_remote_key(key) {
+                continue;
+            }
             match key.strip_suffix("/*").and_then(|c| self.program.object(c).map(|class| (c, class))) {
                 Some((name, class)) => {
                     streamed.push(format!("{name}/"));
@@ -665,7 +692,7 @@ impl Runtime {
     /// the first call subscribes to the whole class, so the list fills as the server sends it.
     pub(crate) fn all_objects(&mut self, class: u16) -> Result<Vec<Rc<ObjRef>>, Exc> {
         let def = &self.program.objects[class as usize];
-        if def.server && !self.server {
+        if self.is_remote_class(class) {
             if self.class_streams.insert(class) {
                 let stream = format!("{}/*", def.name);
                 // The replicas kept on the device come first, so the list shows offline too.
@@ -833,7 +860,7 @@ impl Runtime {
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.methods.values().any(|m| m.invariant))
+            .filter(|(i, d)| !self.is_remote_class(*i as u16) && d.methods.values().any(|m| m.invariant))
             .map(|(i, _)| i as u16)
             .collect();
         let mut checked = 0;
@@ -1038,7 +1065,7 @@ impl Runtime {
             // Objects joined the index above; leaving it can wait, as a stale entry only loads
             // an object without alarms at boot.
             index_changed |= !has_alarms && self.alarm_index.remove(&object);
-            if state_changed {
+            if state_changed && (!remote || !self.server) {
                 let state = if gone { Json::Null } else { Json::Object(record.state) };
                 self.outputs.push(Output::Changed { object, state, seq: record.seq });
             }
