@@ -123,7 +123,7 @@ Bridges are plugins with a common shape, so every bridge works the same way:
 - **Outbound:** tinyjump changes reach outside systems. Change subscriptions are delivered
   over HTTP, queues or databases, through the outbox, so delivery survives outages and
   runs once.
-- **Generated:** `tj bridge openapi spec.yaml` turns an OpenAPI description into a typed
+- **Generated:** `tj bridge openapi spec.json` turns an OpenAPI 3.x description into a typed
   module. The same can follow for GraphQL and gRPC.
 - **Legacy systems:** databases (Postgres, SQL Server, Oracle), queues (Kafka, MQTT,
   RabbitMQ) and business systems (SAP, Salesforce, Odoo), so teams can move one piece at
@@ -164,6 +164,11 @@ enterprise needs:
 
 **Built in `tj` (CLI & lockfile):**
 
+- `tj search [<query>] [--kind <kind>] [--min-trust community|verified|official] [--registry <url-or-dir>] [--json]`
+  queries the registry's `catalog.json` (or scans `index/*.json` in local registries) and filters by keyword, kind and trust mark.
+- `tj info <name> [--registry <url-or-dir>] [--json]` inspects a package's verified manifest, commit/SHA-256 pin, trust mark and declared permissions before installing.
+- `tj bridge openapi <spec.json> [--out <file.tj>] [--base-url <https://...>] [--manifest <file.json>]`
+  generates a typed `.tj` client module (compile-checked, literal HTTPS host prefixes for static permission auditing) plus an optional draft `mindmakr/tj-plugins` bridge manifest from any OpenAPI 3.x JSON specification.
 - `tj add <name> [--registry <url-or-dir>] [--dir <app-dir>] [--min-trust community|verified|official]`
   fetches a manifest from a remote HTTPS registry (or a local/enterprise directory registry,
   overridable via `TJ_REGISTRY`), enforces commit & SHA-256 pins, checks trust marks and
@@ -185,23 +190,26 @@ enterprise needs:
 
 **Live external registry (`https://github.com/mindmakr/tj-plugins`):**
 
-- Public index repository with Official packages (`money` pure-`.tj` integer minor-unit
-  currency library and `gdpr-eu` compliance pack) installable via `tj add <name>`,
-  structured GitHub Issue Forms (`request-library`, `request-port`, `request-bridge`),
-  and `.github/workflows/review.yml` running `tj registry check` on every pull request.
+- Public index repository with 6 Official packages (`money`, `slug`, `csv`, `validate`
+  pure-`.tj` libraries plus `gdpr-eu` and `pdpl-sa` compliance packs) and `catalog.json`
+  installable via `tj add <name>` and searchable via `tj search` / `tj info`, structured
+  GitHub Issue Forms (`request-library`, `request-port`, `request-bridge`), and
+  `.github/workflows/review.yml` running `tj registry check` on pull requests (with
+  community trust-mark gating) plus daily `04:00 UTC` re-scans.
 
 **Later steps (post-v1):**
 
-- Sandboxed behaviour checks, Sigstore/SLSA provenance signing, nightly re-scans,
-  OpenAPI bridge generator, and registry search website.
+- Sandboxed behaviour checks, Sigstore/SLSA provenance signing, and a searchable registry
+  website.
 
 ## Order
 
-1. **`tj add`, `tj.lock`, `--min-trust` and `tj registry check` (done):** local & HTTPS
-   registry client, hash pinning, static permission audit, typosquat & license validator.
-2. **The public registry repository (`mindmakr/tj-plugins`, done):** index, request forms,
-   official entries (`money`, `gdpr-eu`), and PR submission pipeline running
-   `tj registry check`.
-3. **Sandboxed behaviour checks, signing (Sigstore/SLSA) and nightly re-scans.**
-4. **Bridges:** webhooks and outbound delivery (done), then the OpenAPI generator.
+1. **`tj add`, `tj search`, `tj info`, `tj.lock`, `--min-trust` and `tj registry check` (done):** local & HTTPS
+   registry client, catalog search, hash pinning, static permission audit, typosquat & license validator.
+2. **The public registry repository (`mindmakr/tj-plugins`, done):** index, `catalog.json`,
+   request forms, official libraries & compliance packs (`money`, `slug`, `csv`, `validate`,
+   `gdpr-eu`, `pdpl-sa`), PR submission pipeline with trust-mark gating, and nightly re-scans.
+3. **Bridges (done):** webhooks and outbound delivery (`webhooks.json`), plus the OpenAPI 3.x
+   typed `.tj` client & manifest generator (`tj bridge openapi`).
+4. **Sandboxed behaviour checks and signing (Sigstore/SLSA).**
 5. **The registry website, and the publisher programme.**
