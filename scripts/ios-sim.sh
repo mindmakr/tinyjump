@@ -200,7 +200,7 @@ xcrun simctl terminate "$udid" "$bundle" 2>/dev/null || true
 rm -rf "$out/packaged-ios"
 "$tj" build examples/todo/app.tj --ios --aot --out "$out/packaged-ios" --assemble
 test -x "$out/packaged-ios/Todo.app/Todo"
-test -f "$out/packaged-ios/Todo.app/Resources/app.tjb"
+test -f "$out/packaged-ios/Todo.app/app.tjb"
 pkg_bundle=com.mindmakr.tinyjump.todo
 xcrun simctl install "$udid" "$out/packaged-ios/Todo.app"
 xcrun simctl launch "$udid" "$pkg_bundle"

@@ -1059,7 +1059,7 @@ fn generate_ios_project(
          (cd \"$TJ_HOME\" && cargo \"${{CARGO_ARGS[@]}}\")\n\
          APP=\"$PWD/{exec_name}.app\"\n\
          rm -rf \"$APP\"\n\
-         mkdir -p \"$APP/Resources\"\n\
+         mkdir -p \"$APP\"\n\
          SWIFT_ARGS=(-O -parse-as-library -target \"$SWIFT_TARGET\")\n\
          {swift_debug}\
          xcrun --sdk \"$SDK\" swiftc \"${{SWIFT_ARGS[@]}}\" \\\n\
@@ -1067,7 +1067,7 @@ fn generate_ios_project(
            -L \"$TJ_HOME/$TARGET_SUB/$RUST_TARGET/small\" -ltj_ffi \\\n\
            \"$TJ_HOME\"/hosts/ios/Sources/TinyJump/*.swift \"$PWD/AppDelegate.swift\" \\\n\
            -o \"$APP/{exec_name}\"\n\
-         cp \"$PWD/Resources/app.tjb\" \"$APP/Resources/app.tjb\"\n\
+         cp \"$PWD/Resources/app.tjb\" \"$APP/app.tjb\"\n\
          cp \"$PWD/Info.plist\" \"$APP/Info.plist\"\n\
          SIGN_ID=\"${{TJ_IOS_CODESIGN_IDENTITY:--}}\"\n\
          if [[ \"$MODE\" == \"--device\" && \"$SIGN_ID\" == \"-\" ]]; then\n\
