@@ -156,8 +156,7 @@ catalog component, with props and events through the protocol), **`tj build` (do
 `.tjb` bytecode serialization so devices skip the compiler, opt-out `compiler` feature /
 `cargo web-aot`, plus `--web`, `--linux` standalone executables with SHA-256-verified
 embedded bytecode, and turnkey `--android` / `--ios` projects with `--assemble`)**, **golden-image screenshot diffs
-and `tj retro` run reports (done)**, **translations and locale formats (done)**, and GPU/3D
-(next). Size: profile the device builds and cut what is really large
+and `tj retro` run reports (done)**, **translations and locale formats (done)**, and **opt-in GPU/3D (`crates/tj-gfx` on `wgpu`, `hosts/web/plugins/gfx.js`, `<Scene>`/`<Mesh>`/`<Camera>`/`<Light>` + `@frame(dt)`, done)**. Size: profile the device builds and cut what is really large
 (a server-only split was measured at 1.2 KB and dropped,
 `feedback/2026-11-20-builder-004-size-split-measured.md`).
 
@@ -379,9 +378,9 @@ built on demand when packaging precompiled `.tjb` apps:
 
 | Build | Default (compiler + VM) | AOT-only (`--no-default-features`) | Savings |
 |---|---|---|---|
-| Web WASM (`tj_wasm.wasm`) | 842 KB | 540 KB (`cargo web-aot`) | -302 KB (-36%) |
-| Android `arm64-v8a` (`libtj_android.so`) | 1098 KB | 845 KB | -253 KB (-23%) |
-| Android `armeabi-v7a` (`libtj_android.so`) | 782 KB | 606 KB | -176 KB (-22%) |
+| Web WASM (`tj_wasm.wasm`) | 858 KB (322 KB gz) | 553 KB / 219 KB gz (`cargo web-aot`) | -305 KB (-36%) |
+| Android `arm64-v8a` (`libtj_android.so`) | 1106 KB | 852 KB | -254 KB (-23%) |
+| Android `armeabi-v7a` (`libtj_android.so`) | 787 KB | 610 KB | -177 KB (-22%) |
 
 Splitting `server` privacy/retention out of device builds is already done (`check` and
 `server` features in `crates/tj-core/Cargo.toml`); the remaining server access/call-record
