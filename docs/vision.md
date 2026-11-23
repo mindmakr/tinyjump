@@ -366,13 +366,15 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 
 ## Measured device binary sizes
 
-Enforced on every change by `scripts/budget.sh` (`scripts/budget.json`):
+Default builds are enforced on every change by `scripts/budget.sh` (`scripts/budget.json`);
+AOT-only builds (`--no-default-features`, e.g. `cargo web-aot` -> `target/aot/...`) are
+built on demand when packaging precompiled `.tjb` apps:
 
 | Build | Default (compiler + VM) | AOT-only (`--no-default-features`) | Savings |
 |---|---|---|---|
 | Web WASM (`tj_wasm.wasm`) | 842 KB | 540 KB (`cargo web-aot`) | -302 KB (-36%) |
 | Android `arm64-v8a` (`libtj_android.so`) | 1098 KB | 845 KB | -253 KB (-23%) |
-| Android `armeabi-v7a` (`libtj_android.so`) | 781 KB | 606 KB | -175 KB (-22%) |
+| Android `armeabi-v7a` (`libtj_android.so`) | 782 KB | 606 KB | -176 KB (-22%) |
 
 Splitting `server` privacy/retention out of device builds is already done (`check` and
 `server` features in `crates/tj-core/Cargo.toml`); the remaining server access/call-record

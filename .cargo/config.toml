@@ -1,7 +1,7 @@
 [alias]
 # Build the web runtime (WASM) used by `tj dev` and hosts/web.
 web = "build -p tj-wasm --target wasm32-unknown-unknown --profile small"
-# Build the smaller compiler-free AOT-only web runtime (boots `tj build` `.tjb` bundles).
-web-aot = "build -p tj-wasm --target wasm32-unknown-unknown --profile small --no-default-features"
+# Build the smaller compiler-free AOT-only web runtime (into target/aot so `tj dev` is not clobbered).
+web-aot = "build -p tj-wasm --target wasm32-unknown-unknown --profile small --no-default-features --target-dir target/aot"
 # Run the CLI: `cargo tj dev examples/todo/app.tj`
 tj = "run -q -p tj-cli --release --"

@@ -69,9 +69,11 @@ USAGE:
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
-  tj review [<app.tj> [--locale <tag>]... [--width <n>] [--height <n>] | --target <url> [--golden <file.png> [--update-golden] [--threshold <pct>] [--diff <out.png>]]]
-                                 check a running app (with --target, optional golden-image PNG screenshot
-                                 diffing, or offline --golden + --actual PNG comparison) or an app file
+  tj review <app.tj> [--locale <tag>]... [--pseudo] [--width <n>] [--height <n>]
+  tj review [--target <url>] [--golden <file.png> [--update-golden] [--threshold <pct>] [--diff <out.png>]]
+  tj review --golden <file.png> --actual <file.png> [--threshold <pct>] [--diff <out.png>]
+                                 check a running app (layout, a11y, contrast, optional golden-image PNG
+                                 diffing), compare two PNG screenshots offline, or sweep an `<app.tj>`
                                  offline across every locale in `locales/*.json` + pseudo-locale
   tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
   tj privacy export|erase <person id> [--target <url>]
@@ -153,6 +155,7 @@ struct Args {
     data: Option<PathBuf>,
     wasm: Option<PathBuf>,
     target: String,
+    target_set: bool,
     budget: Option<PathBuf>,
     json: bool,
     manifest: bool,
@@ -192,7 +195,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None, review_locales: Vec::new(), review_pseudo: false, width: None, height: None, golden: None, actual: None, update_golden: false, threshold: None, diff_out: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), target_set: false, budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None, review_locales: Vec::new(), review_pseudo: false, width: None, height: None, golden: None, actual: None, update_golden: false, threshold: None, diff_out: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -200,7 +203,10 @@ fn parse_args() -> Result<Args, String> {
             "--host" => args.host = value()?,
             "--data" => args.data = Some(PathBuf::from(value()?)),
             "--wasm" => args.wasm = Some(PathBuf::from(value()?)),
-            "--target" => args.target = value()?,
+            "--target" => {
+                args.target = value()?;
+                args.target_set = true;
+            }
             "--budget" => args.budget = Some(PathBuf::from(value()?)),
             "--json" => args.json = true,
             "--manifest" => args.manifest = true,
@@ -459,22 +465,36 @@ fn review_cmd(args: &Args) -> Result<(), String> {
         return Err("offline review flags (--locale, --pseudo, --width, --height) require an <app.tj> file".into());
     }
     if let Some(golden_path) = &args.golden {
-        // Offline PNG-to-PNG diff when `--actual` is given; otherwise review live `--target` + `/_tj/screenshot`.
-        let mut review_err = None;
-        let actual_png = if let Some(actual_path) = &args.actual {
-            std::fs::read(actual_path).map_err(|e| format!("cannot read actual screenshot {}: {e}", actual_path.display()))?
-        } else {
-            if let Err(e) = review(&args.target) {
-                review_err = Some(e);
-            }
-            fetch_screenshot(&args.target)?
-        };
+        if args.actual.is_some() && args.target_set {
+            return Err("pass either --target <url> or --actual <file.png>, not both".into());
+        }
         let threshold = args.threshold.unwrap_or(golden::DEFAULT_THRESHOLD_PCT);
-        let msg = golden::check_or_update(golden_path, &actual_png, args.update_golden, threshold, args.diff_out.as_deref())?;
-        println!("{msg}");
-        return match review_err {
-            Some(e) => Err(e),
-            None => Ok(()),
+        // Offline PNG-to-PNG diff when `--actual` is given; otherwise review live `--target` + `/_tj/screenshot`.
+        if let Some(actual_path) = &args.actual {
+            let actual_png = std::fs::read(actual_path).map_err(|e| format!("cannot read actual screenshot {}: {e}", actual_path.display()))?;
+            let msg = golden::check_or_update(golden_path, &actual_png, args.update_golden, threshold, args.diff_out.as_deref())?;
+            println!("{msg}");
+            return Ok(());
+        }
+        if args.update_golden {
+            // Never overwrite a golden baseline from a broken screen with layout/a11y errors.
+            review(&args.target)?;
+            let actual_png = fetch_screenshot(&args.target)?;
+            let msg = golden::check_or_update(golden_path, &actual_png, true, threshold, None)?;
+            println!("{msg}");
+            return Ok(());
+        }
+        let review_res = review(&args.target);
+        let golden_res = fetch_screenshot(&args.target).and_then(|actual_png| {
+            let msg = golden::check_or_update(golden_path, &actual_png, false, threshold, args.diff_out.as_deref())?;
+            println!("{msg}");
+            Ok(())
+        });
+        return match (review_res, golden_res) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(r), Ok(())) => Err(r),
+            (Ok(()), Err(g)) => Err(g),
+            (Err(r), Err(g)) => Err(format!("{r}; {g}")),
         };
     }
     review(&args.target)
@@ -485,18 +505,25 @@ fn fetch_screenshot(target: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
     const MAX_SCREENSHOT_BYTES: u64 = 32 * 1024 * 1024;
     let url = format!("{}/_tj/screenshot", target.trim_end_matches('/'));
-    let mut req = ureq::get(&url);
+    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
+    let mut req = agent.get(&url);
     if let Some(h) = auth::client_header() {
         req = req.set("Authorization", &h);
     }
     let resp = match req.call() {
         Ok(r) => r,
+        Err(ureq::Error::Status(404, _)) => {
+            return Err(format!(
+                "{url} returned HTTP 404 (only Android and iOS hosts serve /_tj/screenshot; for web screenshots pass --actual <file.png>)"
+            ));
+        }
         Err(ureq::Error::Status(code, r)) => {
             let msg = r.into_string().unwrap_or_default();
             return Err(format!("{url} returned HTTP {code}: {msg}"));
         }
         Err(e) => return Err(format!("cannot reach {url}: {e}")),
     };
+    let content_type = resp.content_type().to_string();
     let mut bytes = Vec::new();
     resp.into_reader()
         .take(MAX_SCREENSHOT_BYTES + 1)
@@ -504,6 +531,9 @@ fn fetch_screenshot(target: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("failed reading screenshot from {url}: {e}"))?;
     if bytes.len() as u64 > MAX_SCREENSHOT_BYTES {
         return Err(format!("screenshot from {url} exceeds 32 MiB limit"));
+    }
+    if bytes.len() < 8 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err(format!("{url} did not return a PNG image (content-type: {content_type}, {} bytes)", bytes.len()));
     }
     Ok(bytes)
 }
