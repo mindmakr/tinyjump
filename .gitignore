@@ -1,4 +1,5 @@
 /target
+hosts/linux/target/
 .tj-data/
 .playwright-mcp/
 hosts/android/.gradle/

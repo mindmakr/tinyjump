@@ -365,9 +365,9 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 | Web (WASM + DOM) | working |
 | Android (Views, minSdk 21; arm64, armv7, x86, x86_64) | working |
 | iOS (UIKit, iOS 13+) | working: built and driven on the iOS Simulator in CI |
-| macOS | runtime and CLI tested on macOS CI; AppKit host after iOS |
+| macOS (AppKit, macOS 12+) | working: built and driven natively on macOS CI (`hosts/macos`) |
 | Linux (server/CLI, static: x86_64, aarch64, armv7) | working |
-| Linux desktop UI | after mobile |
+| Linux desktop UI (GTK 3) | working: native GTK 3 host (`hosts/linux`, 3.1 MB, zero dev headers) |
 | Microcontrollers | out of scope for now |
 
 ## Measured device binary sizes

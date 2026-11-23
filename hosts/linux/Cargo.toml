@@ -1,0 +1,23 @@
+[package]
+name = "tj-linux"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Native GTK 3 Linux desktop host for tinyjump (dlopen libgtk-3.so.0, zero dev headers required)"
+
+[workspace]
+
+[[bin]]
+name = "tinyjump-linux"
+path = "src/main.rs"
+
+[dependencies]
+tj-core = { path = "../../crates/tj-core", features = ["layout"] }
+serde_json = "1"
+ureq = "2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
