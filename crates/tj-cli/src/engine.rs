@@ -75,8 +75,8 @@ enum Msg {
     Stats(Sender<Json>),
     /// Export (`erase: false`) or erase everything held about a person.
     Privacy { subject: String, erase: bool, done: Sender<Result<Json, Failure>> },
-    /// Fast file-watcher reload used by `tj dev`.
-    Reload(String),
+    /// Fast file-watcher reload used by `tj dev` (optionally updating resolved device permissions).
+    Reload(String, Option<std::collections::BTreeMap<String, crate::device_perms::DevicePermission>>),
     /// Shadow-booted, compatibility- and invariant-checked live reload (`POST /_tj/reload`).
     SafeReload { req: ReloadRequest, done: Sender<Result<Json, Failure>> },
     /// Roll back to the previous known-good bundle (`POST /_tj/rollback`).
@@ -92,6 +92,7 @@ pub struct Engine {
     max_objects: usize,
     max_object_bytes: usize,
     fetch_allowlist: bool,
+    device_plugins: Arc<Mutex<Vec<&'static str>>>,
 }
 
 pub fn now_ms() -> f64 {
@@ -237,6 +238,8 @@ impl Engine {
         let live_source_ref = live_source.clone();
         let fetch_allow = fetch_allow_from_env()?;
         let fetch_allowlist = !fetch_allow.is_empty();
+        let device_plugins = Arc::new(Mutex::new(crate::device_perms::bundled_host_plugins(&device_perms)));
+        let device_plugins_ref = device_plugins.clone();
         let remote_classes = remotes.classes();
         let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
         let fetch_allow_arc = Arc::new(fetch_allow);
@@ -253,7 +256,7 @@ impl Engine {
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms, device_plugins_ref);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -267,7 +270,12 @@ impl Engine {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
-        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist })
+        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist, device_plugins })
+    }
+
+    /// Opt-in host device plugins (`files`, `notifications`, `location`, `camera`) enabled by the app's permissions.
+    pub fn device_plugins(&self) -> Vec<&'static str> {
+        self.device_plugins.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -358,7 +366,16 @@ impl Engine {
 
     /// Re-boots with new source (`tj dev` file watcher). Objects keep their stored state.
     pub fn reload(&self, source: String) {
-        let _ = self.tx.send(Msg::Reload(source));
+        let _ = self.tx.send(Msg::Reload(source, None));
+    }
+
+    /// Re-boots with new source and refreshed device permissions (`tj dev` file watcher).
+    pub fn reload_with_device_perms(
+        &self,
+        source: String,
+        device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
+    ) {
+        let _ = self.tx.send(Msg::Reload(source, Some(device_perms)));
     }
 
     /// Validated shadow-boot live reload (`POST /_tj/reload`): checks compatibility, boots on a
@@ -577,7 +594,8 @@ fn run(
     remotes: Arc<Remotes>,
     webhook_cfg: Arc<Webhooks>,
     webhooks: WebhookSender,
-    device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
+    mut device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
+    device_plugins: Arc<Mutex<Vec<&'static str>>>,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
@@ -697,10 +715,17 @@ fn run(
                 d.subscribers.push(events);
                 continue;
             }
-            Ok(Msg::Reload(source)) => {
+            Ok(Msg::Reload(source, updated_perms)) => {
+                let next_perms = updated_perms.as_ref().unwrap_or(&device_perms);
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&source, &data, render, explain, &refs, &remote_classes, &device_perms) {
+                match boot(&source, &data, render, explain, &refs, &remote_classes, next_perms) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
+                        if let Some(p) = updated_perms {
+                            if let Ok(mut dp) = device_plugins.lock() {
+                                *dp = crate::device_perms::bundled_host_plugins(&p);
+                            }
+                            device_perms = p;
+                        }
                         let new_sha = sha256_hex(&source);
                         previous = Some((current_source, current_sha));
                         current_source = source.clone();

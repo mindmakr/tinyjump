@@ -735,8 +735,8 @@ fn handle(mut req: Request, front: &Front) {
             asked = Some(("whoami", None, None));
             take_verified()
         }.map(|v| match v.caller {
-            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some() }),
-            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some() }),
+            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins() }),
+            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
         (Method::Get, ["_tj", "metrics"]) => {
@@ -884,6 +884,15 @@ fn handle(mut req: Request, front: &Front) {
             match rest {
                 [""] | ["index.html"] => file(web.web_dir.join("index.html"), "text/html; charset=utf-8"),
                 ["tinyjump.js"] => file(web.web_dir.join("tinyjump.js"), "text/javascript; charset=utf-8"),
+                ["device-plugins.js"] => {
+                    if engine.device_plugins().is_empty() {
+                        Response::from_data("export function createDevicePlugins(){return{};}\n")
+                            .with_header(header("Content-Type", "text/javascript; charset=utf-8"))
+                            .with_header(header("Cache-Control", "no-store"))
+                    } else {
+                        file(web.web_dir.join("plugins/device.js"), "text/javascript; charset=utf-8")
+                    }
+                }
                 ["tinyjump.wasm"] => file(web.wasm.clone(), "application/wasm"),
                 // The whole app as one bundle: the entry and the files it imports (or the live
                 // reloaded bundle on `tj serve --web`).

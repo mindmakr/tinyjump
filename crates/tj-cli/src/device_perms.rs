@@ -152,6 +152,25 @@ pub fn manifest_json(perms: &BTreeMap<String, DevicePermission>) -> Vec<Json> {
         .collect()
 }
 
+/// Built-in opt-in host device plugins shipped in `hosts/{web,android,ios}` and bundled
+/// automatically by `tj build` and `tj dev` only when an app declares matching permissions.
+pub fn bundled_host_plugins(perms: &BTreeMap<String, DevicePermission>) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if perms.contains_key("files") {
+        out.push("files");
+    }
+    if perms.contains_key("notifications") {
+        out.push("notifications");
+    }
+    if perms.contains_key("location") || perms.contains_key("location-background") {
+        out.push("location");
+    }
+    if perms.contains_key("camera") {
+        out.push("camera");
+    }
+    out
+}
+
 /// Generates deduplicated `<uses-permission>` and `<uses-feature>` XML lines for `AndroidManifest.xml`
 /// covering `minSdk = 21` through `targetSdk = 35`.
 pub fn android_manifest_xml(perms: &BTreeMap<String, DevicePermission>) -> String {
@@ -343,6 +362,8 @@ mod tests {
         assert_eq!(merged["camera"].reason.as_deref(), Some(arabic_reason));
         assert_eq!(merged["camera"].sources, vec!["tj:qr", "permissions.json"]);
         assert_eq!(merged["notifications"].sources, vec!["tj:qr"]);
+        assert_eq!(bundled_host_plugins(&merged), vec!["notifications", "location", "camera"]);
+        assert!(bundled_host_plugins(&BTreeMap::new()).is_empty());
 
         let ios_xml = ios_plist_xml(&merged, "MyApp", esc);
         assert!(ios_xml.contains("<key>NSCameraUsageDescription</key>"));
