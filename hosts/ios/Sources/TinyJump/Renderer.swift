@@ -1,8 +1,9 @@
 import UIKit
 
 /// Turns UIKit control events into runtime UI events for one node.
-final class EventTarget: NSObject, UITextFieldDelegate {
+final class EventTarget: NSObject, UITextFieldDelegate, UIScrollViewDelegate {
     let fire: (String, Any) -> Void
+    var onScroll: ((UIScrollView) -> Void)?
 
     init(fire: @escaping (String, Any) -> Void) {
         self.fire = fire
@@ -16,6 +17,122 @@ final class EventTarget: NSObject, UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         fire("onSubmit", textField.text ?? "")
         return true
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        onScroll?(scrollView)
+    }
+}
+
+/// A native segmented tab bar (`<Tabs>`), sized to at least 44pt tall for touch targets.
+final class TabsView: UIView {
+    private let control = UISegmentedControl()
+    private var values: [String] = []
+    var onSelect: ((String) -> Void)?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        control.addTarget(self, action: #selector(changed), for: .valueChanged)
+        addSubview(control)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("not used from storyboards")
+    }
+
+    func setItems(_ items: [Any], selected: String?) {
+        control.removeAllSegments()
+        values = []
+        for (i, raw) in items.enumerated() {
+            let val: String
+            let label: String
+            if let dict = raw as? [String: Any] {
+                val = (dict["value"].map { "\($0)" }) ?? (dict["label"].map { "\($0)" }) ?? ""
+                label = (dict["label"].map { "\($0)" }) ?? val
+            } else {
+                val = "\(raw)"
+                label = val
+            }
+            values.append(val)
+            control.insertSegment(withTitle: label, at: i, animated: false)
+        }
+        setSelected(selected)
+    }
+
+    func setSelected(_ selected: String?) {
+        if let s = selected, let idx = values.firstIndex(of: s) {
+            control.selectedSegmentIndex = idx
+        } else {
+            control.selectedSegmentIndex = UISegmentedControl.noSegment
+        }
+    }
+
+    @objc private func changed() {
+        let idx = control.selectedSegmentIndex
+        if idx >= 0 && idx < values.count {
+            onSelect?(values[idx])
+        }
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        let s = control.sizeThatFits(size)
+        return CGSize(width: max(44, s.width), height: max(44, s.height))
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        control.frame = bounds
+    }
+}
+
+/// A vector icon backed by iOS 13+ SF Symbols (`<Icon>`).
+final class IconView: UIImageView {
+    private static let symbols: [String: String] = [
+        "check": "checkmark",
+        "plus": "plus",
+        "close": "xmark",
+        "search": "magnifyingglass",
+        "home": "house",
+        "user": "person",
+        "settings": "gear",
+        "back": "chevron.left",
+        "next": "chevron.right",
+        "edit": "pencil",
+        "trash": "trash",
+        "calendar": "calendar",
+        "clock": "clock",
+        "bell": "bell",
+        "mail": "envelope",
+        "star": "star",
+        "heart": "heart",
+        "info": "info.circle",
+        "warning": "exclamationmark.triangle",
+        "lock": "lock",
+        "menu": "line.horizontal.3",
+        "share": "square.and.arrow.up",
+        "refresh": "arrow.clockwise",
+        "download": "arrow.down.circle",
+    ]
+
+    var iconSize: CGFloat = 20
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        contentMode = .scaleAspectFit
+        tintColor = .label
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("not used from storyboards")
+    }
+
+    func setIcon(_ name: String) {
+        let sym = IconView.symbols[name] ?? "circle"
+        image = UIImage(systemName: sym)
+    }
+
+    override func sizeThatFits(_ size: CGSize) -> CGSize {
+        CGSize(width: iconSize, height: iconSize)
     }
 }
 
@@ -92,6 +209,8 @@ final class Renderer {
         /// Where children go; nil for leaf widgets.
         let container: UIView?
         var target: EventTarget?
+        var nativeComponent: NativeComponent?
+        var lastScrollExtent: CGFloat = -1
         var props: [String: Any] = [:]
         var events: [String] = []
         /// True while the renderer itself changes a control, so its events stay quiet.
@@ -136,10 +255,10 @@ final class Renderer {
                 inheritDirection(n.view)
                 n.events = op["events"] as? [String] ?? []
                 nodes[id] = n
-                setProps(n, props)
+                setProps(n, props, isCreate: true)
             case "update":
                 guard let n = nodes[id] else { continue }
-                setProps(n, op["props"] as? [String: Any] ?? [:])
+                setProps(n, op["props"] as? [String: Any] ?? [:], isCreate: false)
                 if let events = op["events"] as? [String] { n.events = events }
             case "children":
                 guard let box = nodes[id]?.container else { continue }
@@ -147,7 +266,10 @@ final class Renderer {
                 for v in box.subviews where !views.contains(v) { v.removeFromSuperview() }
                 for (i, v) in views.enumerated() where box.subviews.firstIndex(of: v) != i { box.insertSubview(v, at: i) }
             case "remove":
-                if let n = nodes.removeValue(forKey: id) { n.view.removeFromSuperview() }
+                if let n = nodes.removeValue(forKey: id) {
+                    n.nativeComponent?.destroy?(n.view)
+                    n.view.removeFromSuperview()
+                }
             default:
                 break
             }
@@ -171,7 +293,10 @@ final class Renderer {
             let num = { (k: String) in CGFloat((f[k] as? Double) ?? 0) }
             n.view.frame = CGRect(x: num("x"), y: num("y"), width: num("w"), height: num("h"))
             if let content = f["content"] as? Double, let scroll = n.view as? UIScrollView, let box = n.container {
-                box.frame = CGRect(x: 0, y: 0, width: num("w"), height: CGFloat(content))
+                let horiz = n.kind == "List" && ((n.props["horizontal"] as? Bool) ?? false)
+                box.frame = horiz
+                    ? CGRect(x: 0, y: 0, width: CGFloat(content), height: num("h"))
+                    : CGRect(x: 0, y: 0, width: num("w"), height: CGFloat(content))
                 scroll.contentSize = box.frame.size
             }
         }
@@ -196,7 +321,7 @@ final class Renderer {
 
     private func create(id: Int, kind: String, props: [String: Any]) -> Node {
         switch kind {
-        case "Column", "Row":
+        case "Column", "Row", "Theme":
             let box = UIView()
             return Node(id: id, kind: kind, view: box, container: box)
         case "Scroll":
@@ -204,6 +329,33 @@ final class Renderer {
             let content = UIView()
             scroll.addSubview(content)
             return Node(id: id, kind: kind, view: scroll, container: content)
+        case "List":
+            let scroll = UIScrollView()
+            let content = UIView()
+            scroll.addSubview(content)
+            let n = Node(id: id, kind: kind, view: scroll, container: content)
+            let t = target(for: n)
+            t.onScroll = { [weak n, weak t] sv in
+                guard let n = n, let t = t else { return }
+                let horiz = (n.props["horizontal"] as? Bool) ?? false
+                let extent = horiz ? sv.contentSize.width : sv.contentSize.height
+                let viewSize = horiz ? sv.bounds.width : sv.bounds.height
+                let offset = horiz ? sv.contentOffset.x : sv.contentOffset.y
+                if extent > viewSize, extent - offset - viewSize <= 120, n.lastScrollExtent != extent {
+                    n.lastScrollExtent = extent
+                    t.fire("onEndReached", NSNull())
+                }
+            }
+            scroll.delegate = t
+            return n
+        case "Tabs":
+            let tabs = TabsView()
+            let n = Node(id: id, kind: kind, view: tabs, container: nil)
+            let t = target(for: n)
+            tabs.onSelect = { [weak t] val in t?.fire("onChange", val) }
+            return n
+        case "Icon":
+            return Node(id: id, kind: kind, view: IconView(), container: nil)
         case "Button":
             let b = UIButton(type: .system)
             let n = Node(id: id, kind: kind, view: b, container: nil)
@@ -235,8 +387,23 @@ final class Renderer {
             label.numberOfLines = 0
             label.textAlignment = .natural
             return Node(id: id, kind: kind, view: label, container: nil)
-        default: // Spacer
+        case "Spacer":
             return Node(id: id, kind: kind, view: UIView(), container: nil)
+        default:
+            if let comp = TinyJump.nativeComponent(kind) {
+                weak var holder: Node?
+                let view = comp.create(props) { [weak self] event, value in
+                    guard let self = self, let n = holder, !n.quiet, n.events.contains(event) else { return }
+                    self.tj?.send(["type": "ui", "target": ["node": n.id], "event": event, "value": value ?? NSNull()])
+                }
+                let n = Node(id: id, kind: kind, view: view, container: comp.container?(view))
+                n.nativeComponent = comp
+                holder = n
+                return n
+            }
+            let missing = PaddedLabel()
+            missing.text = "<\(kind)>"
+            return Node(id: id, kind: kind, view: missing, container: nil)
         }
     }
 
@@ -254,22 +421,59 @@ final class Renderer {
         return t
     }
 
-    private func setProps(_ n: Node, _ props: [String: Any]) {
+    private func setProps(_ n: Node, _ props: [String: Any], isCreate: Bool) {
         n.quiet = true
         defer { n.quiet = false }
         for (k, v) in props {
             let none = v is NSNull
             if none { n.props.removeValue(forKey: k) } else { n.props[k] = v }
-            setProp(n, k, none ? nil : v)
+            if n.nativeComponent != nil {
+                if k == "id" { n.view.accessibilityIdentifier = none ? nil : (v as? String) }
+                else if k == "label" { n.view.accessibilityLabel = none ? nil : "\(v)" }
+            } else {
+                setProp(n, k, none ? nil : v)
+            }
+        }
+        if let comp = n.nativeComponent, !isCreate {
+            comp.update(n.view, n.props, props)
+        }
+        if n.kind == "Tabs", props.keys.contains(where: { $0 == "items" || $0 == "value" }) {
+            if let tabs = n.view as? TabsView {
+                tabs.setItems(n.props["items"] as? [Any] ?? [], selected: n.props["value"].map { "\($0)" })
+            }
         }
         if props.keys.contains(where: { ["background", "radius", "border"].contains($0) }) { restyle(n) }
-        if props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
+        if n.kind == "Theme", props.keys.contains(where: { ["mode", "accent", "surface", "background"].contains($0) }) { applyTheme(n) }
+        if n.nativeComponent == nil, props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
+    }
+
+    private func applyTheme(_ n: Node) {
+        if let mode = n.props["mode"] as? String {
+            n.view.overrideUserInterfaceStyle = mode == "dark" ? .dark : mode == "light" ? .light : .unspecified
+        } else {
+            n.view.overrideUserInterfaceStyle = .unspecified
+        }
+        if let accent = n.props["accent"] as? String, let c = Renderer.color(accent) {
+            n.view.tintColor = c
+        }
+        if n.props["background"] == nil {
+            if let surface = n.props["surface"] as? String, let c = Renderer.color(surface) {
+                n.view.backgroundColor = c
+            } else if n.props["mode"] != nil {
+                n.view.backgroundColor = .systemBackground
+            }
+        }
     }
 
     /// Visual props. Layout props (width, gap, align, grow, ...) are the core's job.
     private func setProp(_ n: Node, _ k: String, _ v: Any?) {
         let view = n.view
         let label = (view as? UILabel) ?? (view as? ToggleView)?.label
+        if let icon = view as? IconView {
+            if k == "name" { icon.setIcon(v.map { "\($0)" } ?? ""); return }
+            if k == "size" { icon.iconSize = CGFloat((v as? Double) ?? 20); return }
+            if k == "color" { icon.tintColor = v.flatMap { Renderer.color("\($0)") } ?? .label; return }
+        }
         if n.kind == "Time", ["value", "show", "style", "zone"].contains(k) {
             label?.text = Times.show(n.props)
             return

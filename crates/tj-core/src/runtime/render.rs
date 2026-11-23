@@ -83,11 +83,19 @@ fn text(v: &Value, out: &mut String) -> Result<(), String> {
 
 fn elem(e: &Elem) -> Result<VNode, String> {
     let kind = catalog::kind(&e.kind).expect("the compiler only builds catalog elements");
+    let is_native = kind.name == "Native";
+    let mut native_kind: Option<Rc<str>> = None;
     let mut props = Map::new();
     let mut handlers = Vec::new();
     let mut key = None;
     for (name, v) in &e.props {
-        if &**name == "key" {
+        if is_native && &**name == "name" {
+            match v {
+                Value::Str(s) if catalog::valid_native_name(s) => native_kind = Some(s.clone()),
+                Value::Str(s) => return Err(format!("<Native> invalid component name '{s}'")),
+                other => return Err(format!("<Native> name must be a string, got a {}", other.type_name())),
+            }
+        } else if &**name == "key" {
             key = Some(v.display());
         } else if kind.is_event(name) {
             match v {
@@ -99,6 +107,11 @@ fn elem(e: &Elem) -> Result<VNode, String> {
             props.insert(name.to_string(), v.to_json().map_err(|err| format!("<{}> {name}: {err}", e.kind))?);
         }
     }
+    let out_kind = if is_native {
+        native_kind.ok_or_else(|| "<Native> requires a 'name' prop".to_string())?
+    } else {
+        e.kind.clone()
+    };
     let mut children = Vec::new();
     match kind.content {
         Content::Text => {
@@ -117,7 +130,7 @@ fn elem(e: &Elem) -> Result<VNode, String> {
             // A labelled group around one control without a label (a form field, `tj:ui`'s
             // Field): the label names the control, for screen readers and agents alike.
             let unnamed = |n: &VNode| matches!(&*n.kind, "Input" | "Toggle") && !n.props.contains_key("label");
-            if props.contains_key("label") && children.iter().filter(|c| unnamed(c)).count() == 1 {
+            if !is_native && props.contains_key("label") && children.iter().filter(|c| unnamed(c)).count() == 1 {
                 let label = props.remove("label").expect("checked");
                 if let Some(control) = children.iter_mut().find(|c| unnamed(c)) {
                     control.props.insert("label".into(), label);
@@ -126,5 +139,5 @@ fn elem(e: &Elem) -> Result<VNode, String> {
         }
         Content::None => {}
     }
-    Ok(VNode { kind: e.kind.clone(), key, props, handlers, children })
+    Ok(VNode { kind: out_kind, key, props, handlers, children })
 }

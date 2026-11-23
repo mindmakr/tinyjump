@@ -1509,6 +1509,26 @@ impl Compiler {
     fn jsx(&mut self, el: &JsxElement) {
         let sp = el.span;
         if let Some(kind) = catalog::kind(&el.tag) {
+            if kind.name == "Native" {
+                match el.attrs.iter().find(|(n, _)| n == "name") {
+                    None => self.error(
+                        Diagnostic::new("<Native> requires a 'name' prop", sp)
+                            .hint("pass the registered host component name, e.g. <Native name=\"MapView\" ... />"),
+                    ),
+                    Some((_, v)) => {
+                        if let ExprKind::Str(s) = &v.kind {
+                            if !catalog::valid_native_name(s) {
+                                let hint = if catalog::kind(s).is_some() {
+                                    format!("'{s}' is a built-in component; use <{s}> directly")
+                                } else {
+                                    "component names start with a capital letter and use letters, digits or '_' (e.g. \"MapView\")".into()
+                                };
+                                self.error(Diagnostic::new(format!("<Native> invalid component name '{s}'"), v.span).hint(hint));
+                            }
+                        }
+                    }
+                }
+            }
             let mut names = Vec::with_capacity(el.attrs.len());
             for (name, value) in &el.attrs {
                 if !kind.allows(name) {

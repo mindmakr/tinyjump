@@ -90,8 +90,17 @@ impl Walk {
 
     fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool) {
         let kind = n["kind"].as_str().unwrap_or("");
-        let background = prop(n, "background").unwrap_or(inherited_bg).to_string();
-        let interactive = matches!(kind, "Button" | "Input" | "Toggle");
+        let theme_bg = if kind == "Theme" {
+            prop(n, "surface").or_else(|| match prop(n, "mode") {
+                Some("dark") => Some("#111827"),
+                Some("light") => Some("#ffffff"),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let background = prop(n, "background").or(theme_bg).unwrap_or(inherited_bg).to_string();
+        let interactive = matches!(kind, "Button" | "Input" | "Toggle" | "Tabs");
 
         // Accessibility: everything a person can act on must say what it is.
         let named = prop(n, "text").is_some() || prop(n, "label").is_some();
@@ -99,6 +108,9 @@ impl Walk {
             "Button" | "Toggle" if !named => self.add(Severity::Error, "a11y", n, "has no text or label, so screen readers cannot name it".into()),
             "Input" if !named && prop(n, "placeholder").is_none() => self.add(Severity::Warning, "a11y", n, "has no label or placeholder".into()),
             "Image" if prop(n, "label").is_none() => self.add(Severity::Warning, "a11y", n, "has no label (alt text)".into()),
+            "Tabs" if props(n).get("items").and_then(Json::as_array).map_or(true, Vec::is_empty) => {
+                self.add(Severity::Warning, "a11y", n, "has no tab items".into());
+            }
             _ => {}
         }
 
@@ -131,7 +143,7 @@ impl Walk {
         }
 
         if let Some(children) = n["children"].as_array() {
-            self.nodes(children, &background, in_scroll || kind == "Scroll");
+            self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List");
         }
     }
 
@@ -265,5 +277,19 @@ mod tests {
         let white = luminance("#fff").unwrap();
         let black = luminance("black").unwrap();
         assert!(((white + 0.05) / (black + 0.05) - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn theme_background_and_tabs_are_reviewed() {
+        // Light text inside a dark Theme passes contrast; empty Tabs warns.
+        let tree = json!([node(1, "Theme", json!({ "mode": "dark" }), [0.0, 0.0, 390.0, 200.0], vec![
+            node(2, "Text", json!({ "text": "Hello", "color": "#f9fafb" }), [16.0, 16.0, 100.0, 24.0], vec![]),
+            node(3, "Tabs", json!({ "items": ["A", "B"], "value": "A" }), [16.0, 50.0, 200.0, 44.0], vec![]),
+        ])]);
+        assert!(review(&json!({ "tree": tree, "viewport": { "w": 390, "h": 800 } })).is_empty());
+
+        let bad_tabs = json!([node(1, "Tabs", json!({ "items": [] }), [0.0, 0.0, 200.0, 30.0], vec![])]);
+        let found = checks(&json!({ "tree": bad_tabs, "viewport": { "w": 390, "h": 800 } }));
+        assert!(found.contains(&"a11y") && found.contains(&"touch"), "{found:?}");
     }
 }

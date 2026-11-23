@@ -431,6 +431,11 @@ Built-in components, drawn as real native widgets:
 | `Toggle` | `value` | `onChange(checked)` | text (label) |
 | `Image` | `src`, `fit` | | none |
 | `Time` | `value`, `show`, `style`, `zone` | | none |
+| `Tabs` | `items`, `value` | `onChange(value)` | none |
+| `Icon` | `name` | | none |
+| `List` | `itemHeight`, `horizontal` | `onEndReached()` | nodes |
+| `Theme` | `mode`, `accent`, `surface`, `muted` | | nodes |
+| `Native` | `name`, plus any custom props | any `on<Upper>...` | nodes |
 
 Every built-in component also accepts `id` (the automation handle), `key` (list identity),
 `label` (accessibility), and the layout and style props `padding`, `margin`, `gap`,
@@ -438,6 +443,24 @@ Every built-in component also accepts `id` (the automation handle), `key` (list 
 `grow`, `width`, `height`, `color`, `background`, `radius`, `size` (font), `weight`
 (`"bold"` or `"normal"`) and `border` (a width, or `"2px #ccc"`). Numbers are pixels.
 Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
+
+- `<Tabs items={["Active", "Done"]} value={tab} onChange={t => ...} />`: native tab bar.
+  Each entry in `items` is a string or `{ value, label }`.
+- `<Icon name="check" size={20} color="#16a34a" />`: built-in vector icon (`check`, `plus`,
+  `close`, `search`, `home`, `user`, `settings`, `back`, `next`, `edit`, `trash`, `calendar`,
+  `clock`, `bell`, `mail`, `star`, `heart`, `info`, `warning`, `lock`, `menu`, `share`,
+  `refresh`, `download`). Add `label` when an icon carries meaning on its own.
+- `<List itemHeight={56} horizontal={false} onEndReached={() => ...}>…</List>`: scrollable
+  long-list container (vertical by default, or horizontal when `horizontal={true}`). Fires
+  `onEndReached` once per content extent when scrolled near the end.
+- `<Theme mode="light" | "dark" | "system" accent="#2563eb" surface="#111827" muted="#9ca3af">…</Theme>`:
+  applies theme tokens and light/dark appearance to a subtree.
+- `<Native name="MapView" lat={51.5} lng={-0.1} onSelect={id => ...} />`: mounts a custom
+  native widget registered on the host (DOM element on Web, Android `View`, iOS `UIView`).
+  `name` must start with a capital letter and not shadow a built-in component. Props are sent
+  as JSON, and any `on<Upper>...` prop becomes a native event handler. Wrap `<Native>` in a
+  typed `.tj` function (`function MapView(props: { lat: number, lng: number }) { return <Native name="MapView" ... /> }`)
+  so callers get full static type-checking (`docs/host-protocol.md`).
 
 - `<Time value={ms} />` shows a time the way the viewer's phone or browser writes it, in
   their language and time zone. Options:

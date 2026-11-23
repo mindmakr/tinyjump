@@ -37,6 +37,19 @@ public final class TinyJump {
     static final String TAG = "tinyjump";
     private static final int MAX_RESPONSE = 10 << 20;
     private static final int HTTP_TIMEOUT_MS = 30000;
+    private static final Map<String, NativeComponent> COMPONENTS = new HashMap<>();
+
+    /**
+     * Registers a custom native view used from {@code .tj} as {@code <Native name="..." />}.
+     * Call before {@link #start} so the initial render finds it.
+     */
+    public static synchronized void registerComponent(String name, NativeComponent component) {
+        if (component == null) COMPONENTS.remove(name); else COMPONENTS.put(name, component);
+    }
+
+    static synchronized NativeComponent nativeComponent(String name) {
+        return COMPONENTS.get(name);
+    }
 
     final Handler main = new Handler(Looper.getMainLooper());
     final ExecutorService io = Executors.newFixedThreadPool(4);

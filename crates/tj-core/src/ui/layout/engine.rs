@@ -27,6 +27,37 @@ fn is_leaf(kind: &str) -> bool {
     crate::ui::catalog::kind(kind).is_some_and(|k| k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer")
 }
 
+/// Custom native components (`<Native name="MapView" />`) are measured when they have no
+/// children, and act as flexbox containers when they hold children.
+fn is_measured(n: &Node) -> bool {
+    if crate::ui::catalog::kind(&n.kind).is_some() {
+        is_leaf(&n.kind)
+    } else {
+        n.children.is_empty()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScrollAxis {
+    None,
+    Vertical,
+    Horizontal,
+}
+
+fn scroll_axis(n: &Node) -> ScrollAxis {
+    match &*n.kind {
+        "Scroll" => ScrollAxis::Vertical,
+        "List" => {
+            if n.props.get("horizontal").and_then(Json::as_bool).unwrap_or(false) {
+                ScrollAxis::Horizontal
+            } else {
+                ScrollAxis::Vertical
+            }
+        }
+        _ => ScrollAxis::None,
+    }
+}
+
 fn num(props: &Map<String, Json>, key: &str) -> Option<f32> {
     props.get(key).and_then(Json::as_f64).map(|v| v as f32)
 }
@@ -43,8 +74,9 @@ fn dimension(props: &Map<String, Json>, key: &str) -> Dimension {
 fn style(n: &Node, direction: Direction) -> Style {
     let p = &n.props;
     let kind = &*n.kind;
+    let axis = scroll_axis(n);
     let mut s = Style { direction, size: Size { width: dimension(p, "width"), height: dimension(p, "height") }, ..Style::default() };
-    s.flex_direction = if kind == "Row" { FlexDirection::Row } else { FlexDirection::Column };
+    s.flex_direction = if kind == "Row" || axis == ScrollAxis::Horizontal { FlexDirection::Row } else { FlexDirection::Column };
     s.align_items = match p.get("align").and_then(Json::as_str) {
         Some("start") => AlignItems::FLEX_START,
         Some("center") => AlignItems::CENTER,
@@ -68,7 +100,7 @@ fn style(n: &Node, direction: Direction) -> Style {
         s.margin = Rect { left: m, right: m, top: m, bottom: m };
     }
     // Leaves draw their own padding natively (it is part of their measured size).
-    if let (Some(pad), false) = (num(p, "padding"), is_leaf(kind)) {
+    if let (Some(pad), false) = (num(p, "padding"), is_measured(n)) {
         let pad = LengthPercentage::length(pad);
         s.padding = Rect { left: pad, right: pad, top: pad, bottom: pad };
     }
@@ -79,9 +111,16 @@ fn style(n: &Node, direction: Direction) -> Style {
         s.flex_grow = s.flex_grow.max(1.0);
         s.flex_basis = Dimension::length(0.0);
     }
-    if kind == "Scroll" {
-        s.overflow = TPoint { x: Overflow::Visible, y: Overflow::Scroll };
-        s.scrollbar_width = 0.0;
+    match axis {
+        ScrollAxis::Vertical => {
+            s.overflow = TPoint { x: Overflow::Visible, y: Overflow::Scroll };
+            s.scrollbar_width = 0.0;
+        }
+        ScrollAxis::Horizontal => {
+            s.overflow = TPoint { x: Overflow::Scroll, y: Overflow::Visible };
+            s.scrollbar_width = 0.0;
+        }
+        ScrollAxis::None => {}
     }
     s
 }
@@ -98,7 +137,7 @@ impl Layout {
     pub fn compute(&mut self, tree: &Tree, width: f32, height: f32, rtl: bool, measure: &mut dyn Measure) -> Vec<Frame> {
         let direction = if rtl { Direction::Rtl } else { Direction::Ltr };
         let mut t: TaffyTree<Leaf> = TaffyTree::new();
-        let mut ids: Vec<(NodeId, u32, bool)> = Vec::new();
+        let mut ids: Vec<(NodeId, u32, ScrollAxis)> = Vec::new();
         let roots: Vec<NodeId> = tree.roots().iter().map(|n| build(&mut t, n, &mut ids, direction)).collect();
         // Like the web host's root: a full-width column at least as tall as the screen.
         let root_style = Style {
@@ -133,13 +172,21 @@ impl Layout {
 
         let mut now = HashMap::with_capacity(ids.len());
         let mut changed = Vec::new();
-        for (node, id, scroll) in ids {
+        for (node, id, axis) in ids {
             let Ok(l) = t.layout(node) else { continue };
-            let content = scroll.then(|| {
-                let children = t.children(node).unwrap_or_default();
-                let bottom = children.iter().filter_map(|c| t.layout(*c).ok()).map(|c| c.location.y + c.size.height + c.margin.bottom).fold(0.0, f32::max);
-                bottom + l.padding.bottom
-            });
+            let content = match axis {
+                ScrollAxis::Vertical => {
+                    let children = t.children(node).unwrap_or_default();
+                    let bottom = children.iter().filter_map(|c| t.layout(*c).ok()).map(|c| c.location.y + c.size.height + c.margin.bottom).fold(0.0, f32::max);
+                    Some(bottom + l.padding.bottom)
+                }
+                ScrollAxis::Horizontal => {
+                    let children = t.children(node).unwrap_or_default();
+                    let right = children.iter().filter_map(|c| t.layout(*c).ok()).map(|c| c.location.x + c.size.width + c.margin.right).fold(0.0, f32::max);
+                    Some(right + l.padding.right)
+                }
+                ScrollAxis::None => None,
+            };
             let f = Frame { id, x: l.location.x, y: l.location.y, w: l.size.width, h: l.size.height, content };
             if self.previous.get(&id) != Some(&f) {
                 changed.push(f.clone());
@@ -153,16 +200,16 @@ impl Layout {
     }
 }
 
-fn build(t: &mut TaffyTree<Leaf>, n: &Node, ids: &mut Vec<(NodeId, u32, bool)>, direction: Direction) -> NodeId {
+fn build(t: &mut TaffyTree<Leaf>, n: &Node, ids: &mut Vec<(NodeId, u32, ScrollAxis)>, direction: Direction) -> NodeId {
     let s = style(n, direction);
-    let node = if is_leaf(&n.kind) {
+    let node = if is_measured(n) {
         t.new_leaf_with_context(s, Leaf { id: n.id, props: fingerprint(&n.props) })
     } else {
         let children: Vec<NodeId> = n.children.iter().map(|c| build(t, c, ids, direction)).collect();
         t.new_with_children(s, &children)
     }
     .expect("taffy accepts new nodes");
-    ids.push((node, n.id, &*n.kind == "Scroll"));
+    ids.push((node, n.id, scroll_axis(n)));
     node
 }
 
@@ -309,5 +356,26 @@ mod tests {
         assert_eq!(fx + fw, 300.0, "right to left: the first item starts at the right");
         let (sx, sw) = x(&rtl, 3);
         assert_eq!(sx + sw + 10.0, fx, "the second item follows it leftwards");
+    }
+
+    #[test]
+    fn list_theme_tabs_icon_and_custom_native_views_lay_out() {
+        // Horizontal List computes horizontal content width; Theme acts as column container;
+        // custom native leaf is measured via Measure, and native container lays out children.
+        let mut map = v("MapView", json!({}), vec![]);
+        map.props.insert("text".into(), json!("1234567890"));
+        let hlist = v(
+            "List",
+            json!({ "horizontal": true, "width": 100, "gap": 10 }),
+            vec![text("first", json!({})), text("second", json!({})), text("third", json!({}))],
+        );
+        let theme = v("Theme", json!({ "mode": "dark", "padding": 10 }), vec![map, hlist]);
+        let f = lay(vec![theme]);
+        let map_frame = &f[1];
+        assert_eq!((map_frame.x, map_frame.y, map_frame.h), (10.0, 10.0, 20.0), "custom native leaf is measured");
+        let list_frame = &f[2];
+        assert_eq!(list_frame.w, 100.0);
+        // 40 + 10 + 48 + 10 + 40 = 148
+        assert_eq!(list_frame.content, Some(148.0), "horizontal list reports horizontal content width");
     }
 }

@@ -4138,3 +4138,97 @@ object LocalOnly { x: number = 0 }
     let f = tj_core::facts_with_remotes(&pii_remote_ok, &rem_dests);
     assert!(f.transfers.iter().any(|t| t.to == tj_core::Destination::Host("billing.example.com".into()) && t.fields.contains(&"Account.email".to_string())), "remote transfer must be recorded: {:?}", f.transfers);
 }
+
+#[test]
+fn custom_native_components_and_ui_catalog_additions_work_end_to_end() {
+    let src = r##"
+object UiState {
+  tab: string = "map"
+  selected: string = ""
+  pages: number = 1
+  dark: boolean = true
+  setTab(v: string) { this.tab = v }
+  pick(id: string) { this.selected = id }
+  more() { this.pages += 1 }
+}
+
+function MapView(props: { lat: number, lng: number, label: string, onSelect: (id: string) => void }) {
+  return <Native name="MapView" id="map" lat={props.lat} lng={props.lng} label={props.label} height={240} onSelect={props.onSelect} />
+}
+
+function App() {
+  const s = UiState.get("main")
+  return (
+    <Theme mode={s.dark ? "dark" : "light"} accent="#2563eb" surface="#111827" muted="#9ca3af">
+      <Tabs id="tabs" items={[{ value: "map", label: "Map" }, { value: "list", label: "List" }]} value={s.tab} onChange={v => s.setTab(v)} />
+      <Row gap={8}>
+        <Icon id="ico" name="check" size={20} color="#16a34a" label="Ready" />
+        <Text id="picked">{s.selected}</Text>
+      </Row>
+      {s.tab === "map"
+        ? <MapView lat={51.5} lng={-0.1} label="London map" onSelect={id => s.pick(id)} />
+        : <List id="feed" itemHeight={56} onEndReached={() => s.more()}>
+            <Text>{"page " + s.pages}</Text>
+          </List>}
+    </Theme>
+  )
+}
+"##;
+    let prog = compile(src).expect("should compile cleanly");
+    let (mut rt, boot_out) = Runtime::boot(prog, Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+
+    // Verify PatchOp::Create emitted `kind: "MapView"` with `name` stripped and custom props/events intact.
+    let ops: Vec<&tj_core::PatchOp> = boot_out.iter().flat_map(|o| match o { Output::Patch { ops } => ops.iter().collect(), _ => vec![] }).collect();
+    let map_create = ops.iter().find(|op| matches!(op, tj_core::PatchOp::Create { kind, .. } if kind == "MapView")).expect("MapView create patch");
+    if let tj_core::PatchOp::Create { props, events, .. } = map_create {
+        assert!(!props.contains_key("name"), "Native `name` prop must become kind, not stay in props");
+        assert_eq!(props.get("lat"), Some(&json!(51.5)));
+        assert_eq!(props.get("lng"), Some(&json!(-0.1)));
+        assert_eq!(props.get("label"), Some(&json!("London map")));
+        assert_eq!(events, &vec!["onSelect".to_string()]);
+    }
+
+    // Fire custom native event `onSelect` through the standard UI input protocol.
+    let out = rt.handle(2.0, Input::Ui { target: Target::Id { id: "map".into() }, event: "onSelect".into(), value: json!("pin-42"), reply: Some(1) });
+    assert!(reply(&out).is_ok(), "{out:?}");
+    assert_eq!(state(&mut rt, 2.0, "UiState/main")["selected"], json!("pin-42"));
+
+    // Switch tab via `<Tabs onChange>`, swapping `<Native name="MapView">` for `<List>`.
+    let out = rt.handle(3.0, Input::Ui { target: Target::Id { id: "tabs".into() }, event: "onChange".into(), value: json!("list"), reply: Some(2) });
+    assert!(reply(&out).is_ok(), "{out:?}");
+    let switch_ops: Vec<&tj_core::PatchOp> = out.iter().flat_map(|o| match o { Output::Patch { ops } => ops.iter().collect(), _ => vec![] }).collect();
+    assert!(switch_ops.iter().any(|op| matches!(op, tj_core::PatchOp::Create { kind, .. } if kind == "List")), "{switch_ops:?}");
+
+    // Fire `<List onEndReached>` and verify state advances.
+    let out = rt.handle(4.0, Input::Ui { target: Target::Id { id: "feed".into() }, event: "onEndReached".into(), value: Json::Null, reply: Some(3) });
+    assert!(reply(&out).is_ok(), "{out:?}");
+    assert_eq!(state(&mut rt, 4.0, "UiState/main")["pages"], json!(2));
+
+    // Native container keeps its own `label` instead of forwarding it to an inner Input.
+    let container_src = r#"
+function App() {
+  return <Native name="CardFrame" id="card" label="Card box"><Input id="inp" value="" /></Native>
+}
+"#;
+    let (crt, _) = Runtime::boot(compile(container_src).unwrap(), Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+    let tree = crt.inspect()["tree"].clone();
+    assert_eq!(tree[0]["kind"], json!("CardFrame"));
+    assert_eq!(tree[0]["props"]["label"], json!("Card box"));
+
+    // Compile-time & type-check validation for `<Native>`.
+    assert!(errors("function App() { return <Native /> }").contains("requires a 'name' prop"));
+    assert!(errors("function App() { return <Native name=\"Button\" /> }").contains("built-in component"));
+    assert!(errors("function App() { return <Native name=\"mapView\" /> }").contains("invalid component name"));
+    assert!(errors("function App() { return <Native name={123} /> }").contains("expects a string"));
+    assert!(errors("function App() { return <Native name=\"MapView\" onSelect={42} /> }").contains("expects a function"));
+
+    // Runtime validation for dynamic invalid `<Native name={...} />`.
+    let dyn_bad = r#"
+function App() {
+  const n = "bad"
+  return <Native name={n} />
+}
+"#;
+    let (_, bad_out) = Runtime::boot(compile(dyn_bad).unwrap(), Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+    assert!(bad_out.iter().any(|o| matches!(o, Output::Error { message, .. } if message.contains("invalid component name"))), "{bad_out:?}");
+}

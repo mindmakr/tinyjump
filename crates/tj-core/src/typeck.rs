@@ -1262,6 +1262,9 @@ impl<'a> Checker<'a> {
         if let Some(kind) = catalog::kind(&el.tag) {
             for (name, v) in &el.attrs {
                 let t = self.expr(v, None);
+                if kind.name == "Native" && name == "name" && !self.assignable(&t, &Ty::Str) {
+                    self.error(format!("<Native> name expects a string, got {t}"), v.span);
+                }
                 if kind.is_event(name) && !matches!(self.deref(&t), Ty::Func(_) | Ty::Any | Ty::Null) {
                     self.error(format!("<{}> {name} expects a function, got {t}", el.tag), v.span);
                 }
