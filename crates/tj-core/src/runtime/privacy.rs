@@ -79,28 +79,32 @@ impl Runtime {
         (!self.program.objects[class as usize].pii.is_empty()).then_some(class)
     }
 
+    /// Loads or creates the store-persisted secret behind `caller_tag` and `crypto.idempotencyKey`.
+    #[inline]
+    pub(crate) fn store_secret(&mut self) -> Result<std::rc::Rc<str>, String> {
+        if let Some(s) = &self.secret {
+            return Ok(s.clone());
+        }
+        let s = match self.store.load(SECRET_KEY)? {
+            Some(s) => s,
+            None => {
+                let mut bytes = [0u8; 32];
+                self.drbg.fill(&mut bytes);
+                let s = crate::crypto::hex(&bytes);
+                self.store.save(SECRET_KEY, &s)?;
+                s
+            }
+        };
+        let s: std::rc::Rc<str> = s.into();
+        self.secret = Some(s.clone());
+        Ok(s)
+    }
+
     /// The tag a call record keeps for `who`: a keyed hash of a remote caller's id, so shared
     /// objects hold no readable ids, while repeats by the same caller still match.
     pub(crate) fn caller_tag(&mut self, who: &Who) -> Result<String, String> {
         let Who::Remote { id, .. } = who else { return Ok(if matches!(who, Who::System) { "system".into() } else { String::new() }) };
-        let secret = match &self.secret {
-            Some(s) => s.clone(),
-            None => {
-                let s = match self.store.load(SECRET_KEY)? {
-                    Some(s) => s,
-                    None => {
-                        let mut bytes = [0u8; 32];
-                        self.drbg.fill(&mut bytes);
-                        let s = crate::crypto::hex(&bytes);
-                        self.store.save(SECRET_KEY, &s)?;
-                        s
-                    }
-                };
-                let s: std::rc::Rc<str> = s.into();
-                self.secret = Some(s.clone());
-                s
-            }
-        };
+        let secret = self.store_secret()?;
         Ok(crate::crypto::hex(&crate::crypto::hmac(secret.as_bytes(), &[id.as_bytes()])[..16]))
     }
 }

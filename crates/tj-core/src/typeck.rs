@@ -143,6 +143,7 @@ fn builtin(name: &str) -> Option<Ty> {
             ("hmac", func(&[("key", Ty::Str, false), ("text", Ty::Str, false)], None, Ty::Str)),
             ("timingSafeEqual", func(&[("a", Ty::Str, false), ("b", Ty::Str, false)], None, Ty::Bool)),
             ("randomId", func(&[], None, Ty::Str)),
+            ("idempotencyKey", func(&[("label", Ty::Str, false)], None, Ty::Str)),
         ]),
         "Array" => rec(&[("isArray", func(&[("value", Ty::Any, false)], None, Ty::Bool))]),
         "String" => func(&[("value", Ty::Any, false)], None, Ty::Str),
@@ -247,6 +248,8 @@ struct Checker<'a> {
     scopes: Vec<HashMap<String, Var>>,
     generics: Vec<String>,
     this_obj: Option<Rc<str>>,
+    #[cfg(feature = "check")]
+    this_server: bool,
     fns: Vec<FnCtx>,
     depth: usize,
     /// Where the annotation being resolved sits, for unknown-type errors.
@@ -263,6 +266,8 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
         scopes: Vec::new(),
         generics: Vec::new(),
         this_obj: None,
+        #[cfg(feature = "check")]
+        this_server: false,
         fns: Vec::new(),
         depth: 0,
         type_span: Span::default(),
@@ -302,9 +307,13 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
             }
             Item::Object(o) => {
                 let name: Rc<str> = Rc::from(o.name.as_str());
+                #[cfg(feature = "check")]
+                let is_server = o.decorators.iter().any(|d| d.name == "server");
                 for m in &o.methods {
                     let saved = c.this_obj.replace(name.clone());
                     let is_inv = m.decorators.iter().any(|d| d.name == "invariant");
+                    #[cfg(feature = "check")]
+                    let saved_server = std::mem::replace(&mut c.this_server, is_server && !is_inv);
                     let fn_ty = c.function(&m.func, None);
                     if is_inv {
                         let bad_ret = match &m.func.ret {
@@ -327,6 +336,10 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
                         }
                     }
                     c.this_obj = saved;
+                    #[cfg(feature = "check")]
+                    {
+                        c.this_server = saved_server;
+                    }
                 }
             }
             _ => {}
@@ -551,6 +564,12 @@ impl<'a> Checker<'a> {
 
     fn let_decl(&mut self, d: &LetDecl) {
         self.type_span = d.span;
+        #[cfg(feature = "check")]
+        if let (Some(init), Pattern::Record(entries, span)) = (&d.init, &d.pattern) {
+            if entries.iter().any(|(k, _, _)| k == "idempotencyKey") {
+                self.check_idempotency_key(init, "idempotencyKey", *span);
+            }
+        }
         let declared = d.ty.as_ref().map(|t| self.resolve(t));
         let ty = match (&d.init, declared) {
             (Some(e), Some(dt)) => {
@@ -755,12 +774,18 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Record(entries) => self.record(entries, expected, sp),
             ExprKind::Member { obj, name, .. } => {
+                #[cfg(feature = "check")]
+                self.check_idempotency_key(obj, name, sp);
                 let t = self.expr(obj, None);
                 self.member(&t, name, sp)
             }
             ExprKind::Index { obj, index, .. } => {
                 let t = self.expr(obj, None);
                 let it = self.expr(index, None);
+                #[cfg(feature = "check")]
+                if let Ty::StrLit(k) = &it {
+                    self.check_idempotency_key(obj, k, sp);
+                }
                 match (self.deref(&t), it) {
                     (Ty::Arr(e), _) => *e,
                     (Ty::Dict(v), _) => *v,
@@ -771,6 +796,8 @@ impl<'a> Checker<'a> {
             }
             ExprKind::Call { callee, args } => match &callee.kind {
                 ExprKind::Member { obj, name, .. } => {
+                    #[cfg(feature = "check")]
+                    self.check_idempotency_key(obj, name, sp);
                     let t = self.expr(obj, None);
                     self.method_call(&t, name, args, sp)
                 }
@@ -901,6 +928,17 @@ impl<'a> Checker<'a> {
             }
         }
         Ty::Rec(Rc::new(RecTy { fields, open }))
+    }
+
+    /// `crypto.idempotencyKey` is only meaningful on `@server` object methods (`docs/retried-effects.md`).
+    #[cfg(feature = "check")]
+    fn check_idempotency_key(&mut self, obj: &Expr, name: &str, span: Span) {
+        if !self.this_server && name == "idempotencyKey" && matches!(&obj.kind, ExprKind::Ident(ns) if ns == "crypto" && self.var(ns).is_none()) {
+            self.errors.push(
+                Diagnostic::new("crypto.idempotencyKey() is only available inside @server object methods", span)
+                    .hint("call crypto.idempotencyKey() inside an @server object method"),
+            );
+        }
     }
 
     fn numeric(&mut self, t: &Ty) -> bool {

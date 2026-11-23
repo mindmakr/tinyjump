@@ -3491,3 +3491,505 @@ export async function callPeer(obj: string, m: string, a: any[]): any {
     let mut srt = Runtime::boot(compile(fault_src).unwrap(), Box::new(FailLoad), Options { server: true, render: false, ..Options::new(0.0, 7) }).unwrap().0;
     assert_eq!(call_as(&mut srt, 1.0, "Faulty/f1", "loadPeer", json!([]), who("", &[])).unwrap_err().0, Some(503));
 }
+
+#[test]
+fn retried_external_effects_idempotency_key_and_prerequisites() {
+    use std::cell::Cell;
+    use std::rc::Rc as StdRc;
+
+    // 1. Compile-time `@server`-only check and `flow.rs` PII sink check.
+    let bad_client = r#"
+object Local {
+  go(): string { return crypto.idempotencyKey("step") }
+}
+"#;
+    let errs = compile(bad_client).err().expect("must fail compile");
+    assert!(errs.iter().any(|d| d.message.contains("only available inside @server")), "{errs:?}");
+    assert!(compile("function App() { const k = crypto.idempotencyKey(\"x\"); return <Text>{k}</Text> }").is_err());
+
+    let pii_label = r#"
+@server @read("owner") object User {
+  @pii("contact", "billing") email: string = "a@b.c"
+  @allow("owner") async pay() {
+    const k = crypto.idempotencyKey(this.email)
+    await fetch("https://api.example.com/pay", { headers: { "Idempotency-Key": k } })
+  }
+}
+"#;
+    let errs = compile(pii_label).err().expect("must fail compile");
+    assert!(errs.iter().any(|d| d.message.contains("email")), "un-revealed @pii in label must fail compile: {errs:?}");
+
+    // 2. Crash-and-retry multi-step `async` method + cross-caller isolation + duplicate-label guard +
+    //    downstream `{ retryable: true }` vs permanent `check(...)` + ad-hoc turn keys.
+    let pay_src = r#"
+@server @read("anyone") object Order {
+  status: string = "open"
+  chargeId: string = ""
+  receiptSent: boolean = false
+
+  @allow("anyone") @exclusive async pay(amount: number): string {
+    if (this.chargeId === "") {
+      const res = await fetch("https://api.stripe.com/v1/charges", {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.idempotencyKey("charge") },
+        body: JSON.stringify({ amount })
+      })
+      if (res.status === 429 || res.status >= 500) {
+        throw { message: `busy (${res.status})`, retryable: true }
+      }
+      check(res.ok, "payment", `declined (${res.status})`)
+      this.chargeId = res.json().id
+      this.status = "paid"
+    }
+    if (!this.receiptSent) {
+      const mail = await fetch("https://api.mail.example/send", {
+        method: "POST",
+        headers: { "Idempotency-Key": crypto.idempotencyKey("receipt") },
+        body: JSON.stringify({ id: this.chargeId })
+      })
+      check(mail.ok, "receipt", `mail failed (${mail.status})`)
+      this.receiptSent = true
+    }
+    return this.chargeId
+  }
+
+  @allow("anyone") async dupAcrossAwait(): string {
+    const a = crypto.idempotencyKey("step")
+    await fetch("https://api.example.com/1", { headers: { "Idempotency-Key": a } })
+    return crypto.idempotencyKey("step")
+  }
+
+  @allow("anyone") adHocKey(): string {
+    return crypto.idempotencyKey("adhoc")
+  }
+
+  @allow("anyone") async tryCatchTransport(): string {
+    try {
+      await fetch("https://api.example.com/flaky")
+      return "ok"
+    } catch (e) {
+      return `caught:${e.message}`
+    }
+  }
+}
+"#;
+    let store = Shared::default();
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(1.0, 11) }).unwrap().0;
+
+    let first_http = |out: &[Output]| -> (u32, String, String) {
+        out.iter()
+            .find_map(|o| match o {
+                Output::Effect { id, effect: Effect::Http { url, headers, .. } } => Some((*id, url.clone(), headers["Idempotency-Key"].as_str().unwrap_or("").to_string())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected Http effect, got: {out:?}"))
+    };
+
+    // Start pay() as alice with call id "dev1-42" -> emits charge fetch with deterministic key.
+    let out1 = rt.handle(2.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(1), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (_, url1, key1) = first_http(&out1);
+    assert!(url1.contains("stripe"), "{url1}");
+    assert!(key1.starts_with("tj_") && key1.len() == 35, "{key1}");
+
+    // Simulate SERVER CRASH mid-await before charge completes! Restart from same store.
+    drop(rt);
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(3.0, 99) }).unwrap().0;
+
+    // Retry exact same call id as alice -> derives the EXACT same downstream Idempotency-Key!
+    let out2 = rt.handle(4.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(2), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff2, _, key2) = first_http(&out2);
+    assert_eq!(key1, key2, "same (object, method, caller, call_id, label) must derive identical key across crash");
+
+    // Cross-caller isolation: bob sending the SAME call id "dev1-42" on the SAME object `Order/o1`
+    // (on a restarted runtime sharing `tj:secret`) must derive a DIFFERENT downstream key!
+    let mut rt_iso = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(4.6, 7) }).unwrap().0;
+    let out_bob_same_obj = rt_iso.handle(4.7, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(100), call: Some("dev1-42".into()), caller: who("bob", &[]) });
+    let (_, _, key_bob_same_obj) = first_http(&out_bob_same_obj);
+    assert_ne!(key1, key_bob_same_obj, "different callers with same call_id on same object must derive different keys");
+
+    // Prerequisite #2: transient `fetch` transport failure (`unreachable: true`) returns 503 via
+    // `refuse_start` (NO cached 400 CallRecord!), so retrying "dev1-42" runs again with the SAME key!
+    let out_tr = rt.handle(5.0, Input::EffectDone { id: eff2, ok: None, error: Some("the request failed: ConnectionFailed".into()), field: None, unreachable: true });
+    assert!(out_tr.iter().any(|o| matches!(o, Output::Reply { reply: 2, status: Some(503), error: Some(_), .. })), "{out_tr:?}");
+
+    // Retry "dev1-42" again -> gets downstream HTTP 503 response -> app throws `{ retryable: true }`
+    // -> returns 503 WITHOUT caching CallRecord!
+    let out3 = rt.handle(6.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(3), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff3, _, key3) = first_http(&out3);
+    assert_eq!(key1, key3);
+    let out3_done = rt.handle(7.0, Input::EffectDone { id: eff3, ok: Some(json!({ "status": 503, "headers": {}, "body": "overloaded" })), error: None, field: None, unreachable: false });
+    assert!(out3_done.iter().any(|o| matches!(o, Output::Reply { reply: 3, status: Some(503), .. })), "{out3_done:?}");
+
+    // Retry "dev1-42" again -> Step 1 succeeds and checkpoints `chargeId` before Step 2 `await`,
+    // then SERVER CRASHES during Step 2 (mail)!
+    let out4 = rt.handle(8.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(4), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff4, _, key4) = first_http(&out4);
+    assert_eq!(key1, key4);
+    let out4_step2 = rt.handle(9.0, Input::EffectDone { id: eff4, ok: Some(json!({ "status": 200, "headers": {}, "body": "{\"id\":\"ch_123\"}" })), error: None, field: None, unreachable: false });
+    let (_, url_mail1, key_mail1) = first_http(&out4_step2);
+    assert!(url_mail1.contains("mail"), "{url_mail1}");
+    assert_ne!(key_mail1, key1, "different label derives different key");
+
+    // Crash during Step 2 & restart -> retry "dev1-42" -> SKIPS Step 1 (chargeId checkpointed!),
+    // goes straight to Step 2 with the EXACT same mail key, and completes!
+    drop(rt);
+    let mut rt = Runtime::boot(compile(pay_src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(10.0, 55) }).unwrap().0;
+    let out5 = rt.handle(11.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(5), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    let (eff5, url_mail2, key_mail2) = first_http(&out5);
+    assert!(url_mail2.contains("mail"), "Step 1 must be skipped after checkpoint: {url_mail2}");
+    assert_eq!(key_mail1, key_mail2, "Step 2 must derive identical key across crash");
+    let out5_done = rt.handle(12.0, Input::EffectDone { id: eff5, ok: Some(json!({ "status": 200, "headers": {}, "body": "ok" })), error: None, field: None, unreachable: false });
+    assert!(out5_done.iter().any(|o| matches!(o, Output::Reply { reply: 5, ok: Some(v), .. } if *v == json!("ch_123"))), "{out5_done:?}");
+    // Subsequent replay of "dev1-42" returns cached CallRecord without issuing any HTTP effect!
+    let out6 = rt.handle(13.0, Input::Call { object: "Order/o1".into(), method: "pay".into(), args: vec![json!(500)], reply: Some(6), call: Some("dev1-42".into()), caller: who("alice", &[]) });
+    assert!(!out6.iter().any(|o| matches!(o, Output::Effect { .. })), "{out6:?}");
+    assert!(out6.iter().any(|o| matches!(o, Output::Reply { reply: 6, ok: Some(v), .. } if *v == json!("ch_123"))), "{out6:?}");
+
+    // Permanent 402 decline via `check(res.ok, ...)` IS cached as 400 in CallRecord!
+    let out_decl = rt.handle(14.0, Input::Call { object: "Order/o3".into(), method: "pay".into(), args: vec![json!(100)], reply: Some(7), call: Some("decl-1".into()), caller: who("alice", &[]) });
+    let (eff_decl, _, _) = first_http(&out_decl);
+    let out_decl_done = rt.handle(15.0, Input::EffectDone { id: eff_decl, ok: Some(json!({ "status": 402, "headers": {}, "body": "declined" })), error: None, field: None, unreachable: false });
+    assert!(out_decl_done.iter().any(|o| matches!(o, Output::Reply { reply: 7, error: Some(e), status: None, .. } if e.contains("declined"))), "{out_decl_done:?}");
+    let out_decl_replay = rt.handle(16.0, Input::Call { object: "Order/o3".into(), method: "pay".into(), args: vec![json!(100)], reply: Some(8), call: Some("decl-1".into()), caller: who("alice", &[]) });
+    assert!(!out_decl_replay.iter().any(|o| matches!(o, Output::Effect { .. })));
+    assert!(out_decl_replay.iter().any(|o| matches!(o, Output::Reply { reply: 8, error: Some(e), .. } if e.contains("declined"))));
+
+    // Duplicate label across `await` fails fast with fix hint!
+    let out_dup = rt.handle(17.0, Input::Call { object: "Order/o4".into(), method: "dupAcrossAwait".into(), args: vec![], reply: Some(9), call: Some("dup-1".into()), caller: who("alice", &[]) });
+    let (eff_dup, _, _) = first_http(&out_dup);
+    let out_dup_done = rt.handle(18.0, Input::EffectDone { id: eff_dup, ok: Some(json!({ "status": 200, "headers": {}, "body": "" })), error: None, field: None, unreachable: false });
+    assert!(out_dup_done.iter().any(|o| matches!(o, Output::Reply { reply: 9, error: Some(e), .. } if e.contains("already called in this call"))), "{out_dup_done:?}");
+
+    // Ad-hoc calls without `call_id` produce distinct keys per call.
+    let k_a = call_as(&mut rt, 19.0, "Order/o4", "adHocKey", json!([]), who("alice", &[])).unwrap();
+    let k_b = call_as(&mut rt, 20.0, "Order/o4", "adHocKey", json!([]), who("alice", &[])).unwrap();
+    assert_ne!(k_a, k_b);
+
+    // `try/catch` can still catch `unreachable: true` transport errors!
+    let out_tc = rt.handle(21.0, Input::Call { object: "Order/o4".into(), method: "tryCatchTransport".into(), args: vec![], reply: Some(10), call: None, caller: who("alice", &[]) });
+    let eff_tc = out_tc.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let out_tc_done = rt.handle(22.0, Input::EffectDone { id: eff_tc, ok: None, error: Some("timeout".into()), field: None, unreachable: true });
+    assert!(out_tc_done.iter().any(|o| matches!(o, Output::Reply { reply: 10, ok: Some(v), .. } if *v == json!("caught:timeout"))), "{out_tc_done:?}");
+
+    // 3. Prerequisite #1: disk-save failure on `Run::Await` aborts cleanly — drops Output::Effect,
+    //    releases `@exclusive` lock, returns 503 (no CallRecord), and next call works when disk recovers!
+    struct FlakySave {
+        inner: MemStore,
+        fail_save: StdRc<Cell<bool>>,
+    }
+    impl Store for FlakySave {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_save.get() && key.starts_with("Order/") {
+                return Err("disk full".into());
+            }
+            self.inner.save(key, value)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let fail_flag = StdRc::new(Cell::new(true));
+    let flaky = FlakySave { inner: MemStore::default(), fail_save: fail_flag.clone() };
+    let pre_await_src = r#"
+@server @read("anyone") object Order {
+  step: number = 0
+  @allow("anyone") @exclusive async go(): number {
+    this.step = 1
+    await fetch("https://api.example.com/do")
+    this.step = 2
+    return this.step
+  }
+}
+"#;
+    let mut frt = Runtime::boot(compile(pre_await_src).unwrap(), Box::new(flaky), Options { server: true, render: false, ..Options::new(1.0, 5) }).unwrap().0;
+    let fail_out = frt.handle(2.0, Input::Call { object: "Order/x".into(), method: "go".into(), args: vec![], reply: Some(1), call: Some("k-disk".into()), caller: who("alice", &[]) });
+    assert!(fail_out.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "flush failure on Run::Await must return 503: {fail_out:?}");
+    assert!(!fail_out.iter().any(|o| matches!(o, Output::Effect { .. })), "Output::Effect must be dropped on Run::Await flush failure: {fail_out:?}");
+    assert_eq!(state(&mut frt, 3.0, "Order/x")["step"], json!(0), "state must be reverted");
+
+    // Disk recovers: `@exclusive` lock was released and CallRecord was NOT cached, so retrying "k-disk" works!
+    fail_flag.set(false);
+    let ok_out = frt.handle(4.0, Input::Call { object: "Order/x".into(), method: "go".into(), args: vec![], reply: Some(2), call: Some("k-disk".into()), caller: who("alice", &[]) });
+    let eff_ok = ok_out.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).expect("retry after disk recovery must emit Effect");
+    let done_out = frt.handle(5.0, Input::EffectDone { id: eff_ok, ok: Some(json!({ "status": 200, "headers": {}, "body": "" })), error: None, field: None, unreachable: false });
+    assert!(done_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(v), .. } if *v == json!(2))), "{done_out:?}");
+
+    // 4. Critic 048 regressions (IK-1..IK-6):
+    // IK-5: `@invariant` on `@server`, `crypto["idempotencyKey"]`, and `const { idempotencyKey } = crypto` fail compile!
+    assert!(compile("@server object O { @invariant ok(): boolean { return crypto.idempotencyKey(\"x\").length > 0 } }").is_err());
+    assert!(compile("function f() { return crypto[\"idempotencyKey\"](\"x\") }").is_err());
+    assert!(compile("function f() { const { idempotencyKey } = crypto; return idempotencyKey(\"x\") }").is_err());
+
+    // IK-1: device `Run::Await` flush failure after `remote_call` drops the outbox entry from
+    // memory & disk (`tj:outbox`) so future RPCs are NOT wedged and restart sends NO phantom RPC!
+    let dev_src = r#"
+@server @read("anyone") object Remote {
+  n: number = 0
+  @allow("anyone") inc(): number { this.n += 1; return this.n }
+}
+object Draft {
+  text: string = ""
+  async saveAndSend(t: string): number {
+    this.text = t
+    return await Remote.get("r1").inc()
+  }
+}
+"#;
+    struct FailDraftSave {
+        inner: Shared,
+        fail_draft: StdRc<Cell<bool>>,
+    }
+    impl Store for FailDraftSave {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_draft.get() && key.starts_with("Draft/") {
+                return Err("disk full".into());
+            }
+            self.inner.save(key, value)
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let dev_store = Shared::default();
+    let fail_draft = StdRc::new(Cell::new(true));
+    let mut drt = Runtime::boot(
+        compile(dev_src).unwrap(),
+        Box::new(FailDraftSave { inner: dev_store.clone(), fail_draft: fail_draft.clone() }),
+        Options { server: false, render: false, ..Options::new(1.0, 3) },
+    )
+    .unwrap()
+    .0;
+    let d_fail = drt.handle(2.0, Input::Call { object: "Draft/d1".into(), method: "saveAndSend".into(), args: vec![json!("hi")], reply: Some(1), call: None, caller: None });
+    assert!(d_fail.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "{d_fail:?}");
+    assert!(!d_fail.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { .. }, .. })), "aborted turn must not emit Effect::Call: {d_fail:?}");
+    // Restart device from same store: NO phantom RPC dispatched from `tj:outbox`!
+    let (mut drt2, boot_out) = Runtime::boot(
+        compile(dev_src).unwrap(),
+        Box::new(FailDraftSave { inner: dev_store.clone(), fail_draft: fail_draft.clone() }),
+        Options { server: false, render: false, ..Options::new(3.0, 4) },
+    )
+    .unwrap();
+    let tick_out = drt2.handle(4.0, Input::Tick);
+    assert!(!boot_out.iter().chain(&tick_out).any(|o| matches!(o, Output::Effect { effect: Effect::Call { .. }, .. })), "no phantom RPC on restart");
+    // Disk recovers: subsequent call on `Draft/d1` dispatches cleanly (no head-of-line wedge)!
+    fail_draft.set(false);
+    let d_ok = drt2.handle(5.0, Input::Call { object: "Draft/d1".into(), method: "saveAndSend".into(), args: vec![json!("ok")], reply: Some(2), call: None, caller: None });
+    assert!(d_ok.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { object, method, .. }, .. } if object == "Remote/r1" && method == "inc")), "{d_ok:?}");
+
+    // IK-2 & IK-3 & IK-6: catch-and-rethrow preserves `retryable: true` / `503` (uncached);
+    // `invoke()` propagates `503` without caching 400; cross-object, cross-method & NUL/colon framing isolation!
+    let ik_src = r#"
+//# file: app.tj
+import { callInner } from "tj:helper"
+@server @read("anyone") object Service {
+  @allow("anyone") keyFor(label: string): string { return crypto.idempotencyKey(label) }
+  @allow("anyone") keyForOther(label: string): string { return crypto.idempotencyKey(label) }
+  @allow("anyone") async catchAndRethrow(): string {
+    try {
+      await fetch("https://api.example.com/flaky")
+      return "ok"
+    } catch (e) {
+      check(e.retryable === true, "net", "expected retryable flag")
+      throw e
+    }
+  }
+  @allow("anyone") async outerInvoke(): any {
+    return await callInner("Service/s1", "catchAndRethrow", [])
+  }
+}
+//# file: tj:helper
+export async function callInner(obj: string, m: string, args: any[]): any {
+  return await invoke(obj, m, args)
+}
+"#;
+    let ik_store = Shared::default();
+    let mut irt = Runtime::boot(compile(ik_src).unwrap(), Box::new(ik_store.clone()), Options { server: true, render: false, ..Options::new(1.0, 9) }).unwrap().0;
+
+    // IK-3: catch-and-rethrow preserves `e.retryable === true` and returns 503 WITHOUT caching CallRecord!
+    let r1 = irt.handle(2.0, Input::Call { object: "Service/s1".into(), method: "catchAndRethrow".into(), args: vec![], reply: Some(1), call: Some("rethrow-1".into()), caller: who("alice", &[]) });
+    let e1 = r1.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let r1_done = irt.handle(3.0, Input::EffectDone { id: e1, ok: None, error: Some("conn reset".into()), field: None, unreachable: true });
+    assert!(r1_done.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "rethrown transport error must stay 503: {r1_done:?}");
+    // Retry same call_id "rethrow-1" runs again (not cached as 400)!
+    let r1_retry = irt.handle(4.0, Input::Call { object: "Service/s1".into(), method: "catchAndRethrow".into(), args: vec![], reply: Some(2), call: Some("rethrow-1".into()), caller: who("alice", &[]) });
+    assert!(r1_retry.iter().any(|o| matches!(o, Output::Effect { .. })), "503 must not have been cached: {r1_retry:?}");
+
+    // IK-2: `invoke()` propagates 503 so outer `call_once` also returns 503 without caching!
+    let r2 = irt.handle(5.0, Input::Call { object: "Service/s2".into(), method: "outerInvoke".into(), args: vec![], reply: Some(3), call: Some("inv-503".into()), caller: who("alice", &[]) });
+    let e2 = r2.iter().find_map(|o| match o { Output::Effect { id, .. } => Some(*id), _ => None }).unwrap();
+    let r2_done = irt.handle(6.0, Input::EffectDone { id: e2, ok: None, error: Some("timeout".into()), field: None, unreachable: true });
+    assert!(r2_done.iter().any(|o| matches!(o, Output::Reply { reply: 3, status: Some(503), .. })), "invoke() must propagate 503: {r2_done:?}");
+    let r2_retry = irt.handle(7.0, Input::Call { object: "Service/s2".into(), method: "outerInvoke".into(), args: vec![], reply: Some(4), call: Some("inv-503".into()), caller: who("alice", &[]) });
+    assert!(r2_retry.iter().any(|o| matches!(o, Output::Effect { .. })), "invoke 503 must not cache CallRecord: {r2_retry:?}");
+
+    // IK-6: cross-object, cross-method, and NUL/colon framing isolation!
+    let get_key = |obj: &str, method: &str, call_id: &str, label: &str| -> String {
+        // Snapshot `ik_store` (sharing `tj:secret`) by value so each probe starts with a clean CallRecord table.
+        let snap = ik_store.0.borrow().clone();
+        let mut r = Runtime::boot(compile(ik_src).unwrap(), Box::new(snap), Options { server: true, render: false, ..Options::new(10.0, 9) }).unwrap().0;
+        let out = r.handle(11.0, Input::Call { object: obj.into(), method: method.into(), args: vec![json!(label)], reply: Some(1), call: Some(call_id.into()), caller: who("alice", &[]) });
+        out.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::String(s)), .. } => Some(s.clone()), _ => None }).unwrap_or_else(|| panic!("expected key reply, got {out:?}"))
+    };
+    let k_base = get_key("Service/a", "keyFor", "c1", "l1");
+    assert_ne!(k_base, get_key("Service/b", "keyFor", "c1", "l1"), "cross-object isolation");
+    assert_ne!(k_base, get_key("Service/a", "keyForOther", "c1", "l1"), "cross-method isolation");
+    // Delimiter collision attempt: ("a:b", "c") vs ("a", "b:c") and NUL bytes!
+    assert_ne!(get_key("Service/a", "keyFor", "x:y", "z"), get_key("Service/a", "keyFor", "x", "y:z"), "colon framing");
+    assert_ne!(get_key("Service/a", "keyFor", "x\0y", "z"), get_key("Service/a", "keyFor", "x", "y\0z"), "NUL framing");
+
+    // IK-6: `store_secret()` failure returns 503 (not 400) without burning `used_labels`!
+    struct FailSecret {
+        inner: MemStore,
+        fail: StdRc<Cell<bool>>,
+    }
+    impl Store for FailSecret {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> {
+            if self.fail.get() && key == "tj:secret" { Err("secret store unavailable".into()) } else { self.inner.load(key) }
+        }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail.get() && key == "tj:secret" { Err("secret store read-only".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let fail_sec = StdRc::new(Cell::new(true));
+    let mut srt_sec = Runtime::boot(
+        compile(ik_src).unwrap(),
+        Box::new(FailSecret { inner: MemStore::default(), fail: fail_sec.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let sec_err = srt_sec.handle(2.0, Input::Call { object: "Service/a".into(), method: "keyFor".into(), args: vec![json!("step")], reply: Some(1), call: None, caller: who("alice", &[]) });
+    assert!(sec_err.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "store_secret failure must fail closed with 503: {sec_err:?}");
+    fail_sec.set(false);
+    let sec_ok = srt_sec.handle(3.0, Input::Call { object: "Service/a".into(), method: "keyFor".into(), args: vec![json!("step")], reply: Some(2), call: None, caller: who("alice", &[]) });
+    assert!(sec_ok.iter().any(|o| matches!(o, Output::Reply { reply: 2, ok: Some(Json::String(s)), .. } if s.starts_with("tj_"))), "{sec_ok:?}");
+
+    // IK-6: `Run::Blocked` disk-save failure releases already-held `@exclusive` lock on A and does NOT park on B!
+    let blk_src = r#"
+@server @read("anyone") object LockObj {
+  n: number = 0
+  @allow("anyone") @exclusive async hold() { await fetch("https://api.example.com/wait") }
+  @allow("anyone") @exclusive mutateAndEnterB(): number {
+    this.n += 1
+    return LockObj.get("b").touch()
+  }
+  @allow("anyone") @exclusive touch(): number { this.n += 1; return this.n }
+}
+"#;
+    let fail_blk = StdRc::new(Cell::new(false));
+    struct FailA {
+        inner: MemStore,
+        fail_a: StdRc<Cell<bool>>,
+    }
+    impl Store for FailA {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_a.get() && key == "LockObj/a" { Err("disk full".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let mut brt = Runtime::boot(
+        compile(blk_src).unwrap(),
+        Box::new(FailA { inner: MemStore::default(), fail_a: fail_blk.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    // Hold LockObj/b via an in-flight `await fetch`.
+    let _ = brt.handle(2.0, Input::Call { object: "LockObj/b".into(), method: "hold".into(), args: vec![], reply: Some(1), call: None, caller: who("alice", &[]) });
+    // Now make saving LockObj/a fail and call `a.mutateAndEnterB()` -> hits `Run::Blocked(LockObj/b)` -> flush fails -> 503 & releases LockObj/a!
+    fail_blk.set(true);
+    let blk_out = brt.handle(3.0, Input::Call { object: "LockObj/a".into(), method: "mutateAndEnterB".into(), args: vec![], reply: Some(2), call: None, caller: who("alice", &[]) });
+    assert!(blk_out.iter().any(|o| matches!(o, Output::Reply { reply: 2, status: Some(503), .. })), "Run::Blocked flush failure must return 503: {blk_out:?}");
+    // Disk recovers: LockObj/a must be FREE (immediately answers `touch()` without waiting on LockObj/b)!
+    fail_blk.set(false);
+    let a_free = brt.handle(4.0, Input::Call { object: "LockObj/a".into(), method: "touch".into(), args: vec![], reply: Some(3), call: None, caller: who("alice", &[]) });
+    assert!(a_free.iter().any(|o| matches!(o, Output::Reply { reply: 3, ok: Some(v), .. } if *v == json!(1))), "LockObj/a lock must be released: {a_free:?}");
+
+    // 5. Critic 047 regressions (IK-1 & IK-2):
+    // IK-1: multi-object Run::Await flush failure (A saves, B fails) restores A on disk & memory,
+    // drops Output::Changed, suppresses Output::Error on reply.is_some() (no false turn_errors),
+    // and emits only ONE Output::Error on reply.is_none() (no duplicate from refuse_start).
+    let multi_src = r#"
+@server @read("anyone") object BoxObj {
+  v: number = 0
+  @allow("anyone") async touchTwoAndWait(): number {
+    this.v = 1
+    BoxObj.get("b").set(2)
+    await fetch("https://api.example.com/multi")
+    return this.v
+  }
+  @allow("anyone") set(x: number) { this.v = x }
+}
+"#;
+    let fail_b = StdRc::new(Cell::new(true));
+    let multi_store = Shared::default();
+    struct FailB {
+        inner: Shared,
+        fail_b: StdRc<Cell<bool>>,
+    }
+    impl Store for FailB {
+        fn load(&mut self, key: &str) -> Result<Option<String>, String> { self.inner.load(key) }
+        fn save(&mut self, key: &str, value: &str) -> Result<(), String> {
+            if self.fail_b.get() && key == "BoxObj/b" { Err("ENOSPC".into()) } else { self.inner.save(key, value) }
+        }
+        fn remove(&mut self, key: &str) -> Result<(), String> { self.inner.remove(key) }
+        fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> { self.inner.keys(prefix) }
+    }
+    let mut mrt = Runtime::boot(
+        compile(multi_src).unwrap(),
+        Box::new(FailB { inner: multi_store.clone(), fail_b: fail_b.clone() }),
+        Options { server: true, render: false, ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let m_out = mrt.handle(2.0, Input::Call { object: "BoxObj/a".into(), method: "touchTwoAndWait".into(), args: vec![], reply: Some(1), call: Some("m1".into()), caller: who("alice", &[]) });
+    assert!(m_out.iter().any(|o| matches!(o, Output::Reply { reply: 1, status: Some(503), .. })), "{m_out:?}");
+    assert!(!m_out.iter().any(|o| matches!(o, Output::Changed { .. })), "uncommitted Changed must be dropped: {m_out:?}");
+    assert!(!m_out.iter().any(|o| matches!(o, Output::Error { .. })), "reply.is_some() 503 must not also emit Output::Error: {m_out:?}");
+    assert_eq!(state(&mut mrt, 3.0, "BoxObj/a")["v"], json!(0), "earlier saved object A must be reverted in memory");
+    assert!(!multi_store.0.borrow().data.contains_key("BoxObj/a"), "earlier saved new object A must be removed from disk");
+    assert!(mrt.changed_since(&["BoxObj/a".into()], 0).is_empty(), "rolled-back object A must have seq restored so changed_since does not broadcast it");
+    // reply.is_none() emits exactly ONE Output::Error (the specific save error, no duplicate).
+    let m_noreply = mrt.handle(4.0, Input::Call { object: "BoxObj/a".into(), method: "touchTwoAndWait".into(), args: vec![], reply: None, call: None, caller: who("alice", &[]) });
+    assert_eq!(m_noreply.iter().filter(|o| matches!(o, Output::Error { .. })).count(), 1, "reply.is_none() must emit exactly 1 Output::Error: {m_noreply:?}");
+    assert!(!m_noreply.iter().any(|o| matches!(o, Output::Changed { .. })), "{m_noreply:?}");
+
+    // IK-2: same-fiber cross-object method calls scope `crypto.idempotencyKey` by innermost `this`.
+    let cross_src = r#"
+@server @read("anyone") object Item {
+  @allow("anyone") reserve(): string { return crypto.idempotencyKey("reserve") }
+}
+@server @read("anyone") object Cart {
+  @allow("anyone") checkout(): string[] {
+    return [Item.get("sku-1").reserve(), Item.get("sku-2").reserve()]
+  }
+  @allow("anyone") dupSameItem(): string[] {
+    return [Item.get("sku-1").reserve(), Item.get("sku-1").reserve()]
+  }
+}
+"#;
+    let cross_store = Shared::default();
+    let mut crt = Runtime::boot(compile(cross_src).unwrap(), Box::new(cross_store.clone()), Options { server: true, render: false, ..Options::new(1.0, 2) }).unwrap().0;
+    let c_out1 = crt.handle(2.0, Input::Call { object: "Cart/c1".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys1 = c_out1.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap_or_else(|| panic!("expected two keys, got {c_out1:?}"));
+    assert_eq!(keys1.len(), 2);
+    assert_ne!(keys1[0], keys1[1], "distinct objects on same fiber must derive distinct keys");
+    // Crash & replay same entry object + call_id on fresh runtime sharing `tj:secret` -> identical keys!
+    let mut crt2 = Runtime::boot(compile(cross_src).unwrap(), Box::new(cross_store.0.borrow().clone()), Options { server: true, render: false, ..Options::new(3.0, 9) }).unwrap().0;
+    let c_out2 = crt2.handle(4.0, Input::Call { object: "Cart/c1".into(), method: "checkout".into(), args: vec![], reply: Some(1), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys2 = c_out2.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap();
+    assert_eq!(keys1, keys2, "same entry object + call_id must derive identical cross-object keys");
+    // IK-8: DIFFERENT entry object `Cart/c2` with the SAME `call_id: "co-1"` calling the SAME
+    // `Item/sku-1.reserve()` must derive DIFFERENT keys (no cross-entry-object collision)!
+    let c_out_other = crt2.handle(4.5, Input::Call { object: "Cart/c2".into(), method: "checkout".into(), args: vec![], reply: Some(2), call: Some("co-1".into()), caller: who("alice", &[]) });
+    let keys_other = c_out_other.iter().find_map(|o| match o { Output::Reply { ok: Some(Json::Array(a)), .. } => Some(a.clone()), _ => None }).unwrap();
+    assert_ne!(keys1[0], keys_other[0], "Cart/c1 and Cart/c2 with same call_id must not collide on shared Item/sku-1");
+    assert_ne!(keys1[1], keys_other[1], "Cart/c1 and Cart/c2 with same call_id must not collide on shared Item/sku-2");
+    // Same object + same label twice in one fiber STILL fails fast!
+    let c_dup = crt.handle(5.0, Input::Call { object: "Cart/c1".into(), method: "dupSameItem".into(), args: vec![], reply: Some(2), call: Some("co-2".into()), caller: who("alice", &[]) });
+    assert!(c_dup.iter().any(|o| matches!(o, Output::Reply { reply: 2, error: Some(e), .. } if e.contains("already called in this call"))), "{c_dup:?}");
+}

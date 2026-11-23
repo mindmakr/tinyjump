@@ -163,6 +163,23 @@ impl Runtime {
     pub(crate) fn start(&mut self, mut f: Fiber, reply: Option<u64>, entry: Entry) {
         f.caller = entry.who;
         f.chain = if entry.chain == 0 { self.new_chain() } else { entry.chain };
+        #[cfg(feature = "server")]
+        if self.server {
+            if let (Some(obj), Some((class, m))) = (f.frames.first().and_then(|fr| fr.this.as_ref()), f.stat) {
+                let def = &self.program.objects[class as usize];
+                if def.server {
+                    if let Some((method, _)) = def.methods.get_index(m as usize) {
+                        f.idempotency = Some(crate::vm::interp::IdempotencyCtx {
+                            object: Rc::from(obj.key()),
+                            method: method.clone(),
+                            call_id: entry.call_id,
+                            fallback_root: None,
+                            used_labels: std::collections::HashSet::new(),
+                        });
+                    }
+                }
+            }
+        }
         self.origin(&mut f, entry.by);
         let key = f.stat.filter(|_| self.any_exclusive).and_then(|(c, m)| {
             let (_, def) = self.program.objects[c as usize].methods.get_index(m as usize)?;
@@ -232,7 +249,7 @@ impl Runtime {
             let r = self.ready.remove(0);
             let mut f = r.fiber;
             let chain = f.chain;
-            let mark = self.outputs.len();
+            let mark = self.turn_mark();
             self.ran_code = true;
             let result = self.run(&mut f);
             self.settle(f, r.reply, result, mark);
@@ -267,7 +284,7 @@ impl Runtime {
                     self.flush();
                 }
                 let mut f = w.fiber;
-                let mark = self.outputs.len();
+                let mark = self.turn_mark();
                 self.ran_code = true;
                 let r = self.unwind(&mut f, Exc::busy(why)).and_then(|()| self.run(&mut f));
                 self.settle(f, w.reply, r, mark);

@@ -67,8 +67,10 @@ pub enum Input {
         #[serde(default)]
         reply: Option<u64>,
     },
-    /// The result of an [`Output::Effect`]. `unreachable`: a server call never got an
-    /// answer (offline, timed out, or the server is down or busy), so it is retried later.
+    /// The result of an [`Output::Effect`]. `unreachable`: a server `call` never got an
+    /// answer (offline, timed out, or the server is down or busy) so it is retried later, or
+    /// on a server, an `http` effect hit a transient transport failure (unwound as `503`
+    /// without caching a `400` call record).
     EffectDone {
         id: u32,
         #[serde(default)]

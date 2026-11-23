@@ -62,7 +62,9 @@ enum Msg {
     /// An input, who waits for its reply, and when it was sent (for latency).
     Input(Input, Option<Reply>, Instant),
     /// `(generation, effect_id, result)`: mismatched generations from a pre-reload runtime are dropped.
-    EffectDone(u64, u32, Result<Json, String>),
+    /// Error tuple carries `(message, unreachable)` so transient transport failures return 503
+    /// without caching a permanent 400 `CallRecord`.
+    EffectDone(u64, u32, Result<Json, (String, bool)>),
     /// `caller: None` is the admin: every object, unchecked.
     Subscribe { events: Arc<Mailbox>, objects: Vec<String>, since: u64, caller: Option<Caller>, done: Sender<Result<(), Failure>> },
     /// Which of `objects` `caller` may read (for stream tickets).
@@ -431,11 +433,11 @@ fn drain_inflight(rt: &mut Runtime, d: &mut Dispatch, rx: &Receiver<Msg>, pendin
                 if gen != d.generation {
                     continue;
                 }
-                let (ok, error) = match result {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
+                let (ok, error, unreachable) = match result {
+                    Ok(v) => (Some(v), None, false),
+                    Err((e, u)) => (None, Some(e), u),
                 };
-                let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable: false });
+                let out = rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable });
                 d.outputs(rt, out);
                 privacy_effects(rt, d);
             }
@@ -551,11 +553,11 @@ fn run(
                 if gen != d.generation {
                     continue;
                 }
-                let (ok, error) = match result {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(e)),
+                let (ok, error, unreachable) = match result {
+                    Ok(v) => (Some(v), None, false),
+                    Err((e, u)) => (None, Some(e), u),
                 };
-                rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable: false })
+                rt.handle(now_ms(), Input::EffectDone { id, ok, error, field: None, unreachable })
             }
             Ok(Msg::MayRead { objects, caller, done }) => {
                 let _ = done.send(may_read(&rt, &objects, &caller));
@@ -1052,17 +1054,17 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effect: Effect) -> Result<Json, String> {
+fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effect: Effect) -> Result<Json, (String, bool)> {
     let (url, method, headers, body) = match effect {
         Effect::Http { url, method, headers, body } => (url, method, headers, body),
-        Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args),
-        Effect::Call { .. } => return Err("server objects live here; there is no server to call".into()),
+        Effect::Plugin { plugin, method, args } => return plugins.call(&plugin, &method, args).map_err(|e| (e, false)),
+        Effect::Call { .. } => return Err(("server objects live here; there is no server to call".into(), false)),
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err("only http and https addresses can be fetched".into());
+        return Err(("only http and https addresses can be fetched".into(), false));
     }
     if !fetch_allow.is_empty() && !url_host_allowed(&url, fetch_allow) {
-        return Err(format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"));
+        return Err((format!("outbound fetch host is not allowed by {FETCH_ALLOW_ENV}"), false));
     }
     let mut req = agent.request(&method, &url);
     if let Json::Object(h) = &headers {
@@ -1079,12 +1081,28 @@ fn perform(agent: &ureq::Agent, plugins: &Plugins, fetch_allow: &[String], effec
     let resp = match resp {
         Ok(r) | Err(ureq::Error::Status(_, r)) => r,
         // What went wrong, but not the address: app code often shows the error to people, and
-        // an address can be private (a webhook with a token in it).
-        Err(ureq::Error::Transport(t)) => return Err(format!("the request failed: {}", t.kind())),
+        // an address can be private (a webhook with a token in it). Mark `unreachable = true`
+        // so uncaught transport failures return 503 instead of caching a permanent 400 CallRecord.
+        Err(ureq::Error::Transport(t)) => {
+            use std::error::Error as _;
+            let policy = t
+                .source()
+                .and_then(|s| s.downcast_ref::<std::io::Error>())
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+            let deterministic = matches!(
+                t.kind(),
+                ureq::ErrorKind::InvalidUrl
+                    | ureq::ErrorKind::UnknownScheme
+                    | ureq::ErrorKind::TooManyRedirects
+                    | ureq::ErrorKind::InsecureRequestHttpsOnly
+                    | ureq::ErrorKind::InvalidProxyUrl
+            );
+            return Err((format!("the request failed: {}", t.kind()), !policy && !deterministic));
+        }
     };
     let status = resp.status();
     let headers: serde_json::Map<String, Json> = resp.headers_names().into_iter().filter_map(|n| resp.header(&n).map(|v| (n.clone(), Json::String(v.to_string())))).collect();
-    let body = resp.into_string().map_err(|e| e.to_string())?;
+    let body = resp.into_string().map_err(|e| (e.to_string(), true))?;
     Ok(json!({ "status": status, "headers": headers, "body": body }))
 }
 
@@ -1268,8 +1286,20 @@ mod tests {
         // The address may be private (a webhook with a token in it), and apps show errors.
         let agent = ureq::AgentBuilder::new().resolver(public_only).timeout(Duration::from_secs(2)).build();
         let url = "http://127.0.0.1:9/hook?token=secret123";
-        let e = perform(&agent, &Plugins::default(), &[], Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        let (e, unreachable) = perform(&agent, &Plugins::default(), &[], Effect::Http { url: url.into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
         assert!(e.starts_with("the request failed") && !e.contains("secret123") && !e.contains("127.0.0.1"), "{e}");
+        assert!(!unreachable, "public_only PermissionDenied policy refusal must not mark unreachable");
+
+        // Real TCP connection refusal on an allowed loopback address marks `unreachable = true` (503 retriable).
+        let open_agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(2)).build();
+        let (e2, unreachable2) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "http://127.0.0.1:1/".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        assert!(e2.starts_with("the request failed"), "{e2}");
+        assert!(unreachable2, "real transport failure must mark unreachable=true");
+
+        // IK-4: deterministic URL parse errors (`InvalidUrl`) must NOT mark `unreachable = true`.
+        let (e3, unreachable3) = perform(&open_agent, &Plugins::default(), &[], Effect::Http { url: "https://[bad url".into(), method: "GET".into(), headers: Json::Null, body: None }).unwrap_err();
+        assert!(e3.starts_with("the request failed"), "{e3}");
+        assert!(!unreachable3, "InvalidUrl must not trigger infinite 503 retries");
     }
 
     #[test]
@@ -1372,7 +1402,7 @@ import { erase, exportData } from "tj:privacy"
         assert!(!url_host_allowed("https://evil.com/steal", &allow));
         // `perform` refuses disallowed hosts without leaking the URL.
         let agent = ureq::AgentBuilder::new().build();
-        let err = perform(
+        let (err, unreachable) = perform(
             &agent,
             &Plugins::default(),
             &allow,
@@ -1384,6 +1414,7 @@ import { erase, exportData } from "tj:privacy"
             },
         )
         .unwrap_err();
+        assert!(!unreachable, "allowlist refusal must not mark unreachable");
         assert!(err.contains(FETCH_ALLOW_ENV), "{err}");
         assert!(!err.contains("TOPSECRET") && !err.contains("evil.com"), "error must not leak URL: {err}");
 
@@ -1409,7 +1440,7 @@ import { erase, exportData } from "tj:privacy"
                 Ok(netloc.to_socket_addrs()?.collect())
             })
             .build();
-        let redir_err = perform(
+        let (redir_err, redir_unreachable) = perform(
             &redirect_agent,
             &Plugins::default(),
             &local_allow,
@@ -1421,6 +1452,7 @@ import { erase, exportData } from "tj:privacy"
             },
         )
         .unwrap_err();
+        assert!(!redir_unreachable, "redirect allowlist refusal must not mark unreachable");
         assert!(redir_err.contains("the request failed"), "redirect to disallowed host must fail: {redir_err}");
         assert!(!redir_err.contains("disallowed.example.invalid"), "redirect error must not leak URL: {redir_err}");
         let _ = handle.join();

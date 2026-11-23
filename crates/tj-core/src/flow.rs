@@ -1035,8 +1035,16 @@ impl Checker {
                         return clean();
                     }
                     // A keyed hash and random ids are how apps avoid storing the value itself.
+                    // `idempotencyKey(label)` takes a step label (not raw PII).
                     "crypto" => {
-                        self.union(&arg_refs, fr);
+                        if name == "idempotencyKey" {
+                            for a in args {
+                                let v = self.expr(a, fr);
+                                self.sink(&v, a.span, "`crypto.idempotencyKey`");
+                            }
+                        } else {
+                            self.union(&arg_refs, fr);
+                        }
                         return clean();
                     }
                     _ => {}
