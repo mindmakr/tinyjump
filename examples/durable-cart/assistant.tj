@@ -1,8 +1,9 @@
 // A shop assistant: ask in plain words ("two teas, please") and it changes the shared cart
 // through the app's own methods. It runs on tj:agent, so every tool call is checked as the
 // person who asked: anyone may shop through it, but only staff may restock, exactly as
-// without it. The model runs through the tj:ai plugin on the server, so the API key never
-// reaches a device (see plugins.json).
+// without it. The model runs through the tj:ai plugin on the server (Claude, OpenAI,
+// Gemini, or a local LLM via Ollama / llama.cpp / LM Studio — see plugins.json and
+// docs/plugins.md), so API keys never reach a device.
 
 import { act, Skill } from "tj:agent"
 import { Message } from "tj:ai"

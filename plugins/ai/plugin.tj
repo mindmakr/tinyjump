@@ -1,6 +1,7 @@
 // tj:ai: a language model, for apps and agents (docs/plugins.md). It runs on the server as
-// `tj plugin ai`, an MCP server that calls Claude with the server's ANTHROPIC_API_KEY, so
-// keys never reach devices. Call it from @server objects.
+// `tj plugin ai`, an MCP server supporting external LLMs (Anthropic Claude, OpenAI, Gemini,
+// OpenRouter/Groq) and local LLMs (Ollama, llama.cpp, LM Studio, vLLM) so API keys never
+// reach devices. Call it from @server objects.
 
 /// A tool the model may ask to use. `input` is a JSON Schema for its arguments.
 export type Tool = { name: string, description: string, input: any }

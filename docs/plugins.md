@@ -80,9 +80,34 @@ automatically into `AndroidManifest.xml` and `Info.plist`. See
 
 ## The agent loop, as a plugin and a library
 
-The first plugin is `tj:ai`, a model call. Its implementation is `tj plugin ai`, an MCP
-server that calls the Anthropic Messages API with `ANTHROPIC_API_KEY`; the model is
-configurable. On top of it, `tj:agent` is a library written in tinyjump:
+The first plugin is `tj:ai`, a provider-agnostic model call. Its built-in implementation is
+`tj plugin ai`, a stdio MCP server that connects to both **external** and **local** LLMs
+without adding any bytes to `tj-core` or device builds:
+
+| Provider (`TJ_AI_PROVIDER`) | Default endpoint (`TJ_AI_BASE_URL`) | API key env | Default model (`TJ_AI_MODEL`) |
+|---|---|---|---|
+| `anthropic` *(default)* | `https://api.anthropic.com/v1/messages` | `ANTHROPIC_API_KEY` (or `TJ_AI_API_KEY`) | `claude-opus-5-5` (`TJ_AI_EFFORT=medium`) |
+| `openai` *(OpenAI, OpenRouter, Groq, vLLM, LM Studio, `llama.cpp`)* | `https://api.openai.com/v1` | `OPENAI_API_KEY` / `TJ_AI_API_KEY` *(optional on loopback)* | `gpt-4o-mini` |
+| `ollama` *(local shortcut)* | `http://127.0.0.1:11434/v1` | none required (`OLLAMA_API_KEY` optional) | `llama3.2` |
+| `gemini` *(Google Gemini OpenAI-compat)* | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` / `TJ_AI_API_KEY` | `gemini-2.5-flash` |
+
+- **Auto-detection:** if `TJ_AI_PROVIDER` is unset, `tj plugin ai` uses `openai` when
+  `TJ_AI_BASE_URL` is set, or matches `ANTHROPIC_API_KEY` → `OPENAI_API_KEY` →
+  `GEMINI_API_KEY`. Pass the env vars you want in `plugins.json` `"env"` so secrets stay
+  scoped to the `ai` plugin process.
+- **Local LLM quickstart (zero API key):**
+  ```sh
+  # Ollama running locally on 127.0.0.1:11434
+  TJ_AI_PROVIDER=ollama TJ_AI_MODEL=qwen2.5 cargo tj dev examples/durable-cart/app.tj
+
+  # Any local OpenAI-compatible runner (llama.cpp server, LM Studio, vLLM)
+  TJ_AI_BASE_URL=http://127.0.0.1:8080/v1 TJ_AI_MODEL=local-model cargo tj dev examples/durable-cart/app.tj
+  ```
+- **Security rules (fail closed):** plain `http://` is permitted **only** for loopback hosts
+  (`localhost`, `127.0.0.1`, `[::1]`) — remote endpoints require `https://`, HTTP redirects
+  are disabled so API keys cannot leak across hosts, and responses are capped at 4 MiB.
+
+On top of `tj:ai`, `tj:agent` is a library written in tinyjump:
 
 - **An agent's state is a durable object:** its messages, its pending tool calls and its
   status. It survives restarts and can be inspected like any object.

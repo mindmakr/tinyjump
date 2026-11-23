@@ -1360,7 +1360,7 @@
             <p>Package native artifacts in one command and connect cleanly to existing systems.</p>
             <ul class="feature-list">
               <li><code>tj build</code>: <code>--web</code>, standalone <code>--linux</code>, <code>--android --assemble</code>, <code>--ios --assemble</code></li>
-              <li>MCP plugins (<code>tj:ai</code>, <code>tj:agent</code>) &amp; <code>tj bridge openapi</code></li>
+              <li>MCP plugins (<code>tj:ai</code> for Claude, OpenAI, Gemini &amp; local Ollama/<code>llama.cpp</code>; <code>tj:agent</code>) &amp; <code>tj bridge openapi</code></li>
               <li>Server-to-server object replicas &amp; HMAC-signed webhooks</li>
               <li>Live <a href="https://mindmakr.github.io/tj-plugins/"><code>tj-plugins</code></a> registry: <code>tj search</code>, <code>tj add</code>, SHA-256 lockfile</li>
             </ul>
@@ -1447,8 +1447,8 @@
               <span class="mini-tag">Durable stock timers</span>
               <span class="mini-tag">Realtime SSE</span>
             </div>
-            <p style="color:var(--muted);font-size:13.5px;margin:0;">Run it locally with a deterministic fake model or your Anthropic key:</p>
-            <div class="cmd-box">cargo tj dev examples/durable-cart/app.tj \<br>&nbsp;&nbsp;--plugin ai=fake:examples/durable-cart/fake-ai.json</div>
+            <p style="color:var(--muted);font-size:13.5px;margin:0;">Run it offline with a fake model, a local LLM (Ollama / <code>llama.cpp</code>), or Claude / OpenAI / Gemini:</p>
+            <div class="cmd-box">TJ_AI_PROVIDER=ollama cargo tj dev examples/durable-cart/app.tj<br># or offline: cargo tj dev examples/durable-cart/app.tj --plugin ai=fake:examples/durable-cart/fake-ai.json</div>
           </div>
           <div class="code-win">
             <div class="code-bar">

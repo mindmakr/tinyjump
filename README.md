@@ -41,8 +41,10 @@ Examples (`cargo tj dev examples/<name>/app.tj`):
 - **durable-cart:** one cart shared by every device, the backend, the HTTP API and AI agents.
   Change it anywhere, and every subscribed screen updates at once. Held stock is released
   by a durable timer on the backend. A shop assistant changes the cart in plain words
-  through the `tj:ai` plugin (set `ANTHROPIC_API_KEY`, or run with
-  `--plugin ai=fake:examples/durable-cart/fake-ai.json`). Staff restock with an API key.
+  through `tj:agent` + `tj:ai` — works with external LLMs (`ANTHROPIC_API_KEY`,
+  `OPENAI_API_KEY`, `GEMINI_API_KEY`, or any OpenAI-compatible `TJ_AI_BASE_URL`), local
+  LLMs (`TJ_AI_PROVIDER=ollama` / `llama.cpp` / LM Studio with no API key), or offline via
+  `--plugin ai=fake:examples/durable-cart/fake-ai.json`. Staff restock with an API key.
 - **members:** personal data (`@pii`), consent (`tj:consent` + `@needs`) and a sample GDPR
   compliance pack (`examples/members/gdpr-eu.sample.json`).
 - **smart-meter:** an event-driven workflow. Timer readings, API readings, actions and
