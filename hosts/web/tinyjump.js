@@ -387,19 +387,20 @@ export async function start(opts) {
 
   function renderTabs(el) {
     const items = Array.isArray(el.__tabs.items) ? el.__tabs.items : [];
-    const current = el.__tabs.value;
+    const current = el.__tabs.value === null || el.__tabs.value === undefined ? null : String(el.__tabs.value);
     while (el.firstChild) el.removeChild(el.firstChild);
     items.forEach((raw) => {
-      const val = raw && typeof raw === 'object' ? String(raw.value !== undefined ? raw.value : raw.label || '') : String(raw);
-      const label = raw && typeof raw === 'object' ? String(raw.label !== undefined ? raw.label : val) : String(raw);
+      const val = raw && typeof raw === 'object' ? String(raw.value !== undefined && raw.value !== null ? raw.value : (raw.label !== undefined && raw.label !== null ? raw.label : '')) : String(raw === null || raw === undefined ? '' : raw);
+      const label = raw && typeof raw === 'object' ? String(raw.label !== undefined && raw.label !== null ? raw.label : val) : val;
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'tj-tab';
       btn.setAttribute('role', 'tab');
-      btn.setAttribute('aria-selected', val === current ? 'true' : 'false');
+      btn.dataset.tjVal = val;
+      btn.setAttribute('aria-selected', current !== null && val === current ? 'true' : 'false');
       btn.textContent = label;
       btn.addEventListener('click', () => {
-        if (el.__tj && el.__tj.events.indexOf('onChange') >= 0) {
+        if (el.__tj && !el.__quiet && el.__tj.events.indexOf('onChange') >= 0) {
           send({ type: 'ui', target: { node: el.__tj.id }, event: 'onChange', value: val });
         }
       });
@@ -407,10 +408,20 @@ export async function start(opts) {
     });
   }
 
+  function updateTabSelection(el) {
+    const current = el.__tabs.value === null || el.__tabs.value === undefined ? null : String(el.__tabs.value);
+    for (let i = 0; i < el.childNodes.length; i++) {
+      const btn = el.childNodes[i];
+      if (btn && btn.dataset) {
+        btn.setAttribute('aria-selected', current !== null && btn.dataset.tjVal === current ? 'true' : 'false');
+      }
+    }
+  }
+
   function renderIcon(el) {
     const name = el.__icon.name || '';
     const size = typeof el.__icon.size === 'number' && el.__icon.size > 0 ? el.__icon.size : 20;
-    const d = ICONS[name] || 'M12 5a7 7 0 1 0 0 14a7 7 0 1 0 0-14';
+    const d = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : 'M12 5a7 7 0 1 0 0 14a7 7 0 1 0 0-14';
     const ns = 'http://www.w3.org/2000/svg';
     let svg = el.firstChild;
     if (!svg) {
@@ -436,10 +447,11 @@ export async function start(opts) {
     const dark = t.mode === 'dark' || (t.mode === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
     const mode = dark ? 'dark' : 'light';
     el.setAttribute('data-tj-theme', mode);
+    el.style.colorScheme = t.mode ? mode : '';
     const surface = t.surface || (t.mode ? (dark ? '#111827' : '#ffffff') : '');
     const fg = t.color || (t.mode ? (dark ? '#f9fafb' : '#111827') : '');
     const muted = t.muted || (t.mode ? (dark ? '#9ca3af' : '#6b7280') : '');
-    const border = t.border || (t.mode ? (dark ? '#374151' : '#e5e7eb') : '');
+    const border = t.mode ? (dark ? '#374151' : '#e5e7eb') : '';
     const setVar = (name, val) => { if (val) el.style.setProperty(name, val); else el.style.removeProperty(name); };
     setVar('--tj-surface', surface);
     setVar('--tj-fg', fg);
@@ -453,20 +465,30 @@ export async function start(opts) {
     let el;
     if (BUILTIN_KINDS.indexOf(kind) < 0) {
       const spec = components.get(kind);
+      let creating = true;
       const emit = (event, value) => {
-        if (el && el.__tj && el.__tj.events.indexOf(event) >= 0) {
+        if (!creating && el && el.__tj && !el.__quiet && el.__tj.events.indexOf(event) >= 0) {
           send({ type: 'ui', target: { node: id }, event, value: value === undefined ? null : value });
         }
       };
       if (spec && typeof spec.create === 'function') {
         el = spec.create(Object.assign({}, props), emit);
-        el.__native = { spec, props: Object.assign({}, props) };
+        creating = false;
+        const container = typeof spec.container === 'function' ? spec.container(el) : null;
+        if (container) {
+          container.style.display = 'flex';
+          container.style.flexDirection = 'column';
+          container.style.boxSizing = 'border-box';
+          container.style.minWidth = '0';
+        }
+        el.__native = { spec, props: Object.assign({}, props), container };
       } else {
+        creating = false;
         el = document.createElement('div');
         el.className = 'tj-native-missing';
         el.setAttribute('data-tj-native', kind);
         el.textContent = '<' + kind + '>';
-        el.__native = { spec: null, props: Object.assign({}, props) };
+        el.__native = { spec: null, props: Object.assign({}, props), container: null };
       }
       return el;
     }
@@ -575,14 +597,15 @@ export async function start(opts) {
     const none = v === null || v === undefined;
     if (el.__native) {
       // Custom native components own their custom props via spec.create/update; only apply shared layout/style/a11y props.
+      const cs = (el.__native.container || el).style;
       switch (k) {
         case 'id': if (none) delete el.dataset.tjId; else el.dataset.tjId = v; break;
         case 'label': if (none) el.removeAttribute('aria-label'); else el.setAttribute('aria-label', v); break;
-        case 'padding': s.padding = none ? '' : px(v); break;
+        case 'padding': cs.padding = none ? '' : px(v); break;
         case 'margin': s.margin = none ? '' : px(v); break;
-        case 'gap': s.gap = none ? '' : px(v); break;
-        case 'align': s.alignItems = none ? '' : (ALIGN[v] || v); break;
-        case 'justify': s.justifyContent = none ? '' : (JUSTIFY[v] || v); break;
+        case 'gap': cs.gap = none ? '' : px(v); break;
+        case 'align': cs.alignItems = none ? '' : (ALIGN[v] || v); break;
+        case 'justify': cs.justifyContent = none ? '' : (JUSTIFY[v] || v); break;
         case 'grow': s.flexGrow = none ? '' : String(v); break;
         case 'width': s.width = none ? '' : px(v); break;
         case 'height': s.height = none ? '' : px(v); break;
@@ -614,7 +637,6 @@ export async function start(opts) {
     }
     if (kind === 'Tabs' && (k === 'items' || k === 'value')) {
       el.__tabs[k] = none ? (k === 'items' ? [] : null) : v;
-      renderTabs(el);
       return;
     }
     if (kind === 'Icon') {
@@ -647,7 +669,7 @@ export async function start(opts) {
         return;
       }
     }
-    if (kind === 'Theme' && ['mode', 'accent', 'surface', 'muted', 'color', 'border', 'radius'].indexOf(k) >= 0) {
+    if (kind === 'Theme' && ['mode', 'accent', 'surface', 'muted', 'color', 'radius'].indexOf(k) >= 0) {
       if (none) delete el.__theme[k]; else el.__theme[k] = v;
       applyTheme(el);
       if (k === 'mode' || k === 'accent' || k === 'surface' || k === 'muted') return;
@@ -711,6 +733,7 @@ export async function start(opts) {
         const extent = horiz ? el.scrollWidth : el.scrollHeight;
         const view = horiz ? el.clientWidth : el.clientHeight;
         const offset = horiz ? Math.abs(el.scrollLeft) : el.scrollTop;
+        if (extent < el.__list.lastExtent) el.__list.lastExtent = -1;
         if (extent > view && extent - offset - view <= 120 && el.__list.lastExtent !== extent) {
           el.__list.lastExtent = extent;
           fire('onEndReached', null);
@@ -719,36 +742,55 @@ export async function start(opts) {
     }
   }
 
+  function applyProps(el, kind, props, isCreate) {
+    const keys = Object.keys(props);
+    el.__quiet = true;
+    try {
+      keys.forEach((k) => setProp(el, kind, k, props[k]));
+      if (kind === 'Tabs') {
+        if (isCreate || Object.prototype.hasOwnProperty.call(props, 'items')) renderTabs(el);
+        else if (Object.prototype.hasOwnProperty.call(props, 'value')) updateTabSelection(el);
+      }
+      if (kind === 'Icon' && isCreate && !Object.prototype.hasOwnProperty.call(props, 'name') && !Object.prototype.hasOwnProperty.call(props, 'size')) {
+        renderIcon(el);
+      }
+      if (!isCreate && el.__native) {
+        keys.forEach((k) => {
+          if (props[k] === null) delete el.__native.props[k];
+          else el.__native.props[k] = props[k];
+        });
+        if (el.__native.spec && typeof el.__native.spec.update === 'function') {
+          el.__native.spec.update(el, Object.assign({}, el.__native.props), Object.assign({}, props));
+        }
+      }
+    } finally {
+      el.__quiet = false;
+    }
+  }
+
   function patch(op) {
     switch (op.op) {
       case 'create': {
         const el = create(op.id, op.kind, op.props);
         el.__tj = { id: op.id, kind: op.kind, events: op.events };
-        Object.keys(op.props).forEach((k) => setProp(el, op.kind, k, op.props[k]));
+        applyProps(el, op.kind, op.props, true);
         listen(el, op.id, op.kind);
         nodes.set(op.id, el);
         break;
       }
       case 'update': {
         const el = nodes.get(op.id);
-        Object.keys(op.props).forEach((k) => setProp(el, el.__tj.kind, k, op.props[k]));
+        if (!el) break;
         if (op.events) el.__tj.events = op.events;
-        if (el.__native) {
-          Object.keys(op.props).forEach((k) => {
-            if (op.props[k] === null) delete el.__native.props[k];
-            else el.__native.props[k] = op.props[k];
-          });
-          if (el.__native.spec && typeof el.__native.spec.update === 'function') {
-            el.__native.spec.update(el, Object.assign({}, el.__native.props), op.props);
-          }
-        }
+        applyProps(el, el.__tj.kind, op.props, false);
         break;
       }
       case 'children': {
         const rawParent = nodes.get(op.id);
-        const parent = rawParent && rawParent.__native && rawParent.__native.spec && typeof rawParent.__native.spec.container === 'function'
-          ? (rawParent.__native.spec.container(rawParent) || rawParent)
-          : rawParent;
+        if (!rawParent) break;
+        if (rawParent.__native && !rawParent.__native.container) break;
+        const parent = rawParent.__native ? rawParent.__native.container : rawParent;
+        if (rawParent.__list && op.ids.length < parent.childNodes.length) rawParent.__list.lastExtent = -1;
         op.ids.forEach((cid, i) => {
           const child = nodes.get(cid);
           if (parent.childNodes[i] !== child) parent.insertBefore(child, parent.childNodes[i] || null);

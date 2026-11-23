@@ -140,7 +140,11 @@ impl Measure for TestMeasure {
                 let s = num_prop("size").unwrap_or(20.0);
                 (s.ceil(), s.ceil())
             }
-            _ => (num_prop("width").unwrap_or(120.0).ceil(), num_prop("height").unwrap_or(80.0).ceil()),
+            _ => {
+                let w = num_prop("width").unwrap_or(120.0);
+                let w = if props.contains_key("width") { w } else { max_width.map_or(w, |mw| w.min(mw)) };
+                (w.ceil(), num_prop("height").unwrap_or(80.0).ceil())
+            }
         }
     }
 }

@@ -47,8 +47,13 @@ final class TabsView: UIView {
             let val: String
             let label: String
             if let dict = raw as? [String: Any] {
-                val = (dict["value"].map { "\($0)" }) ?? (dict["label"].map { "\($0)" }) ?? ""
-                label = (dict["label"].map { "\($0)" }) ?? val
+                let rawVal = dict["value"].flatMap { $0 is NSNull ? nil : "\($0)" }
+                let rawLbl = dict["label"].flatMap { $0 is NSNull ? nil : "\($0)" }
+                val = rawVal ?? rawLbl ?? ""
+                label = rawLbl ?? val
+            } else if raw is NSNull {
+                val = ""
+                label = ""
             } else {
                 val = "\(raw)"
                 label = val
@@ -258,11 +263,12 @@ final class Renderer {
                 setProps(n, props, isCreate: true)
             case "update":
                 guard let n = nodes[id] else { continue }
-                setProps(n, op["props"] as? [String: Any] ?? [:], isCreate: false)
                 if let events = op["events"] as? [String] { n.events = events }
+                setProps(n, op["props"] as? [String: Any] ?? [:], isCreate: false)
             case "children":
-                guard let box = nodes[id]?.container else { continue }
+                guard let parent = nodes[id], let box = parent.container else { continue }
                 let views = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0]?.view }
+                if parent.kind == "List", views.count < box.subviews.count { parent.lastScrollExtent = -1 }
                 for v in box.subviews where !views.contains(v) { v.removeFromSuperview() }
                 for (i, v) in views.enumerated() where box.subviews.firstIndex(of: v) != i { box.insertSubview(v, at: i) }
             case "remove":
@@ -275,6 +281,14 @@ final class Renderer {
             }
         }
         return !ops.isEmpty
+    }
+
+    /// Cleans up mounted custom native views when `TinyJump.stop()` is called.
+    func destroy() {
+        for n in nodes.values {
+            n.nativeComponent?.destroy?(n.view)
+        }
+        nodes.removeAll()
     }
 
     /// Views take the root's direction, so text alignment and widget parts mirror with it.
@@ -341,6 +355,7 @@ final class Renderer {
                 let extent = horiz ? sv.contentSize.width : sv.contentSize.height
                 let viewSize = horiz ? sv.bounds.width : sv.bounds.height
                 let offset = horiz ? sv.contentOffset.x : sv.contentOffset.y
+                if extent < n.lastScrollExtent { n.lastScrollExtent = -1 }
                 if extent > viewSize, extent - offset - viewSize <= 120, n.lastScrollExtent != extent {
                     n.lastScrollExtent = extent
                     t.fire("onEndReached", NSNull())
@@ -355,7 +370,7 @@ final class Renderer {
             tabs.onSelect = { [weak t] val in t?.fire("onChange", val) }
             return n
         case "Icon":
-            return Node(id: id, kind: kind, view: IconView(), container: nil)
+            return Node(id: id, kind: kind, view: IconView(frame: .zero), container: nil)
         case "Button":
             let b = UIButton(type: .system)
             let n = Node(id: id, kind: kind, view: b, container: nil)
@@ -437,13 +452,19 @@ final class Renderer {
         if let comp = n.nativeComponent, !isCreate {
             comp.update(n.view, n.props, props)
         }
-        if n.kind == "Tabs", props.keys.contains(where: { $0 == "items" || $0 == "value" }) {
-            if let tabs = n.view as? TabsView {
-                tabs.setItems(n.props["items"] as? [Any] ?? [], selected: n.props["value"].map { "\($0)" })
+        if n.kind == "List", props["horizontal"] != nil {
+            n.lastScrollExtent = -1
+        }
+        if n.kind == "Tabs", let tabs = n.view as? TabsView {
+            let selected = n.props["value"].flatMap { $0 is NSNull ? nil : "\($0)" }
+            if isCreate || props["items"] != nil {
+                tabs.setItems(n.props["items"] as? [Any] ?? [], selected: selected)
+            } else if props["value"] != nil {
+                tabs.setSelected(selected)
             }
         }
-        if props.keys.contains(where: { ["background", "radius", "border"].contains($0) }) { restyle(n) }
-        if n.kind == "Theme", props.keys.contains(where: { ["mode", "accent", "surface", "background"].contains($0) }) { applyTheme(n) }
+        if props.keys.contains(where: { ["background", "radius", "border", "surface", "mode"].contains($0) }) { restyle(n) }
+        if n.kind == "Theme", props.keys.contains(where: { ["mode", "accent"].contains($0) }) { applyTheme(n) }
         if n.nativeComponent == nil, props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
     }
 
@@ -453,16 +474,7 @@ final class Renderer {
         } else {
             n.view.overrideUserInterfaceStyle = .unspecified
         }
-        if let accent = n.props["accent"] as? String, let c = Renderer.color(accent) {
-            n.view.tintColor = c
-        }
-        if n.props["background"] == nil {
-            if let surface = n.props["surface"] as? String, let c = Renderer.color(surface) {
-                n.view.backgroundColor = c
-            } else if n.props["mode"] != nil {
-                n.view.backgroundColor = .systemBackground
-            }
-        }
+        n.view.tintColor = (n.props["accent"] as? String).flatMap(Renderer.color)
     }
 
     /// Visual props. Layout props (width, gap, align, grow, ...) are the core's job.
@@ -513,6 +525,7 @@ final class Renderer {
             view.accessibilityIdentifier = v as? String
         case "label":
             view.accessibilityLabel = v.map { "\($0)" }
+            if view is IconView { view.isAccessibilityElement = (v != nil) }
         case "color":
             let c = v.flatMap { Renderer.color("\($0)") }
             label?.textColor = c ?? .label
@@ -540,7 +553,15 @@ final class Renderer {
     }
 
     private func restyle(_ n: Node) {
-        n.view.backgroundColor = (n.props["background"] as? String).flatMap(Renderer.color)
+        var bg = (n.props["background"] as? String).flatMap(Renderer.color)
+        if bg == nil && n.kind == "Theme" {
+            if let surface = n.props["surface"] as? String, let c = Renderer.color(surface) {
+                bg = c
+            } else if n.props["mode"] != nil {
+                bg = .systemBackground
+            }
+        }
+        n.view.backgroundColor = bg
         let radius = CGFloat((n.props["radius"] as? Double) ?? 0)
         n.view.layer.cornerRadius = radius
         n.view.clipsToBounds = radius > 0 || n.view is UIImageView

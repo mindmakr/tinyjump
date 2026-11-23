@@ -151,6 +151,7 @@ public final class TinyJump {
         sync.stop();
         io.shutdownNow();
         if (automation != null) automation.stop();
+        renderer.destroy();
     }
 
     /** Sends an input that expects a reply (call, get, ui, inspect). */

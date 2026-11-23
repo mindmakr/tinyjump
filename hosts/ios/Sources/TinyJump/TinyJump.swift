@@ -112,6 +112,7 @@ public final class TinyJump {
         wake?.cancel()
         sync.stop()
         automation?.stop()
+        renderer.destroy()
     }
 
     /// Sends an input that expects a reply (call, get, ui, inspect).

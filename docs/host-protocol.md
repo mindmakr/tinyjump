@@ -80,9 +80,13 @@ and `on<Upper>...` handlers in `events`. Register the native implementation befo
 - **iOS (`hosts/ios`):** `TinyJump.registerComponent("MapView", NativeComponent(create: { props, emit in ... }, update: { view, props, changed in ... }))`.
 
 Calling `emit(event, value)` sends `{ type: "ui", target: { node: id }, event, value }` back
-into the runtime. Leaf custom native nodes (no children) are measured via the host's
-`measure` callback like built-in leaves; nodes with children lay out their children via the
-optional `container` view.
+into the runtime. On Android and iOS, `emit` must be called on the main thread (and calls
+fired synchronously inside `create` or `update` are ignored to prevent re-entrant patch
+handling). Shared layout/style/accessibility props (`id`, `label`, `background`, `radius`,
+`border`, plus layout props on Web) are applied by the host to the native view, so custom
+props should avoid built-in `COMMON_PROPS` names. Leaf custom native nodes (no children) are
+measured via the host's `measure` callback like built-in leaves; nodes with children lay out
+their children via the optional `container` view.
 
 ## Layout (native hosts)
 

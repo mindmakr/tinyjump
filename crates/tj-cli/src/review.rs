@@ -29,7 +29,7 @@ struct Walk {
 pub fn review(snapshot: &Json) -> Vec<Finding> {
     let mut w = Walk { viewport_w: snapshot["viewport"]["w"].as_f64(), findings: Vec::new() };
     match snapshot["tree"].as_array() {
-        Some(tree) if !tree.is_empty() => w.nodes(tree, "#ffffff", false),
+        Some(tree) if !tree.is_empty() => w.nodes(tree, "#ffffff", false, false),
         // Nothing drawn means nothing checked: say so, rather than "No findings".
         _ => w.findings.push(Finding {
             severity: Severity::Error,
@@ -81,14 +81,14 @@ impl Walk {
         self.findings.push(Finding { severity, check, node: describe(n), message });
     }
 
-    fn nodes(&mut self, list: &[Json], background: &str, in_scroll: bool) {
+    fn nodes(&mut self, list: &[Json], background: &str, in_scroll: bool, in_h_scroll: bool) {
         for n in list {
-            self.node(n, background, in_scroll);
+            self.node(n, background, in_scroll, in_h_scroll);
         }
         self.overlaps(list);
     }
 
-    fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool) {
+    fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool, in_h_scroll: bool) {
         let kind = n["kind"].as_str().unwrap_or("");
         let theme_bg = if kind == "Theme" {
             prop(n, "surface").or_else(|| match prop(n, "mode") {
@@ -118,9 +118,11 @@ impl Walk {
             if interactive && n["visible"].as_bool() != Some(false) && (r.h < MIN_TOUCH || (kind == "Button" && r.w < MIN_TOUCH)) {
                 self.add(Severity::Warning, "touch", n, format!("touch target is {:.0}x{:.0}; make it at least {MIN_TOUCH:.0}x{MIN_TOUCH:.0}", r.w, r.h));
             }
-            if let Some(vw) = self.viewport_w {
-                if r.x + r.w > vw + 1.0 || r.x < -1.0 {
-                    self.add(Severity::Error, "overflow", n, format!("spans x {:.0}..{:.0} but the screen is {vw:.0} wide", r.x, r.x + r.w));
+            if !in_h_scroll {
+                if let Some(vw) = self.viewport_w {
+                    if r.x + r.w > vw + 1.0 || r.x < -1.0 {
+                        self.add(Severity::Error, "overflow", n, format!("spans x {:.0}..{:.0} but the screen is {vw:.0} wide", r.x, r.x + r.w));
+                    }
                 }
             }
         }
@@ -143,7 +145,8 @@ impl Walk {
         }
 
         if let Some(children) = n["children"].as_array() {
-            self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List");
+            let h_scroll = in_h_scroll || (kind == "List" && props(n).get("horizontal").and_then(Json::as_bool) == Some(true));
+            self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List", h_scroll);
         }
     }
 
@@ -291,5 +294,17 @@ mod tests {
         let bad_tabs = json!([node(1, "Tabs", json!({ "items": [] }), [0.0, 0.0, 200.0, 30.0], vec![])]);
         let found = checks(&json!({ "tree": bad_tabs, "viewport": { "w": 390, "h": 800 } }));
         assert!(found.contains(&"a11y") && found.contains(&"touch"), "{found:?}");
+
+        // Horizontal List descendants may extend past viewport width; vertical List still flags horizontal overflow.
+        let hlist = json!([node(1, "List", json!({ "horizontal": true }), [0.0, 0.0, 390.0, 80.0], vec![
+            node(2, "Text", json!({ "text": "card 1" }), [0.0, 0.0, 240.0, 60.0], vec![]),
+            node(3, "Text", json!({ "text": "card 2" }), [250.0, 0.0, 240.0, 60.0], vec![]),
+        ])]);
+        assert!(review(&json!({ "tree": hlist, "viewport": { "w": 390, "h": 800 } })).is_empty());
+
+        let vlist = json!([node(1, "List", json!({}), [0.0, 0.0, 390.0, 200.0], vec![
+            node(2, "Text", json!({ "text": "too wide" }), [0.0, 0.0, 450.0, 40.0], vec![]),
+        ])]);
+        assert!(checks(&json!({ "tree": vlist, "viewport": { "w": 390, "h": 800 } })).contains(&"overflow"));
     }
 }

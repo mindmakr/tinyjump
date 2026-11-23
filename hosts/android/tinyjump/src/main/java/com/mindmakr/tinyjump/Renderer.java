@@ -111,6 +111,7 @@ final class Renderer {
     static final class IconView extends View {
         private final float density;
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Path path = new Path();
         private String name = "";
         private float sizeDp = 20f;
 
@@ -151,7 +152,8 @@ final class Renderer {
             float s = Math.min(getWidth(), getHeight()) / 24f;
             if (s <= 0f) return;
             paint.setStrokeWidth(2f * s);
-            Path p = new Path();
+            Path p = path;
+            p.reset();
             switch (name) {
                 case "check":
                     p.moveTo(5 * s, 13 * s); p.lineTo(9 * s, 17 * s); p.lineTo(19 * s, 7 * s);
@@ -269,16 +271,33 @@ final class Renderer {
         }
     }
 
+    static final class ThemeStyle {
+        final boolean dark;
+        final int fg;
+        final int accent;
+
+        ThemeStyle(boolean dark, int fg, int accent) {
+            this.dark = dark;
+            this.fg = fg;
+            this.accent = accent;
+        }
+    }
+
     static final class Node {
         final int id;
         final String kind;
-        final View view;
+        View view;
         /** Where children go; null for leaf widgets. */
         final ViewGroup container;
         final FrameBox frameBox;
+        LinearLayout tabsRow;
         NativeComponent nativeComponent;
         ViewTreeObserver.OnScrollChangedListener scrollListener;
         int lastScrollExtent = -1;
+        final List<Node> children = new ArrayList<>();
+        ThemeStyle parentTheme;
+        ThemeStyle theme;
+        Integer defaultTextColor;
         final JSONObject props = new JSONObject();
         List<String> events = new ArrayList<>();
         /** True while the renderer itself changes a widget, so listeners stay quiet. */
@@ -335,19 +354,25 @@ final class Renderer {
                 case "update": {
                     Node n = nodes.get(id);
                     if (n == null) break;
-                    setProps(n, op.getJSONObject("props"), false);
                     if (op.has("events")) n.events = strings(op.getJSONArray("events"));
+                    setProps(n, op.getJSONObject("props"), false);
                     break;
                 }
                 case "children": {
                     Node p = nodes.get(id);
                     if (p == null || p.container == null) break;
                     JSONArray ids = op.getJSONArray("ids");
+                    if ("List".equals(p.kind) && ids.length() < p.children.size()) p.lastScrollExtent = -1;
+                    p.children.clear();
                     for (int j = 0; j < ids.length(); j++) {
                         Node c = nodes.get(ids.getInt(j));
-                        if (c == null || p.container.getChildAt(j) == c.view) continue;
-                        if (c.view.getParent() instanceof ViewGroup) ((ViewGroup) c.view.getParent()).removeView(c.view);
-                        p.container.addView(c.view, j, c.view.getLayoutParams() instanceof Frame ? c.view.getLayoutParams() : new Frame());
+                        if (c == null) continue;
+                        p.children.add(c);
+                        if (p.container.getChildAt(j) != c.view) {
+                            if (c.view.getParent() instanceof ViewGroup) ((ViewGroup) c.view.getParent()).removeView(c.view);
+                            p.container.addView(c.view, j, c.view.getLayoutParams() instanceof Frame ? c.view.getLayoutParams() : new Frame());
+                        }
+                        if (p.theme != null || c.parentTheme != null) propagateTheme(c, p.theme);
                     }
                     while (p.container.getChildCount() > ids.length()) p.container.removeViewAt(p.container.getChildCount() - 1);
                     break;
@@ -368,6 +393,17 @@ final class Renderer {
             }
         }
         return ops.length() > 0;
+    }
+
+    /** Cleans up mounted custom native views and listeners when {@link TinyJump#stop()} is called. */
+    void destroy() {
+        for (Node n : nodes.values()) {
+            if (n.scrollListener != null && n.view.getViewTreeObserver().isAlive()) {
+                n.view.getViewTreeObserver().removeOnScrollChangedListener(n.scrollListener);
+            }
+            if (n.nativeComponent != null) n.nativeComponent.destroy(n.view);
+        }
+        nodes.clear();
     }
 
     /** Places nodes at the frames the core computed (dp, relative to their parent). */
@@ -436,39 +472,21 @@ final class Renderer {
             }
             case "List": {
                 final boolean horiz = props.optBoolean("horizontal", false);
-                final View scroll;
                 final FrameBox content = new FrameBox(ctx);
-                if (horiz) {
-                    HorizontalScrollView hsv = new HorizontalScrollView(ctx);
-                    hsv.addView(content, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
-                    scroll = hsv;
-                } else {
-                    ScrollView sv = new ScrollView(ctx);
-                    sv.addView(content, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-                    scroll = sv;
-                }
+                final View scroll = makeListScroll(horiz, content);
                 final Node n = new Node(id, kind, scroll, content);
-                final int threshold = px(120);
-                n.scrollListener = new ViewTreeObserver.OnScrollChangedListener() {
-                    @Override
-                    public void onScrollChanged() {
-                        if (!n.events.contains("onEndReached")) return;
-                        int extent = horiz ? content.getWidth() : content.getHeight();
-                        int viewSize = horiz ? scroll.getWidth() : scroll.getHeight();
-                        int offset = horiz ? scroll.getScrollX() : scroll.getScrollY();
-                        if (extent > viewSize && extent - offset - viewSize <= threshold && n.lastScrollExtent != extent) {
-                            n.lastScrollExtent = extent;
-                            fire(n, "onEndReached", JSONObject.NULL);
-                        }
-                    }
-                };
-                scroll.getViewTreeObserver().addOnScrollChangedListener(n.scrollListener);
+                attachListScrollListener(n, horiz);
                 return n;
             }
             case "Tabs": {
+                HorizontalScrollView hsv = new HorizontalScrollView(ctx);
+                hsv.setHorizontalScrollBarEnabled(false);
                 LinearLayout row = new LinearLayout(ctx);
                 row.setOrientation(LinearLayout.HORIZONTAL);
-                return new Node(id, kind, row, null);
+                hsv.addView(row, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+                Node n = new Node(id, kind, hsv, null);
+                n.tabsRow = row;
+                return n;
             }
             case "Icon": {
                 return new Node(id, kind, new IconView(ctx, density), null);
@@ -551,13 +569,20 @@ final class Renderer {
                 NativeComponent comp = TinyJump.nativeComponent(kind);
                 if (comp != null) {
                     final Node[] holder = new Node[1];
-                    View v = comp.create(ctx, props, new NativeComponent.EventSink() {
+                    View v = comp.create(ctx, copyJson(props), new NativeComponent.EventSink() {
                         @Override
                         public void emit(String event, Object value) {
                             if (holder[0] != null) fire(holder[0], event, value == null ? JSONObject.NULL : value);
                         }
                     });
-                    Node n = new Node(id, kind, v, comp.container(v), null);
+                    ViewGroup hostBox = comp.container(v);
+                    FrameBox inner = null;
+                    if (hostBox != null) {
+                        // Wrap the host's ViewGroup in a FrameBox so Taffy Frame LayoutParams work safely.
+                        inner = new FrameBox(ctx);
+                        hostBox.addView(inner, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+                    }
+                    Node n = new Node(id, kind, v, inner);
                     n.nativeComponent = comp;
                     holder[0] = n;
                     return n;
@@ -569,38 +594,112 @@ final class Renderer {
         }
     }
 
+    private View makeListScroll(boolean horiz, FrameBox content) {
+        if (horiz) {
+            HorizontalScrollView hsv = new HorizontalScrollView(ctx);
+            hsv.addView(content, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT));
+            return hsv;
+        }
+        ScrollView sv = new ScrollView(ctx);
+        sv.addView(content, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        return sv;
+    }
+
+    private void attachListScrollListener(final Node n, final boolean horiz) {
+        final View scroll = n.view;
+        final FrameBox content = n.frameBox;
+        final int threshold = px(120);
+        n.scrollListener = new ViewTreeObserver.OnScrollChangedListener() {
+            @Override
+            public void onScrollChanged() {
+                if (!n.events.contains("onEndReached") || content == null) return;
+                int extent = horiz ? content.getWidth() : content.getHeight();
+                int viewSize = horiz ? scroll.getWidth() : scroll.getHeight();
+                int offset = horiz ? scroll.getScrollX() : scroll.getScrollY();
+                if (extent < n.lastScrollExtent) n.lastScrollExtent = -1;
+                if (extent > viewSize && extent - offset - viewSize <= threshold && n.lastScrollExtent != extent) {
+                    n.lastScrollExtent = extent;
+                    fire(n, "onEndReached", JSONObject.NULL);
+                }
+            }
+        };
+        scroll.getViewTreeObserver().addOnScrollChangedListener(n.scrollListener);
+    }
+
+    private void swapListAxis(Node n, boolean horiz) {
+        if (n.frameBox == null) return;
+        boolean wasHoriz = n.view instanceof HorizontalScrollView;
+        if (wasHoriz == horiz) return;
+        View old = n.view;
+        if (n.scrollListener != null && old.getViewTreeObserver().isAlive()) {
+            old.getViewTreeObserver().removeOnScrollChangedListener(n.scrollListener);
+        }
+        if (n.frameBox.getParent() instanceof ViewGroup) ((ViewGroup) n.frameBox.getParent()).removeView(n.frameBox);
+        View next = makeListScroll(horiz, n.frameBox);
+        next.setTag(old.getTag());
+        next.setContentDescription(old.getContentDescription());
+        if (old.getParent() instanceof ViewGroup) {
+            ViewGroup parent = (ViewGroup) old.getParent();
+            int idx = parent.indexOfChild(old);
+            ViewGroup.LayoutParams lp = old.getLayoutParams();
+            parent.removeViewAt(idx);
+            parent.addView(next, idx, lp != null ? lp : new Frame());
+        }
+        n.view = next;
+        n.lastScrollExtent = -1;
+        attachListScrollListener(n, horiz);
+        if (n.customBackground) restyle(n);
+    }
+
+    private static JSONObject copyJson(JSONObject src) {
+        JSONObject out = new JSONObject();
+        for (Iterator<String> it = src.keys(); it.hasNext(); ) {
+            String k = it.next();
+            try { out.put(k, src.get(k)); } catch (JSONException ignored) {}
+        }
+        return out;
+    }
+
     private void rebuildTabs(final Node n) {
-        if (!(n.view instanceof LinearLayout)) return;
-        LinearLayout row = (LinearLayout) n.view;
+        LinearLayout row = n.tabsRow;
+        if (row == null) return;
         row.removeAllViews();
         JSONArray items = n.props.optJSONArray("items");
         if (items == null) return;
         String current = n.props.isNull("value") ? null : n.props.optString("value", null);
         int minH = px(44);
         int padH = px(14);
+        int activeColor = n.theme != null ? n.theme.accent : 0xFF2563EB;
+        int inactiveColor = n.theme != null ? n.theme.fg : 0xFF374151;
         for (int i = 0; i < items.length(); i++) {
             Object raw = items.opt(i);
             final String val;
             final String label;
             if (raw instanceof JSONObject) {
                 JSONObject o = (JSONObject) raw;
-                val = o.has("value") ? o.optString("value", "") : o.optString("label", "");
-                label = o.has("label") ? o.optString("label", val) : val;
+                String rv = o.isNull("value") ? null : o.optString("value", null);
+                String rl = o.isNull("label") ? null : o.optString("label", null);
+                val = rv != null ? rv : (rl != null ? rl : "");
+                label = rl != null ? rl : val;
+            } else if (raw == null || raw == JSONObject.NULL) {
+                val = "";
+                label = "";
             } else {
-                val = raw == null ? "" : String.valueOf(raw);
+                val = String.valueOf(raw);
                 label = val;
             }
             boolean active = val.equals(current);
             Button b = new Button(ctx);
             b.setAllCaps(false);
             b.setText(label);
+            b.setTag(val);
             b.setMinimumHeight(minH);
             b.setMinimumWidth(minH);
             b.setPadding(padH, 0, padH, 0);
             b.setSelected(active);
             b.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
             b.setBackgroundColor(Color.TRANSPARENT);
-            b.setTextColor(active ? 0xFF2563EB : 0xFF374151);
+            b.setTextColor(active ? activeColor : inactiveColor);
             b.setOnClickListener(new View.OnClickListener() {
                 @Override
                 public void onClick(View v) {
@@ -611,17 +710,59 @@ final class Renderer {
         }
     }
 
-    private void applyTheme(Node n) {
-        if (n.props.has("background")) return;
-        String surface = n.props.has("surface") ? n.props.optString("surface", "") : "";
-        Integer bg = !surface.isEmpty() ? color(surface) : null;
-        if (bg == null && n.props.has("mode")) {
-            String mode = n.props.optString("mode", "");
-            boolean dark = "dark".equals(mode)
-                    || ("system".equals(mode) && (ctx.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES);
-            bg = dark ? 0xFF111827 : 0xFFFFFFFF;
+    private void updateTabSelection(Node n) {
+        LinearLayout row = n.tabsRow;
+        if (row == null) return;
+        String current = n.props.isNull("value") ? null : n.props.optString("value", null);
+        int activeColor = n.theme != null ? n.theme.accent : 0xFF2563EB;
+        int inactiveColor = n.theme != null ? n.theme.fg : 0xFF374151;
+        for (int i = 0; i < row.getChildCount(); i++) {
+            View child = row.getChildAt(i);
+            if (!(child instanceof Button)) continue;
+            Button b = (Button) child;
+            boolean active = current != null && current.equals(b.getTag());
+            b.setSelected(active);
+            b.setTypeface(null, active ? Typeface.BOLD : Typeface.NORMAL);
+            b.setTextColor(active ? activeColor : inactiveColor);
         }
-        if (bg != null) n.view.setBackgroundColor(bg);
+    }
+
+    private ThemeStyle resolveTheme(Node n) {
+        boolean hasAny = n.props.has("mode") || n.props.has("accent") || n.props.has("color") || n.props.has("surface");
+        if (!hasAny) return null;
+        String mode = n.props.optString("mode", "");
+        boolean dark = "dark".equals(mode)
+                || ("system".equals(mode) && (ctx.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES);
+        Integer customFg = n.props.has("color") ? color(n.props.optString("color", "")) : null;
+        Integer customAccent = n.props.has("accent") ? color(n.props.optString("accent", "")) : null;
+        int fg = customFg != null ? customFg : (dark ? 0xFFF9FAFB : 0xFF111827);
+        int accent = customAccent != null ? customAccent : (dark ? 0xFF60A5FA : 0xFF2563EB);
+        return new ThemeStyle(dark, fg, accent);
+    }
+
+    private void propagateTheme(Node n, ThemeStyle inherited) {
+        n.parentTheme = inherited;
+        ThemeStyle active = "Theme".equals(n.kind) ? resolveTheme(n) : null;
+        ThemeStyle effective = active != null ? active : inherited;
+        n.theme = effective;
+        applyThemeToNode(n, effective);
+        for (Node c : n.children) propagateTheme(c, effective);
+    }
+
+    private void applyThemeToNode(Node n, ThemeStyle t) {
+        if ("Tabs".equals(n.kind)) {
+            updateTabSelection(n);
+            return;
+        }
+        if ("Icon".equals(n.kind) && n.view instanceof IconView && !n.props.has("color")) {
+            ((IconView) n.view).setIconColor(t != null ? t.fg : 0xFF111827);
+            return;
+        }
+        if (("Text".equals(n.kind) || "Time".equals(n.kind)) && n.view instanceof TextView && !n.props.has("color")) {
+            TextView tv = (TextView) n.view;
+            if (n.defaultTextColor == null) n.defaultTextColor = tv.getCurrentTextColor();
+            tv.setTextColor(t != null ? t.fg : n.defaultTextColor);
+        }
     }
 
     private void fire(Node n, String event, Object value) {
@@ -635,16 +776,23 @@ final class Renderer {
 
     private void setProps(Node n, JSONObject props, boolean isCreate) throws JSONException {
         boolean box = false;
-        boolean tabsChanged = false;
+        boolean tabsItemsChanged = false;
+        boolean tabsValueChanged = false;
         boolean themeChanged = false;
+        boolean listAxisChanged = false;
         for (Iterator<String> it = props.keys(); it.hasNext(); ) {
             String k = it.next();
             Object v = props.get(k);
             boolean none = v == JSONObject.NULL;
             if (none) n.props.remove(k); else n.props.put(k, v);
             if ("background".equals(k) || "radius".equals(k) || "border".equals(k)) box = true;
-            if ("Tabs".equals(n.kind) && ("items".equals(k) || "value".equals(k))) tabsChanged = true;
-            if ("Theme".equals(n.kind) && ("mode".equals(k) || "surface".equals(k) || "background".equals(k))) themeChanged = true;
+            if ("Tabs".equals(n.kind) && "items".equals(k)) tabsItemsChanged = true;
+            if ("Tabs".equals(n.kind) && "value".equals(k)) tabsValueChanged = true;
+            if ("List".equals(n.kind) && "horizontal".equals(k)) listAxisChanged = true;
+            if ("Theme".equals(n.kind) && ("mode".equals(k) || "surface".equals(k) || "accent".equals(k) || "color".equals(k) || "background".equals(k))) {
+                themeChanged = true;
+                box = true;
+            }
             if (n.nativeComponent != null) {
                 if ("id".equals(k)) n.view.setTag(none ? null : v);
                 else if ("label".equals(k)) n.view.setContentDescription(none ? null : String.valueOf(v));
@@ -652,10 +800,19 @@ final class Renderer {
                 setProp(n, k, v, none);
             }
         }
-        if (n.nativeComponent != null && !isCreate) n.nativeComponent.update(n.view, n.props, props);
-        if (tabsChanged) rebuildTabs(n);
+        if (n.nativeComponent != null && !isCreate) {
+            n.quiet = true;
+            try {
+                n.nativeComponent.update(n.view, copyJson(n.props), copyJson(props));
+            } finally {
+                n.quiet = false;
+            }
+        }
+        if (listAxisChanged && !isCreate) swapListAxis(n, n.props.optBoolean("horizontal", false));
+        if (tabsItemsChanged) rebuildTabs(n);
+        else if (tabsValueChanged) updateTabSelection(n);
         if (box) restyle(n);
-        if (themeChanged) applyTheme(n);
+        if (themeChanged) propagateTheme(n, n.parentTheme);
     }
 
     /** Visual props. Layout props (width, gap, align, grow, ...) are the core's job. */
@@ -667,10 +824,10 @@ final class Renderer {
             if ("Icon".equals(n.kind) && view instanceof IconView) {
                 IconView icon = (IconView) view;
                 if ("name".equals(k)) { icon.setIconName(none ? "" : String.valueOf(v)); return; }
-                if ("size".equals(k)) { icon.setIconSize(none ? 20f : ((Number) v).floatValue()); return; }
+                if ("size".equals(k)) { icon.setIconSize(!none && v instanceof Number ? ((Number) v).floatValue() : 20f); return; }
                 if ("color".equals(k)) {
                     Integer c = none ? null : color(String.valueOf(v));
-                    icon.setIconColor(c != null ? c : 0xFF111827);
+                    icon.setIconColor(c != null ? c : (n.theme != null ? n.theme.fg : 0xFF111827));
                     return;
                 }
             }
@@ -742,8 +899,10 @@ final class Renderer {
                     break;
                 case "color":
                     if (text != null) {
+                        if (n.defaultTextColor == null) n.defaultTextColor = text.getCurrentTextColor();
                         Integer c = none ? null : color(String.valueOf(v));
                         if (c != null) text.setTextColor(c);
+                        else if (none) text.setTextColor(n.theme != null ? n.theme.fg : n.defaultTextColor);
                     }
                     break;
                 case "size":
@@ -801,6 +960,16 @@ final class Renderer {
     /** Background color, corner radius and border share one drawable. */
     private void restyle(Node n) {
         Integer bg = n.props.has("background") ? color(n.props.optString("background")) : null;
+        if (bg == null && "Theme".equals(n.kind)) {
+            String surface = n.props.has("surface") ? n.props.optString("surface", "") : "";
+            bg = !surface.isEmpty() ? color(surface) : null;
+            if (bg == null && n.props.has("mode")) {
+                String mode = n.props.optString("mode", "");
+                boolean dark = "dark".equals(mode)
+                        || ("system".equals(mode) && (ctx.getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES);
+                bg = dark ? 0xFF111827 : 0xFFFFFFFF;
+            }
+        }
         double radius = n.props.optDouble("radius", 0);
         Object border = n.props.opt("border");
         if (bg == null && radius == 0 && border == null) {

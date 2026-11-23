@@ -172,7 +172,12 @@ impl Layout {
 
         let mut now = HashMap::with_capacity(ids.len());
         let mut changed = Vec::new();
-        for (node, id, axis) in ids {
+        // In RTL, Taffy lays out overflowing horizontal List children leftward into negative x.
+        // Native scroll views (Android HorizontalScrollView / iOS UIScrollView) only scroll 0..content,
+        // so shift RTL horizontal List children rightward into 0..content and report the full span.
+        // `build()` pushes parents after children, so iterating in reverse visits parents first.
+        let mut shifts: Vec<(NodeId, f32)> = Vec::new();
+        for &(node, id, axis) in ids.iter().rev() {
             let Ok(l) = t.layout(node) else { continue };
             let content = match axis {
                 ScrollAxis::Vertical => {
@@ -182,12 +187,30 @@ impl Layout {
                 }
                 ScrollAxis::Horizontal => {
                     let children = t.children(node).unwrap_or_default();
-                    let right = children.iter().filter_map(|c| t.layout(*c).ok()).map(|c| c.location.x + c.size.width + c.margin.right).fold(0.0, f32::max);
-                    Some(right + l.padding.right)
+                    let mut min_left = f32::INFINITY;
+                    let mut max_right = f32::NEG_INFINITY;
+                    for &c in &children {
+                        if let Ok(cl) = t.layout(c) {
+                            min_left = min_left.min(cl.location.x - cl.margin.left);
+                            max_right = max_right.max(cl.location.x + cl.size.width + cl.margin.right);
+                        }
+                    }
+                    if !min_left.is_finite() {
+                        Some(l.padding.left + l.padding.right)
+                    } else if rtl && min_left < l.padding.left {
+                        let shift = l.padding.left - min_left;
+                        for c in children {
+                            shifts.push((c, shift));
+                        }
+                        Some(max_right + shift + l.padding.right)
+                    } else {
+                        Some(max_right.max(0.0) + l.padding.right)
+                    }
                 }
                 ScrollAxis::None => None,
             };
-            let f = Frame { id, x: l.location.x, y: l.location.y, w: l.size.width, h: l.size.height, content };
+            let shift = shifts.iter().find(|(n, _)| *n == node).map_or(0.0, |(_, s)| *s);
+            let f = Frame { id, x: l.location.x + shift, y: l.location.y, w: l.size.width, h: l.size.height, content };
             if self.previous.get(&id) != Some(&f) {
                 changed.push(f.clone());
             }
@@ -377,5 +400,21 @@ mod tests {
         assert_eq!(list_frame.w, 100.0);
         // 40 + 10 + 48 + 10 + 40 = 148
         assert_eq!(list_frame.content, Some(148.0), "horizontal list reports horizontal content width");
+
+        // RTL overflowing horizontal List shifts children into 0..content so native scroll views never clip them.
+        let mut rtl_tree = Tree::default();
+        rtl_tree.update(vec![v(
+            "List",
+            json!({ "horizontal": true, "width": 100, "gap": 10 }),
+            vec![text("first", json!({})), text("second", json!({})), text("third", json!({}))],
+        )]);
+        let rtl_texts: HashMap<u32, String> = [(2, "first".into()), (3, "second".into()), (4, "third".into())].into_iter().collect();
+        let mut rtl_frames = Layout::default().compute(&rtl_tree, 300.0, 600.0, true, &mut Fake(rtl_texts));
+        rtl_frames.sort_by_key(|fr| fr.id);
+        assert_eq!(rtl_frames[0].content, Some(148.0), "RTL horizontal list reports full content width");
+        for child in &rtl_frames[1..] {
+            assert!(child.x >= 0.0 && child.x + child.w <= 148.0 + 0.01, "RTL child frame must be in 0..content: {child:?}");
+        }
+        assert!(rtl_frames[1].x > rtl_frames[2].x && rtl_frames[2].x > rtl_frames[3].x, "RTL order runs right-to-left: {rtl_frames:?}");
     }
 }
