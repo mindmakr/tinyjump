@@ -1,3 +1,17 @@
 {
-  "ai": { "command": ["tj", "plugin", "ai"], "env": ["ANTHROPIC_API_KEY", "TJ_AI_MODEL", "TJ_AI_EFFORT"] }
+  "ai": {
+    "command": ["tj", "plugin", "ai"],
+    "env": [
+      "TJ_AI_PROVIDER",
+      "TJ_AI_BASE_URL",
+      "TJ_AI_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "OPENAI_API_KEY",
+      "GEMINI_API_KEY",
+      "OLLAMA_API_KEY",
+      "TJ_AI_MODEL",
+      "TJ_AI_EFFORT",
+      "TJ_AI_MAX_TOKENS"
+    ]
+  }
 }

@@ -27,7 +27,7 @@ Keep every app minimal, idiomatic, and compile-clean on the first try:
    - Always use `===` and `!==` (never `==` or `!=`).
    - Top-level declarations: `object`, `function`, `type`, `interface`, `let`, `const`. `function App()` is the UI root in `app.tj`.
    - Split larger apps into modules with `export` and `import { Foo } from "./foo"` (no default exports, no `import * as`, no `as` renames).
-   - Built-in registry/plugins: `tj:ui` (`Field`, `Notice`, `Form`, `FormInput`, `Actions`), `tj:ai`, `tj:agent`, `tj:privacy`, `tj:consent`, or external Official packages via `tj search` / `tj add <name>` (e.g. `money`, `slug`, `csv`, `validate`, `files`, `notifications`, `location`, `camera`, `webrtc`, `gdpr-eu`, `pdpl-sa`).
+   - Built-in registry/plugins: `tj:ui` (`Field`, `Notice`, `Form`, `FormInput`, `Actions`), `tj:ai` (Claude, OpenAI, Gemini, or local Ollama/`llama.cpp`), `tj:agent`, `tj:privacy`, `tj:consent`, or external Official packages via `tj search` / `tj add <name>` (e.g. `money`, `slug`, `csv`, `validate`, `files`, `notifications`, `location`, `camera`, `webrtc`, `gdpr-eu`, `pdpl-sa`).
 2. **Durable objects (`object`) and real-time backend (`@server`):**
    - Local screen/device state lives on plain `object`s (`Counter.get("main")`).
    - Shared backend state lives on `@server` objects (`@server @read("anyone") object Room { ... }`). Every device automatically gets an offline-cached replica and live SSE updates.
