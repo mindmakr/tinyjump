@@ -1019,9 +1019,10 @@
         <a href="#what-it-has">What it has</a>
         <a href="#what-it-can">What it can</a>
         <a href="#timeline">Timeline</a>
-        <a href="#what-it-could-be">What it could be</a>
+        <a href="guide/">Agent Skills</a>
       </nav>
       <div class="nav-actions">
+        <a class="btn sm" href="guide/">Skills &amp; Guide</a>
         <a class="btn sm" href="demo/">Live demo</a>
         <a class="btn sm primary" href="https://github.com/mindmakr/tinyjump">GitHub</a>
         <button class="icon-btn" id="theme-toggle" type="button" title="Switch light or dark theme" aria-label="Switch theme">
@@ -1039,17 +1040,18 @@
           <div>
             <div class="eyebrow">
               <span class="pulse-dot" aria-hidden="true"></span>
-              Open Source · Web · Android · iOS · Linux · MIT / Apache-2.0
+              Open Source · Web · Android · iOS · macOS · Linux · MIT / Apache-2.0
             </div>
             <h1>One tiny runtime where <span class="hl">humans and AI agents</span> build reliable software together.</h1>
-            <p class="hero-lede">Write one TypeScript-shaped codebase. Get native screens on the web, Android, and iOS, a durable real-time backend with privacy and access rules built in, and native automation so coding agents can write, prove, drive, and evolve apps safely alongside people.</p>
+            <p class="hero-lede">Write one TypeScript-shaped codebase. Get native screens on Web, Android, iOS, macOS AppKit, and Linux GTK 3, a durable real-time backend with privacy and access rules built in, opt-in device &amp; WebRTC plugins at 0 KB core cost, and native automation so coding agents can write, prove, drive, and evolve apps safely alongside people.</p>
             <div class="hero-cta">
-              <a class="btn accent" href="demo/">
-                Try live WASM demo
+              <a class="btn accent" href="guide/">
+                Install Agent Skill &amp; Guide
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
               </a>
-              <a class="btn" href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Read the whole language (1 page)</a>
-              <a class="btn" href="https://mindmakr.github.io/tj-plugins/">Registry</a>
+              <a class="btn" href="demo/">Try live WASM demo</a>
+              <a class="btn" href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Language (1 page)</a>
+              <a class="btn" href="https://mindmakr.github.io/tj-plugins/">Registry (11 Official)</a>
             </div>
             <div class="hero-trust">
               <span><i>✓</i> Closed by default</span>
@@ -1108,16 +1110,16 @@
             <span>Complete installable native Android APK (arm64 AOT)</span>
           </div>
           <div class="proof-item">
-            <b>&lt;0.2 ms</b>
-            <span>Cold boot time across every example app</span>
+            <b>3.1 MB</b>
+            <span>Native Linux GTK 3 host (zero dev headers) + macOS AppKit</span>
           </div>
           <div class="proof-item">
-            <b>0 KB ICU</b>
-            <span>Translations, CLDR plurals &amp; RTL via native formatters</span>
+            <b>0.05 ms</b>
+            <span>Sub-0.2 ms cold boot &amp; 0.001–0.018 ms per tick</span>
           </div>
           <div class="proof-item">
-            <b>249+</b>
-            <span>Automated tests + live iOS Simulator CI on every PR</span>
+            <b>0 B core</b>
+            <span>Device plugins, WebRTC, desktop hosts &amp; 11 registry pkgs</span>
           </div>
         </div>
       </div>
@@ -1374,20 +1376,20 @@
             <span>Complete installable native Android APK (arm64 AOT: <code>484 KB</code> runtime, <code>42 KB</code> plain-Java DEX, zero AndroidX/Kotlin).</span>
           </div>
           <div class="num-card">
-            <b>0.07 ms boot</b>
-            <span>Sub-0.2 ms boot across all examples; <code>0.002–0.026 ms</code> per tick in <code>tj bench</code>.</span>
+            <b>3.1 MB GTK 3</b>
+            <span>Native Linux GTK 3 desktop binary (<code>dlopen</code>, zero <code>-dev</code> headers) alongside zero-Xcode macOS AppKit &amp; iOS UIKit <code>.app</code>s.</span>
           </div>
           <div class="num-card">
-            <b>283 lines</b>
-            <span>Complete 4-platform booking app (offline sync, <code>@exclusive</code>, alarms, <code>@pii</code>, GDPR export &amp; erase).</span>
+            <b>0.05 ms boot</b>
+            <span><code>0.045–0.104 ms</code> cold boot across examples; <code>0.001–0.018 ms</code> per tick in <code>tj bench</code>.</span>
           </div>
           <div class="num-card">
             <b>0 B core cost</b>
-            <span>Registry packages, audit log, encryption at rest, compliance packs, and packaging add zero bytes to device runtimes.</span>
+            <span>Device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC calls, desktop hosts, audit log, encryption, and 11 Official registry packages add zero bytes to <code>tj-core</code>.</span>
           </div>
           <div class="num-card">
-            <b>Android 5+ / iOS 13+</b>
-            <span><code>minSdk 21</code>, 2019-era ES2017 browsers with no build step, and static Linux binaries (<code>x86_64</code>, <code>aarch64</code>, <code>armv7</code>).</span>
+            <b>6 native targets</b>
+            <span>Web (ES2017), Android 5+ (<code>minSdk 21</code>), iOS 13+, macOS 12+, Linux Desktop (GTK 3), and static Linux servers (<code>x86_64</code>, <code>aarch64</code>, <code>armv7</code>).</span>
           </div>
         </div>
 
@@ -1738,19 +1740,37 @@
             </div>
           </article>
 
-          <article class="tl-item active">
+          <article class="tl-item">
             <div class="tl-head">
-              <h3>Now · Opt-In Device Capability Plugins &amp; UI Craft</h3>
+              <h3>Phase 5 · Opt-In Device Plugins, WebRTC Calls &amp; Native Desktop Hosts</h3>
               <div class="tl-badges">
-                <span class="badge date">In progress</span>
-                <span class="badge doing">Building now</span>
+                <span class="badge date">Nov 23, 2026</span>
+                <span class="badge done">Done</span>
               </div>
             </div>
-            <p>Wiring native device hardware — camera, microphone, location, notifications, files, biometrics, Bluetooth, and sensors — through one unified opt-in <code>registerPlugin</code> protocol across Web, Android, and iOS with canonical declared permissions (<code>permissions.json</code> / <code>tj.lock</code>), automatic <code>AndroidManifest.xml</code> and <code>Info.plist</code> injection, and <strong>0 bytes</strong> added to <code>tj-core</code>. Alongside this: UI design polish for <code>tj:ui</code> and starter apps.</p>
+            <p>Shipped the unified opt-in <code>registerPlugin</code> / <code>DevicePlugin</code> protocol and 11 canonical permissions with automatic <code>AndroidManifest.xml</code> &amp; <code>Info.plist</code> injection; core opt-in plugins for <code>files</code>, <code>notifications</code>, <code>location</code>, and <code>camera</code> across Web, Android, and iOS; opt-in WebRTC voice/video calls (<code>&lt;Native name="VideoCall" /&gt;</code> + <code>@server</code> signaling, 11 Official packages live on <code>mindmakr/tj-plugins</code>); plus full native desktop hosts for <strong>macOS AppKit</strong> (CI-verified) and <strong>Linux GTK 3</strong> (3.1 MB, zero dev headers) — all at <strong>0 bytes</strong> core overhead.</p>
             <div class="tl-pills">
               <span class="mini-tag">0 B core overhead</span>
-              <span class="mini-tag">Canonical permissions</span>
-              <span class="mini-tag">Web · Android · iOS hooks</span>
+              <span class="mini-tag">files · notifications · location · camera</span>
+              <span class="mini-tag">WebRTC VideoCall</span>
+              <span class="mini-tag">macOS AppKit</span>
+              <span class="mini-tag">Linux GTK 3 (3.1 MB)</span>
+              <span class="mini-tag">11 Official packages</span>
+            </div>
+          </article>
+
+          <article class="tl-item active">
+            <div class="tl-head">
+              <h3>Next · Optional GPU &amp; 3D (<code>tj-gfx</code> on <code>wgpu</code>) &amp; UI Craft</h3>
+              <div class="tl-badges">
+                <span class="badge date">Up next</span>
+                <span class="badge doing">Next milestone</span>
+              </div>
+            </div>
+            <p>Adding opt-in GPU graphics and 3D (<code>tj-gfx</code> on <code>wgpu</code> with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code> and <code>@frame(dt)</code> so 2D apps pay 0 KB), alongside UI design polish for <code>tj:ui</code> and starter apps.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">tj-gfx on wgpu</span>
+              <span class="mini-tag">0 KB for 2D apps</span>
               <span class="mini-tag">tj:ui polish</span>
             </div>
           </article>
@@ -1770,29 +1790,29 @@
         <div class="grid-4">
           <div class="card">
             <div class="card-icon" aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></svg>
-            </div>
-            <h3>Real-Time Voice &amp; Video</h3>
-            <p>1:1 and group WebRTC calls &amp; media streaming as opt-in plugins — signaling over existing <code>@server</code> objects and native <code>&lt;Native name="VideoCall" /&gt;</code> views.</p>
-            <div class="card-meta">Next · Opt-in plugin</div>
-          </div>
-
-          <div class="card">
-            <div class="card-icon" aria-hidden="true">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-            </div>
-            <h3>Native Desktop Hosts</h3>
-            <p>First-class macOS AppKit and Linux desktop UI hosts sharing the same Taffy layout engine, C ABI, and automation protocol as mobile and web.</p>
-            <div class="card-meta">Next · After device plugins</div>
-          </div>
-
-          <div class="card">
-            <div class="card-icon" aria-hidden="true">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
             </div>
             <h3>Optional GPU &amp; 3D (<code>tj-gfx</code>)</h3>
             <p>One Rust renderer on <code>wgpu</code> (Vulkan, Metal, D3D12, WebGPU, WebGL2) with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, and <code>@frame(dt)</code> — opt-in so 2D apps pay 0 KB.</p>
-            <div class="card-meta">Roadmap · Optional module</div>
+            <div class="card-meta">Next · Optional module</div>
+          </div>
+
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></svg>
+            </div>
+            <h3>Realtime Media &amp; Canvas Demo</h3>
+            <p>A compact showcase uniting live chat, WebRTC audio/video calls, screen sharing, and a collaborative drawing board on one durable runtime.</p>
+            <div class="card-meta">Backlog · Showcase app</div>
+          </div>
+
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.5 7.5L6.5 16.5M13.5 7.5l4 9"/></svg>
+            </div>
+            <h3>Topics &amp; Cross-Object Messaging</h3>
+            <p>Topic groups across objects (<code>Room/*</code>) and durable server object-to-object messaging — added cleanly as real apps pressure-test them.</p>
+            <div class="card-meta">On-demand · Messaging</div>
           </div>
 
           <div class="card">
@@ -1800,21 +1820,21 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
             </div>
             <h3>Verified Agentic Ecosystem</h3>
-            <p>A clean, audited registry of tiny libraries and regional compliance packs ported by humans and agents — with sandboxed behaviour checks and Sigstore/SLSA provenance.</p>
+            <p>11 Official packages live today in <code>mindmakr/tj-plugins</code> — growing toward Sigstore/SLSA publisher provenance, sealed OCI units, and <code>tj migrate</code>.</p>
             <div class="card-meta">Growing · mindmakr/tj-plugins</div>
           </div>
         </div>
 
         <div class="vision-banner">
           <div>
-            <div class="kicker" style="color:#ff9a6c;margin-bottom:10px;">Join the Movement</div>
-            <h3>Help build the runtime for human + AI collaboration.</h3>
-            <p>Whether you are a systems engineer, a product founder, a security researcher, a designer, a translator, or an engineer directing AI coding agents — tinyjump is open source, early, and shaped by real people solving real problems.</p>
+            <div class="kicker" style="color:#ff9a6c;margin-bottom:10px;">Build With Your Own Agent</div>
+            <h3>Install the tinyjump skill and ship your first 6-platform app today.</h3>
+            <p>Whether you use <strong>Claude Code</strong>, <strong>Antigravity / Gemini CLI</strong>, <strong>OpenAI Codex</strong>, or <strong>Cursor</strong>, install our open <code>SKILL.md</code> package in one command — your agent will load <code>tj docs</code>, verify access &amp; privacy rules, run deterministic tests, and package Web, Android, iOS, macOS, and Linux builds.</p>
             <p style="margin-bottom:0;">Try an example, publish a pure-<code>.tj</code> library or compliance pack to the registry, run an empty-mind critique in <code>feedback/</code>, or build your next app on a runtime you can understand from top to bottom.</p>
             <div class="cta-row">
-              <a class="btn light" href="https://github.com/mindmakr/tinyjump">Star &amp; contribute on GitHub</a>
+              <a class="btn light" href="guide/">Open Agent Skills &amp; Multi-Platform Guide</a>
+              <a class="btn ghost" href="https://github.com/mindmakr/tinyjump">Star on GitHub</a>
               <a class="btn ghost" href="demo/">Open live browser demo</a>
-              <a class="btn ghost" href="https://github.com/mindmakr/tinyjump/blob/main/docs/vision.md">Read docs/vision.md</a>
             </div>
           </div>
 
@@ -1845,6 +1865,7 @@ curl -X POST localhost:4700/api/Cart/demo/add \
         <strong style="color:var(--fg);">tinyjump</strong> · Created by Asif Raja (<a href="https://github.com/mindmakr">mindmakr</a>) · Dual-licensed MIT / Apache-2.0
       </div>
       <div class="footer-links">
+        <a href="guide/">Agent Skills</a>
         <a href="demo/">Demo</a>
         <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Language</a>
         <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/vision.md">Vision</a>
