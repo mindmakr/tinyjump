@@ -1103,8 +1103,8 @@
 
         <div class="proof-strip" aria-label="Measured runtime benchmarks">
           <div class="proof-item">
-            <b>215 KB</b>
-            <span>AOT Web WASM gzipped (540 KB raw, compiler-free)</span>
+            <b>219 KB</b>
+            <span>AOT Web WASM gzipped (553 KB raw, compiler-free)</span>
           </div>
           <div class="proof-item">
             <b>531 KB</b>
@@ -1369,8 +1369,8 @@
 
         <div class="numbers-grid" aria-label="Detailed runtime measurements">
           <div class="num-card">
-            <b>215 KB gz</b>
-            <span>Compiler-free AOT web runtime (<code>540 KB</code> raw via <code>cargo web-aot</code>; <code>842 KB</code> / <code>317 KB</code> gz with compiler).</span>
+            <b>219 KB gz</b>
+            <span>Compiler-free AOT web runtime (<code>553 KB</code> raw via <code>cargo web-aot</code>; <code>858 KB</code> / <code>322 KB</code> gz with compiler).</span>
           </div>
           <div class="num-card">
             <b>531 KB APK</b>
@@ -1385,8 +1385,8 @@
             <span><code>0.045–0.104 ms</code> cold boot across examples; <code>0.001–0.018 ms</code> per tick in <code>tj bench</code>.</span>
           </div>
           <div class="num-card">
-            <b>0 B core cost</b>
-            <span>Device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC calls, desktop hosts, audit log, encryption, and 11 Official registry packages add zero bytes to <code>tj-core</code>.</span>
+            <b>0 B wgpu cost</b>
+            <span>Opt-in <code>tj-gfx</code> (<code>wgpu</code>), <code>gfx.js</code>, device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC calls, desktop hosts, audit log, and encryption add zero bytes to non-opting-in apps.</span>
           </div>
           <div class="num-card">
             <b>6 native targets</b>
@@ -1760,19 +1760,37 @@
             </div>
           </article>
 
+          <article class="tl-item done">
+            <div class="tl-head">
+              <h3>Phase 6 · Opt-In GPU &amp; 3D (<code>tj-gfx</code> on <code>wgpu</code>) &amp; Multi-Provider AI</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 24, 2026</span>
+                <span class="badge done">Shipped</span>
+              </div>
+            </div>
+            <p>Shipped the standalone opt-in <code>crates/tj-gfx</code> renderer on <code>wgpu</code> 25 (Vulkan, Metal, D3D12, GLES 3, WebGPU) with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code>, synchronous <code>@frame(dt)</code> animation hooks, occlusion-aware ray picking, headless RGBA/PNG readback, and a plain-ES2017 WebGL2/Canvas2D plugin (<code>hosts/web/plugins/gfx.js</code>) — keeping <strong>0 KB of <code>wgpu</code></strong> in device builds and <strong>0 KB of 3D JS</strong> in 2D apps. Also shipped multi-provider &amp; local LLM support in <code>tj plugin ai</code> (Anthropic, OpenAI-compatible, Ollama, Gemini).</p>
+            <div class="tl-pills">
+              <span class="mini-tag">tj-gfx on wgpu 25</span>
+              <span class="mini-tag">&lt;Scene&gt; &lt;Mesh&gt; &lt;Camera&gt; &lt;Light&gt;</span>
+              <span class="mini-tag">@frame(dt)</span>
+              <span class="mini-tag">0 KB wgpu in core</span>
+              <span class="mini-tag">Ollama / OpenAI / Gemini</span>
+            </div>
+          </article>
+
           <article class="tl-item active">
             <div class="tl-head">
-              <h3>Next · Optional GPU &amp; 3D (<code>tj-gfx</code> on <code>wgpu</code>) &amp; UI Craft</h3>
+              <h3>Next · UI Craft, Cross-Object Messaging &amp; Realtime Showcase</h3>
               <div class="tl-badges">
                 <span class="badge date">Up next</span>
                 <span class="badge doing">Next milestone</span>
               </div>
             </div>
-            <p>Adding opt-in GPU graphics and 3D (<code>tj-gfx</code> on <code>wgpu</code> with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code> and <code>@frame(dt)</code> so 2D apps pay 0 KB), alongside UI design polish for <code>tj:ui</code> and starter apps.</p>
+            <p>Polishing <code>tj:ui</code> and starter apps (<code>examples/booking</code>), adding on-demand topic groups (<code>Room/*</code>) and durable object-to-object messaging, and building a compact realtime media &amp; collaborative drawing showcase.</p>
             <div class="tl-pills">
-              <span class="mini-tag">tj-gfx on wgpu</span>
-              <span class="mini-tag">0 KB for 2D apps</span>
               <span class="mini-tag">tj:ui polish</span>
+              <span class="mini-tag">Room/* topics</span>
+              <span class="mini-tag">Realtime media showcase</span>
             </div>
           </article>
         </div>
@@ -1794,8 +1812,8 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
             </div>
             <h3>Optional GPU &amp; 3D (<code>tj-gfx</code>)</h3>
-            <p>One Rust renderer on <code>wgpu</code> (Vulkan, Metal, D3D12, WebGPU, WebGL2) with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, and <code>@frame(dt)</code> — opt-in so 2D apps pay 0 KB.</p>
-            <div class="card-meta">Next · Optional module</div>
+            <p>One Rust renderer on <code>wgpu</code> (Vulkan, Metal, D3D12, GLES 3, WebGPU) plus an opt-in ES2017 WebGL2 plugin with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code>, and <code>@frame(dt)</code> — 0 KB of <code>wgpu</code> in 2D builds.</p>
+            <div class="card-meta">Shipped · crates/tj-gfx</div>
           </div>
 
           <div class="card">
