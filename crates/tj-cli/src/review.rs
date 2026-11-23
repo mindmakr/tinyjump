@@ -132,7 +132,7 @@ impl Walk {
         }
 
         // Contrast of text against the nearest background (WCAG AA).
-        if let (Some(fg), true) = (prop(n, "color"), matches!(kind, "Text" | "Toggle" | "Input")) {
+        if let (Some(fg), true) = (prop(n, "color"), matches!(kind, "Text" | "Toggle" | "Input" | "Format" | "Time")) {
             if let (Some(a), Some(b)) = (luminance(fg), luminance(&background)) {
                 let ratio = (a.max(b) + 0.05) / (a.min(b) + 0.05);
                 let size = props(n).get("size").and_then(Json::as_f64).unwrap_or(16.0);
@@ -306,5 +306,11 @@ mod tests {
             node(2, "Text", json!({ "text": "too wide" }), [0.0, 0.0, 450.0, 40.0], vec![]),
         ])]);
         assert!(checks(&json!({ "tree": vlist, "viewport": { "w": 390, "h": 800 } })).contains(&"overflow"));
+
+        // Format and Time participate in WCAG contrast checks just like Text.
+        let low_fmt = json!([node(1, "Format", json!({ "value": 19.99, "text": "$19.99", "color": "#cccccc" }), [0.0, 0.0, 100.0, 24.0], vec![])]);
+        assert!(checks(&json!({ "tree": low_fmt, "viewport": { "w": 390, "h": 800 } })).contains(&"contrast"));
+        let low_time = json!([node(1, "Time", json!({ "value": 1800000000000.0, "text": "2026-11-22", "color": "#cccccc" }), [0.0, 0.0, 120.0, 24.0], vec![])]);
+        assert!(checks(&json!({ "tree": low_time, "viewport": { "w": 390, "h": 800 } })).contains(&"contrast"));
     }
 }

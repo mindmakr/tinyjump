@@ -23,8 +23,8 @@ enum Times {
         return f
     }
 
-    /// What a `<Time>` shows.
-    static func show(_ props: [String: Any]) -> String {
+    /// What a `<Time>` shows in the viewer's active locale.
+    static func show(_ props: [String: Any], locale localeId: String? = nil) -> String {
         guard let ms = (props["value"] as? NSNumber)?.doubleValue, ms.isFinite else { return "" }
         let date = Date(timeIntervalSince1970: ms / 1000)
         let show = props["show"] as? String ?? "datetime"
@@ -35,6 +35,10 @@ enum Times {
             return show == "date" ? s : show == "time" ? String(s.suffix(5)) : s
         }
         let f = DateFormatter()
+        if let raw = localeId, !raw.isEmpty {
+            let tag = raw.lowercased() == "pseudo" ? "en-US" : raw
+            f.locale = Locale(identifier: tag)
+        }
         f.timeZone = tz
         f.dateStyle = show == "time" ? .none : .medium
         f.timeStyle = show == "date" ? .none : .short

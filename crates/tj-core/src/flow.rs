@@ -806,7 +806,7 @@ impl Checker {
         let is_native = el.tag == "Native";
         for (name, expr) in &el.attrs {
             let v = self.expr(expr, fr);
-            if is_native && !matches!(name.as_str(), "name" | "id" | "key") {
+            if is_native && name != "key" {
                 self.sink(&v, expr.span, "a custom <Native> view (host code outside the privacy check)");
             }
             props.push((name.clone(), v));

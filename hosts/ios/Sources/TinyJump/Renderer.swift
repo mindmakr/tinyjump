@@ -221,6 +221,9 @@ final class Renderer {
         var target: EventTarget?
         var nativeComponent: NativeComponent?
         var lastScrollExtent: CGFloat = -1
+        var children: [Node] = []
+        var parentMuted: UIColor?
+        var mutedColor: UIColor?
         var props: [String: Any] = [:]
         var events: [String] = []
         /// True while the renderer itself changes a control, so its events stay quiet.
@@ -245,8 +248,12 @@ final class Renderer {
         let rtl = Renderer.isRtlLocale(localeId)
         root.semanticContentAttribute = rtl ? .forceRightToLeft : .forceLeftToRight
         inheritDirection(root)
-        for n in nodes.values where n.kind == "Format" {
-            (n.view as? UILabel)?.text = formatNumber(n.props)
+        for n in nodes.values {
+            if n.kind == "Format" {
+                (n.view as? UILabel)?.text = formatNumber(n.props)
+            } else if n.kind == "Time" {
+                (n.view as? UILabel)?.text = Times.show(n.props, locale: localeId)
+            }
         }
     }
 
@@ -313,10 +320,15 @@ final class Renderer {
                 setProps(n, op["props"] as? [String: Any] ?? [:], isCreate: false)
             case "children":
                 guard let parent = nodes[id], let box = parent.container else { continue }
-                let views = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0]?.view }
+                let childNodes = (op["ids"] as? [Int] ?? []).compactMap { nodes[$0] }
+                let views = childNodes.map { $0.view }
                 if parent.kind == "List", views.count < box.subviews.count { parent.lastScrollExtent = -1 }
+                parent.children = childNodes
                 for v in box.subviews where !views.contains(v) { v.removeFromSuperview() }
                 for (i, v) in views.enumerated() where box.subviews.firstIndex(of: v) != i { box.insertSubview(v, at: i) }
+                for c in childNodes where parent.mutedColor != nil || c.parentMuted != nil {
+                    propagateMuted(c, inherited: parent.mutedColor)
+                }
             case "remove":
                 if let n = nodes.removeValue(forKey: id) {
                     n.nativeComponent?.destroy?(n.view)
@@ -514,6 +526,26 @@ final class Renderer {
         if n.nativeComponent == nil, props.keys.contains(where: { ["size", "weight"].contains($0) }) { refont(n) }
     }
 
+    private func resolveMuted(_ n: Node) -> UIColor? {
+        if let custom = (n.props["muted"] as? String).flatMap(Renderer.color) { return custom }
+        guard let mode = n.props["mode"] as? String else { return nil }
+        let dark = mode == "dark" || (mode == "system" && root.traitCollection.userInterfaceStyle == .dark)
+        return Renderer.color(dark ? "#9ca3af" : "#6b7280")
+    }
+
+    private func propagateMuted(_ n: Node, inherited: UIColor?) {
+        n.parentMuted = inherited
+        let own = n.kind == "Theme" ? resolveMuted(n) : nil
+        let effective = own ?? inherited
+        n.mutedColor = effective
+        if let tabs = n.view as? TabsView {
+            tabs.setMutedColor(effective)
+        }
+        for c in n.children {
+            propagateMuted(c, inherited: effective)
+        }
+    }
+
     private func applyTheme(_ n: Node) {
         if let mode = n.props["mode"] as? String {
             n.view.overrideUserInterfaceStyle = mode == "dark" ? .dark : mode == "light" ? .light : .unspecified
@@ -521,17 +553,7 @@ final class Renderer {
             n.view.overrideUserInterfaceStyle = .unspecified
         }
         n.view.tintColor = (n.props["accent"] as? String).flatMap(Renderer.color)
-        let mutedColor = (n.props["muted"] as? String).flatMap(Renderer.color)
-        applyMuted(n.view, color: mutedColor)
-    }
-
-    private func applyMuted(_ view: UIView, color: UIColor?) {
-        if let tabs = view as? TabsView {
-            tabs.setMutedColor(color)
-        }
-        for sub in view.subviews {
-            applyMuted(sub, color: color)
-        }
+        propagateMuted(n, inherited: n.parentMuted)
     }
 
     /// Visual props. Layout props (width, gap, align, grow, ...) are the core's job.
@@ -544,7 +566,7 @@ final class Renderer {
             if k == "color" { icon.tintColor = v.flatMap { Renderer.color("\($0)") } ?? .label; return }
         }
         if n.kind == "Time", ["value", "show", "style", "zone"].contains(k) {
-            label?.text = Times.show(n.props)
+            label?.text = Times.show(n.props, locale: localeId)
             return
         }
         if n.kind == "Format", ["value", "kind", "currency", "decimals", "locale"].contains(k) {

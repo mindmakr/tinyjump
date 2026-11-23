@@ -21,7 +21,7 @@ pub enum Message {
     Plural(Box<[Option<Rc<str>>; 6]>),
 }
 
-/// One locale's sorted key-to-message table (binary-searched with zero extra map codegen).
+/// One locale's key-to-message table (compact `Vec` to avoid map/sort codegen in device builds).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocaleTable {
     pub tag: Rc<str>,
@@ -39,7 +39,7 @@ impl LocaleTable {
 pub struct Locales {
     /// Normalized base locale tag (e.g. `"en"`), or empty when the app has no locale files.
     pub base: Rc<str>,
-    /// Per-locale message tables, sorted by normalized locale tag.
+    /// Per-locale message tables.
     pub tables: Vec<LocaleTable>,
 }
 
@@ -97,11 +97,13 @@ pub fn placeholders(template: &str) -> Vec<String> {
             }
             if let Some(rel_end) = template[i + 1..].find('}') {
                 let name = &template[i + 1..i + 1 + rel_end];
-                if is_placeholder_name(name) && !out.iter().any(|p| p == name) {
-                    out.push(name.to_string());
+                if is_placeholder_name(name) {
+                    if !out.iter().any(|p| p == name) {
+                        out.push(name.to_string());
+                    }
+                    i += rel_end + 2;
+                    continue;
                 }
-                i += rel_end + 2;
-                continue;
             }
         } else if bytes[i] == b'}' && i + 1 < bytes.len() && bytes[i + 1] == b'}' {
             i += 2;
@@ -138,7 +140,8 @@ pub fn required_placeholders(msg: &Message) -> Vec<String> {
 pub fn plural_category_index(locale: &str, n: f64) -> usize {
     let lang = primary_language(locale);
     let abs = n.abs();
-    let is_int = abs.is_finite() && abs.fract() == 0.0;
+    // Beyond 2^53 - 1, f64 integers lose unit-digit precision and `as u64` saturates >= 2^64.
+    let is_int = abs.is_finite() && abs.fract() == 0.0 && abs <= 9_007_199_254_740_991.0;
     let i = if is_int { abs as u64 } else { 0 };
     match lang.as_str() {
         "ar" => {
@@ -303,10 +306,10 @@ pub fn parse_locale_files(src: &str, files: &[File]) -> Result<Locales, Vec<Diag
     }
     let base = if tables.iter().any(|t| t.tag.as_ref() == "en") {
         Rc::from("en")
-    } else if let Some(t) = tables.iter().find(|t| t.tag.starts_with("en-")) {
+    } else if let Some(t) = tables.iter().filter(|t| t.tag.starts_with("en-")).min_by(|a, b| a.tag.cmp(&b.tag)) {
         t.tag.clone()
     } else {
-        tables.first().map(|t| t.tag.clone()).unwrap_or_else(|| Rc::from(""))
+        tables.iter().min_by(|a, b| a.tag.cmp(&b.tag)).map(|t| t.tag.clone()).unwrap_or_else(|| Rc::from(""))
     };
     Ok(Locales { base, tables })
 }
@@ -541,6 +544,22 @@ mod tests {
         assert_eq!(plural_category("en", 2.0), "other");
 
         assert_eq!(plural_category("ja", 1.0), "other");
+        // Edge numbers: NaN, Infinity, negative, fractional, and floats >= 2^53.
+        assert_eq!(plural_category("ar", f64::NAN), "other");
+        assert_eq!(plural_category("ar", f64::INFINITY), "other");
+        assert_eq!(plural_category("ar", 1e20), "other");
+        assert_eq!(plural_category("ru", 1e20), "other");
+        assert_eq!(plural_category("en", -1.0), "one");
+        assert_eq!(plural_category("en", 1.5), "other");
+
+        // Brace-scanning parity between compile-time `placeholders()` and runtime `interpolate()`.
+        assert_eq!(placeholders("Set { {name} }"), vec!["name".to_string()]);
+        assert_eq!(placeholders("{{{name}}}"), vec!["name".to_string()]);
+        let mut p = Record::new();
+        p.insert(Rc::from("name"), Value::str("Ana"));
+        assert_eq!(interpolate("Set { {name} }", Some(&p), false), "Set { Ana }");
+        assert_eq!(interpolate("{{{name}}}", Some(&p), false), "{Ana}");
+
         assert!(is_rtl_locale("ar"));
         assert!(is_rtl_locale("ar-SA"));
         assert!(is_rtl_locale("ur_PK"));

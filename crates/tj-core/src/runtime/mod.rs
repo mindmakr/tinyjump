@@ -498,6 +498,8 @@ impl Runtime {
                 let next = if next.is_empty() { "en" } else { next };
                 if &*self.locale != next {
                     self.locale = Rc::from(next);
+                    #[cfg(feature = "layout")]
+                    self.layout.clear_cache();
                     if self.render {
                         self.render_app();
                     }

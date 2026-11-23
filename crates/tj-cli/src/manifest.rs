@@ -56,6 +56,9 @@ impl Manifest {
         if !is_aot {
             let canon_types = canonical_field_types(source);
             for f in modules::files(source) {
+                if tj_core::i18n::is_locale_file(&f.name) {
+                    continue;
+                }
                 let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
                 for imp in &parsed.imports {
                     if imp.from.starts_with("tj:") {
@@ -357,6 +360,9 @@ pub fn canonical_field_types(source: &str) -> HashMap<(String, String), String> 
     let mut aliases: HashMap<String, TypeExpr> = HashMap::new();
     let mut raw_fields: Vec<(String, String, TypeExpr)> = Vec::new();
     for f in modules::files(source) {
+        if tj_core::i18n::is_locale_file(&f.name) {
+            continue;
+        }
         let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
         for item in &parsed.items {
             match item {

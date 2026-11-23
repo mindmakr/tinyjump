@@ -1,4 +1,4 @@
-//! Ahead-of-time bytecode serialization (`TJB\x01`) and validation.
+//! Ahead-of-time bytecode serialization (`TJB\x02`) and validation.
 //!
 //! `tj build` compiles a `.tj` app once into compact binary bytecode (`.tjb`) or a
 //! UTF-8 bundle (`//# tjb:1:<base64>`) that every host (`tj-wasm`, `tj-android`, `tj-ffi`,
@@ -522,7 +522,9 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
         locale_tables.push(crate::i18n::LocaleTable { tag, entries });
     }
     let locales = crate::i18n::Locales { base: locale_base, tables: locale_tables };
-    if !locales.base.is_empty() && locales.table(&locales.base).is_none() {
+    if (locales.base.is_empty() && !locales.tables.is_empty())
+        || (!locales.base.is_empty() && locales.table(&locales.base).is_none())
+    {
         return Err("bytecode base locale missing from locale tables");
     }
     if r.pos != bytes.len() {

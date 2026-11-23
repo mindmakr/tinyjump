@@ -106,6 +106,9 @@ final class Automation {
             let input = tj.renderer.forAgent(raw)
             if ["call", "get", "ui", "inspect"].contains(input["type"] as? String ?? "") {
                 tj.request(input, reply: finish)
+            } else if input["type"] as? String == "locale" {
+                tj.setLocale(input["locale"] as? String ?? "")
+                finish(NSNull(), nil)
             } else {
                 tj.send(input)
                 finish(NSNull(), nil)

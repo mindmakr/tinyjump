@@ -16,7 +16,7 @@ pub fn read(entry: &Path) -> Result<App, String> {
     // Precompiled binary `.tjb` bytecode: wrap into the UTF-8 bundle format so every command
     // (`tj serve`, `tj bench`, `tj reload`) loads it without invoking the compiler.
     if let Ok(raw) = std::fs::read(entry) {
-        if raw.starts_with(tj_core::vm::bytecode::MAGIC) {
+        if raw.starts_with(b"TJB") {
             return Ok(App { source: tj_core::vm::bytecode::bundle_from_bytes(&raw), files: vec![entry.to_path_buf()] });
         }
     }
@@ -81,6 +81,7 @@ pub fn read(entry: &Path) -> Result<App, String> {
     // Auto-discover `locales/<tag>.json` next to the entry file (sorted for deterministic builds).
     let locales_dir = dir.join("locales");
     if let Ok(entries) = std::fs::read_dir(&locales_dir) {
+        watched.push(locales_dir.clone());
         let mut json_files: Vec<(String, PathBuf)> = entries
             .filter_map(Result::ok)
             .filter_map(|e| {

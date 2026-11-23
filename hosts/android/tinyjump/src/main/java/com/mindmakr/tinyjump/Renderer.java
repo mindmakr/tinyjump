@@ -340,6 +340,8 @@ final class Renderer {
         for (Node n : nodes.values()) {
             if ("Format".equals(n.kind) && n.view instanceof TextView) {
                 ((TextView) n.view).setText(formatNumber(n.props));
+            } else if ("Time".equals(n.kind) && n.view instanceof TextView) {
+                ((TextView) n.view).setText(Times.show(n.props, this.locale));
             }
         }
     }
@@ -897,7 +899,7 @@ final class Renderer {
                 }
             }
             if ("Time".equals(n.kind) && ("value".equals(k) || "show".equals(k) || "style".equals(k) || "zone".equals(k))) {
-                if (text != null) text.setText(Times.show(n.props));
+                if (text != null) text.setText(Times.show(n.props, this.locale));
                 return;
             }
             if ("Format".equals(n.kind) && ("value".equals(k) || "kind".equals(k) || "currency".equals(k) || "decimals".equals(k) || "locale".equals(k))) {

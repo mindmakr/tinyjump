@@ -4320,7 +4320,8 @@ function App() {
     assert!(bad(r#"function App() { return <Text>{t("tasks.remaining", { count: "two" })}</Text> }"#).contains("numeric 'count'"));
     assert!(bad(r#"function App() { return <Text>{t("title", { x: 1 })}</Text> }"#).contains("takes no placeholders"));
 
-    // Critic 053 carryover (NC-2): @pii passed into <Native> requires reveal() with a declared purpose.
+    // Critic 053 carryover (NC-2) + Critic 056 (C-056.7): @pii passed into any <Native> prop
+    // including `id` requires reveal() with a declared purpose.
     let native_pii = r#"
 @server @read("owner") object Profile {
   @pii("contact", "support") email: string = ""
@@ -4331,4 +4332,39 @@ function App() {
 }
 "#;
     assert!(errors(native_pii).contains("custom <Native> view"));
+    let native_id_pii = r#"
+@server @read("owner") object Profile {
+  @pii("contact", "support") email: string = ""
+}
+function App() {
+  const p = Profile.get(caller.id)
+  return <Native name="MapView" id={p.email} />
+}
+"#;
+    assert!(errors(native_id_pii).contains("custom <Native> view"));
+
+    // Critic 056 (C-056.2): Input::Locale invalidates Taffy's leaf measurement cache so `<Format>`
+    // is re-measured on Android/iOS even when node id & props are unchanged.
+    struct CountingMeasure(std::rc::Rc<std::cell::Cell<usize>>);
+    impl tj_core::ui::layout::Measure for CountingMeasure {
+        fn measure(&mut self, _node: u32, _max_width: Option<f32>) -> (f32, f32) {
+            let n = self.0.get() + 1;
+            self.0.set(n);
+            (60.0 + (n as f32) * 10.0, 20.0)
+        }
+    }
+    let fmt_src = r#"function App() { return <Column><Format id="p" value={1234.5} kind="currency" currency="USD" /></Column> }"#;
+    let (mut lrt, _) = Runtime::boot(compile(fmt_src).unwrap(), Box::new(MemStore::default()), Options::new(1.0, 1)).unwrap();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    lrt.set_measure(Box::new(CountingMeasure(calls.clone())));
+    let _ = lrt.handle(1.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    let after_first = calls.get();
+    assert!(after_first > 0);
+    // Same locale -> cached (no new measure calls).
+    let _ = lrt.handle(2.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    assert_eq!(calls.get(), after_first);
+    // Switching locale invalidates cache -> `<Format>` is re-measured.
+    let _ = lrt.handle(3.0, Input::Locale { locale: "de-DE".into() });
+    let _ = lrt.handle(4.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
+    assert!(calls.get() > after_first, "locale change must invalidate layout measurement cache");
 }
