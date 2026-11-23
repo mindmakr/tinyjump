@@ -193,4 +193,19 @@ input "{\"type\":\"ui\",\"target\":{\"id\":\"book-$slot_id\"},\"event\":\"onPres
 expect "$api/_tj/inspect" "cancel-$slot_id"
 curl -sf "$api/_tj/screenshot" -o "$out/booking-customer.png"
 "$tj" review --target "$api"
+
+echo "== packaging: tj build --ios --aot --assemble (turnkey compiler-free .app)"
+kill $server 2>/dev/null || true
+xcrun simctl terminate "$udid" "$bundle" 2>/dev/null || true
+rm -rf "$out/packaged-ios"
+"$tj" build examples/todo/app.tj --ios --aot --out "$out/packaged-ios" --assemble
+test -x "$out/packaged-ios/Todo.app/Todo"
+test -f "$out/packaged-ios/Todo.app/app.tjb"
+pkg_bundle=com.mindmakr.tinyjump.todo
+xcrun simctl install "$udid" "$out/packaged-ios/Todo.app"
+xcrun simctl launch "$udid" "$pkg_bundle"
+wait_up
+expect "$api/_tj/inspect" 'Add'
+"$tj" review --target "$api"
+xcrun simctl terminate "$udid" "$pkg_bundle" 2>/dev/null || true
 echo "iOS tests passed"

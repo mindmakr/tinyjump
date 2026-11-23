@@ -162,11 +162,14 @@
     <section>
       <h2>Measured, not claimed</h2>
       <div class="numbers">
-        <div class="num"><b>842 KB</b><span>web runtime, compiler included (317 KB compressed); 540 KB AOT-only (215 KB compressed)</span></div>
-        <div class="num"><b>~1.1 MB</b><span>arm64 Android library (782 KB on 32-bit ARM; 845 KB / 606 KB AOT-only)</span></div>
-        <div class="num"><b>&lt;0.2 ms</b><span>to boot each example app on a laptop (<code>tj bench</code>)</span></div>
-        <div class="num"><b>245</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
-        <div class="num"><b>Android 5</b><span>and up, iOS 13 and up, and 2019-era browsers</span></div>
+        <div class="num"><b>215 KB</b><span>AOT web runtime compressed (540 KB raw via <code>cargo web-aot</code>; 842 KB / 317 KB compressed with compiler)</span></div>
+        <div class="num"><b>531 KB</b><span>complete installable native Android APK (arm64 AOT: 484 KB runtime, 42 KB plain-Java DEX, zero AndroidX/Kotlin)</span></div>
+        <div class="num"><b>&lt;0.2 ms</b><span>boot time across every example app (0.07 ms for <code>todo</code>; 0.002–0.026 ms per tick in <code>tj bench</code>)</span></div>
+        <div class="num"><b>283 lines</b><span>full 4-platform booking app (web, Android, iOS, Linux, offline sync, alarms, <code>@pii</code> &amp; GDPR)</span></div>
+        <div class="num"><b>0 KB ICU</b><span>translations, CLDR plurals, RTL layout and <code>&lt;Format&gt;</code>/<code>&lt;Time&gt;</code> use native formatters with zero ICU data in core</span></div>
+        <div class="num"><b>0 B core</b><span>registry packages, audit log, encryption at rest and packaging add zero bytes to device runtimes</span></div>
+        <div class="num"><b>246</b><span>automated tests; iOS Simulator and turnkey AOT <code>.app</code> boot run on every pull request</span></div>
+        <div class="num"><b>Android 5</b><span>and up (<code>minSdk 21</code>), iOS 13 and up, and 2019-era browsers (plain ES2017, no build step)</span></div>
         <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM, plus single-file <code>tj build --linux</code> apps</span></div>
       </div>
     </section>
@@ -185,9 +188,8 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Turnkey mobile packaging: assemble signed Android APKs and iOS <code>.app</code> bundles directly from <code>tj build</code>.</li>
+          <li>OpenAPI bridge generator, CLI registry discovery (<code>tj search</code>), nightly re-scans, Sigstore/SLSA signing and a searchable registry site.</li>
           <li>Device capabilities (camera, location, notifications, files) and 1:1 / group voice and video calls (WebRTC) as opt-in plugins.</li>
-          <li>OpenAPI bridge generator, sandboxed registry behaviour checks, Sigstore/SLSA signing and a searchable registry site.</li>
           <li>Desktop native UI hosts (macOS AppKit and Linux desktop).</li>
           <li>Optional GPU graphics and 3D module (<code>tj-gfx</code> on <code>wgpu</code>) so apps without 3D stay small.</li>
         </ul>
@@ -198,6 +200,7 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>Turnkey mobile and AOT web packaging.</b> <code>tj build app.tj --android --aot --assemble</code> generates a self-contained Gradle project and builds an installable native Android APK (531 KB for single-ABI arm64 AOT, zero AndroidX/Kotlin, env-var release signing); <code>--ios --aot --assemble</code> compiles and signs a zero-Xcode UIKit <code>.app</code> bundle on macOS (boot-verified on the iOS Simulator in CI); and <code>--web</code> auto-bundles the 215 KB gzipped AOT WASM runtime.</li>
           <li><b>Golden-image diffs and compiler-free AOT builds.</b> <code>tj review --target &lt;url&gt; --golden baseline.png</code> (or offline <code>--golden</code> + <code>--actual</code>) diffs PNG screenshots pixel-by-pixel with configurable <code>--threshold</code> and red-highlighted <code>--diff</code> output. Opt-out <code>compiler</code> feature builds (<code>cargo web-aot</code>, <code>--no-default-features</code>) strip the compiler out of AOT-only device runtimes: Web WASM drops 36% to 540 KB (215 KB gzipped) and Android drops 22–23%.</li>
           <li><b>Translations, locales and pseudo-locale sweeps.</b> Built-in <code>t("key", { count })</code> with <code>locales/*.json</code>, CLDR plural rules and compile-time key/placeholder checks; <code>&lt;Format&gt;</code> and <code>&lt;Time&gt;</code> format numbers, currencies, percentages and dates with the host's native formatter (zero ICU data in core); and <code>tj review app.tj</code> sweeps every locale plus an expanded <code>"pseudo"</code> locale offline to catch truncation and RTL overlap before release.</li>
           <li><b>AOT builds, UI catalog and custom native views.</b> <code>tj build</code> compiles apps to validated <code>.tjb</code> bytecode and emits static <code>--web</code> bundles, standalone SHA-256-verified <code>--linux</code> executables and <code>--android</code> / <code>--ios</code> asset bundles. Added <code>&lt;Tabs&gt;</code>, <code>&lt;Icon&gt;</code>, <code>&lt;List&gt;</code>, <code>&lt;Theme&gt;</code> and <code>&lt;Native name="..." /&gt;</code> across the web, Android and iOS hosts.</li>

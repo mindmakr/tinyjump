@@ -154,7 +154,7 @@ view, a Swift view or a web element registered under a name and used from `.tj` 
 catalog component, with props and events through the protocol), **`tj build` (done: AOT
 `.tjb` bytecode serialization so devices skip the compiler, opt-out `compiler` feature /
 `cargo web-aot`, plus `--web`, `--linux` standalone executables with SHA-256-verified
-embedded bytecode, `--android` and `--ios` asset bundles)**, **golden-image screenshot diffs
+embedded bytecode, and turnkey `--android` / `--ios` projects with `--assemble`)**, **golden-image screenshot diffs
 and `tj retro` run reports (done)**, **translations and locale formats (done)**, and GPU/3D
 (next). Size: profile the device builds and cut what is really large
 (a server-only split was measured at 1.2 KB and dropped,
@@ -234,10 +234,14 @@ In order:
    not ship `.tj` source. The opt-out `compiler` feature (`--no-default-features`,
    `cargo web-aot`) strips the lexer, parser, type-checker, compiler and built-in `.tj`
    sources out of AOT-only device builds.
-3. **Packaging (in progress):** `tj build --linux` produces a single executable with
-   SHA-256-verified embedded bytecode; `--web` emits a static web bundle; `--android` and
-   `--ios` stage `assets/app.tjb` / `Resources/app.tjb` for host projects (full turnkey
-   APK / `.app` template assembly comes next).
+3. **Packaging (done):** `tj build --linux` produces a single executable with
+   SHA-256-verified embedded bytecode; `--web` emits a static web bundle (preferring
+   compiler-free AOT WASM when built); `--android` generates a self-contained Gradle
+   project (with `--aot`, `--app-id`, `--title`, `--version`, `--abis`, `--server`,
+   and `--assemble` / `--release` to build a ready-to-install `.apk`, `531 KB` for a
+   single-ABI AOT `arm64-v8a` APK); and `--ios` generates `Info.plist`, `AppDelegate.swift`,
+   `Resources/app.tjb`, and a zero-Xcode `build.sh` (`--assemble` emits `<Name>.app` on
+   macOS, tested in `apple.yml`).
 4. **Machine code for app logic:** only if benchmarks show the VM is too slow for a real
    workload. It costs size, complicates durable state and replay, and slows the reload
    loop. Heavy computation can go into WASM or Rust plugins instead.
