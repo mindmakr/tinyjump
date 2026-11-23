@@ -735,8 +735,8 @@ fn handle(mut req: Request, front: &Front) {
             asked = Some(("whoami", None, None));
             take_verified()
         }.map(|v| match v.caller {
-            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins() }),
-            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins() }),
+            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call() }),
+            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
         (Method::Get, ["_tj", "metrics"]) => {
@@ -891,6 +891,15 @@ fn handle(mut req: Request, front: &Front) {
                             .with_header(header("Cache-Control", "no-store"))
                     } else {
                         file(web.web_dir.join("plugins/device.js"), "text/javascript; charset=utf-8")
+                    }
+                }
+                ["webrtc-plugin.js"] => {
+                    if !engine.has_video_call() {
+                        Response::from_data("export function createVideoCallComponents(){return{};}\n")
+                            .with_header(header("Content-Type", "text/javascript; charset=utf-8"))
+                            .with_header(header("Cache-Control", "no-store"))
+                    } else {
+                        file(web.web_dir.join("plugins/webrtc.js"), "text/javascript; charset=utf-8")
                     }
                 }
                 ["tinyjump.wasm"] => file(web.wasm.clone(), "application/wasm"),
@@ -2143,6 +2152,79 @@ mod tests {
             .unwrap();
         assert_eq!(ok2.status(), 200);
         assert_eq!(ok2.into_string().unwrap(), r#"{"ok":1}"#);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serves_opt_in_device_and_webrtc_plugins_or_stubs() {
+        let dir = std::env::temp_dir().join(format!("tj-http-devplugins-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d1 = dir.join("plain");
+        let d2 = dir.join("call");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::create_dir_all(&d2).unwrap();
+        let web_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../hosts/web");
+        let wasm = dir.join("dummy.wasm");
+        std::fs::write(&wasm, b"").unwrap();
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+
+        // 1. Plain app: /api/whoami reports empty devicePlugins + videoCall=false; stubs served.
+        let src_plain = "function App() { return <Column><Text>hi</Text></Column> }\n".to_string();
+        let audit1 = Audit::start(&d1).unwrap().0;
+        let eng1 = Engine::start(src_plain, d1.clone(), false, true, Arc::default(), audit1.clone()).unwrap();
+        let srv1 = Server::http("127.0.0.1:0").unwrap();
+        let port1 = srv1.server_addr().to_ip().unwrap().port();
+        let web1 = Some(Arc::new(Web { source: d1.join("app.tj"), web_dir: web_dir.clone(), wasm: wasm.clone() }));
+        let f1 = Arc::new(Front::new(eng1, web1, None, Automation::Open, Identity::anonymous(), audit1, Leases::open(&d1), false));
+        thread::spawn(move || {
+            for req in srv1.incoming_requests() {
+                handle(req, &f1);
+            }
+        });
+        let who1: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port1}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
+        assert_eq!(who1["ok"]["devicePlugins"], json!([]));
+        assert_eq!(who1["ok"]["videoCall"], json!(false));
+        let dev_stub = agent.get(&format!("http://127.0.0.1:{port1}/device-plugins.js")).call().unwrap().into_string().unwrap();
+        assert!(dev_stub.len() < 80 && dev_stub.contains("createDevicePlugins"));
+        let rtc_stub = agent.get(&format!("http://127.0.0.1:{port1}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(rtc_stub.len() < 80 && rtc_stub.contains("createVideoCallComponents"));
+
+        // 2. VideoCall app with camera+microphone permissions: full plugin files served.
+        let src_call = "function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }\n".to_string();
+        let mut perms = std::collections::BTreeMap::new();
+        perms.insert("camera".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
+        perms.insert("microphone".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
+        let audit2 = Audit::start(&d2).unwrap().0;
+        let eng2 = Engine::start_with_integrations(
+            src_call,
+            d2.clone(),
+            false,
+            true,
+            Arc::default(),
+            audit2.clone(),
+            None,
+            Arc::default(),
+            Arc::default(),
+            perms,
+        )
+        .unwrap();
+        let srv2 = Server::http("127.0.0.1:0").unwrap();
+        let port2 = srv2.server_addr().to_ip().unwrap().port();
+        let web2 = Some(Arc::new(Web { source: d2.join("app.tj"), web_dir, wasm }));
+        let f2 = Arc::new(Front::new(eng2, web2, None, Automation::Open, Identity::anonymous(), audit2, Leases::open(&d2), false));
+        thread::spawn(move || {
+            for req in srv2.incoming_requests() {
+                handle(req, &f2);
+            }
+        });
+        let who2: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port2}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
+        assert_eq!(who2["ok"]["devicePlugins"], json!(["camera"]));
+        assert_eq!(who2["ok"]["videoCall"], json!(true));
+        let dev_full = agent.get(&format!("http://127.0.0.1:{port2}/device-plugins.js")).call().unwrap().into_string().unwrap();
+        assert!(dev_full.len() > 2000 && dev_full.contains("handleCamera"));
+        let rtc_full = agent.get(&format!("http://127.0.0.1:{port2}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(rtc_full.len() > 2000 && rtc_full.contains("RTCPeerConnection"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

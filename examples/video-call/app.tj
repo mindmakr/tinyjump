@@ -1,0 +1,202 @@
+// Peer-to-peer WebRTC voice & video calling signaled by a tiny @server object.
+// Run with: cargo tj dev examples/video-call/app.tj
+// Open two browser tabs at http://127.0.0.1:4700, enter different names, and join the same room.
+//
+// NOTE: This demo uses `@read("anyone")` / `@allow("anyone")` so two local tabs can connect
+// without sign-in. Production apps should restrict rooms with `@read("signedIn")` and bind
+// `peerId` to `caller.id` (see examples/chat/app.tj and docs/access-control.md).
+
+type Signal = {
+  seq: number,
+  from: string,
+  to: string,
+  kind: string,
+  payload: string,
+}
+
+@server @read("anyone") object CallRoom {
+  peers: string[] = []
+  signals: Signal[] = []
+  nextSeq: number = 1
+
+  @allow("anyone") join(peerId: string): string[] {
+    const id = peerId.trim()
+    check(id.length > 0 && id.length <= 40, "peerId", "enter a name (1-40 characters)")
+    if (!this.peers.includes(id)) {
+      check(this.peers.length < 2, "room", "this 1:1 call room already has two participants")
+      this.peers.push(id)
+    }
+    return this.peers
+  }
+
+  @allow("anyone") leave(peerId: string): string[] {
+    const id = peerId.trim()
+    this.peers = this.peers.filter((p) => p !== id)
+    // Prune signals involving the departing peer so rejoins never replay stale offers/ICE/bye.
+    this.signals = this.signals.filter((s) => s.from !== id && s.to !== id)
+    if (this.peers.length === 0) {
+      this.signals = []
+    }
+    return this.peers
+  }
+
+  @allow("anyone") reset(): boolean {
+    this.peers = []
+    this.signals = []
+    return true
+  }
+
+  @allow("anyone") sendSignal(from: string, to: string, kind: string, payload: string): number {
+    const f = from.trim()
+    const t = to.trim()
+    check(f !== t, "to", "cannot send a call signal to yourself")
+    check(this.peers.includes(f), "from", "join the room before sending call signals")
+    check(this.peers.includes(t), "to", "recipient is not in this call room")
+    check(kind === "offer" || kind === "answer" || kind === "ice" || kind === "bye", "kind", "unsupported WebRTC signal kind")
+    const maxLen = kind === "ice" ? 8192 : kind === "bye" ? 256 : 65536
+    check(payload.length <= maxLen, "payload", "signal payload is too large")
+    const seq = this.nextSeq
+    this.nextSeq += 1
+    this.signals.push({ seq, from: f, to: t, kind, payload })
+    if (this.signals.length > 60) {
+      this.signals = this.signals.slice(this.signals.length - 60)
+    }
+    return seq
+  }
+}
+
+object LocalCall {
+  roomName: string = "studio"
+  peerName: string = ""
+  inCall: boolean = false
+  joining: boolean = false
+  videoEnabled: boolean = true
+  muted: boolean = false
+  cameraOff: boolean = false
+  callState: string = "idle"
+  lastError: string = ""
+
+  setRoom(v: string) { this.roomName = v }
+  setName(v: string) { this.peerName = v }
+  toggleMute() { this.muted = !this.muted }
+  toggleCamera() { this.cameraOff = !this.cameraOff }
+  setState(s: string) { this.callState = s }
+  setError(e: string) { this.lastError = e }
+
+  async joinRoom(roomKey: string, video: boolean) {
+    const me = this.peerName.trim()
+    if (me === "") {
+      this.lastError = "Enter your name before joining."
+      return
+    }
+    this.joining = true
+    this.lastError = ""
+    try {
+      await CallRoom.get(roomKey).join(me)
+      this.videoEnabled = video
+      this.muted = false
+      this.cameraOff = !video
+      this.inCall = true
+    } catch (e) {
+      this.lastError = e.message || "could not join room"
+      this.inCall = false
+    }
+    this.joining = false
+  }
+
+  async leaveRoom(roomKey: string, remote: string) {
+    const me = this.peerName.trim()
+    this.inCall = false
+    this.callState = "idle"
+    this.lastError = ""
+    const room = CallRoom.get(roomKey)
+    if (remote !== "") {
+      try { await room.sendSignal(me, remote, "bye", "") } catch (e) { }
+    }
+    try { await room.leave(me) } catch (e) { }
+  }
+}
+
+function App() {
+  const local = LocalCall.get("me")
+  const roomKey = local.roomName.trim() || "studio"
+  const room = CallRoom.get(roomKey)
+  const me = local.peerName.trim()
+  const remote = room.peers.find((p) => p !== me) || ""
+  const initiator = local.inCall && remote !== "" && room.peers.length >= 2 && room.peers[0] === me
+
+  return <Column padding={20} gap={14} background="#f6f4ef">
+    <Text size={24} weight="bold">TinyJump Call</Text>
+    <Text size={14} color="#5f5b50">Peer-to-peer WebRTC signaled by one @server object (0 bytes in tj-core).</Text>
+
+    {!local.inCall && <Row gap={10}>
+      <Input
+        id="room-input"
+        grow={1}
+        value={local.roomName}
+        placeholder="Room name"
+        onChange={(v) => local.setRoom(v)}
+      />
+      <Input
+        id="name-input"
+        grow={1}
+        value={local.peerName}
+        placeholder="Your name (e.g. Alice)"
+        onChange={(v) => local.setName(v)}
+      />
+    </Row>}
+
+    {!local.inCall && <Row gap={10}>
+      <Button id="join-video" disabled={local.joining} onPress={() => local.joinRoom(roomKey, true)}>
+        {local.joining ? "Joining..." : "Join Video Call"}
+      </Button>
+      <Button id="join-audio" disabled={local.joining} onPress={() => local.joinRoom(roomKey, false)}>
+        Join Voice Only
+      </Button>
+      {room.peers.length > 0 && <Button id="reset-room" onPress={() => room.reset()}>
+        Clear Room
+      </Button>}
+    </Row>}
+
+    {local.inCall && <Row gap={10}>
+      <Button id="toggle-mute" onPress={() => local.toggleMute()}>
+        {local.muted ? "Unmute" : "Mute"}
+      </Button>
+      {local.videoEnabled && <Button id="toggle-camera" onPress={() => local.toggleCamera()}>
+        {local.cameraOff ? "Camera On" : "Camera Off"}
+      </Button>}
+      <Button id="leave-call" onPress={() => local.leaveRoom(roomKey, remote)}>
+        End Call
+      </Button>
+    </Row>}
+
+    <Text id="status" size={14} color="#374151">
+      {`Room: ${roomKey} · Peers (${room.peers.length}/2): ${room.peers.join(", ") || "none"} · State: ${local.callState}`}
+    </Text>
+
+    {local.lastError !== "" && <Text id="error" size={14} color="#b91c1c">{local.lastError}</Text>}
+
+    <Native
+      name="VideoCall"
+      id="video-call"
+      height={320}
+      active={local.inCall}
+      peerId={me}
+      remotePeerId={remote}
+      initiator={initiator}
+      audio={true}
+      video={local.videoEnabled}
+      muted={local.muted}
+      cameraOff={local.cameraOff}
+      signals={room.signals}
+      onSignal={(sig) => {
+        if (local.inCall && sig && sig.to) {
+          room.sendSignal(me, sig.to, sig.kind, sig.payload || "")
+        }
+      }}
+      onState={(s) => local.setState(s)}
+      onError={(e) => local.setError(e)}
+    />
+  </Column>
+}
+

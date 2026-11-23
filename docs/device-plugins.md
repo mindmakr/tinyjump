@@ -144,13 +144,14 @@ Install the typed `.tj` wrapper modules from the official registry via:
 tj add files notifications location camera
 ```
 
-## Calls and media streaming (WebRTC, planned in 3c)
+## Calls and media streaming (WebRTC)
 
-Voice and video calls build directly on the same primitives:
+See [docs/webrtc.md](webrtc.md) and [examples/video-call/app.tj](../examples/video-call/app.tj)
+for the opt-in `<Native name="VideoCall" ... />` component and `@server` signaling pattern:
 
 - **Signaling:** an existing `@server` object holds room membership, SDP offers/answers, and
   ICE candidates over the existing realtime change stream.
-- **Native view:** `<Native name="VideoCall" room={id} muted={m} onState={...} />` renders the
-  platform's WebRTC surface (`RTCPeerConnection` / `RTCVideoView` / Android `SurfaceViewRenderer`).
-- **Plugin permissions:** `permissions.device: ["camera", "microphone"]` plus declared
-  STUN/TURN relay hosts in `permissions.network`.
+- **Native view:** `<Native name="VideoCall" active={...} peerId={...} remotePeerId={...} signals={...} onSignal={...} />`
+  bundles `hosts/web/plugins/webrtc.js` automatically on Web (0 bytes when unused) and
+  exposes the identical `registerComponent("VideoCall", ...)` contract on Android & iOS.
+- **Plugin permissions:** `permissions.device: ["camera", "microphone"]`.

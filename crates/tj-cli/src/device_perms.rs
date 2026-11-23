@@ -171,6 +171,19 @@ pub fn bundled_host_plugins(perms: &BTreeMap<String, DevicePermission>) -> Vec<&
     out
 }
 
+/// Whether a compiled app opts into the built-in WebRTC `<Native name="VideoCall" ... />` host
+/// component: requires `camera` or `microphone` permission AND a compiled `<Native>` element with
+/// a `"VideoCall"` string constant. Works identically for `.tj` sources and AOT `.tjb` bundles
+/// while adding 0 bytes to `tj-core`.
+pub fn uses_video_call(program: &tj_core::vm::program::Program, perms: &BTreeMap<String, DevicePermission>) -> bool {
+    (perms.contains_key("camera") || perms.contains_key("microphone"))
+        && program.elems.iter().any(|e| &*e.kind == "Native")
+        && program
+            .consts
+            .iter()
+            .any(|v| matches!(v, tj_core::vm::value::Value::Str(s) if &**s == "VideoCall"))
+}
+
 /// Generates deduplicated `<uses-permission>` and `<uses-feature>` XML lines for `AndroidManifest.xml`
 /// covering `minSdk = 21` through `targetSdk = 35`.
 pub fn android_manifest_xml(perms: &BTreeMap<String, DevicePermission>) -> String {
@@ -364,6 +377,16 @@ mod tests {
         assert_eq!(merged["notifications"].sources, vec!["tj:qr"]);
         assert_eq!(bundled_host_plugins(&merged), vec!["notifications", "location", "camera"]);
         assert!(bundled_host_plugins(&BTreeMap::new()).is_empty());
+
+        // `uses_video_call` checks compiled bytecode (works for .tj AND AOT .tjb, ignores comments).
+        let call_prog = tj_core::compile("function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }").unwrap();
+        assert!(uses_video_call(&call_prog, &merged), "VideoCall + camera/mic opts in");
+        assert!(!uses_video_call(&call_prog, &BTreeMap::new()), "missing camera/mic permission stays opted out");
+        let aot_bytes = call_prog.to_bytes().unwrap();
+        let aot_prog = tj_core::vm::program::Program::from_bytes(&aot_bytes).unwrap();
+        assert!(uses_video_call(&aot_prog, &merged), "AOT .tjb bundle still detects VideoCall");
+        let comment_only = tj_core::compile("// VideoCall in a comment\nfunction App() { return <Column><Text>hi</Text></Column> }").unwrap();
+        assert!(!uses_video_call(&comment_only, &merged), "comment mentioning VideoCall does not opt in");
 
         let ios_xml = ios_plist_xml(&merged, "MyApp", esc);
         assert!(ios_xml.contains("<key>NSCameraUsageDescription</key>"));

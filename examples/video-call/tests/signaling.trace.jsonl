@@ -1,0 +1,39 @@
+# Deterministic trace test for examples/video-call/app.tj
+{"do": "boot", "now": 1800000000000, "seed": 1, "server": true, "render": true}
+{"do": "assertScreen", "contains": ["TinyJump Call", "Join Video Call", "Join Voice Only"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+
+# Validation: blank peer name rejected
+{"do": "call", "object": "CallRoom/demo", "method": "join", "args": ["   "], "expectError": "enter a name"}
+
+# Alice and Bob join; 3rd participant rejected
+{"do": "call", "object": "CallRoom/demo", "method": "join", "args": ["alice"], "expect": ["alice"]}
+{"do": "call", "object": "CallRoom/demo", "method": "join", "args": ["bob"], "expect": ["alice", "bob"]}
+{"do": "call", "object": "CallRoom/demo", "method": "join", "args": ["charlie"], "expectError": "two participants"}
+
+# Signaling validation: self-signal, non-member, and unsupported kind rejected
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["alice", "alice", "offer", "{}"], "expectError": "yourself"}
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["charlie", "alice", "offer", "{}"], "expectError": "join the room"}
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["alice", "bob", "bogus", "{}"], "expectError": "unsupported"}
+
+# Happy path: offer, answer, ICE relayed with monotonic seq
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["alice", "bob", "offer", "{\"type\":\"offer\",\"sdp\":\"v=0\"}"], "expect": 1}
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["bob", "alice", "answer", "{\"type\":\"answer\",\"sdp\":\"v=0\"}"], "expect": 2}
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["alice", "bob", "ice", "{\"candidate\":\"candidate:1\"}"], "expect": 3}
+
+# Leaving prunes departing peer's signals so rejoins never replay stale offers/ICE
+{"do": "call", "object": "CallRoom/demo", "method": "leave", "args": ["alice"], "expect": ["bob"]}
+{"do": "get", "object": "CallRoom/demo", "expectContains": {"peers": ["bob"], "signals": []}}
+
+# Rejoin gets fresh monotonic seq; reset clears ghost peers
+{"do": "call", "object": "CallRoom/demo", "method": "join", "args": ["alice"], "expect": ["bob", "alice"]}
+{"do": "call", "object": "CallRoom/demo", "method": "sendSignal", "args": ["bob", "alice", "offer", "{\"type\":\"offer\",\"sdp\":\"v=0\"}"], "expect": 4}
+{"do": "call", "object": "CallRoom/demo", "method": "reset", "args": [], "expect": true}
+{"do": "get", "object": "CallRoom/demo", "expectContains": {"peers": [], "signals": []}}
+
+# UI flow: enter name, join video call, verify screen updates
+{"do": "ui", "target": "#name-input", "event": "onChange", "value": "Alice"}
+{"do": "ui", "target": "#join-video", "event": "onPress"}
+{"do": "get", "object": "CallRoom/studio", "expectContains": {"peers": ["Alice"]}}
+{"do": "assertScreen", "contains": ["End Call", "Mute", "Camera Off", "Peers (1/2)"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
