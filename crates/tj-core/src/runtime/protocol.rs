@@ -119,6 +119,8 @@ pub enum Input {
     /// The viewer's active BCP-47 locale tag (e.g. `"en"`, `"ar"`, `"fr-CA"`, or `"pseudo"`
     /// for pseudo-localization). Triggers a UI re-render when it changes.
     Locale { locale: String },
+    /// One render frame elapsed (`dt` in seconds, finite and >= 0); runs `@frame` hooks on loaded device objects.
+    Frame { dt: f64 },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -328,6 +330,13 @@ impl TryFrom<Json> for Input {
                 "identity" => Input::Identity { user: f.opt_string("user")?, roles: f.roles()? },
                 "entropy" => Input::Entropy { bytes: f.string("bytes")? },
                 "locale" => Input::Locale { locale: f.string("locale")? },
+                "frame" => {
+                    let dt = f.number("dt")?;
+                    if !dt.is_finite() || dt < 0.0 {
+                        return Err("`dt` must be a finite non-negative number".into());
+                    }
+                    Input::Frame { dt }
+                }
                 "tick" => Input::Tick,
                 "inspect" => Input::Inspect { reply: f.opt_u64("reply")? },
                 other => return Err(format!("unknown type `{other}`")),
@@ -389,6 +398,7 @@ mod tests {
             Input::Identity { user: None, roles: Vec::new() },
             Input::Entropy { bytes: "ab".repeat(32) },
             Input::Locale { locale: "ar-SA".into() },
+            Input::Frame { dt: 0.016 },
             Input::Tick,
             Input::Inspect { reply: Some(5) },
         ];
@@ -406,6 +416,7 @@ mod tests {
         assert!(err(r#"{"type":"call","object":"A/b","method":"m","args":3}"#).contains("`args` must be an array"));
         assert!(err(r#"{"type":"ui","target":{},"event":"onPress"}"#).contains("`target` needs `node`, `id` or `text`"));
         assert!(err(r#"{"type":"get","object":"A/b","caller":{"roles":["x"]}}"#).contains("missing `id`"));
+        assert!(err(r#"{"type":"frame","dt":-0.1}"#).contains("finite non-negative"));
         assert!(err(r#"[1]"#).contains("an input must be a JSON object"));
     }
 }

@@ -30,10 +30,11 @@ and the same agents can drive and inspect the running app.
    every device holds a live, offline-cached replica of them (the server is the authority).
 6. **Talk to the world.** `fetch` for REST from any host. More transports later.
 7. **Agent loop as a building block** (after the hosts are solid).
-8. **GPU graphics and 3D as an optional module** (`tj-gfx`, after the web host). One Rust renderer
-   on `wgpu` (Vulkan / Metal / D3D12 / GLES 3 / WebGPU / WebGL2, so old devices still work).
-   Scenes are declared in the same catalog (`<Scene>`, `<Mesh>`, `<Camera>`, `<Light>`) and patched
-   like UI, plus a `@frame(dt)` hook. Hosts opt in, so apps without 3D stay small.
+8. **GPU graphics and 3D as an optional module (done)** (`crates/tj-gfx`, `docs/gfx.md`). One Rust renderer
+   on `wgpu` (Vulkan / Metal / D3D12 / GLES 3 / WebGPU / WebGL2, so old devices still work) plus an
+   opt-in plain-ES2017 WebGL2 web plugin (`hosts/web/plugins/gfx.js`). Scenes are declared in the
+   same catalog (`<Scene>`, `<Mesh>`, `<Camera>`, `<Light>`) and patched like UI, plus a `@frame(dt)`
+   hook (`Input::Frame`). Hosts opt in, so apps without 3D stay small.
 
 ## Order of work (agreed)
 

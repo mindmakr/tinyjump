@@ -448,6 +448,11 @@ fn find_web_webrtc_js() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn find_web_gfx_js() -> Option<PathBuf> {
+    let candidates = [workspace_dir().join("hosts/web/plugins/gfx.js"), PathBuf::from("hosts/web/plugins/gfx.js")];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Resolves the WASM runtime for `--web`. Returns `(path, used_aot, stale_aot_note)`.
 fn find_wasm(explicit: Option<&Path>, require_aot: bool) -> (Option<PathBuf>, bool, Option<String>) {
     if let Some(p) = explicit {
@@ -628,10 +633,22 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             } else if stale_webrtc_js.exists() {
                 let _ = fs::remove_file(&stale_webrtc_js);
             }
+            let has_frame = program.has_frame();
+            let has_gfx = program.uses_scene() || has_frame;
+            let stale_gfx_js = dest.join("gfx-plugin.js");
+            if has_gfx {
+                if let Some(gjs) = find_web_gfx_js() {
+                    fs::copy(&gjs, &stale_gfx_js).map_err(|e| format!("cannot copy {}: {e}", gjs.display()))?;
+                } else {
+                    notes.push("hosts/web/plugins/gfx.js not found in workspace; copy it as gfx-plugin.js into this folder".into());
+                }
+            } else if stale_gfx_js.exists() {
+                let _ = fs::remove_file(&stale_gfx_js);
+            }
             if has_server_objects && opts.server_url.is_none() {
                 notes.push("this app has @server objects; pass --server <url> (or '' for same-origin) so the web host knows where `tj serve` runs".into());
             }
-            let html = web_index_html(title, opts.server_url, &host_plugins, has_video_call);
+            let html = web_index_html(title, opts.server_url, &host_plugins, has_video_call, has_gfx, has_frame);
             fs::write(dest.join("index.html"), html).map_err(|e| format!("cannot write index.html: {e}"))?;
             let manifest = json!({
                 "target": "web",
@@ -1222,7 +1239,7 @@ fn strip_win_unc(p: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
 }
 
-fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], video_call: bool) -> String {
+fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], video_call: bool, gfx: bool, has_frame: bool) -> String {
     let escaped = escape_xml(title);
     let server_opt = match server {
         Some(url) => {
@@ -1252,8 +1269,16 @@ fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], vide
     } else {
         (String::new(), String::new())
     };
+    let (gfx_import, gfx_opt) = if gfx {
+        (
+            "import { createGfxPlugin } from './gfx-plugin.js';\n".to_string(),
+            format!(", gfx: createGfxPlugin({{ animate: {has_frame} }})"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}{webrtc_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt}{webrtc_opt} }}));\n</script>\n</body>\n</html>\n"
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}{webrtc_import}{gfx_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt}{webrtc_opt}{gfx_opt} }}));\n</script>\n</body>\n</html>\n"
     )
 }
 
@@ -1565,11 +1590,28 @@ function App() {
         let app_file = dir.join("app.tj");
         fs::write(&app_file, "function App() { return <Column><Text>hi</Text></Column> }\n").unwrap();
 
-        // 1. Without device permissions: 0 extra plugin files or hooks on Web, Android, iOS.
+        // 1. Without device permissions or 3D scene: 0 extra plugin files or hooks on Web, Android, iOS.
         let web_plain = dir.join("web-plain");
         build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_plain), ..Default::default() }).unwrap();
         assert!(!web_plain.join("device-plugins.js").exists());
-        assert!(!fs::read_to_string(web_plain.join("index.html")).unwrap().contains("device-plugins.js"));
+        assert!(!web_plain.join("gfx-plugin.js").exists());
+        let plain_html = fs::read_to_string(web_plain.join("index.html")).unwrap();
+        assert!(!plain_html.contains("device-plugins.js"));
+        assert!(!plain_html.contains("gfx-plugin.js"));
+
+        // 1b. App using `<Scene>` bundles `gfx-plugin.js` only when opted in, and cleans stale copies when removed.
+        let scene_file = dir.join("scene.tj");
+        fs::write(&scene_file, "function App() { return <Scene><Mesh geometry=\"box\" /></Scene> }\n").unwrap();
+        let web_3d = dir.join("web-3d");
+        build_app(&scene_file, Target::Web, &BuildOpts { out: Some(&web_3d), ..Default::default() }).unwrap();
+        assert!(web_3d.join("gfx-plugin.js").exists());
+        let html_3d = fs::read_to_string(web_3d.join("index.html")).unwrap();
+        assert!(html_3d.contains("import { createGfxPlugin } from './gfx-plugin.js';"));
+        assert!(html_3d.contains("gfx: createGfxPlugin({ animate: false })"));
+        // Rebuilding plain app into the same output dir cleans stale `gfx-plugin.js`.
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_3d), ..Default::default() }).unwrap();
+        assert!(!web_3d.join("gfx-plugin.js").exists());
+        assert!(!fs::read_to_string(web_3d.join("index.html")).unwrap().contains("gfx-plugin.js"));
 
         let and_plain = dir.join("and-plain");
         build_app(&app_file, Target::Android, &BuildOpts { out: Some(&and_plain), app_id: Some("com.example.plain"), ..Default::default() }).unwrap();

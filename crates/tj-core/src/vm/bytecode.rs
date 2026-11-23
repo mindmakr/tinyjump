@@ -1,4 +1,4 @@
-//! Ahead-of-time bytecode serialization (`TJB\x02`) and validation.
+//! Ahead-of-time bytecode serialization (`TJB\x03`) and validation.
 //!
 //! `tj build` compiles a `.tj` app once into compact binary bytecode (`.tjb`) or a
 //! UTF-8 bundle (`//# tjb:1:<base64>`) that every host (`tj-wasm`, `tj-android`, `tj-ffi`,
@@ -12,8 +12,8 @@ use super::value::Value;
 use indexmap::IndexMap;
 use std::rc::Rc;
 
-/// Binary `.tjb` file header: magic `TJB` + format version `2`.
-pub const MAGIC: &[u8; 4] = b"TJB\x02";
+/// Binary `.tjb` file header: magic `TJB` + format version `3`.
+pub const MAGIC: &[u8; 4] = b"TJB\x03";
 
 /// UTF-8 transport prefix accepted by `JsonHost::boot` and `tj serve` alongside `.tj` source.
 pub const BUNDLE_PREFIX: &str = "//# tjb:1:";
@@ -294,6 +294,9 @@ fn validate(p: &Program) -> Res<()> {
                     return Err("bytecode invalid @every duration");
                 }
             }
+            if m.frame && (o.server || m.invariant || m.every.is_some() || m.allow.is_some() || m.exclusive || m.params.len() > 1) {
+                return Err("bytecode invalid @frame method");
+            }
             check_root_proto(m.proto)?;
         }
     }
@@ -351,7 +354,7 @@ pub fn decode(bytes: &[u8]) -> Result<Program, String> {
 fn decode_inner(bytes: &[u8]) -> Res<Program> {
     let mut r = Reader { bytes, pos: 0 };
     if r.take(4)? != MAGIC {
-        return Err("invalid bytecode header (expected TJB v2)");
+        return Err("invalid bytecode header (expected TJB v3)");
     }
     if r.u16()? as usize != builtins::GLOBALS.len() {
         return Err("bytecode builtin count mismatch; rebuild with this tj version");
@@ -466,6 +469,7 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
             let allow = r.opt_str_list()?;
             let exclusive = r.bool()?;
             let invariant = r.bool()?;
+            let frame = r.bool()?;
             let n_params = r.count(6)?;
             let mut params = Vec::with_capacity(n_params);
             for _ in 0..n_params {
@@ -474,7 +478,7 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
             if methods.contains_key(&mname) {
                 return Err("bytecode duplicate method name");
             }
-            methods.insert(mname, MethodDef { proto, private, every, allow, exclusive, invariant, params });
+            methods.insert(mname, MethodDef { proto, private, every, allow, exclusive, invariant, frame, params });
         }
         objects.push(ObjectDef { name, fields, init, methods, server, read, pii, guards, retain, hold });
     }
@@ -855,6 +859,7 @@ mod enc {
                 w.opt_str_list(&m.allow)?;
                 w.bool(m.exclusive);
                 w.bool(m.invariant);
+                w.bool(m.frame);
                 w.len(m.params.len())?;
                 for (pname, opt, ty) in &m.params {
                     w.str(pname)?;

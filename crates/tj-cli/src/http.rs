@@ -735,8 +735,8 @@ fn handle(mut req: Request, front: &Front) {
             asked = Some(("whoami", None, None));
             take_verified()
         }.map(|v| match v.caller {
-            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call() }),
-            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call() }),
+            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
+            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
         (Method::Get, ["_tj", "metrics"]) => {
@@ -900,6 +900,15 @@ fn handle(mut req: Request, front: &Front) {
                             .with_header(header("Cache-Control", "no-store"))
                     } else {
                         file(web.web_dir.join("plugins/webrtc.js"), "text/javascript; charset=utf-8")
+                    }
+                }
+                ["gfx-plugin.js"] => {
+                    if !engine.has_gfx() {
+                        Response::from_data("export function createGfxPlugin(){return null;}\n")
+                            .with_header(header("Content-Type", "text/javascript; charset=utf-8"))
+                            .with_header(header("Cache-Control", "no-store"))
+                    } else {
+                        file(web.web_dir.join("plugins/gfx.js"), "text/javascript; charset=utf-8")
                     }
                 }
                 ["tinyjump.wasm"] => file(web.wasm.clone(), "application/wasm"),
@@ -2185,13 +2194,16 @@ mod tests {
         let who1: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port1}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
         assert_eq!(who1["ok"]["devicePlugins"], json!([]));
         assert_eq!(who1["ok"]["videoCall"], json!(false));
+        assert_eq!(who1["ok"]["gfx"], json!(false));
         let dev_stub = agent.get(&format!("http://127.0.0.1:{port1}/device-plugins.js")).call().unwrap().into_string().unwrap();
         assert!(dev_stub.len() < 80 && dev_stub.contains("createDevicePlugins"));
         let rtc_stub = agent.get(&format!("http://127.0.0.1:{port1}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(rtc_stub.len() < 80 && rtc_stub.contains("createVideoCallComponents"));
+        let gfx_stub = agent.get(&format!("http://127.0.0.1:{port1}/gfx-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(gfx_stub.len() < 80 && gfx_stub.contains("createGfxPlugin"));
 
-        // 2. VideoCall app with camera+microphone permissions: full plugin files served.
-        let src_call = "function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }\n".to_string();
+        // 2. VideoCall + 3D Scene app with camera+microphone permissions: full plugin files served.
+        let src_call = "function App() { return <Column><Native name=\"VideoCall\" active={false} /><Scene><Mesh geometry=\"box\" /></Scene></Column> }\n".to_string();
         let mut perms = std::collections::BTreeMap::new();
         perms.insert("camera".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
         perms.insert("microphone".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
@@ -2221,10 +2233,13 @@ mod tests {
         let who2: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port2}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
         assert_eq!(who2["ok"]["devicePlugins"], json!(["camera"]));
         assert_eq!(who2["ok"]["videoCall"], json!(true));
+        assert_eq!(who2["ok"]["gfx"], json!(true));
         let dev_full = agent.get(&format!("http://127.0.0.1:{port2}/device-plugins.js")).call().unwrap().into_string().unwrap();
         assert!(dev_full.len() > 2000 && dev_full.contains("handleCamera"));
         let rtc_full = agent.get(&format!("http://127.0.0.1:{port2}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(rtc_full.len() > 2000 && rtc_full.contains("RTCPeerConnection"));
+        let gfx_full = agent.get(&format!("http://127.0.0.1:{port2}/gfx-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(gfx_full.len() > 2000 && gfx_full.contains("createGfxPlugin"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -144,6 +144,8 @@ pub struct MethodDef {
     /// `@invariant`: synchronous boolean check run before saving modified objects; returning
     /// `false` or throwing rolls the turn's changes back and fails the call.
     pub invariant: bool,
+    /// `@frame`: synchronous per-frame hook invoked by [`Input::Frame { dt }`] on loaded device objects.
+    pub frame: bool,
     /// Its parameters: name, whether it may be left out, and type. A call from outside (the
     /// HTTP API, another device) is checked against them before the method runs.
     pub params: Vec<(Rc<str>, bool, ArgTy)>,
@@ -344,5 +346,15 @@ impl Program {
 
     pub fn object(&self, name: &str) -> Option<u16> {
         self.objects.iter().position(|o| &*o.name == name).map(|i| i as u16)
+    }
+
+    /// Whether the compiled app declares a `<Scene>` element (works for both `.tj` and AOT `.tjb`).
+    pub fn uses_scene(&self) -> bool {
+        self.elems.iter().any(|e| &*e.kind == "Scene")
+    }
+
+    /// Whether any object in the compiled app declares a `@frame` method.
+    pub fn has_frame(&self) -> bool {
+        self.objects.iter().any(|o| o.methods.values().any(|m| m.frame))
     }
 }

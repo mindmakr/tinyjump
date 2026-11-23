@@ -66,7 +66,7 @@ const ICONS = {
   download: 'M12 4v11M8 11l4 4 4-4M5 19h14',
 };
 
-const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Format', 'Tabs', 'Icon', 'List', 'Theme'];
+const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Format', 'Tabs', 'Icon', 'List', 'Theme', 'Scene', 'Mesh', 'Camera', 'Light'];
 const REGISTRY = new Map();
 const PLUGINS = new Map();
 
@@ -186,6 +186,7 @@ export async function start(opts) {
       plugins.set(k, opts.plugins[k] == null ? null : opts.plugins[k]);
     });
   }
+  const gfx = opts.gfx || null;
   const pending = new Map();
   let nextReply = 1;
   let wakeTimer = null;
@@ -232,7 +233,7 @@ export async function start(opts) {
   function apply(outputs) {
     for (const o of outputs) {
       switch (o.type) {
-        case 'patch': o.ops.forEach(patch); break;
+        case 'patch': o.ops.forEach(patch); if (gfx && typeof gfx.flush === 'function') gfx.flush(); break;
         case 'effect': runEffect(o.id, o.effect); break;
         case 'subscribe': subscribe(o.object, o.seq); break;
         case 'wake': wake(o.at); break;
@@ -570,6 +571,28 @@ export async function start(opts) {
         }
         break;
       }
+      case 'Scene': {
+        let creating = true;
+        const emit = (event, value) => {
+          if (!creating && el && el.__tj && !el.__quiet && el.__tj.events.indexOf(event) >= 0) {
+            send({ type: 'ui', target: { node: id }, event, value: value === undefined ? null : value });
+          }
+        };
+        if (gfx && typeof gfx.createScene === 'function') {
+          el = gfx.createScene(id, Object.assign({}, props), emit);
+        } else {
+          el = document.createElement('div');
+          el.className = 'tj-native-missing';
+          el.textContent = '<Scene>';
+        }
+        creating = false;
+        el.__scene = true;
+        break;
+      }
+      case 'Mesh':
+      case 'Camera':
+      case 'Light':
+        return { __gfx3d: true, style: {}, dataset: {} };
       default: el = document.createElement('div'); el.className = 'tj-' + kind.toLowerCase();
     }
     return el;
@@ -665,6 +688,7 @@ export async function start(opts) {
   }
 
   function setProp(el, kind, k, v) {
+    if (el.__gfx3d) return;
     const s = el.style;
     const none = v === null || v === undefined;
     if (el.__native) {
@@ -846,6 +870,7 @@ export async function start(opts) {
   }
 
   function patch(op) {
+    if (gfx && typeof gfx.onPatch === 'function') gfx.onPatch(op);
     switch (op.op) {
       case 'create': {
         const el = create(op.id, op.kind, op.props);
@@ -864,12 +889,13 @@ export async function start(opts) {
       }
       case 'children': {
         const rawParent = nodes.get(op.id);
-        if (!rawParent) break;
+        if (!rawParent || rawParent.__scene || rawParent.__gfx3d) break;
         if (rawParent.__native && !rawParent.__native.container) break;
         const parent = rawParent.__native ? rawParent.__native.container : rawParent;
         if (rawParent.__list && op.ids.length < parent.childNodes.length) rawParent.__list.lastExtent = -1;
         op.ids.forEach((cid, i) => {
           const child = nodes.get(cid);
+          if (!child || child.__gfx3d) return;
           if (parent.childNodes[i] !== child) parent.insertBefore(child, parent.childNodes[i] || null);
         });
         while (parent.childNodes.length > op.ids.length) parent.removeChild(parent.lastChild);
@@ -878,6 +904,7 @@ export async function start(opts) {
       case 'remove': {
         const el = nodes.get(op.id);
         if (el && el.__themeCleanup) el.__themeCleanup();
+        if (el && el.__scene && gfx && typeof gfx.destroyScene === 'function') gfx.destroyScene(op.id);
         if (el && el.__native && el.__native.spec && typeof el.__native.spec.destroy === 'function') {
           el.__native.spec.destroy(el);
         }
@@ -895,8 +922,8 @@ export async function start(opts) {
     const vh = window.innerHeight;
     return list.map((n) => {
       const el = nodes.get(n.id);
-      const r = el ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
-      const visible = !!el && r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+      const r = el && !el.__gfx3d && typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+      const visible = !!el && !el.__gfx3d && r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
       return Object.assign({}, n, {
         // A time or formatted number shows what the platform made of it, so agents read what people see.
         props: el && (el.__time || el.__format) ? Object.assign({}, n.props, { text: el.textContent }) : n.props,
@@ -945,6 +972,7 @@ export async function start(opts) {
       return Promise.resolve(null);
     },
     tick: () => send({ type: 'tick' }),
+    frame: (dt) => send({ type: 'frame', dt }),
     /** The signed-in user's token and id; a new id drops what the previous user queued or saw. */
     setToken,
     /** Forgets the token, the replicas and every queued server call. */
@@ -959,6 +987,7 @@ export async function start(opts) {
 
   // ---------- boot ----------
 
+  if (gfx && typeof gfx.attach === 'function') gfx.attach(send);
   const [p, n] = writeStr(opts.source);
   // The seed drives Math.random (set it to replay a run); ids and crypto.randomId() use the
   // secure bytes sent as `entropy` below.

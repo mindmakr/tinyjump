@@ -15,7 +15,7 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
    Boot returns the first outputs, including the initial `patch`. An app of several files
    is passed as one **bundle**: each file follows a line `//# file: <path>`, with the path
    relative to the entry file's folder and the entry first. A one-file app is just its
-   source. A precompiled AOT bytecode file (`tj build <app.tj>`) uses the binary `TJB\x02`
+   source. A precompiled AOT bytecode file (`tj build <app.tj>`) uses the binary `TJB\x03`
    format; for text-based host boundaries (`JsonHost::boot` on Web, Android and iOS, and
    `tj build` `--web` / `--android` / `--ios` asset bundles), the same bytecode is wrapped
    as a UTF-8 bundle `//# tjb:1:<base64>`, skipping the compiler on devices with no ABI
@@ -41,6 +41,7 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
 | `identity` | `user`: the signed-in user's id, or `null`; `roles` (optional): their roles as the server reports them (`GET /api/whoami`). Devices only. They become `caller` in local code (`""` and `[]` when signed out), and the UI is drawn again. A new user drops the server calls queued by the previous one and clears the replicas | — |
 | `entropy` | `bytes`: at least 32 bytes from the platform's secure random source, as hex. Every host sends it right after boot (before `identity`). Each delivery is mixed into the generator behind device ids and `crypto.randomId()`, never replacing it, so known bytes cannot make ids guessable. Until it arrives, `crypto.randomId()` throws | — |
 | `locale` | `locale`: BCP-47 locale tag (e.g. `"en"`, `"ar-SA"`, `"fr"`, or `"pseudo"` for pseudo-localization). Sets the active locale for `t()` and re-renders the UI when it changes. Hosts send their system/browser locale after boot and expose `setLocale(tag)` | — |
+| `frame` | `dt`: finite non-negative seconds since the previous frame (e.g. `0.016`). Runs `@frame` hooks on loaded local device objects and re-renders the view tree (including `<Scene>` patches) | — |
 | `tick` | — | — |
 | `inspect` | — | `{ tree, objects, outbox, wake, locale, metrics, stats }` |
 

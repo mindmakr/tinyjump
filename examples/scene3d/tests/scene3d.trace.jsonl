@@ -1,0 +1,24 @@
+# Deterministic trace test for examples/scene3d/app.tj
+{"do": "boot", "now": 1800000000000, "seed": 1, "server": false, "render": true}
+{"do": "assertScreen", "contains": ["TinyJump 3D Scene", "Cube clicks: 0", "Pause", "Wireframe"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+
+# Step @frame(dt) deterministically and verify rotation advances
+{"do": "frame", "dt": 0.5, "count": 2}
+{"do": "get", "object": "Stage/main", "expect": {"angle": 1.2, "speed": 1.2, "paused": false, "clicks": 0, "wireframe": false}}
+
+# Click the 3D hero cube (`<Mesh id="hero-cube" onPress={...}>`)
+{"do": "ui", "target": "#hero-cube", "event": "onPress"}
+{"do": "assertScreen", "contains": ["Cube clicks: 1"]}
+
+# Pause animation and verify subsequent frames hold angle steady
+{"do": "ui", "target": "#pause", "event": "onPress"}
+{"do": "assertScreen", "contains": ["Resume"]}
+{"do": "frame", "dt": 0.5, "count": 2}
+{"do": "get", "object": "Stage/main", "expect": {"angle": 1.2, "speed": 1.2, "paused": true, "clicks": 1, "wireframe": false}}
+
+# Toggle wireframe and reset
+{"do": "ui", "target": "#wire", "event": "onPress"}
+{"do": "assertScreen", "contains": ["Solid"]}
+{"do": "ui", "target": "#reset", "event": "onPress"}
+{"do": "get", "object": "Stage/main", "expect": {"angle": 0, "speed": 1.2, "paused": false, "clicks": 0, "wireframe": false}}

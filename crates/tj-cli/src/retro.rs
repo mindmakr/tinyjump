@@ -258,7 +258,7 @@ pub(crate) fn check_dead_methods(source: &str, out: &mut Vec<RetroFinding>) {
                         entry.push((None, field_refs));
                     }
                     for m in &o.methods {
-                        let special = m.decorators.iter().any(|d| matches!(d.name.as_str(), "every" | "invariant"));
+                        let special = m.decorators.iter().any(|d| matches!(d.name.as_str(), "every" | "invariant" | "frame"));
                         if m.private && !special {
                             private_methods.push((o.name.clone(), m.func.name.clone()));
                         }

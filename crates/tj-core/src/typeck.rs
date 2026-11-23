@@ -107,6 +107,10 @@ fn builtin(name: &str) -> Option<Ty> {
             ("sign", num1()),
             ("sqrt", num1()),
             ("pow", func(&[("x", Ty::Num, false), ("y", Ty::Num, false)], None, Ty::Num)),
+            ("sin", num1()),
+            ("cos", num1()),
+            ("tan", num1()),
+            ("atan2", func(&[("y", Ty::Num, false), ("x", Ty::Num, false)], None, Ty::Num)),
             ("min", func(&[], Some(Ty::Num), Ty::Num)),
             ("max", func(&[], Some(Ty::Num), Ty::Num)),
             ("random", func(&[], None, Ty::Num)),
@@ -321,9 +325,23 @@ pub fn check_with_locales(items: &[&Item], locales: &crate::i18n::Locales) -> Ve
                 for m in &o.methods {
                     let saved = c.this_obj.replace(name.clone());
                     let is_inv = m.decorators.iter().any(|d| d.name == "invariant");
+                    let is_frame = m.decorators.iter().any(|d| d.name == "frame");
                     #[cfg(feature = "check")]
                     let saved_server = std::mem::replace(&mut c.this_server, is_server && !is_inv);
                     let fn_ty = c.function(&m.func, None);
+                    if is_frame {
+                        if let Some((pname, pty, _)) = fn_ty.params.first() {
+                            if !c.assignable(&Ty::Num, pty) {
+                                c.errors.push(
+                                    Diagnostic::new(
+                                        format!("@frame method {}.{} parameter '{pname}' must accept number, got {pty}", o.name, m.func.name),
+                                        m.func.params[0].pattern.span(),
+                                    )
+                                    .hint("write `@frame step(dt: number) { ... }`"),
+                                );
+                            }
+                        }
+                    }
                     if is_inv {
                         let bad_ret = match &m.func.ret {
                             Some(r) => {
