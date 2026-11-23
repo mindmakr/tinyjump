@@ -4,7 +4,7 @@
 //! Devices and standalone servers boot `.tjb` bytecode directly via `Program::from_bytes` /
 //! `Program::from_bundle`, skipping the lexer, parser, type-checker and compiler at startup.
 
-use crate::{app, registry, remotes};
+use crate::{app, registry, remotes, webhooks};
 use serde_json::{json, Value as Json};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -40,14 +40,14 @@ impl Target {
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--runner <file>] [--assemble] [--min-trust <level>] [--json]";
+    let usage = "usage: tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--server <url>] [--runner <file>] [--min-trust <level>] [--json]";
     let mut file: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut target = Target::Bytecode;
     let mut target_set = false;
     let mut wasm: Option<PathBuf> = None;
+    let mut server_url: Option<String> = None;
     let mut runner: Option<PathBuf> = None;
-    let mut assemble = false;
     let mut min_trust: Option<registry::Trust> = None;
     let mut json_out = false;
 
@@ -72,15 +72,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--android" => set_target(Target::Android)?,
             "--ios" => set_target(Target::Ios)?,
             "--wasm" => wasm = Some(PathBuf::from(value()?)),
+            "--server" => server_url = Some(value()?.clone()),
             "--runner" => runner = Some(PathBuf::from(value()?)),
-            "--assemble" => assemble = true,
             "--min-trust" => min_trust = Some(registry::Trust::parse(value()?)?),
             "--json" => json_out = true,
             other => return Err(format!("unknown option {other}\n\n{usage}")),
         }
     }
     let entry = file.ok_or_else(|| format!("`tj build` needs an app file\n\n{usage}"))?;
-    let report = build_app(&entry, target, out.as_deref(), wasm.as_deref(), runner.as_deref(), assemble, min_trust)?;
+    let report = build_app(&entry, target, out.as_deref(), wasm.as_deref(), server_url.as_deref(), runner.as_deref(), min_trust)?;
     if json_out {
         println!("{}", serde_json::to_string_pretty(&report).expect("json"));
     } else {
@@ -149,8 +149,8 @@ fn build_app(
     target: Target,
     out: Option<&Path>,
     wasm: Option<&Path>,
+    server_url: Option<&str>,
     runner: Option<&Path>,
-    assemble: bool,
     min_trust: Option<registry::Trust>,
 ) -> Result<Json, String> {
     let app_dir = entry.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -165,14 +165,17 @@ fn build_app(
     let program = tj_core::compile(&loaded.source).map_err(|errs| {
         errs.iter().map(|d| d.render(&entry.display().to_string(), &loaded.source)).collect::<Vec<_>>().join("\n\n")
     })?;
-    // Enforce remote privacy-flow checks if remotes.json sits next to the app.
+    // Enforce remote privacy-flow and webhook validation if remotes.json / webhooks.json sit next to the app.
+    let private_fetch = std::env::var(crate::engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let fetch_allow = crate::engine::fetch_allow_from_env()?;
-    let rem = remotes::Remotes::load(entry, &program, false, true, &fetch_allow)?;
+    let rem = remotes::Remotes::load(entry, &program, false, private_fetch, &fetch_allow)?;
+    let rem_classes = rem.classes();
     let rem_dests = rem.destinations();
     let flow_errs = tj_core::check_remote_flows(&loaded.source, &rem_dests);
     if !flow_errs.is_empty() {
         return Err(flow_errs.iter().map(|d| d.render(&entry.display().to_string(), &loaded.source)).collect::<Vec<_>>().join("\n\n"));
     }
+    let _ = webhooks::Webhooks::load(entry, &program, &rem_classes, false, private_fetch, &fetch_allow)?;
 
     let bytes = program.to_bytes()?;
     let bundle = bytecode::bundle_from_bytes(&bytes);
@@ -181,6 +184,7 @@ fn build_app(
     let name = app_name(entry);
     let objects: Vec<&str> = program.objects.iter().map(|o| &*o.name).collect();
     let has_ui = program.app.is_some();
+    let has_server_objects = program.objects.iter().any(|o| o.server);
     let mut notes: Vec<String> = Vec::new();
 
     let output_path = match target {
@@ -208,7 +212,10 @@ fn build_app(
             } else {
                 notes.push("tj_wasm.wasm not found; run `cargo web` and re-run `tj build --web` (or pass --wasm <file>)".into());
             }
-            let html = web_index_html(&name);
+            if has_server_objects && server_url.is_none() {
+                notes.push("this app has @server objects; pass --server <url> (or '' for same-origin) so the web host knows where `tj serve` runs".into());
+            }
+            let html = web_index_html(&name, server_url);
             fs::write(dest.join("index.html"), html).map_err(|e| format!("cannot write index.html: {e}"))?;
             let manifest = json!({
                 "target": "web",
@@ -235,6 +242,11 @@ fn build_app(
             if cfg!(windows) && runner.is_none() {
                 notes.push("packaged using the current Windows tj binary; pass --runner <path-to-linux-tj> to cross-package a Linux ELF".into());
             }
+            for sidecar in ["plugins.json", "remotes.json", "webhooks.json"] {
+                if app_dir.join(sidecar).exists() {
+                    notes.push(format!("{sidecar} is not loaded by standalone binaries yet; deploy with `tj serve <app.tj>` when using {sidecar}"));
+                }
+            }
             dest
         }
         Target::Android => {
@@ -256,12 +268,9 @@ fn build_app(
                 .map_err(|e| format!("cannot write manifest.json: {e}"))?;
             fs::write(
                 dest.join("README.txt"),
-                "Load assets/app.tjb as a UTF-8 string and pass it to TinyJump.start(context, root, source).\nThe runtime boots directly from AOT bytecode without running the compiler.\n",
+                "assets/app.tjb is a UTF-8 AOT bytecode bundle (//# tjb:1:<base64>).\nLoad it as a UTF-8 string and pass it to TinyJump.start(context, root, source).\nThe runtime boots directly from AOT bytecode without running the compiler.\n",
             )
             .map_err(|e| format!("cannot write README.txt: {e}"))?;
-            if assemble {
-                assemble_android()?;
-            }
             dest
         }
         Target::Ios => {
@@ -283,12 +292,9 @@ fn build_app(
                 .map_err(|e| format!("cannot write manifest.json: {e}"))?;
             fs::write(
                 dest.join("README.txt"),
-                "Bundle Resources/app.tjb into your Xcode target and pass its UTF-8 contents to TinyJump.start(root:source:).\nThe runtime boots directly from AOT bytecode without running the compiler.\n",
+                "Resources/app.tjb is a UTF-8 AOT bytecode bundle (//# tjb:1:<base64>).\nBundle it into your Xcode target and pass its UTF-8 contents to TinyJump.start(root:source:).\nThe runtime boots directly from AOT bytecode without running the compiler.\n",
             )
             .map_err(|e| format!("cannot write README.txt: {e}"))?;
-            if assemble {
-                assemble_ios()?;
-            }
             dest
         }
     };
@@ -306,7 +312,7 @@ fn build_app(
     }))
 }
 
-fn web_index_html(title: &str) -> String {
+fn web_index_html(title: &str, server: Option<&str>) -> String {
     let escaped: String = title
         .chars()
         .map(|c| match c {
@@ -317,20 +323,28 @@ fn web_index_html(title: &str) -> String {
             _ => c.to_string(),
         })
         .collect();
+    let server_opt = match server {
+        Some(url) => format!(", server: {}", serde_json::to_string(url).expect("json string")),
+        None => String::new(),
+    };
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body,#app{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\nfetch('./app.tjb').then((r) => r.text()).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app') }}));\n</script>\n</body>\n</html>\n"
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\nfetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt} }}));\n</script>\n</body>\n</html>\n"
     )
 }
 
 /// Appends a compiled `.tjb` payload + 48-byte SHA-256 trailer to a copy of `runner`.
-/// Any existing embedded trailer on `runner` is stripped first.
+/// Any existing verified embedded trailer on `runner` is stripped first.
 pub fn package_standalone(runner: &Path, bytecode: &[u8], out: &Path) -> Result<(), String> {
     if (bytecode.len() as u64) > MAX_EMBEDDED_BYTES {
         return Err(format!("bytecode payload ({} bytes) exceeds 64 MiB limit", bytecode.len()));
     }
     let mut base = fs::read(runner).map_err(|e| format!("cannot read runner {}: {e}", runner.display()))?;
-    // If runner itself already carries an embedded app, strip it cleanly before appending the new one.
-    if let Some((payload_start, _)) = find_trailer(&base)? {
+    // If runner itself carries an embedded app, verify its SHA-256 before stripping it.
+    if let Some((payload_start, expected)) = find_trailer(&base)? {
+        let payload_end = base.len() - TRAILER_LEN as usize;
+        if sha256(&base[payload_start..payload_end]) != expected {
+            return Err("runner carries a corrupt embedded app trailer (SHA-256 mismatch)".into());
+        }
         base.truncate(payload_start);
     }
     let digest = sha256(bytecode);
@@ -347,7 +361,8 @@ pub fn package_standalone(runner: &Path, bytecode: &[u8], out: &Path) -> Result<
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(out, fs::Permissions::from_mode(0o755));
+        fs::set_permissions(out, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("cannot mark {} executable: {e}", out.display()))?;
     }
     Ok(())
 }
@@ -404,45 +419,11 @@ pub fn embedded_app() -> Result<Option<Vec<u8>>, String> {
     extract_embedded(&exe)
 }
 
-fn assemble_android() -> Result<(), String> {
-    let android_dir = workspace_dir().join("hosts/android");
-    let gradlew = if cfg!(windows) { android_dir.join("gradlew.bat") } else { android_dir.join("gradlew") };
-    if !gradlew.exists() {
-        return Err(format!("Android Gradle wrapper not found at {}; bundle was staged without assembling an APK", gradlew.display()));
-    }
-    if std::env::var_os("ANDROID_HOME").is_none() && std::env::var_os("ANDROID_SDK_ROOT").is_none() {
-        return Err("ANDROID_HOME is not set; set ANDROID_HOME to assemble an Android APK".into());
-    }
-    let status = std::process::Command::new(&gradlew)
-        .current_dir(&android_dir)
-        .arg(":demo:assembleRelease")
-        .status()
-        .map_err(|e| format!("failed to run Gradle: {e}"))?;
-    if !status.success() {
-        return Err(format!("Gradle :demo:assembleRelease failed with status {status}"));
-    }
-    Ok(())
-}
-
-fn assemble_ios() -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err("--ios --assemble requires macOS with Xcode; Resources/app.tjb was staged for Xcode packaging".into());
-    }
-    let ios_dir = workspace_dir().join("hosts/ios");
-    let status = std::process::Command::new("xcodebuild")
-        .current_dir(&ios_dir)
-        .arg("-version")
-        .status()
-        .map_err(|e| format!("xcodebuild not available: {e}"))?;
-    if !status.success() {
-        return Err("xcodebuild failed; ensure Xcode command-line tools are installed".into());
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat;
+    use crate::manifest::Manifest;
     use tj_core::vm::program::Program;
 
     fn tmp(name: &str) -> PathBuf {
@@ -473,7 +454,7 @@ function App() {
 
         // 1. Default bytecode (.tjb) target + binary read-back via app::read.
         let tjb_path = dir.join("out.tjb");
-        let rep = build_app(&app_file, Target::Bytecode, Some(&tjb_path), None, None, false, None).unwrap();
+        let rep = build_app(&app_file, Target::Bytecode, Some(&tjb_path), None, None, None, None).unwrap();
         assert!(tjb_path.exists());
         assert_eq!(rep["target"], json!("bytecode"));
         let raw = fs::read(&tjb_path).unwrap();
@@ -482,11 +463,25 @@ function App() {
         let read_back = app::read(&tjb_path).unwrap();
         assert!(read_back.source.starts_with(bytecode::BUNDLE_PREFIX));
         assert!(tj_core::load(&read_back.source).is_ok());
+        // BT-4: tj_core::compile() fails closed on a .tjb bundle (never treats it as empty comment).
+        assert!(tj_core::compile(&read_back.source).is_err());
 
-        // 2. Web target writes app.tjb, index.html, manifest.json (and copies tinyjump.js).
+        // BT-5: Manifest::build and Snapshot::build preserve objects/methods for AOT .tjb bundles.
+        let aot_manifest = Manifest::build(&read_back.source, &prog, &[]);
+        assert_eq!(aot_manifest.json["aot"], json!(true));
+        let objs = aot_manifest.json["objects"].as_array().unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0]["name"], json!("Notes"));
+        let snap1 = compat::Snapshot::build(&read_back.source, &prog);
+        let prog_empty = tj_core::compile("function App() { return <Column /> }").unwrap();
+        let snap2 = compat::Snapshot::build(&prog_empty.to_bundle().unwrap(), &prog_empty);
+        assert!(compat::has_breaking(&compat::check_snapshots(&snap1, &snap2)), "dropping Notes in AOT reload must be caught as breaking");
+
+        // 2. Web target writes app.tjb, index.html (with flex CSS + r.ok check + --server), tinyjump.js, manifest.json.
         let web_dir = dir.join("web");
-        build_app(&app_file, Target::Web, Some(&web_dir), None, None, false, None).unwrap();
-        assert!(web_dir.join("index.html").exists());
+        build_app(&app_file, Target::Web, Some(&web_dir), None, Some("https://api.example.com"), None, None).unwrap();
+        let html = fs::read_to_string(web_dir.join("index.html")).unwrap();
+        assert!(html.contains("flex-direction:column") && html.contains("r.ok") && html.contains("https://api.example.com"));
         assert!(web_dir.join("tinyjump.js").exists());
         assert!(web_dir.join("manifest.json").exists());
         let web_bundle = fs::read_to_string(web_dir.join("app.tjb")).unwrap();
@@ -494,33 +489,34 @@ function App() {
 
         // 3. Android and iOS targets stage assets/app.tjb and Resources/app.tjb.
         let and_dir = dir.join("android");
-        build_app(&app_file, Target::Android, Some(&and_dir), None, None, false, None).unwrap();
+        build_app(&app_file, Target::Android, Some(&and_dir), None, None, None, None).unwrap();
         assert!(Program::from_bundle(&fs::read_to_string(and_dir.join("assets/app.tjb")).unwrap()).unwrap().is_ok());
         let ios_dir = dir.join("ios");
-        build_app(&app_file, Target::Ios, Some(&ios_dir), None, None, false, None).unwrap();
+        build_app(&app_file, Target::Ios, Some(&ios_dir), None, None, None, None).unwrap();
         assert!(Program::from_bundle(&fs::read_to_string(ios_dir.join("Resources/app.tjb")).unwrap()).unwrap().is_ok());
 
         // 4. Standalone executable packaging: append, verify SHA-256, detect tampering, re-package cleanly.
         let fake_runner = dir.join("fake-runner");
         fs::write(&fake_runner, b"ELF-MOCK-RUNNER-BINARY").unwrap();
         let exe_out = dir.join("my-app");
-        build_app(&app_file, Target::Linux, Some(&exe_out), None, Some(&fake_runner), false, None).unwrap();
+        build_app(&app_file, Target::Linux, Some(&exe_out), None, None, Some(&fake_runner), None).unwrap();
         let extracted = extract_embedded(&exe_out).unwrap().expect("embedded app");
         assert_eq!(extracted, raw);
         assert!(Program::from_bytes(&extracted).is_ok());
 
-        // Re-packaging from an already-packaged executable strips the old trailer cleanly.
+        // Re-packaging from an already-packaged executable strips the verified old trailer cleanly.
         let exe_out2 = dir.join("my-app-2");
         package_standalone(&exe_out, &raw, &exe_out2).unwrap();
         assert_eq!(fs::metadata(&exe_out2).unwrap().len(), fs::metadata(&exe_out).unwrap().len());
 
-        // Flipping 1 byte in the payload fails SHA-256 verification.
+        // Flipping 1 byte in the payload fails SHA-256 verification on extract AND re-package.
         let mut tampered = fs::read(&exe_out).unwrap();
         let idx = b"ELF-MOCK-RUNNER-BINARY".len() + 2;
         tampered[idx] ^= 0xff;
         let bad_exe = dir.join("tampered");
         fs::write(&bad_exe, tampered).unwrap();
         assert!(extract_embedded(&bad_exe).unwrap_err().contains("SHA-256"));
+        assert!(package_standalone(&bad_exe, &raw, &dir.join("repack-bad")).unwrap_err().contains("SHA-256"));
 
         let _ = fs::remove_dir_all(&dir);
     }

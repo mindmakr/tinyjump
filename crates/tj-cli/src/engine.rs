@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tj_core::runtime::protocol::{Caller, Effect};
-use tj_core::{compile, Input, Options, Output, Runtime};
+use tj_core::{Input, Options, Output, Runtime};
 
 const EFFECT_WORKERS: usize = 4;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -431,11 +431,18 @@ fn shadow_validate(
     if smoke_traces.len() > MAX_SMOKE_TRACES {
         return Err((400, format!("at most {MAX_SMOKE_TRACES} smoke traces per reload")));
     }
-    let program = compile(source)
+    let is_bytecode = source.starts_with(tj_core::vm::bytecode::BUNDLE_PREFIX);
+    let program = tj_core::load(source)
         .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")))?;
     let remote_classes = remotes.classes();
     let remote_dests = remotes.destinations();
-    let flow_errs = tj_core::check_remote_flows(source, &remote_dests);
+    if is_bytecode && compliance.is_some() {
+        return Err((400, "reloading a precompiled .tjb bundle under --compliance is refused; send .tj source for static compliance/privacy-flow checks".into()));
+    }
+    if is_bytecode && !remote_dests.is_empty() && program.objects.iter().any(|o| !o.pii.is_empty()) {
+        return Err((400, "reloading a precompiled .tjb bundle with both @pii and remotes.json is refused; send .tj source for static remote-flow checks".into()));
+    }
+    let flow_errs = if is_bytecode { Vec::new() } else { tj_core::check_remote_flows(source, &remote_dests) };
     if !flow_errs.is_empty() {
         return Err((400, flow_errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")));
     }

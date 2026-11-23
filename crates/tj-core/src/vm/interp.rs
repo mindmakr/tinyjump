@@ -133,7 +133,8 @@ impl Runtime {
                 let fr = &f.frames[fi];
                 (fr.closure.clone(), fr.ip, fr.base)
             };
-            let code = &prog.protos[closure.proto as usize].code;
+            let proto = &prog.protos[closure.proto as usize];
+            let code = &proto.code;
 
             macro_rules! throw {
                 ($e:expr) => {{
@@ -153,15 +154,24 @@ impl Runtime {
                     }
                 };
             }
+            let floor = base + proto.locals as usize;
+            const MAX_STACK: usize = 65_536;
+            const MAX_HANDLERS: usize = 1_024;
             macro_rules! pop {
-                () => {
-                    f.stack.pop().expect("stack underflow")
-                };
+                () => {{
+                    if f.stack.len() <= floor {
+                        throw!(Exc::fault("stack underflow"));
+                    }
+                    f.stack.pop().unwrap()
+                }};
             }
             macro_rules! top {
-                () => {
-                    f.stack.last().expect("stack underflow")
-                };
+                () => {{
+                    if f.stack.len() <= floor {
+                        throw!(Exc::fault("stack underflow"));
+                    }
+                    f.stack.last().unwrap()
+                }};
             }
             macro_rules! name {
                 ($k:expr) => {
@@ -177,6 +187,9 @@ impl Runtime {
                 if *budget == 0 {
                     f.frames[fi].ip = ip;
                     return Err(self.failure(f, "the program ran too long without finishing (an endless loop?)".into()));
+                }
+                if f.stack.len() >= MAX_STACK {
+                    throw!(Exc::fault("stack overflow"));
                 }
                 let op = code[ip];
                 ip += 1;
@@ -194,12 +207,18 @@ impl Runtime {
                     }
                     Op::Dup2 => {
                         let n = f.stack.len();
+                        if n < floor + 2 {
+                            throw!(Exc::fault("stack underflow"));
+                        }
                         let (a, b) = (f.stack[n - 2].clone(), f.stack[n - 1].clone());
                         f.stack.push(a);
                         f.stack.push(b);
                     }
                     Op::LoadLocal(s) => {
                         let v = f.stack[base + s as usize].clone();
+                        if matches!(v, Value::Cell(_)) {
+                            throw!(Exc::fault("invalid cell load"));
+                        }
                         f.stack.push(v);
                     }
                     Op::StoreLocal(s) => {
@@ -363,7 +382,11 @@ impl Runtime {
                         f.stack.push(Value::Bool(r));
                     }
                     Op::Concat(n) => {
-                        let start = f.stack.len() - n as usize;
+                        let need = n as usize;
+                        if f.stack.len() < floor + need {
+                            throw!(Exc::fault("stack underflow"));
+                        }
+                        let start = f.stack.len() - need;
                         let s: String = f.stack.drain(start..).map(|v| v.display()).collect();
                         f.stack.push(Value::str(&s));
                     }
@@ -408,12 +431,20 @@ impl Runtime {
                         }
                     }
                     Op::Call(argc) => {
+                        let need = 1 + argc as usize;
+                        if f.stack.len() < floor + need {
+                            throw!(Exc::fault("stack underflow"));
+                        }
                         f.frames[fi].ip = ip;
-                        let pos = f.stack.len() - 1 - argc as usize;
+                        let pos = f.stack.len() - need;
                         tri!(self.call_value(f, pos));
                         continue 'frames;
                     }
                     Op::CallMethod(k, argc) => {
+                        let need = 1 + argc as usize;
+                        if f.stack.len() < floor + need {
+                            throw!(Exc::fault("stack underflow"));
+                        }
                         f.frames[fi].ip = ip;
                         let name = name!(k);
                         if let Some(key) = tri!(self.must_wait(f, &name, argc as usize)) {
@@ -464,7 +495,11 @@ impl Runtime {
                     Op::Elem(d) => {
                         let desc = &prog.elems[d as usize];
                         let np = desc.props.len();
-                        let vals = f.stack.split_off(f.stack.len() - np - desc.children as usize);
+                        let need = np.saturating_add(desc.children as usize);
+                        if f.stack.len() < floor + need {
+                            throw!(Exc::fault("stack underflow"));
+                        }
+                        let vals = f.stack.split_off(f.stack.len() - need);
                         let (props, children) = vals.split_at(np);
                         let elem = Elem { kind: desc.kind.clone(), props: desc.props.iter().cloned().zip(props.iter().cloned()).collect(), children: children.to_vec() };
                         f.stack.push(Value::Elem(Rc::new(elem)));
@@ -507,7 +542,12 @@ impl Runtime {
                         let kind = crate::vm::value::ExcKind::User;
                         throw!(Exc(v, kind));
                     }
-                    Op::TryBegin(t) => f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize }),
+                    Op::TryBegin(t) => {
+                        if f.handlers.len() >= MAX_HANDLERS {
+                            throw!(Exc::fault("handler stack overflow"));
+                        }
+                        f.handlers.push(Handler { frames: f.frames.len(), stack: f.stack.len(), ip: t as usize });
+                    }
                     Op::TryEnd => {
                         f.handlers.pop();
                     }

@@ -22,79 +22,89 @@ pub struct Manifest {
 }
 
 /// AST metadata for one user-declared object, complementing `Program`'s compiled `ObjectDef`.
+#[derive(Default)]
 struct AstObject {
     field_types: HashMap<String, String>,
     method_needs: HashMap<String, Vec<String>>,
 }
 
 impl Manifest {
-    /// Builds the static manifest for a compiled app bundle.
+    /// Builds the static manifest for a compiled app bundle (or precompiled AOT `.tjb` bundle).
     pub fn build(source: &str, program: &Program, configured_plugins: &[&str]) -> Manifest {
         let app_sha256 = sha256_hex(source);
-        let files: Vec<String> = modules::files(source).into_iter().map(|f| f.name).collect();
+        let is_aot = source.starts_with(tj_core::vm::bytecode::BUNDLE_PREFIX);
+        let files: Vec<String> = if is_aot { Vec::new() } else { modules::files(source).into_iter().map(|f| f.name).collect() };
         let mut ast_objects: HashMap<String, AstObject> = HashMap::new();
         let mut imported_plugins: BTreeSet<String> = BTreeSet::new();
 
-        let canon_types = canonical_field_types(source);
-        for f in modules::files(source) {
-            let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
-            for imp in &parsed.imports {
-                if imp.from.starts_with("tj:") {
-                    imported_plugins.insert(imp.from.clone());
-                }
-            }
-            for item in &parsed.items {
-                let Item::Object(o) = item else { continue };
-                let field_types = o
-                    .fields
-                    .iter()
-                    .filter_map(|fl| canon_types.get(&(o.name.clone(), fl.name.clone())).map(|t| (fl.name.clone(), t.clone())))
-                    .collect();
-                let mut method_needs = HashMap::new();
-                for m in &o.methods {
-                    let needs = decorator_strings(&m.decorators, "needs");
-                    if !needs.is_empty() {
-                        method_needs.insert(m.func.name.clone(), needs);
+        if !is_aot {
+            let canon_types = canonical_field_types(source);
+            for f in modules::files(source) {
+                let Ok(parsed) = parse_range(source, f.start, f.end) else { continue };
+                for imp in &parsed.imports {
+                    if imp.from.starts_with("tj:") {
+                        imported_plugins.insert(imp.from.clone());
                     }
                 }
-                ast_objects.insert(o.name.clone(), AstObject { field_types, method_needs });
+                for item in &parsed.items {
+                    let Item::Object(o) = item else { continue };
+                    let field_types = o
+                        .fields
+                        .iter()
+                        .filter_map(|fl| canon_types.get(&(o.name.clone(), fl.name.clone())).map(|t| (fl.name.clone(), t.clone())))
+                        .collect();
+                    let mut method_needs = HashMap::new();
+                    for m in &o.methods {
+                        let needs = decorator_strings(&m.decorators, "needs");
+                        if !needs.is_empty() {
+                            method_needs.insert(m.func.name.clone(), needs);
+                        }
+                    }
+                    ast_objects.insert(o.name.clone(), AstObject { field_types, method_needs });
+                }
             }
         }
 
-        // Include only the app's own objects (built-in plugin objects like `tj:ui`'s Form/Actions
-        // are already represented under `plugins.imported`).
-        let objects: Vec<Json> = program
-            .objects
-            .iter()
-            .filter_map(|o| ast_objects.get(&*o.name).map(|ast| object_json(o, ast)))
-            .collect();
+        // For `.tj` source, include only the app's own objects (built-in plugin objects like
+        // `tj:ui`'s Form/Actions are represented under `plugins.imported`). For precompiled AOT
+        // `.tjb` bundles (no AST), emit every compiled `ObjectDef` directly so `/_tj/manifest`
+        // and upgrade compatibility checks remain accurate.
+        let empty_ast = AstObject::default();
+        let objects: Vec<Json> = if is_aot {
+            program.objects.iter().map(|o| object_json(o, &empty_ast)).collect()
+        } else {
+            program.objects.iter().filter_map(|o| ast_objects.get(&*o.name).map(|ast| object_json(o, ast))).collect()
+        };
 
         let mut configured: Vec<String> = configured_plugins.iter().map(|s| (*s).to_string()).collect();
         configured.sort();
         configured.dedup();
 
-        let facts = tj_core::facts(source);
-        let lawful_basis: Map<String, Json> = facts
-            .lawful_basis
-            .unwrap_or_default()
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .map(|(k, v)| (k, json!(v)))
-            .collect();
-        let reveals: Vec<Json> = facts
-            .reveals
-            .iter()
-            .map(|r| json!({ "at": privacy::place(source, r.at), "fields": r.fields, "purpose": r.purpose }))
-            .collect();
-        let transfers: Vec<Json> = facts
-            .transfers
-            .iter()
-            .map(|t| json!({ "at": privacy::place(source, t.at), "fields": t.fields, "to": privacy::destination(&t.to) }))
-            .collect();
-
-        let warnings = access::warnings(source);
-        let json = json!({
+        let (lawful_basis, reveals, transfers, warnings) = if is_aot {
+            (Map::new(), Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let facts = tj_core::facts(source);
+            let lawful_basis: Map<String, Json> = facts
+                .lawful_basis
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .map(|(k, v)| (k, json!(v)))
+                .collect();
+            let reveals: Vec<Json> = facts
+                .reveals
+                .iter()
+                .map(|r| json!({ "at": privacy::place(source, r.at), "fields": r.fields, "purpose": r.purpose }))
+                .collect();
+            let transfers: Vec<Json> = facts
+                .transfers
+                .iter()
+                .map(|t| json!({ "at": privacy::place(source, t.at), "fields": t.fields, "to": privacy::destination(&t.to) }))
+                .collect();
+            (lawful_basis, reveals, transfers, access::warnings(source))
+        };
+        let mut json = json!({
             "appSha256": app_sha256,
             "files": files,
             "hasUi": program.app.is_some(),
@@ -110,6 +120,9 @@ impl Manifest {
             },
             "warnings": warnings,
         });
+        if is_aot {
+            json["aot"] = json!(true);
+        }
         Manifest { json }
     }
 

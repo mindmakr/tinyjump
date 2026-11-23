@@ -203,7 +203,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Validates every table reference and jump target so a corrupt `.tjb` cannot panic the VM.
+/// Validates every table reference, metadata invariant, and jump/capture target so a corrupt `.tjb` cannot panic the VM.
 fn validate(p: &Program) -> Res<()> {
     if p.globals.len() < builtins::GLOBALS.len() {
         return Err("bytecode globals table is incompatible with this runtime");
@@ -213,9 +213,19 @@ fn validate(p: &Program) -> Res<()> {
             return Err("bytecode builtin slot mismatch");
         }
     }
+    if p.objects.len() > u16::MAX as usize {
+        return Err("bytecode object count exceeds u16");
+    }
     let check_proto = |idx: u32| -> Res<()> {
         if (idx as usize) >= p.protos.len() {
             return Err("bytecode proto index out of range");
+        }
+        Ok(())
+    };
+    let check_root_proto = |idx: u32| -> Res<()> {
+        check_proto(idx)?;
+        if !p.protos[idx as usize].captures.is_empty() {
+            return Err("bytecode entry proto cannot have captures");
         }
         Ok(())
     };
@@ -225,8 +235,9 @@ fn validate(p: &Program) -> Res<()> {
             _ => Err("bytecode string constant out of range"),
         }
     };
+    let positive_finite = |v: f64| v.is_finite() && v > 0.0;
     for &m in &p.main {
-        check_proto(m)?;
+        check_root_proto(m)?;
     }
     if let Some(slot) = p.app {
         if (slot as usize) >= p.globals.len() {
@@ -238,15 +249,60 @@ fn validate(p: &Program) -> Res<()> {
             return Err("bytecode element kind is not in the catalog");
         }
     }
-    for o in &p.objects {
-        check_proto(o.init)?;
+    for (oi, o) in p.objects.iter().enumerate() {
+        if o.name.is_empty() || o.name.contains('/') || o.name.contains('*') {
+            return Err("bytecode invalid object name");
+        }
+        if p.objects[..oi].iter().any(|prev| prev.name == o.name) {
+            return Err("bytecode duplicate object name");
+        }
+        if o.methods.len() > u16::MAX as usize {
+            return Err("bytecode method count exceeds u16");
+        }
+        for (fi, f) in o.fields.iter().enumerate() {
+            if o.fields[..fi].iter().any(|prev| prev == f) {
+                return Err("bytecode duplicate field name");
+            }
+        }
+        if let Some(r) = o.retain {
+            if !positive_finite(r.ms) {
+                return Err("bytecode invalid @retain duration");
+            }
+        }
+        if let Some(h) = o.hold {
+            if !positive_finite(h) {
+                return Err("bytecode invalid @legalHold duration");
+            }
+        }
+        for pii in &o.pii {
+            if !o.fields.contains(&pii.field) {
+                return Err("bytecode @pii references unknown field");
+            }
+            if !crate::vm::program::PII_CATEGORIES.contains(&&*pii.category) {
+                return Err("bytecode invalid @pii category");
+            }
+        }
+        for g in &o.guards {
+            if !o.fields.contains(&g.field) {
+                return Err("bytecode guard references unknown field");
+            }
+        }
+        check_root_proto(o.init)?;
         for m in o.methods.values() {
-            check_proto(m.proto)?;
+            if let Some(ms) = m.every {
+                if !positive_finite(ms) {
+                    return Err("bytecode invalid @every duration");
+                }
+            }
+            check_root_proto(m.proto)?;
         }
     }
     for proto in &p.protos {
-        if proto.offsets.len() != proto.code.len() || proto.params > proto.locals {
+        if proto.code.is_empty() || proto.offsets.len() != proto.code.len() || proto.params > proto.locals {
             return Err("bytecode proto header mismatch");
+        }
+        if !matches!(proto.code.last(), Some(Op::Return | Op::Throw | Op::Jump(_))) {
+            return Err("bytecode proto does not terminate");
         }
         let clen = proto.code.len();
         for &op in &proto.code {
@@ -258,7 +314,16 @@ fn validate(p: &Program) -> Res<()> {
                     return Err("bytecode local out of range");
                 }
                 Op::LoadUpval(i) | Op::StoreUpval(i) if (i as usize) >= proto.captures.len() => return Err("bytecode upval out of range"),
-                Op::Closure(i) => check_proto(i)?,
+                Op::Closure(i) => {
+                    check_proto(i)?;
+                    for &cap in &p.protos[i as usize].captures {
+                        match cap {
+                            Capture::Local(s) if s >= proto.locals => return Err("bytecode capture local out of range"),
+                            Capture::Upval(u) if (u as usize) >= proto.captures.len() => return Err("bytecode capture upval out of range"),
+                            _ => {}
+                        }
+                    }
+                }
                 Op::Elem(i) if (i as usize) >= p.elems.len() => return Err("bytecode elem out of range"),
                 Op::Jump(t)
                 | Op::JumpIfFalse(t)
@@ -267,7 +332,7 @@ fn validate(p: &Program) -> Res<()> {
                 | Op::JumpIfNotNullKeep(t)
                 | Op::JumpIfNullKeep(t)
                 | Op::TryBegin(t)
-                    if (t as usize) > clen =>
+                    if (t as usize) >= clen =>
                 {
                     return Err("bytecode jump target out of range");
                 }
@@ -406,6 +471,9 @@ fn decode_inner(bytes: &[u8]) -> Res<Program> {
             for _ in 0..n_params {
                 params.push((r.str()?, r.bool()?, r.arg_ty(0)?));
             }
+            if methods.contains_key(&mname) {
+                return Err("bytecode duplicate method name");
+            }
             methods.insert(mname, MethodDef { proto, private, every, allow, exclusive, invariant, params });
         }
         objects.push(ObjectDef { name, fields, init, methods, server, read, pii, guards, retain, hold });
@@ -439,15 +507,20 @@ pub fn decode_bundle(src: &str) -> Option<Result<Program, String>> {
 }
 
 fn base64_decode(s: &str) -> Res<Vec<u8>> {
-    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut out = Vec::with_capacity((s.len() / 4).saturating_mul(3));
     let mut buf = 0u32;
     let mut bits = 0u8;
     let mut pad = 0u8;
+    let mut chars = 0usize;
     for b in s.bytes() {
         if b.is_ascii_whitespace() {
             continue;
         }
+        chars += 1;
         if b == b'=' {
+            if pad >= 2 {
+                return Err("invalid base64 padding in bytecode bundle");
+            }
             pad += 1;
             continue;
         }
@@ -469,8 +542,9 @@ fn base64_decode(s: &str) -> Res<Vec<u8>> {
             out.push((buf >> bits) as u8);
         }
     }
-    if pad > 2 || bits >= 6 {
-        return Err("truncated base64 in bytecode bundle");
+    let valid_tail = matches!((bits, pad), (0, 0) | (2, 1) | (4, 2));
+    if chars % 4 != 0 || !valid_tail || (bits > 0 && (buf & ((1u32 << bits) - 1)) != 0) {
+        return Err("invalid base64 length or padding in bytecode bundle");
     }
     Ok(out)
 }
@@ -879,6 +953,131 @@ function App() {
         assert!(Program::from_bytes(&bytes).err().unwrap().contains("builtin count"));
         assert!(Program::from_bundle("//# tjb:1:!!!not-base64!!!").unwrap().is_err());
         assert!(Program::from_bundle("function f() { return 1 }").is_none());
+
+        // BT-3: base64 padding overflow (256 '='), bad lengths, and non-zero trailing bits.
+        let huge_pad = format!("{BUNDLE_PREFIX}{}", "=".repeat(256));
+        assert!(Program::from_bundle(&huge_pad).unwrap().is_err());
+        for bad_b64 in ["AAAA=", "AA", "AAA==", "AB=="] {
+            assert!(Program::from_bundle(&format!("{BUNDLE_PREFIX}{bad_b64}")).unwrap().is_err(), "{bad_b64}");
+        }
+
+        // BT-4 & BT-9: compile() refuses .tjb bundles and Diagnostic::render omits raw base64 line.
+        let bundle = prog.to_bundle().unwrap();
+        let errs = compile(&bundle).err().unwrap();
+        assert!(errs[0].message.contains("expected .tj source"));
+        let rendered = errs[0].render("app.tjb", &bundle);
+        assert!(!rendered.contains(BUNDLE_PREFIX), "diagnostic must not dump raw base64: {rendered}");
+
+        // BT-1 & BT-2: adversarial Program structures rejected by validate() or caught safely at runtime.
+        let mut bad = compile("function f() { return 1 }").unwrap();
+        bad.protos[0].code.clear();
+        bad.protos[0].offsets.clear();
+        assert!(Program::from_bytes(&bad.to_bytes().unwrap()).is_err(), "empty code rejected");
+
+        let mut bad = compile("function f() { return 1 }").unwrap();
+        bad.protos.push(Proto { name: Rc::from("x"), params: 0, locals: 0, code: vec![Op::Null], offsets: vec![0], captures: vec![], source: Source::User });
+        assert!(Program::from_bytes(&bad.to_bytes().unwrap()).is_err(), "non-terminating proto rejected");
+
+        let mut bad = compile("function f() { return 1 }").unwrap();
+        bad.protos.push(Proto { name: Rc::from("j"), params: 0, locals: 0, code: vec![Op::Jump(1)], offsets: vec![0], captures: vec![], source: Source::User });
+        assert!(Program::from_bytes(&bad.to_bytes().unwrap()).is_err(), "Jump(clen) rejected");
+
+        let mut bad = compile("function f() { return 1 }").unwrap();
+        let main_idx = bad.main[0] as usize;
+        bad.protos[main_idx].captures.push(Capture::Local(0));
+        assert!(Program::from_bytes(&bad.to_bytes().unwrap()).is_err(), "entry proto with captures rejected");
+
+        // Capture::Local out of enclosing proto's locals rejected.
+        let mut bad = compile("function f() { return 1 }").unwrap();
+        let child = bad.protos.len() as u32;
+        bad.protos.push(Proto { name: Rc::from("c"), params: 0, locals: 0, code: vec![Op::Null, Op::Return], offsets: vec![0, 0], captures: vec![Capture::Local(99)], source: Source::User });
+        bad.protos.push(Proto { name: Rc::from("p"), params: 0, locals: 1, code: vec![Op::Closure(child), Op::Return], offsets: vec![0, 0], captures: vec![], source: Source::User });
+        assert!(Program::from_bytes(&bad.to_bytes().unwrap()).is_err(), "Capture::Local OOB rejected");
+
+        // BT-2: NaN / -NaN / 0 / -1 / +Inf in every, retain, hold rejected.
+        for bad_val in [f64::NAN, -f64::NAN, 0.0, -5.0, f64::INFINITY] {
+            let mut p = compile("@server @read(\"anyone\") object A { n: number = 0\n @every(\"1m\") beat() {} }").unwrap();
+            p.objects[0].methods.get_mut("beat").unwrap().every = Some(bad_val);
+            assert!(Program::from_bytes(&p.to_bytes().unwrap()).is_err(), "every={bad_val} must be rejected");
+
+            let mut p = compile("@server @read(\"anyone\") @retain(\"1d\") object A { n: number = 0 }").unwrap();
+            p.objects[0].retain.as_mut().unwrap().ms = bad_val;
+            assert!(Program::from_bytes(&p.to_bytes().unwrap()).is_err(), "retain={bad_val} must be rejected");
+
+            let mut p = compile("@server @read(\"anyone\") @legalHold(\"1d\") object A { n: number = 0 }").unwrap();
+            p.objects[0].hold = Some(bad_val);
+            assert!(Program::from_bytes(&p.to_bytes().unwrap()).is_err(), "hold={bad_val} must be rejected");
+        }
+
+        // Duplicate object name, invalid object name, unknown pii field/category rejected.
+        let mut p = compile("@server @read(\"anyone\") object A { n: number = 0 }").unwrap();
+        p.objects[0].name = Rc::from("A/B");
+        assert!(Program::from_bytes(&p.to_bytes().unwrap()).is_err());
+
+        let mut p = compile("@server @read(\"anyone\") object A { n: number = 0 }").unwrap();
+        p.objects[0].pii.push(Pii { field: Rc::from("missing"), category: Rc::from("contact"), purposes: Rc::from([]), by: None });
+        assert!(Program::from_bytes(&p.to_bytes().unwrap()).is_err());
+
+        // BT-1 runtime hardening: stack underflow, stack overflow, handler overflow, and non-record init fail cleanly without panicking.
+        let mut under = compile("function f() { return 1 }").unwrap();
+        let pid = under.protos.len() as u32;
+        under.protos.push(Proto { name: Rc::from("u"), params: 0, locals: 0, code: vec![Op::Pop, Op::Return], offsets: vec![0, 0], captures: vec![], source: Source::User });
+        under.main = vec![pid];
+        let decoded = Program::from_bytes(&under.to_bytes().unwrap()).unwrap();
+        assert!(Runtime::boot(decoded, Box::new(MemStore::default()), Options::new(1.0, 1)).is_err());
+
+        let mut over = compile("function f() { return 1 }").unwrap();
+        let pid = over.protos.len() as u32;
+        over.protos.push(Proto { name: Rc::from("o"), params: 0, locals: 0, code: vec![Op::Null, Op::Jump(0)], offsets: vec![0, 0], captures: vec![], source: Source::User });
+        over.main = vec![pid];
+        let decoded = Program::from_bytes(&over.to_bytes().unwrap()).unwrap();
+        let err = Runtime::boot(decoded, Box::new(MemStore::default()), Options::new(1.0, 1)).err().unwrap();
+        assert!(err.message.contains("stack overflow"), "{err}");
+
+        let mut bad_init = compile("@server @read(\"anyone\") object A { n: number = 0\n @allow(\"anyone\") ping(): number { return 1 } }").unwrap();
+        let bad_init_p = bad_init.protos.len() as u32;
+        bad_init.protos.push(Proto { name: Rc::from("bad_init"), params: 0, locals: 0, code: vec![Op::Null, Op::Return], offsets: vec![0, 0], captures: vec![], source: Source::User });
+        bad_init.objects[0].init = bad_init_p;
+        let decoded = Program::from_bytes(&bad_init.to_bytes().unwrap()).unwrap();
+        let (mut rt, _) = Runtime::boot(decoded, Box::new(MemStore::default()), Options { server: true, render: false, ..Options::new(1.0, 1) }).unwrap();
+        let out = rt.handle(2.0, Input::Call { object: "A/1".into(), method: "ping".into(), args: vec![], reply: Some(1), call: None, caller: Some(crate::runtime::protocol::Caller::trusted()) });
+        assert!(out.iter().any(|o| matches!(o, Output::Reply { reply: 1, error: Some(e), .. } if e.contains("object init"))), "{out:?}");
+    }
+
+    #[test]
+    fn full_decorators_and_arg_types_round_trip_through_aot_bytecode() {
+        let src = r#"
+import { Consent } from "tj:consent"
+type Entry = { customer: string, at: number, tag?: "vip" | "std" }
+@server @read("staff") @retain("30d") object Roster {
+  @pii("contact", "booking") @by("customer", "at") entries: Entry[] = []
+  @exclusive @allow("staff") add(e: Entry, meta: Record<string, number>, flag: boolean | null): boolean {
+    this.entries.push(e)
+    return true
+  }
+}
+@server @read("owner") @legalHold("1y") object Profile {
+  @pii("contact", "news") email: string = ""
+  @needs("consent:news") @allow("owner") ping(): boolean { return true }
+}
+@server @read("signedIn") object Slot {
+  @read("self") bookedBy: string = ""
+}
+"#;
+        let prog = compile(src).unwrap();
+        let bytes = prog.to_bytes().unwrap();
+        let decoded = Program::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.objects.len(), prog.objects.len());
+        let roster = decoded.objects.iter().find(|o| &*o.name == "Roster").unwrap();
+        assert!(roster.retain.is_some());
+        assert_eq!(roster.pii.len(), 1);
+        assert!(roster.pii[0].by.is_some());
+        assert!(roster.methods["add"].exclusive);
+        assert_eq!(roster.methods["add"].params.len(), 3);
+        let profile = decoded.objects.iter().find(|o| &*o.name == "Profile").unwrap();
+        assert!(profile.hold.is_some());
+        let slot = decoded.objects.iter().find(|o| &*o.name == "Slot").unwrap();
+        assert!(slot.guards.iter().any(|g| g.names_a_person()));
     }
 
     #[test]

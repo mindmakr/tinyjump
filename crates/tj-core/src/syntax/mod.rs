@@ -42,6 +42,14 @@ impl Diagnostic {
     /// a bundle of several files (see `modules`): `entry` is how to name the entry file, and
     /// the others are named relative to it.
     pub fn render(&self, entry: &str, src: &str) -> String {
+        if src.starts_with(crate::vm::bytecode::BUNDLE_PREFIX) {
+            let mut out = format!("{entry}: error: {}", self.message);
+            if let Some(h) = &self.hint {
+                out.push_str("\n  hint: ");
+                out.push_str(h);
+            }
+            return out;
+        }
         let offset = self.span.start as usize;
         let (name, line, col) = crate::modules::locate(src, offset);
         let files = crate::modules::files(src);

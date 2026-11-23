@@ -61,7 +61,7 @@ USAGE:
                                  static permission audit)
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
-  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--runner <file>] [--assemble] [--json]
+  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--server <url>] [--runner <file>] [--json]
                                  compile AOT bytecode (.tjb) or package a static web bundle, a standalone
                                  executable with embedded bytecode, or Android/iOS AOT asset bundles
   tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
@@ -603,19 +603,6 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     let source = read_source(file)?;
-    let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
-    let loopback = http::is_loopback(&args.host);
-    if args.as_user.is_some() && !(dev_mode && loopback) {
-        return Err("--as is for `tj dev` on this machine only (with --host 127.0.0.1)".into());
-    }
-    let identity = identity::Identity::new(args.as_user.as_deref())?;
-    // In dev mode the browser runs the UI; the server keeps the backend objects. Dev also
-    // explains refusals, which a real server must not.
-    let plugins = Arc::new(plugins::load(file, &args.plugins)?);
-    plugins.start_all()?;
-    // Checked before anything starts: a folder that mixes plain and sealed records, or a key
-    // file that cannot be read, stops the server here.
-    let (_, storage) = sealed::open_store(&data, &[])?;
     let is_bytecode = source.starts_with(tj_core::vm::bytecode::BUNDLE_PREFIX);
     if is_bytecode && args.compliance.is_some() {
         return Err("--compliance requires .tj source for static privacy-flow analysis; run `tj check --compliance` before `tj build`".into());
@@ -629,6 +616,19 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     if is_bytecode && !remote_dests.is_empty() && program.objects.iter().any(|o| !o.pii.is_empty()) {
         return Err("serving a precompiled .tjb with both @pii and remotes.json is refused because static remote-flow checks need .tj source; run `tj serve <app.tj>`".into());
     }
+    let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
+    let loopback = http::is_loopback(&args.host);
+    if args.as_user.is_some() && !(dev_mode && loopback) {
+        return Err("--as is for `tj dev` on this machine only (with --host 127.0.0.1)".into());
+    }
+    let identity = identity::Identity::new(args.as_user.as_deref())?;
+    // In dev mode the browser runs the UI; the server keeps the backend objects. Dev also
+    // explains refusals, which a real server must not.
+    let plugins = Arc::new(plugins::load(file, &args.plugins)?);
+    plugins.start_all()?;
+    // Checked before anything starts: a folder that mixes plain and sealed records, or a key
+    // file that cannot be read, stops the server here.
+    let (_, storage) = sealed::open_store(&data, &[])?;
     let flow_errs = if is_bytecode { Vec::new() } else { tj_core::check_remote_flows(&source, &remote_dests) };
     if !flow_errs.is_empty() {
         return Err(flow_errs.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"));
@@ -737,6 +737,11 @@ fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
     let leases = leases::Leases::open(&data);
     let tls = http::credentials_need_tls(false, &host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
     eprintln!("tinyjump standalone server on http://{addr} (data: {}; storage: {storage}; audit: {audit_key})", data.display());
+    if tls {
+        eprintln!("credentials: refused over plain HTTP on {host}; behind a TLS proxy, set {}=1", http::TLS_TERMINATED_ENV);
+    } else if std::env::var(http::TLS_TERMINATED_ENV).is_ok_and(|v| v == "1") && std::env::var("TJ_TRUST_PROXY").ok().as_deref() != Some("1") {
+        eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
+    }
     http::serve(&addr, http::Front::new(engine, None, None, automation, identity, audit, leases, tls).with_webhooks(webhooks))
 }
 

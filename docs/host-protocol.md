@@ -15,11 +15,12 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
    Boot returns the first outputs, including the initial `patch`. An app of several files
    is passed as one **bundle**: each file follows a line `//# file: <path>`, with the path
    relative to the entry file's folder and the entry first. A one-file app is just its
-   source. A precompiled AOT bytecode bundle starts with `//# tjb:1:<base64>` (encoding the
-   binary `TJB\x01` format) and is accepted by `JsonHost::boot` on Web, Android and iOS
-   with no ABI change, skipping the compiler on devices. `tj` builds bundles by following
-   imports (`crates/tj-cli/src/app.rs`), and `tj dev` serves them as `/app.tj`. Native demo
-   apps bundle an example's folder.
+   source. A precompiled AOT bytecode file (`tj build <app.tj>`) uses the binary `TJB\x01`
+   format; for text-based host boundaries (`JsonHost::boot` on Web, Android and iOS, and
+   `tj build` `--web` / `--android` / `--ios` asset bundles), the same bytecode is wrapped
+   as a UTF-8 bundle `//# tjb:1:<base64>`, skipping the compiler on devices with no ABI
+   change. `tj` builds source bundles by following imports (`crates/tj-cli/src/app.rs`),
+   and `tj dev` serves them as `/app.tj`. Native demo apps bundle an example's folder.
 2. For every event, call `runtime.handle(now_ms, input)` and carry out the outputs in order.
 3. Every batch ends with `wake { at }`. Send `tick` at that time (or earlier). `null` means
    no timer is pending.

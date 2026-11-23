@@ -828,8 +828,8 @@ fn handle(mut req: Request, front: &Front) {
                     None | Some(Json::Null) => 3,
                     Some(v) => v.as_u64().ok_or_else(|| (400, "\"errorThreshold\" must be a non-negative integer".to_string()))?,
                 };
-                // Pre-compile on the HTTP thread so syntax/type errors fail fast (400) without stalling `tj-runtime`.
-                tj_core::compile(&source).map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", &source)).collect::<Vec<_>>().join("\n\n")))?;
+                // Pre-compile (or validate AOT bytecode) on the HTTP thread so bad bundles fail fast (400) without stalling `tj-runtime`.
+                tj_core::load(&source).map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", &source)).collect::<Vec<_>>().join("\n\n")))?;
                 let res = engine.safe_reload(ReloadRequest {
                     source,
                     allow_breaking,
