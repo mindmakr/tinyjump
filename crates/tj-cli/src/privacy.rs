@@ -56,8 +56,18 @@ fn span(ms: f64) -> String {
 /// The record of processing (GDPR article 30) the code can state, as Markdown: what
 /// personal data is held, about whom and why, where it is let out, how long it is kept, and
 /// the measures the runtime provides. What only people know is left blank to fill in.
+#[cfg(test)]
 pub fn record(src: &str, program: &Program) -> String {
-    let facts = tj_core::facts(src);
+    record_with_transfers(src, program, &std::collections::HashMap::new(), &[])
+}
+
+pub fn record_with_transfers(
+    src: &str,
+    program: &Program,
+    remote_dests: &std::collections::HashMap<String, tj_core::Destination>,
+    extra_transfers: &[(String, tj_core::Destination, Vec<String>)],
+) -> String {
+    let facts = tj_core::facts_with_remotes(src, remote_dests);
     let basis = match &facts.lawful_basis {
         Some(b) if !b.is_empty() => b.iter().map(|(p, l)| format!("{p}: {l}")).collect::<Vec<_>>().join(", "),
         _ => "____".into(),
@@ -86,11 +96,14 @@ pub fn record(src: &str, program: &Program) -> String {
         out.push_str(&format!("- `{}`: {}, for {}\n", place(src, r.at), r.fields.join(", "), r.purpose));
     }
     out.push_str("\n## Where it is sent (recipients)\n\n");
-    if facts.transfers.is_empty() {
+    if facts.transfers.is_empty() && extra_transfers.is_empty() {
         out.push_str("- Nowhere outside the server.\n");
     }
     for t in &facts.transfers {
         out.push_str(&format!("- `{}`: {} to {}\n", place(src, t.at), t.fields.join(", "), destination(&t.to)));
+    }
+    for (at, to, fields) in extra_transfers {
+        out.push_str(&format!("- `{at}`: {} to {}\n", fields.join(", "), destination(to)));
     }
     out.push_str("\n## How long it is kept\n\n");
     for o in program.objects.iter().filter(|o| o.belongs_to_a_person() || !o.pii.is_empty()) {

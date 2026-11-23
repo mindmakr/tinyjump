@@ -4088,6 +4088,53 @@ object LocalOnly { x: number = 0 }
     let out_pending = rt.handle(20.0, Input::Call { object: "Order/o1".into(), method: "buy".into(), args: vec![json!("sku-1"), json!(1)], reply: Some(4), call: None, caller: who("alice", &[]) });
     let pending_call_id = out_pending.iter().find_map(|o| match o { Output::Effect { effect: Effect::Call { call, .. }, .. } => Some(call.clone()), _ => None }).unwrap();
     drop(rt);
-    let (_rt2, boot_ent_out) = boot_b(25.0);
+    let (mut rt2, boot_ent_out) = boot_b(25.0);
     assert!(boot_ent_out.iter().any(|o| matches!(o, Output::Effect { effect: Effect::Call { call, .. }, .. } if *call == pending_call_id)), "server restart must resume pending remote outbox calls on boot: {boot_ent_out:?}");
+
+    // C-050.2: external `Input::Get`, `may_read`, `changed_since`, and `invoke()` refuse remote
+    // classes BEFORE `resolve_object` (never emitting `Output::Subscribe` for attacker-chosen IDs).
+    let get_ref = rt2.handle(26.0, Input::Get { object: "Stock/attacker-99".into(), reply: Some(5), caller: who("alice", &[]) });
+    assert!(get_ref.iter().any(|o| matches!(o, Output::Reply { reply: 5, status: Some(400), error: Some(e), .. } if e.contains("lives on another server"))), "{get_ref:?}");
+    assert!(!get_ref.iter().any(|o| matches!(o, Output::Subscribe { .. })), "rejected Get must never emit Subscribe: {get_ref:?}");
+    assert!(rt2.may_read("Stock/attacker-99", &Caller::Remote { id: "alice".into(), roles: vec![] }).is_err());
+    assert!(rt2.changed_since(&["Stock/sku-1".into(), "Stock/*".into()], 0).is_empty());
+
+    // C-050.10: `check_invariants()` skips remote replicas during shadow-boot reload.
+    let inv_src = r#"
+@server @read("anyone") object RemoteInv {
+  n: number = 0
+  @invariant mustBePositive(): boolean { return this.n > 0 }
+}
+"#;
+    let mut irt = Runtime::boot(
+        compile(inv_src).unwrap(),
+        Box::new(MemStore::default()),
+        Options { server: true, render: false, remote_classes: vec!["RemoteInv".into()], ..Options::new(1.0, 2) },
+    )
+    .unwrap()
+    .0;
+    let _ = irt.handle(2.0, Input::Sync { object: "RemoteInv/r1".into(), state: json!({ "n": 0 }), seq: Some(1) });
+    assert_eq!(irt.check_invariants().unwrap(), 0, "check_invariants must skip remote replicas");
+
+    // C-050.6: `check_remote_flows` blocks unrevealed `@pii` passed to a remote class stub,
+    // and `facts_with_remotes` records a Transfer to the remote host when `reveal()` is used!
+    let pii_remote_bad = r#"
+@server @read("service") object RemoteBilling {
+  @allow("service") charge(email: string): boolean { return true }
+}
+@server @read("owner") object Account {
+  @pii("contact", "billing") email: string = ""
+  @allow("owner") async bill(): boolean {
+    return await RemoteBilling.get("b1").charge(this.email)
+  }
+}
+"#;
+    let mut rem_dests = std::collections::HashMap::new();
+    rem_dests.insert("RemoteBilling".to_string(), tj_core::Destination::Host("billing.example.com".into()));
+    let errs = tj_core::check_remote_flows(pii_remote_bad, &rem_dests);
+    assert!(!errs.is_empty(), "unrevealed @pii passed to remote stub must be caught");
+    let pii_remote_ok = pii_remote_bad.replace("this.email", "reveal(this.email, \"billing\")");
+    assert!(tj_core::check_remote_flows(&pii_remote_ok, &rem_dests).is_empty());
+    let f = tj_core::facts_with_remotes(&pii_remote_ok, &rem_dests);
+    assert!(f.transfers.iter().any(|t| t.to == tj_core::Destination::Host("billing.example.com".into()) && t.fields.contains(&"Account.email".to_string())), "remote transfer must be recorded: {:?}", f.transfers);
 }

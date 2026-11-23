@@ -307,6 +307,11 @@ impl Runtime {
         }
     }
 
+    #[cfg(feature = "server")]
+    pub(crate) fn is_remote_key(&self, key: &str) -> bool {
+        self.server && key.split('/').next().and_then(|c| self.program.object(c)).is_some_and(|c| self.is_remote_class(c))
+    }
+
     pub(crate) fn is_remote(&self, o: &ObjRef) -> bool {
         self.inst(o).remote
     }
@@ -636,6 +641,10 @@ impl Runtime {
         let mut keys: Vec<String> = Vec::new();
         let mut streamed: Vec<String> = Vec::new();
         for key in objects {
+            #[cfg(feature = "server")]
+            if self.is_remote_key(key) {
+                continue;
+            }
             match key.strip_suffix("/*").and_then(|c| self.program.object(c).map(|class| (c, class))) {
                 Some((name, class)) => {
                     streamed.push(format!("{name}/"));
@@ -851,7 +860,7 @@ impl Runtime {
             .objects
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.methods.values().any(|m| m.invariant))
+            .filter(|(i, d)| !self.is_remote_class(*i as u16) && d.methods.values().any(|m| m.invariant))
             .map(|(i, _)| i as u16)
             .collect();
         let mut checked = 0;

@@ -12,7 +12,7 @@ use crate::remotes::{strict_agent, RemoteHub, Remotes, SyncSink};
 use crate::stats::Stats;
 use crate::store::OverlayStore;
 use crate::test_runner;
-use crate::webhooks::{OutgoingWebhook, WebhookSender};
+use crate::webhooks::{WebhookSender, Webhooks};
 use serde_json::{json, Value as Json};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -156,7 +156,13 @@ fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugi
     let manifest = Manifest::build(source, &program, configured_plugins);
     let snap = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
-    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    // Remote replicas are owned by another server and skipped by local erasure (C-050.13).
+    let personal: Vec<String> = program
+        .objects
+        .iter()
+        .filter(|d| d.belongs_to_a_person() && !remote_classes.iter().any(|r| r == &*d.name))
+        .map(|d| d.name.to_string())
+        .collect();
     let (store, _) = crate::sealed::open_store(data, &personal)?;
     let seed = crate::bytes::random::<8>()?;
     let max_objects = std::env::var("TJ_MAX_OBJECTS").ok().and_then(|v| v.parse().ok()).unwrap_or(MAX_OBJECTS);
@@ -192,10 +198,10 @@ impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
     #[cfg(test)]
     pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit) -> Result<Engine, String> {
-        Self::start_with_integrations(source, data, render, explain, plugins, audit, None, Arc::default(), Vec::new())
+        Self::start_with_integrations(source, data, render, explain, plugins, audit, None, Arc::default(), Arc::default())
     }
 
-    /// Starts the runtime thread with compliance, server-to-server remotes, and outgoing webhooks.
+    /// Starts the runtime thread with compliance, server-to-server remotes, and webhooks.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_integrations(
         source: String,
@@ -206,7 +212,7 @@ impl Engine {
         audit: Audit,
         compliance: Option<ComplianceGate>,
         remotes: Arc<Remotes>,
-        outgoing_webhooks: Vec<OutgoingWebhook>,
+        webhooks: Arc<Webhooks>,
     ) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
@@ -221,6 +227,9 @@ impl Engine {
         let fetch_allow = fetch_allow_from_env()?;
         let fetch_allowlist = !fetch_allow.is_empty();
         let remote_classes = remotes.classes();
+        let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+        let fetch_allow_arc = Arc::new(fetch_allow);
+        let webhook_sender = WebhookSender::start(webhooks.outgoing.clone(), &data, audit.clone(), private_fetch, fetch_allow_arc.clone())?;
         thread::Builder::new()
             .name("tj-runtime".into())
             .spawn(move || {
@@ -233,7 +242,7 @@ impl Engine {
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow, remotes, outgoing_webhooks);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -416,15 +425,25 @@ fn shadow_validate(
     data: &Path,
     explain: bool,
     compliance: Option<&ComplianceGate>,
-    remote_classes: &[String],
+    remotes: &Remotes,
+    webhooks: &Webhooks,
 ) -> Result<(Vec<compat::Finding>, Snapshot), Failure> {
     if smoke_traces.len() > MAX_SMOKE_TRACES {
         return Err((400, format!("at most {MAX_SMOKE_TRACES} smoke traces per reload")));
     }
     let program = compile(source)
         .map_err(|errs| (400, errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")))?;
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(source, &remote_dests);
+    if !flow_errs.is_empty() {
+        return Err((400, flow_errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n")));
+    }
+    webhooks.validate_against(&program, &remote_classes).map_err(|e| (409, e))?;
     if let Some((pack, server)) = compliance {
-        let (report, ok) = pack.report(&pack.evaluate(source, &program, Some(server)));
+        let facts = tj_core::facts_with_remotes(source, &remote_dests);
+        let wh_transfers = webhooks.pii_transfers(&program, &facts.reveals);
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(source, &program, Some(server), &remote_dests, &wh_transfers));
         if !ok {
             return Err((409, format!("compliance pack {} not met:\n{report}", pack.title)));
         }
@@ -435,7 +454,12 @@ fn shadow_validate(
         return Err((409, format!("breaking upgrade changes found; pass allowBreaking: true if intentional\n{}", compat::report(&findings))));
     }
     // Shadow boot against a copy-on-write overlay over the real data dir (never mutates disk).
-    let personal: Vec<String> = program.objects.iter().filter(|d| d.belongs_to_a_person()).map(|d| d.name.to_string()).collect();
+    let personal: Vec<String> = program
+        .objects
+        .iter()
+        .filter(|d| d.belongs_to_a_person() && !remote_classes.iter().any(|r| r == &*d.name))
+        .map(|d| d.name.to_string())
+        .collect();
     let (base, _) = crate::sealed::open_store(data, &personal).map_err(|e| (503, e))?;
     let overlay = OverlayStore::new(base);
     let seed = crate::bytes::random::<8>().map_err(|e| (500, e))?;
@@ -531,18 +555,17 @@ fn run(
     mut current_source: String,
     mut current_snap: Snapshot,
     compliance: Option<ComplianceGate>,
-    fetch_allow: Vec<String>,
+    fetch_allow: Arc<Vec<String>>,
     remotes: Arc<Remotes>,
-    outgoing_webhooks: Vec<OutgoingWebhook>,
+    webhook_cfg: Arc<Webhooks>,
+    webhooks: WebhookSender,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let plugin_names: Vec<String> = plugins.names().into_iter().map(str::to_string).collect();
     let remote_classes = remotes.classes();
-    let fetch_allow = Arc::new(fetch_allow);
     let remote_hub = (!remotes.is_empty()).then(|| RemoteHub::new(remotes.clone(), Arc::new(EngineSyncSink(back.clone())), private_fetch, fetch_allow.clone()));
-    let webhooks = WebhookSender::start(outgoing_webhooks, &data, audit.clone(), private_fetch, fetch_allow.clone());
-    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch, fetch_allow, remotes);
+    let effects = effect_pool(back, plugins, stats.clone(), audit.clone(), private_fetch, fetch_allow, remotes.clone());
     let mut d = Dispatch {
         replies: HashMap::new(),
         next_reply: 0,
@@ -696,7 +719,7 @@ fn run(
                 // Drain in-flight effects BEFORE shadow_validate so all pending writes are on disk
                 // and validated against the new bundle's `@invariant`s and smoke traces (T1-5).
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
-                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref(), &remote_classes) {
+                let (findings, new_snap) = match shadow_validate(&req.source, req.allow_breaking, &req.smoke_traces, &current_snap, &data, explain, compliance.as_ref(), &remotes, &webhook_cfg) {
                     Ok(v) => v,
                     Err(e) => {
                         let _ = done.send(Err(e));

@@ -267,6 +267,11 @@ impl Runtime {
         while let Some(i) = self.invocations.pop_front() {
             ran = true;
             let reply = Some(INVOKE_REPLY_BASE + u64::from(i.promise));
+            #[cfg(feature = "server")]
+            if self.is_remote_key(&i.object) {
+                self.reply_status(reply, 400, format!("{} lives on another server; call it there", i.object));
+                continue;
+            }
             if let Some(why) = self.refusal(&i.object, Some(&i.method), &i.who) {
                 self.count_refused(&i.object, &i.method);
                 self.reply_status(reply, 403, why);

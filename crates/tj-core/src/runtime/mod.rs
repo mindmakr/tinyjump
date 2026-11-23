@@ -418,7 +418,7 @@ impl Runtime {
         match input {
             Input::Call { object, method, args, reply, call, caller } => {
                 #[cfg(feature = "server")]
-                let remote_target = self.server && object.split('/').next().and_then(|c| self.program.object(c)).is_some_and(|c| self.is_remote_class(c));
+                let remote_target = self.is_remote_key(&object);
                 #[cfg(not(feature = "server"))]
                 let remote_target = false;
                 if remote_target {
@@ -446,28 +446,38 @@ impl Runtime {
                     }
                 }
             }
-            Input::Get { object, reply, caller } => match self.admit(&object, None, caller) {
-                Err((status, why)) => self.reply_status(reply, status, why),
-                Ok(who) => {
-                    // Each field reaches the readers its rule names; tools see personal data masked.
-                    let state = self.resolve_object(&object).and_then(|o| {
-                        let mut s = self.object_state(&o)?;
-                        let hidden = self.hidden(o.class, &o.id, &s, &who);
-                        self.hide(o.class, &mut s, &hidden);
-                        Ok(s)
-                    });
-                    match state {
-                        Ok(s) => {
-                            // Reading is an event too: subscribers learn who is looking. It never
-                            // changes state, so a replica fetching state cannot start a loop.
-                            self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
-                            self.reply(reply, Ok(s));
+            Input::Get { object, reply, caller } => {
+                #[cfg(feature = "server")]
+                let remote_target = self.is_remote_key(&object);
+                #[cfg(not(feature = "server"))]
+                let remote_target = false;
+                if remote_target {
+                    self.reply_status(reply, 400, format!("{object} lives on another server; read it there"));
+                } else {
+                    match self.admit(&object, None, caller) {
+                        Err((status, why)) => self.reply_status(reply, status, why),
+                        Ok(who) => {
+                            // Each field reaches the readers its rule names; tools see personal data masked.
+                            let state = self.resolve_object(&object).and_then(|o| {
+                                let mut s = self.object_state(&o)?;
+                                let hidden = self.hidden(o.class, &o.id, &s, &who);
+                                self.hide(o.class, &mut s, &hidden);
+                                Ok(s)
+                            });
+                            match state {
+                                Ok(s) => {
+                                    // Reading is an event too: subscribers learn who is looking. It never
+                                    // changes state, so a replica fetching state cannot start a loop.
+                                    self.outputs.push(Output::Emit { object: object.clone(), name: "read".into(), data: Json::Null });
+                                    self.reply(reply, Ok(s));
+                                }
+                                // The rules admitted it, so this is the store failing.
+                                Err(e) => self.reply_status(reply, 503, e),
+                            }
                         }
-                        // The rules admitted it, so this is the store failing.
-                        Err(e) => self.reply_status(reply, 503, e),
                     }
                 }
-            },
+            }
             Input::Identity { user, roles } => self.set_identity(user, roles),
             Input::Entropy { bytes } => match crate::crypto::unhex(&bytes).filter(|b| b.len() >= 32) {
                 Some(b) => {

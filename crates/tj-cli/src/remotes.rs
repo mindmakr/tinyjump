@@ -21,9 +21,10 @@ use std::time::Duration;
 use tj_core::vm::program::Program;
 
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const SSE_READ_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(25) };
+const SSE_READ_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(2) };
 const RECONNECT_MIN: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(1) };
 const RECONNECT_MAX: Duration = if cfg!(test) { Duration::from_millis(500) } else { Duration::from_secs(30) };
+const MAX_SSE_EVENT_BYTES: usize = 1 << 20;
 
 /// One remote tinyjump server endpoint configured in `remotes.json`.
 #[derive(Clone, Debug)]
@@ -122,6 +123,11 @@ impl Remotes {
         self.by_class.get(class)
     }
 
+    /// Maps each remote class name to its network `Destination` for `@pii` flow & compliance checks.
+    pub fn destinations(&self) -> HashMap<String, tj_core::Destination> {
+        self.by_class.iter().map(|(c, t)| (c.clone(), url_destination(&t.url))).collect()
+    }
+
     /// Executes one durable outbox `Effect::Call` against the remote server owning `object`.
     /// Returns `Ok(result)` on HTTP 200, `Err((msg, field, false))` on permanent 4xx refusal,
     /// or `Err((msg, None, true))` (`unreachable = true`) on 5xx / transport errors so the
@@ -166,8 +172,8 @@ impl Remotes {
             }
             return Ok(j.get("ok").cloned().unwrap_or(Json::Null));
         }
-        // 5xx, 408, 429, or unexpected redirects (3xx with redirects=0): treat as retryable
-        // unless 4xx permanent refusal.
+        // 5xx, 408, and 429 are transient and retried; 3xx redirects (disabled) and other 4xx
+        // responses are permanent failures.
         let msg = parsed
             .as_ref()
             .and_then(|j| j.get("error").and_then(Json::as_str))
@@ -223,13 +229,42 @@ pub fn validate_http_url(raw: &str, allow_query: bool, private_fetch: bool, fetc
         return Err("missing host".into());
     }
     let loopback = matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1");
+    if loopback && !private_fetch {
+        return Err("loopback URLs require TJ_ALLOW_PRIVATE_FETCH=1 or tj dev".into());
+    }
     if !is_https && !loopback && !private_fetch {
-        return Err("must use https:// (plain http:// is only allowed for localhost/127.0.0.1/[::1] or when TJ_ALLOW_PRIVATE_FETCH=1)".into());
+        return Err("must use https:// (plain http:// is only allowed for loopback or when TJ_ALLOW_PRIVATE_FETCH=1)".into());
     }
     if !fetch_allow.is_empty() && !netloc_allowed(authority, fetch_allow) {
         return Err(format!("host {host:?} is not allowed by {FETCH_ALLOW_ENV}"));
     }
     Ok(if allow_query { trimmed.to_string() } else { trimmed.trim_end_matches('/').to_string() })
+}
+
+/// Extracts a privacy/compliance `Destination` (`Host` for HTTPS, `Cleartext` for HTTP) from a
+/// validated remote server or webhook URL.
+pub fn url_destination(url: &str) -> tj_core::Destination {
+    let (secure, rest) = if let Some(r) = url.strip_prefix("https://") {
+        (true, r)
+    } else if let Some(r) = url.strip_prefix("http://") {
+        (false, r)
+    } else {
+        return tj_core::Destination::Unknown;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split_once(']').map(|(h, _)| format!("[{h}]")).unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or("").to_string()
+    }
+    .to_ascii_lowercase();
+    if host.is_empty() {
+        tj_core::Destination::Unknown
+    } else if secure {
+        tj_core::Destination::Host(host)
+    } else {
+        tj_core::Destination::Cleartext(host)
+    }
 }
 
 fn validate_remote_url(raw: &str, private_fetch: bool, fetch_allow: &[String]) -> Result<String, String> {
@@ -330,17 +365,7 @@ impl RemoteHub {
             }
         };
         let changed = if let Ok(mut objs) = stream.objects.lock() {
-            match objs.get(&object) {
-                Some(&existing) if existing >= seq => false,
-                Some(_) => {
-                    objs.insert(object, seq);
-                    false
-                }
-                None => {
-                    objs.insert(object, seq);
-                    true
-                }
-            }
+            register_subscription(&mut objs, object, seq)
         } else {
             false
         };
@@ -402,6 +427,7 @@ fn run_sse_worker(
     }
     let agent = b.build();
     let mut backoff = RECONNECT_MIN;
+    let mut logged_outage = false;
 
     while !shutdown.load(Ordering::SeqCst) {
         let ver = stream.version.load(Ordering::SeqCst);
@@ -435,20 +461,31 @@ fn run_sse_worker(
         match req.call() {
             Ok(resp) => {
                 backoff = RECONNECT_MIN;
+                if std::mem::take(&mut logged_outage) {
+                    eprintln!("[tj] remote SSE stream to {} reconnected", target.url);
+                }
                 sink.on_online();
                 let mut reader = BufReader::new(resp.into_reader());
                 let mut event_name = String::new();
                 let mut data_buf = String::new();
-                let mut line = String::new();
+                let mut line = Vec::new();
                 loop {
                     if shutdown.load(Ordering::SeqCst) || stream.version.load(Ordering::SeqCst) != ver {
                         break;
                     }
-                    line.clear();
-                    match reader.read_line(&mut line) {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            let l = line.trim_end_matches(['\r', '\n']);
+                    match read_bounded_line(&mut reader, &mut line, MAX_SSE_EVENT_BYTES) {
+                        Ok(LineRead::Eof) => break,
+                        Ok(LineRead::TooLong) => {
+                            eprintln!("[tj] remote SSE stream {} exceeded {} byte line limit; reconnecting", target.url, MAX_SSE_EVENT_BYTES);
+                            break;
+                        }
+                        Ok(LineRead::Line) => {
+                            let Ok(s) = std::str::from_utf8(&line) else {
+                                event_name.clear();
+                                data_buf.clear();
+                                continue;
+                            };
+                            let l = s.trim_end_matches(['\r', '\n']);
                             if l.is_empty() {
                                 if !data_buf.is_empty() {
                                     handle_sse_event(&event_name, &data_buf, &stream, &*sink, &target.url);
@@ -458,21 +495,33 @@ fn run_sse_worker(
                             } else if let Some(ev) = l.strip_prefix("event:") {
                                 event_name = ev.trim().to_string();
                             } else if let Some(d) = l.strip_prefix("data:") {
+                                let part = d.trim_start();
+                                if data_buf.len() + part.len() + 1 > MAX_SSE_EVENT_BYTES {
+                                    eprintln!("[tj] remote SSE stream {} exceeded {} byte event limit; reconnecting", target.url, MAX_SSE_EVENT_BYTES);
+                                    break;
+                                }
                                 if !data_buf.is_empty() {
                                     data_buf.push('\n');
                                 }
-                                data_buf.push_str(d.trim_start());
+                                data_buf.push_str(part);
                             }
                         }
                         Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {
-                            // Read timeout lets us notice shutdown or new subscriptions promptly.
                             continue;
                         }
                         Err(_) => break,
                     }
                 }
             }
-            Err(_) => {
+            Err(err) => {
+                if !logged_outage {
+                    let why = match &err {
+                        ureq::Error::Status(s, _) => format!("HTTP {s}"),
+                        ureq::Error::Transport(t) => format!("{}", t.kind()),
+                    };
+                    eprintln!("[tj] remote SSE stream to {} failed ({why}); retrying", target.url);
+                    logged_outage = true;
+                }
                 let Ok(guard) = stream.objects.lock() else { return };
                 if !shutdown.load(Ordering::SeqCst) && stream.version.load(Ordering::SeqCst) == ver {
                     let _ = stream.wake.wait_timeout(guard, backoff);
@@ -480,6 +529,78 @@ fn run_sse_worker(
                 backoff = (backoff * 2).min(RECONNECT_MAX);
             }
         }
+    }
+}
+
+/// Registers `object` in `objs`, deduplicating `Class/id` against an existing `Class/*` stream
+/// (and pruning redundant per-instance entries when `Class/*` is added) to avoid O(N^2) SSE
+/// reconnect storms during `Class.all()` catch-up. Returns `true` when the active SSE query
+/// must reconnect.
+fn register_subscription(objs: &mut BTreeMap<String, u64>, object: String, seq: u64) -> bool {
+    if let Some(class) = object.strip_suffix("/*") {
+        let prefix = format!("{class}/");
+        objs.retain(|k, _| k == &object || !k.starts_with(&prefix));
+        match objs.get(&object) {
+            Some(&existing) if existing >= seq => false,
+            Some(_) => {
+                objs.insert(object, seq);
+                false
+            }
+            None => {
+                objs.insert(object, seq);
+                true
+            }
+        }
+    } else {
+        if let Some((class, _)) = object.split_once('/') {
+            if objs.contains_key(&format!("{class}/*")) {
+                return false;
+            }
+        }
+        match objs.get(&object) {
+            Some(&existing) if existing >= seq => false,
+            Some(_) => {
+                objs.insert(object, seq);
+                false
+            }
+            None => {
+                objs.insert(object, seq);
+                true
+            }
+        }
+    }
+}
+
+enum LineRead {
+    Line,
+    Eof,
+    TooLong,
+}
+
+fn read_bounded_line<R: BufRead>(reader: &mut R, out: &mut Vec<u8>, max_bytes: usize) -> std::io::Result<LineRead> {
+    out.clear();
+    loop {
+        let buf = reader.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(if out.is_empty() { LineRead::Eof } else { LineRead::Line });
+        }
+        if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let take = pos + 1;
+            if out.len() + take > max_bytes {
+                reader.consume(take);
+                return Ok(LineRead::TooLong);
+            }
+            out.extend_from_slice(&buf[..take]);
+            reader.consume(take);
+            return Ok(LineRead::Line);
+        }
+        let n = buf.len();
+        if out.len() + n > max_bytes {
+            reader.consume(n);
+            return Ok(LineRead::TooLong);
+        }
+        out.extend_from_slice(buf);
+        reader.consume(n);
     }
 }
 
@@ -547,9 +668,22 @@ object LocalOnly { x: number = 0 }
         // Fetch allowlist enforced.
         let err = Remotes::parse(r#"{"Stock":{"url":"https://evil.example.net"}}"#, "remotes.json", &prog, false, false, &["api.example.com".into()]).unwrap_err();
         assert!(err.contains("TJ_FETCH_ALLOW"), "{err}");
+        // Loopback URLs are rejected when private_fetch == false (matching public_only at runtime).
+        let err = Remotes::parse(r#"{"Stock":{"url":"http://127.0.0.1:4700"}}"#, "remotes.json", &prog, false, false, &[]).unwrap_err();
+        assert!(err.contains("TJ_ALLOW_PRIVATE_FETCH"), "{err}");
         // Valid HTTPS + allowlist passes.
         let ok = Remotes::parse(r#"{"Stock":{"url":"https://api.example.com/","keyEnv":"MY_KEY"}}"#, "remotes.json", &prog, false, false, &["api.example.com".into()]).unwrap();
         assert_eq!(ok.classes(), vec!["Stock"]);
         assert_eq!(ok.target_for_object("Stock/s1").unwrap().url, "https://api.example.com");
+        assert_eq!(ok.destinations().get("Stock"), Some(&tj_core::Destination::Host("api.example.com".into())));
+
+        // C-050.5: Class/* deduplicates per-instance subscriptions and prunes existing ones.
+        let mut subs = BTreeMap::new();
+        assert!(register_subscription(&mut subs, "Stock/s1".into(), 0));
+        assert!(register_subscription(&mut subs, "Stock/*".into(), 0));
+        assert_eq!(subs.keys().cloned().collect::<Vec<_>>(), vec!["Stock/*"]);
+        assert!(!register_subscription(&mut subs, "Stock/s2".into(), 0));
+        assert!(!register_subscription(&mut subs, "Stock/s3".into(), 0));
+        assert_eq!(subs.len(), 1);
     }
 }

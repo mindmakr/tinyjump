@@ -490,24 +490,45 @@ fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core
     if access {
         print!("{}", access::report(src));
     }
+    let private_fetch = std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let fetch_allow = engine::fetch_allow_from_env()?;
+    let remotes = match remotes::Remotes::load(file, program, false, private_fetch, &fetch_allow) {
+        Ok(r) => r,
+        Err(e) => {
+            failures.push(e);
+            remotes::Remotes::default()
+        }
+    };
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(src, &remote_dests);
+    if !flow_errs.is_empty() {
+        let name = file.display().to_string();
+        for d in &flow_errs {
+            failures.push(d.render(&name, src));
+        }
+    }
+    let webhooks = match webhooks::Webhooks::load(file, program, &remote_classes, false, private_fetch, &fetch_allow) {
+        Ok(w) => w,
+        Err(e) => {
+            failures.push(e);
+            webhooks::Webhooks::default()
+        }
+    };
+    let src_facts = tj_core::facts_with_remotes(src, &remote_dests);
+    let wh_transfers = webhooks.pii_transfers(program, &src_facts.reveals);
     if privacy && record {
-        print!("{}", privacy::record(src, program));
+        print!("{}", privacy::record_with_transfers(src, program, &remote_dests, &wh_transfers));
     } else if privacy {
         print!("{}", privacy::report(program));
     }
     if let Some(pack) = pack {
         let pack = compliance::Pack::load(pack)?;
-        let (report, ok) = pack.report(&pack.evaluate(src, program, None));
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(src, program, None, &remote_dests, &wh_transfers));
         print!("{report}");
         if !ok {
             failures.push("some controls are not met (above)".into());
         }
-    }
-    if let Err(e) = remotes::Remotes::load(file, program, false, true, &[]) {
-        failures.push(e);
-    }
-    if let Err(e) = webhooks::Webhooks::load(file, program, false, true, &[]) {
-        failures.push(e);
     }
     if failures.is_empty() { Ok(()) } else { Err(failures.join("\n")) }
 }
@@ -570,7 +591,13 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     let private_fetch = dev_mode || std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
     let fetch_allow = engine::fetch_allow_from_env()?;
     let remotes = Arc::new(remotes::Remotes::load(file, &program, true, private_fetch, &fetch_allow)?);
-    let webhooks = Arc::new(webhooks::Webhooks::load(file, &program, true, private_fetch, &fetch_allow)?);
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    let flow_errs = tj_core::check_remote_flows(&source, &remote_dests);
+    if !flow_errs.is_empty() {
+        return Err(flow_errs.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"));
+    }
+    let webhooks = Arc::new(webhooks::Webhooks::load(file, &program, &remote_classes, true, private_fetch, &fetch_allow)?);
     let compliance_gate = if let Some(pack) = &args.compliance {
         let pack = compliance::Pack::load(pack)?;
         let key_file = std::env::var_os(sealed::KEY_FILE_ENV).filter(|v| !v.is_empty()).map(PathBuf::from);
@@ -580,7 +607,9 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
             audit_key_apart: audit::kept_apart(&audit::key_path(&data), &data),
             tls: !http::credentials_need_tls(dev_mode, &args.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref()),
         };
-        let (report, ok) = pack.report(&pack.evaluate(&source, &program, Some(&server)));
+        let facts = tj_core::facts_with_remotes(&source, &remote_dests);
+        let wh_transfers = webhooks.pii_transfers(&program, &facts.reveals);
+        let (report, ok) = pack.report(&pack.evaluate_with_transfers(&source, &program, Some(&server), &remote_dests, &wh_transfers));
         if !ok {
             return Err(format!("{report}\nnot starting: some controls of the compliance pack are not met (above)"));
         }
@@ -599,7 +628,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         audit.clone(),
         compliance_gate,
         remotes.clone(),
-        webhooks.outgoing.clone(),
+        webhooks.clone(),
     )?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };

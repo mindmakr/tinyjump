@@ -101,6 +101,10 @@ impl Runtime {
         if !matches!(who, Who::Remote { .. }) {
             return None;
         }
+        #[cfg(feature = "server")]
+        if self.is_remote_key(key) {
+            return Some(if self.explain { format!("not allowed: {key} lives on another server") } else { "not allowed".to_string() });
+        }
         let reason = match self.rule_for(key, method) {
             Ok((rule, id)) if allows(&rule, who, id) => return None,
             Ok((rule, _)) => format!("{key}{} needs {}", method.map(|m| format!(".{m}")).unwrap_or_default(), describe(&rule)),
@@ -150,6 +154,10 @@ impl Runtime {
 
     /// Whether a remote caller may read `key` (for the server's change streams).
     pub fn may_read(&self, key: &str, caller: &Caller) -> Result<(), String> {
+        #[cfg(feature = "server")]
+        if self.is_remote_key(key) {
+            return Err(if self.explain { format!("not allowed: {key} lives on another server") } else { "not allowed".to_string() });
+        }
         match self.refusal(key, None, &Who::from_caller(caller, self.server)) {
             None => Ok(()),
             Some(why) => Err(why),

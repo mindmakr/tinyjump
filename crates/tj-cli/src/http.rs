@@ -421,9 +421,21 @@ fn handle_webhook(req: &mut Request, front: &Front, name: &str, started: Instant
                 .with_header(header("Retry-After", &retry_after.to_string()));
         }
     }
+    // Check known webhook name BEFORE reading up to 1 MiB of body bytes (C-050.11).
+    if !front.webhooks.incoming.contains_key(name) {
+        if front.rate.limit > 0 {
+            let _ = front.rate.check(&bad_key, started);
+        }
+        return json_response(404, &json!({ "error": "unknown webhook" }));
+    }
     let raw = match read_raw_json_bytes(req) {
         Ok(b) => b,
-        Err((s, e)) => return json_response(s, &json!({ "error": e })),
+        Err((s, e)) => {
+            if front.rate.limit > 0 {
+                let _ = front.rate.check(&bad_key, started);
+            }
+            return json_response(s, &json!({ "error": e }));
+        }
     };
     let ts = header_value(req, "X-TinyJump-Timestamp");
     let sig = header_value(req, "X-TinyJump-Signature");
@@ -1948,6 +1960,7 @@ mod tests {
                 max_age_secs: 300,
             },
         );
+        let wh_arc = Arc::new(wh_cfg);
         let audit_b = Audit::start(&dir_b).unwrap().0;
         let eng_b = Engine::start_with_integrations(
             src_b,
@@ -1958,14 +1971,14 @@ mod tests {
             audit_b.clone(),
             None,
             remotes_b,
-            outgoing_b,
+            wh_arc.clone(),
         )
         .unwrap();
         let srv_b = Server::http("127.0.0.1:0").unwrap();
         let port_b = srv_b.server_addr().to_ip().unwrap().port();
         let front_b = Arc::new(
             Front::new(eng_b, None, None, Automation::Open, Identity::anonymous(), audit_b, Leases::open(&dir_b), false)
-                .with_webhooks(Arc::new(wh_cfg)),
+                .with_webhooks(wh_arc),
         );
         thread::spawn(move || {
             for req in srv_b.incoming_requests() {

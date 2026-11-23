@@ -179,9 +179,23 @@ impl Pack {
     }
 
     /// Each control with its verdict, for an app; `server` when a server is starting.
+    #[cfg(test)]
     pub fn evaluate(&self, src: &str, program: &Program, server: Option<&Server>) -> Vec<(&Control, Verdict)> {
+        self.evaluate_with_transfers(src, program, server, &std::collections::HashMap::new(), &[])
+    }
+
+    /// Like [`Pack::evaluate`], also incorporating remote-server destinations (`remotes.json`)
+    /// and outgoing webhook personal-data transfers (`webhooks.json`).
+    pub fn evaluate_with_transfers(
+        &self,
+        src: &str,
+        program: &Program,
+        server: Option<&Server>,
+        remote_dests: &std::collections::HashMap<String, tj_core::Destination>,
+        extra_transfers: &[(String, tj_core::Destination, Vec<String>)],
+    ) -> Vec<(&Control, Verdict)> {
         let special_bases = self.special_bases.clone().unwrap_or_else(|| BTreeSet::from(["consent".to_string()]));
-        let facts = tj_core::facts(src);
+        let facts = tj_core::facts_with_remotes(src, remote_dests);
         let bases = facts.lawful_basis;
         let held: Vec<_> = program.objects.iter().filter(|o| !o.pii.is_empty()).collect();
         let basis_of = |purpose: &str| bases.as_ref().and_then(|b| b.iter().find(|(p, _)| p == purpose).map(|(_, b)| b.clone()));
@@ -229,7 +243,7 @@ impl Pack {
                     }
                     "subject-rights" => Verdict::Met("built in: tj privacy export|erase, and tj:privacy in app code".into()),
                     "records" => Verdict::Met("built in: tj check --privacy --record".into()),
-                    "transfers" => self.transfers_verdict(src, &facts.transfers),
+                    "transfers" => self.transfers_verdict(src, &facts.transfers, extra_transfers),
                     "consent" => {
                         let on_consent: Vec<&str> = bases.iter().flatten().filter(|(_, b)| b == "consent").map(|(p, _)| p.as_str()).collect();
                         if on_consent.is_empty() {
@@ -264,16 +278,20 @@ impl Pack {
     }
 
     /// Every transfer must be to a destination the pack allows.
-    fn transfers_verdict(&self, src: &str, transfers: &[tj_core::Transfer]) -> Verdict {
-        if transfers.is_empty() {
+    fn transfers_verdict(&self, src: &str, transfers: &[tj_core::Transfer], extra: &[(String, tj_core::Destination, Vec<String>)]) -> Verdict {
+        if transfers.is_empty() && extra.is_empty() {
             return Verdict::Met("personal data is not sent outside the server".into());
         }
         let mut problems = Vec::new();
         let mut allowed = BTreeSet::new();
-        for t in transfers {
-            let at = crate::privacy::place(src, t.at);
-            let what = t.fields.join(", ");
-            let name = match &t.to {
+        let all: Vec<(String, &tj_core::Destination, &[String])> = transfers
+            .iter()
+            .map(|t| (crate::privacy::place(src, t.at), &t.to, t.fields.as_slice()))
+            .chain(extra.iter().map(|(at, to, fields)| (at.clone(), to, fields.as_slice())))
+            .collect();
+        for (at, to, fields) in all {
+            let what = fields.join(", ");
+            let name = match to {
                 tj_core::Destination::Host(h) => h.clone(),
                 tj_core::Destination::Cleartext(h) => {
                     problems.push(format!("{at} sends {what} to {h} over plain HTTP, readable on the way; use https://"));
@@ -285,11 +303,11 @@ impl Pack {
                     continue;
                 }
             };
-            match self.transfers.iter().find(|(to, _)| matches(to, &name)) {
+            match self.transfers.iter().find(|(pat, _)| matches(pat, &name)) {
                 Some((_, basis)) => {
                     allowed.insert(format!("{name} ({basis})"));
                 }
-                None => problems.push(format!("{at} sends {what} to {}; list \"{name}\" in the pack's \"transfers\" with its basis, or stop sending it", crate::privacy::destination(&t.to))),
+                None => problems.push(format!("{at} sends {what} to {}; list \"{name}\" in the pack's \"transfers\" with its basis, or stop sending it", crate::privacy::destination(to))),
             }
         }
         if problems.is_empty() {
