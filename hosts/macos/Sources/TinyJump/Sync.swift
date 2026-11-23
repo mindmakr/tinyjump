@@ -1,0 +1,165 @@
+import Foundation
+
+/// Server objects: calls `@server` methods over HTTP and keeps this device's replicas current
+/// from the server's realtime stream. The stream resumes from a change number, so after a
+/// reconnect the server sends only what this device missed. Main thread only.
+final class Sync: NSObject, URLSessionDataDelegate {
+    private weak var tj: TinyJump?
+    private let server: String?
+    private var replicas: [String: UInt64] = [:]
+    private var cursor: UInt64 = 0
+    private var session: URLSession!
+    private var stream: URLSessionDataTask?
+    private var buffer = Data()
+    private var generation = 0
+    private var token: String?
+    private var user: String?
+    private var roles: [String] = []
+    var onTokenExpired: (() -> Void)?
+
+    init(tj: TinyJump, server: String?) {
+        self.tj = tj
+        self.server = server.map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
+        super.init()
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 60
+        session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
+    }
+
+    func subscribe(_ key: String, seq: UInt64) {
+        guard server != nil, replicas[key] == nil else { return }
+        if !key.hasSuffix("/*"), replicas[String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"] != nil { return }
+        if key.hasSuffix("/*") {
+            let prefix = String(key.dropLast())
+            replicas = replicas.filter { !$0.key.hasPrefix(prefix) }
+        }
+        replicas[key] = seq
+        cursor = replicas.values.min() ?? 0
+        connect()
+    }
+
+    func stop() {
+        generation += 1
+        stream?.cancel()
+        session.invalidateAndCancel()
+    }
+
+    func call(_ effect: [String: Any], done: @escaping (Any?, String?, String?, Bool) -> Void) {
+        let object = effect["object"] as? String ?? ""
+        guard server != nil, let url = URL(string: objectUrl(object) + "/" + Sync.encode(effect["method"] as? String ?? "")) else {
+            done(nil, "no server configured for \(object)", nil, false)
+            return
+        }
+        var req = URLRequest(url: url, timeoutInterval: 30)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(effect["call"] as? String, forHTTPHeaderField: "Idempotency-Key")
+        authorize(&req)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: effect["args"] as? [Any] ?? [])
+        URLSession.shared.dataTask(with: req) { data, response, error in
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let reply = status < 502 && status != 401 && status != 429 ? data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] : nil
+            DispatchQueue.main.async {
+                if status == 401 { self.onTokenExpired?() }
+                if let message = reply?["error"] as? String {
+                    done(nil, message, reply?["field"] as? String, false)
+                } else if (200..<300).contains(status), let reply = reply {
+                    done(reply["ok"], nil, nil, false)
+                } else {
+                    done(nil, error?.localizedDescription ?? "the server did not answer", nil, true)
+                }
+            }
+        }.resume()
+    }
+
+    private static func encode(_ s: String) -> String {
+        var allowed = CharacterSet.alphanumerics
+        allowed.insert(charactersIn: "-._~")
+        return s.addingPercentEncoding(withAllowedCharacters: allowed) ?? s
+    }
+
+    private func objectUrl(_ key: String) -> String {
+        (server ?? "") + "/api/" + key.split(separator: "/").map { Sync.encode(String($0)) }.joined(separator: "/")
+    }
+
+    private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
+        cursor = max(cursor, seq)
+        let whole = String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"
+        let entry = replicas[whole] != nil ? whole : key
+        guard let have = replicas[entry] else { return }
+        replicas[entry] = max(have, seq)
+        tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
+    }
+
+    func setToken(_ newToken: String?, user newUser: String?, roles newRoles: [String]) -> Bool {
+        token = newToken
+        let changed = newUser != user || newRoles != roles
+        user = newUser
+        roles = newRoles
+        if changed {
+            replicas = [:]
+            cursor = 0
+            generation += 1
+            stream?.cancel()
+            stream = nil
+        } else if !replicas.isEmpty {
+            connect()
+        }
+        return changed
+    }
+
+    private func authorize(_ req: inout URLRequest) {
+        if let token = token { req.setValue("Bearer " + token, forHTTPHeaderField: "Authorization") }
+    }
+
+    private func connect() {
+        generation += 1
+        stream?.cancel()
+        buffer = Data()
+        let query = replicas.keys.map { "object=" + Sync.encode($0) }.joined(separator: "&")
+        guard let url = URL(string: (server ?? "") + "/api/events?" + query + "&since=\(cursor)") else { return }
+        var req = URLRequest(url: url)
+        authorize(&req)
+        stream = session.dataTask(with: req)
+        stream?.resume()
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        let status = (response as? HTTPURLResponse)?.statusCode
+        if dataTask === stream, status == 200 {
+            tj?.send(["type": "online"])
+        }
+        if dataTask === stream, status == 401 { onTokenExpired?() }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard dataTask === stream else { return }
+        buffer.append(data)
+        let separator = Data("\n\n".utf8)
+        while let r = buffer.range(of: separator) {
+            let chunk = String(decoding: buffer.subdata(in: buffer.startIndex..<r.lowerBound), as: UTF8.self)
+            buffer.removeSubrange(buffer.startIndex..<r.upperBound)
+            var event = ""
+            var payload = ""
+            for line in chunk.split(separator: "\n") {
+                if line.hasPrefix("event: ") { event = String(line.dropFirst(7)) }
+                if line.hasPrefix("data: ") { payload = String(line.dropFirst(6)) }
+            }
+            guard event == "changed",
+                  let d = (try? JSONSerialization.jsonObject(with: Data(payload.utf8))) as? [String: Any],
+                  let key = d["object"] as? String, let state = d["state"],
+                  let seq = (d["seq"] as? NSNumber)?.uint64Value else { continue }
+            deliver(key, state, seq)
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard task === stream else { return }
+        let gen = generation
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self = self, self.generation == gen else { return }
+            self.connect()
+        }
+    }
+}

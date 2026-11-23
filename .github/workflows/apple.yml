@@ -42,11 +42,16 @@ jobs:
       - name: iOS app on the Simulator
         run: bash scripts/ios-sim.sh test
 
+      - name: macOS native AppKit host
+        run: bash scripts/macos.sh test
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios-simulator
+          name: apple-hosts
           path: |
             target/ios-sim/*.png
             target/ios-sim/*.json
+            target/macos/*.png
+            target/macos/*.json
           if-no-files-found: ignore
