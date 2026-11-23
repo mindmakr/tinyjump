@@ -10,7 +10,7 @@
 use serde_json::{json, Value as Json};
 use std::path::Path;
 use std::time::Instant;
-use tj_core::{compile, Input, MemStore, Options, Output, Runtime};
+use tj_core::{Input, MemStore, Options, Output, Runtime};
 
 const RUNS: usize = 5;
 const START: f64 = 1_800_000_000_000.0;
@@ -71,7 +71,7 @@ pub fn bench(name: &str, source: &str) -> Result<Bench, String> {
     let mut best: Option<Bench> = None;
     for _ in 0..RUNS {
         let t = Instant::now();
-        let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render(name, source)).collect::<Vec<_>>().join("\n\n"))?;
+        let program = tj_core::load(source).map_err(|errs| errs.iter().map(|d| d.render(name, source)).collect::<Vec<_>>().join("\n\n"))?;
         let compile_ms = ms(t);
         let t = Instant::now();
         let opts = Options { server: true, ..Options::new(START, 1) };

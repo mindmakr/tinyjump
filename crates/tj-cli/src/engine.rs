@@ -152,7 +152,7 @@ struct Booted {
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
 fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str], remote_classes: &[String]) -> Result<Booted, String> {
-    let program = compile(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
+    let program = tj_core::load(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let manifest = Manifest::build(source, &program, configured_plugins);
     let snap = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.

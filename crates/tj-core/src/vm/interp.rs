@@ -549,9 +549,13 @@ impl Runtime {
                 let at = match proto.source {
                     Source::User => {
                         let off = proto.offsets.get(fr.ip.saturating_sub(1)).copied().unwrap_or(0);
-                        match crate::modules::locate(&self.program.user_source, off as usize) {
-                            (Some(file), line, col) => format!("{file}:{line}:{col}"),
-                            (None, line, col) => format!("{line}:{col}"),
+                        if self.program.user_source.is_empty() {
+                            format!("bytecode+{off}")
+                        } else {
+                            match crate::modules::locate(&self.program.user_source, off as usize) {
+                                (Some(file), line, col) => format!("{file}:{line}:{col}"),
+                                (None, line, col) => format!("{line}:{col}"),
+                            }
                         }
                     }
                     Source::Prelude => "prelude".into(),

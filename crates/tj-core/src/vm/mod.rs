@@ -1,6 +1,7 @@
 //! The bytecode VM: values, programs, builtins and the interpreter loop.
 
 pub mod builtins;
+pub mod bytecode;
 pub mod interp;
 pub mod program;
 pub mod time;

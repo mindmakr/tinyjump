@@ -24,6 +24,15 @@ pub use {
     compile::{check_remote_flows, facts, facts_with_remotes, Facts},
     flow::{Destination, Reveal, Transfer},
 };
+
+/// Loads precompiled `//# tjb:1:...` bytecode directly, or compiles `.tj` source.
+pub fn load(src: &str) -> Result<vm::program::Program, Vec<syntax::Diagnostic>> {
+    if let Some(decoded) = vm::program::Program::from_bundle(src) {
+        decoded.map_err(|m| vec![syntax::Diagnostic::new(m, syntax::Span::default()).hint("rebuild the .tjb bundle with `tj build`")])
+    } else {
+        compile(src)
+    }
+}
 pub use runtime::protocol::{Input, Output, PatchOp, Target};
 pub use runtime::store::{MemStore, Store};
 pub use runtime::{BootError, Options, Runtime};
