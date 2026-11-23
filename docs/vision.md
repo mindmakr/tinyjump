@@ -150,10 +150,13 @@ the goal; being in the market early, to gain momentum and contributors, is.
 After that: **the UI catalog (`<Tabs>`, `<Icon>`, `<List>`, `<Theme>`, done) and native
 components (`<Native name="MapView" ... />`, done)** (owner, 2026-11-20: a Kotlin or Java
 view, a Swift view or a web element registered under a name and used from `.tj` like any
-catalog component, with props and events through the protocol), `tj build`, the rest of
-automation (golden images, run reports), translations and locale formats, and GPU/3D. Size:
-profile the device builds and cut what is really large (a server-only split was measured at
-1.2 KB and dropped, `feedback/2026-11-20-builder-004-size-split-measured.md`).
+catalog component, with props and events through the protocol), **`tj build` (done: AOT
+`.tjb` bytecode serialization so devices skip the compiler, plus `--web`, `--linux`
+standalone executables with SHA-256-verified embedded bytecode, `--android` and `--ios`
+asset bundles)**, the rest of automation (golden images, run reports), translations and
+locale formats, and GPU/3D. Size: profile the device builds and cut what is really large
+(a server-only split was measured at 1.2 KB and dropped,
+`feedback/2026-11-20-builder-004-size-split-measured.md`).
 
 ## The ecosystem: filling the gap of missing libraries (agreed)
 
@@ -207,13 +210,12 @@ languages, with local time, number and currency formats.
   translations and RTL mirroring, and runs a pseudo-locale (long, accented text) to catch
   layout breaks early.
 
-## Modules and app builds (planned)
+## Modules and app builds
 
-Apps can be several `.tj` files with imports (below). Native hosts ship the source
-inside a real app (APK or `.app`, with native widgets) and compile it to bytecode on the
-device at startup. The web runs the runtime as WASM, and Linux uses one static `tj` binary.
-App code is interpreted bytecode, which iOS allows, and it keeps apps small, deterministic
-and live-reloadable.
+Apps can be several `.tj` files with imports (below). Native hosts can boot either source
+or precompiled AOT `.tjb` bytecode (skipping the compiler at startup). The web runs the
+runtime as WASM, and Linux uses one static `tj` binary. App code is interpreted bytecode,
+which iOS allows, and it keeps apps small, deterministic and live-reloadable.
 
 In order:
 
@@ -221,10 +223,14 @@ In order:
    files compile into one program. The type checker and `tj check` work across files, and
    errors name the right file and line. Apps travel as one text bundle, so hosts did not
    change.
-2. **Ahead-of-time bytecode:** `tj build` emits bytecode, so devices skip the compiler.
-   Apps are smaller, start faster, and do not ship the source.
-3. **Packaging:** `tj build --android`, `--ios` and `--linux` produce the APK, the `.app`,
-   or a single binary with the app embedded.
+2. **Ahead-of-time bytecode (done):** `tj build` emits validated `.tjb` bytecode (and
+   `//# tjb:1:<base64>` bundles) so devices and servers skip the compiler at startup and do
+   not ship `.tj` source. An opt-out compiler feature for smaller AOT-only device binaries
+   comes with binary-size profiling.
+3. **Packaging (in progress):** `tj build --linux` produces a single executable with
+   SHA-256-verified embedded bytecode; `--web` emits a static web bundle; `--android` and
+   `--ios` stage `assets/app.tjb` / `Resources/app.tjb` for host projects (full turnkey
+   APK / `.app` template assembly comes next).
 4. **Machine code for app logic:** only if benchmarks show the VM is too slow for a real
    workload. It costs size, complicates durable state and replay, and slows the reload
    loop. Heavy computation can go into WASM or Rust plugins instead.

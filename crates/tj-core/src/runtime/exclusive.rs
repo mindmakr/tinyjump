@@ -210,6 +210,9 @@ impl Runtime {
         if !self.any_exclusive {
             return Ok(None);
         }
+        if f.stack.len() <= argc {
+            return Ok(None);
+        }
         let Value::Obj(o) = &f.stack[f.stack.len() - 1 - argc] else { return Ok(None) };
         if self.is_remote(o) || !self.is_exclusive(o.class, name) {
             return Ok(None);

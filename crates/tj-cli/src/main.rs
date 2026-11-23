@@ -5,6 +5,7 @@ mod app;
 mod audit;
 mod auth;
 mod bench;
+mod build;
 mod bytes;
 mod compat;
 mod compliance;
@@ -60,6 +61,9 @@ USAGE:
                                  static permission audit)
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
+  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--server <url>] [--runner <file>] [--json]
+                                 compile AOT bytecode (.tjb) or package a static web bundle, a standalone
+                                 executable with embedded bytecode, or Android/iOS AOT asset bundles
   tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
@@ -214,8 +218,24 @@ fn parse_args() -> Result<Args, String> {
 }
 
 fn main() -> ExitCode {
-    // `tj plugin <name> [file]` speaks MCP on stdio; it has its own arguments.
     let raw: Vec<String> = std::env::args().collect();
+    // Standalone executable built with `tj build --linux`: boot the embedded AOT bytecode directly.
+    match build::embedded_app() {
+        Ok(Some(bytecode)) => {
+            return match serve_embedded(&bytecode, &raw[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     // `tj`, `tj --help`, `tj help` and `--help` after any command print the usage.
     if raw.iter().skip(1).any(|a| matches!(a.as_str(), "--version" | "-V" | "version")) {
         println!("tj {}", env!("CARGO_PKG_VERSION"));
@@ -236,6 +256,15 @@ fn main() -> ExitCode {
     }
     if raw.get(1).map(String::as_str) == Some("lease") {
         return match leases::run(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("build") {
+        return match build::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
@@ -574,6 +603,19 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         eprintln!("warning: {w}");
     }
     let source = read_source(file)?;
+    let is_bytecode = source.starts_with(tj_core::vm::bytecode::BUNDLE_PREFIX);
+    if is_bytecode && args.compliance.is_some() {
+        return Err("--compliance requires .tj source for static privacy-flow analysis; run `tj check --compliance` before `tj build`".into());
+    }
+    let program = tj_core::load(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"))?;
+    let private_fetch = dev_mode || std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let fetch_allow = engine::fetch_allow_from_env()?;
+    let remotes = Arc::new(remotes::Remotes::load(file, &program, true, private_fetch, &fetch_allow)?);
+    let remote_classes = remotes.classes();
+    let remote_dests = remotes.destinations();
+    if is_bytecode && !remote_dests.is_empty() && program.objects.iter().any(|o| !o.pii.is_empty()) {
+        return Err("serving a precompiled .tjb with both @pii and remotes.json is refused because static remote-flow checks need .tj source; run `tj serve <app.tj>`".into());
+    }
     let data = args.data.clone().unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).join(".tj-data"));
     let loopback = http::is_loopback(&args.host);
     if args.as_user.is_some() && !(dev_mode && loopback) {
@@ -587,13 +629,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     // Checked before anything starts: a folder that mixes plain and sealed records, or a key
     // file that cannot be read, stops the server here.
     let (_, storage) = sealed::open_store(&data, &[])?;
-    let program = tj_core::compile(&source).map_err(|e| e.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"))?;
-    let private_fetch = dev_mode || std::env::var(engine::PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
-    let fetch_allow = engine::fetch_allow_from_env()?;
-    let remotes = Arc::new(remotes::Remotes::load(file, &program, true, private_fetch, &fetch_allow)?);
-    let remote_classes = remotes.classes();
-    let remote_dests = remotes.destinations();
-    let flow_errs = tj_core::check_remote_flows(&source, &remote_dests);
+    let flow_errs = if is_bytecode { Vec::new() } else { tj_core::check_remote_flows(&source, &remote_dests) };
     if !flow_errs.is_empty() {
         return Err(flow_errs.iter().map(|d| d.render(&file.display().to_string(), &source)).collect::<Vec<_>>().join("\n\n"));
     }
@@ -659,6 +695,54 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
     }
     http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()).with_webhooks(webhooks))
+}
+
+fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
+    let mut port: u16 = 4700;
+    let mut host = "127.0.0.1".to_string();
+    let mut data: Option<PathBuf> = None;
+    let mut info = false;
+    let mut it = raw_args.iter();
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--info" => info = true,
+            "--port" => port = value()?.parse().map_err(|_| "--port must be a number")?,
+            "--host" => host = value()?.clone(),
+            "--data" => data = Some(PathBuf::from(value()?)),
+            "--help" | "-h" => {
+                println!("Standalone tinyjump app (embedded AOT bytecode)\n\nOPTIONS:\n  --port <n>      port to listen on (default 4700)\n  --host <addr>   address to bind (default 127.0.0.1)\n  --data <dir>    where objects are stored (default: .tj-data)\n  --info          print embedded app metadata and exit");
+                return Ok(());
+            }
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    let program = tj_core::vm::program::Program::from_bytes(bytecode)?;
+    if info {
+        let objects: Vec<&str> = program.objects.iter().map(|o| &*o.name).collect();
+        println!("embedded AOT app: {} bytes bytecode, objects: [{}], ui: {}", bytecode.len(), objects.join(", "), program.app.is_some());
+        return Ok(());
+    }
+    let source = tj_core::vm::bytecode::bundle_from_bytes(bytecode);
+    let data = data.unwrap_or_else(|| PathBuf::from(".tj-data"));
+    let identity = identity::Identity::new(None)?;
+    let (_, storage) = sealed::open_store(&data, &[])?;
+    let (audit, audit_key) = audit::Audit::start(&data)?;
+    let plugins = Arc::new(plugins::Plugins::default());
+    let remotes = Arc::new(remotes::Remotes::default());
+    let webhooks = Arc::new(webhooks::Webhooks::default());
+    let engine = Engine::start_with_integrations(source, data.clone(), false, false, plugins, audit.clone(), None, remotes, webhooks.clone())?;
+    let addr = format!("{host}:{port}");
+    let automation = auth::Automation::for_serve()?;
+    let leases = leases::Leases::open(&data);
+    let tls = http::credentials_need_tls(false, &host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
+    eprintln!("tinyjump standalone server on http://{addr} (data: {}; storage: {storage}; audit: {audit_key})", data.display());
+    if tls {
+        eprintln!("credentials: refused over plain HTTP on {host}; behind a TLS proxy, set {}=1", http::TLS_TERMINATED_ENV);
+    } else if std::env::var(http::TLS_TERMINATED_ENV).is_ok_and(|v| v == "1") && std::env::var("TJ_TRUST_PROXY").ok().as_deref() != Some("1") {
+        eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
+    }
+    http::serve(&addr, http::Front::new(engine, None, None, automation, identity, audit, leases, tls).with_webhooks(webhooks))
 }
 
 fn reload_cmd(args: &[String]) -> Result<(), String> {

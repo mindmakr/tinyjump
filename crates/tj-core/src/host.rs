@@ -19,19 +19,32 @@ pub struct JsonHost {
 }
 
 impl JsonHost {
-    /// Compiles and boots `src`, replacing any running app. Native hosts pass a `measure` for layout.
+    /// Compiles (or decodes precompiled `//# tjb:1:...` bytecode) and boots `src`,
+    /// replacing any running app. Native hosts pass a `measure` for layout.
     pub fn boot(&mut self, src: &str, store: Box<dyn Store>, measure: Option<Box<dyn Measure>>, now: f64, seed: u64, render: bool) -> (i32, String) {
-        let program = match compile(src) {
-            Ok(p) => p,
-            Err(errs) => {
-                let list: Vec<Json> = errs
-                    .iter()
-                    .map(|d| {
-                        let (line, col) = crate::syntax::line_col(src, d.span.start as usize);
-                        json!({ "message": d.message, "hint": d.hint, "line": line, "col": col, "text": d.render("app.tj", src) })
-                    })
-                    .collect();
-                return (INVALID, Json::Array(list).to_string());
+        let program = if let Some(decoded) = crate::vm::program::Program::from_bundle(src) {
+            match decoded {
+                Ok(p) => p,
+                Err(msg) => {
+                    return (
+                        INVALID,
+                        Json::Array(vec![json!({ "message": msg, "hint": "rebuild the .tjb bundle with `tj build`", "line": 1, "col": 1, "text": format!("error: {msg}") })]).to_string(),
+                    );
+                }
+            }
+        } else {
+            match compile(src) {
+                Ok(p) => p,
+                Err(errs) => {
+                    let list: Vec<Json> = errs
+                        .iter()
+                        .map(|d| {
+                            let (line, col) = crate::syntax::line_col(src, d.span.start as usize);
+                            json!({ "message": d.message, "hint": d.hint, "line": line, "col": col, "text": d.render("app.tj", src) })
+                        })
+                        .collect();
+                    return (INVALID, Json::Array(list).to_string());
+                }
             }
         };
         // Foreign-language hosts are devices: `@server` objects are replicas.

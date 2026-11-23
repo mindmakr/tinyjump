@@ -32,7 +32,7 @@ use std::rc::Rc;
 use tj_core::runtime::protocol::{Caller, Effect};
 use tj_core::ui::layout::{Frame, Measure};
 use tj_core::vm::program::Program;
-use tj_core::{compile, Input, MemStore, Options, Output, PatchOp, Runtime, Store, Target};
+use tj_core::{Input, MemStore, Options, Output, PatchOp, Runtime, Store, Target};
 
 const DEFAULT_START_MS: f64 = 1_800_000_000_000.0;
 const DEFAULT_SEED: u64 = 1;
@@ -292,7 +292,7 @@ impl Harness {
         self.booted_once = true;
         self.nodes.borrow_mut().clear();
         self.frames.clear();
-        let program: Program = compile(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
+        let program: Program = tj_core::load(&self.source).map_err(|e| format!("compile failed: {}", e.iter().map(|d| d.message.as_str()).collect::<Vec<_>>().join("; ")))?;
         let opts = Options {
             now: self.now,
             seed: self.seed,
@@ -983,7 +983,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let app_file = app_file.ok_or_else(|| format!("`tj test` needs an app file\n\n{usage}"))?;
     let source = crate::app::read(&app_file)?.source;
     // Fail early with full rendered diagnostics if the app does not compile.
-    if let Err(errs) = compile(&source) {
+    if let Err(errs) = tj_core::load(&source) {
         let name = app_file.display().to_string();
         return Err(errs.iter().map(|d| d.render(&name, &source)).collect::<Vec<_>>().join("\n\n"));
     }

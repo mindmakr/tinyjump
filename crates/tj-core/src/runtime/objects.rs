@@ -234,7 +234,7 @@ impl Runtime {
             Exc::msg(fail.message)
         })? {
             Value::Rec(state) => Ok(Rc::clone(&state)),
-            _ => unreachable!("object init returns a record"),
+            _ => Err(Exc::fault("object init must return a record")),
         }
     }
 

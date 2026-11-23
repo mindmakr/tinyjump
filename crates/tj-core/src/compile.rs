@@ -76,6 +76,10 @@ pub fn check_remote_flows(src: &str, remote_dests: &HashMap<String, crate::flow:
 
 /// Compiles a source file (plus the prelude) to a program.
 pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
+    if src.starts_with(crate::vm::bytecode::BUNDLE_PREFIX) {
+        return Err(vec![Diagnostic::new("expected .tj source, got a precompiled .tjb bytecode bundle", Span::default())
+            .hint("use `tj_core::load()` to run precompiled bytecode, or pass the .tj source file")]);
+    }
     let prelude = parse(PRELUDE).expect("prelude parses");
     // Plugins that ship with tinyjump come with the compiler (see `modules::BUILT_IN`).
     let src = &*modules::with_built_ins(src);

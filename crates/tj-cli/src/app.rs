@@ -13,6 +13,13 @@ pub struct App {
 }
 
 pub fn read(entry: &Path) -> Result<App, String> {
+    // Precompiled binary `.tjb` bytecode: wrap into the UTF-8 bundle format so every command
+    // (`tj serve`, `tj bench`, `tj reload`) loads it without invoking the compiler.
+    if let Ok(raw) = std::fs::read(entry) {
+        if raw.starts_with(tj_core::vm::bytecode::MAGIC) {
+            return Ok(App { source: tj_core::vm::bytecode::bundle_from_bytes(&raw), files: vec![entry.to_path_buf()] });
+        }
+    }
     let dir = entry.parent().unwrap_or(Path::new(""));
     let entry_name = entry.file_name().map(|n| n.to_string_lossy().into_owned()).ok_or_else(|| format!("{} is not a file", entry.display()))?;
     let mut names = vec![entry_name];

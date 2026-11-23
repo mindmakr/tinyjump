@@ -301,7 +301,7 @@ impl Value {
             Value::Class(_) => "[object type]".into(),
             Value::Elem(e) => format!("<{}>", e.kind),
             Value::Promise(_) => "[promise]".into(),
-            Value::Cell(c) => c.borrow().display(),
+            Value::Cell(c) => c.try_borrow().map_or_else(|_| "[cell]".into(), |v| v.display()),
         }
     }
 
