@@ -415,47 +415,51 @@ fn read_raw_json_bytes(req: &mut Request) -> Result<Vec<u8>, Failure> {
 fn handle_webhook(req: &mut Request, front: &Front, name: &str, started: Instant) -> Body {
     let ip = client_ip(req, front.trust_proxy);
     let bad_key = format!("bad:{ip}");
-    if front.rate.limit > 0 {
-        if let Some(retry_after) = front.rate.is_exhausted(&bad_key, started) {
-            return json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
-                .with_header(header("Retry-After", &retry_after.to_string()));
-        }
-    }
-    // Check known webhook name BEFORE reading up to 1 MiB of body bytes (C-050.11).
-    if !front.webhooks.incoming.contains_key(name) {
+    // Charge `bad:{ip}` ONLY on failed requests (404 / malformed headers / 413 / 415 / 401),
+    // returning 429 once exhausted and throttling `audit.security` writes — never blocking
+    // valid HMAC-signed webhooks behind a shared NAT or reverse proxy (`RW-2`).
+    let charge_bad = |status: u16, msg: String| -> Body {
         if front.rate.limit > 0 {
-            let _ = front.rate.check(&bad_key, started);
-        }
-        return json_response(404, &json!({ "error": "unknown webhook" }));
-    }
-    let raw = match read_raw_json_bytes(req) {
-        Ok(b) => b,
-        Err((s, e)) => {
-            if front.rate.limit > 0 {
-                let _ = front.rate.check(&bad_key, started);
+            if let Err((retry_after, audit_now)) = front.rate.check(&bad_key, started) {
+                if audit_now {
+                    front.audit.record(
+                        Entry::new("refused")
+                            .who(Actor::Invalid)
+                            .text("request", "rate limit")
+                            .text("webhook", name)
+                            .num("status", 429),
+                    );
+                }
+                return json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
+                    .with_header(header("Retry-After", &retry_after.to_string()));
             }
-            return json_response(s, &json!({ "error": e }));
         }
+        if status == 401 {
+            let _ = front.audit.security(
+                Entry::new("refused")
+                    .who(Actor::Invalid)
+                    .text("request", "webhook")
+                    .text("webhook", name)
+                    .num("status", u64::from(status)),
+            );
+        }
+        json_response(status, &json!({ "error": msg }))
     };
+    // Validate webhook name, timestamp replay window, and signature hex syntax BEFORE reading
+    // up to 1 MiB of body bytes (`RW-2`).
     let ts = header_value(req, "X-TinyJump-Timestamp");
     let sig = header_value(req, "X-TinyJump-Signature");
-    let hook = match front.webhooks.verify_incoming(name, ts.as_deref(), sig.as_deref(), &raw, now_secs()) {
+    let (hook, ts_str, tag) = match front.webhooks.parse_incoming_headers(name, ts.as_deref(), sig.as_deref(), now_secs()) {
+        Ok(v) => v,
+        Err((status, msg)) => return charge_bad(status, msg),
+    };
+    let raw = match read_raw_json_bytes(req) {
+        Ok(b) => b,
+        Err((s, e)) => return charge_bad(s, e),
+    };
+    let hook = match Webhooks::verify_incoming_body(hook, ts_str, &tag, &raw) {
         Ok(h) => h,
-        Err((status, msg)) => {
-            if front.rate.limit > 0 {
-                let _ = front.rate.check(&bad_key, started);
-            }
-            if status == 401 {
-                let _ = front.audit.security(
-                    Entry::new("refused")
-                        .who(Actor::Invalid)
-                        .text("request", "webhook")
-                        .text("webhook", name)
-                        .num("status", u64::from(status)),
-                );
-            }
-            return json_response(status, &json!({ "error": msg }));
-        }
+        Err((status, msg)) => return charge_bad(status, msg),
     };
     if front.rate.limit > 0 {
         let wh_key = format!("wh:{name}");
@@ -1977,9 +1981,23 @@ mod tests {
         let srv_b = Server::http("127.0.0.1:0").unwrap();
         let port_b = srv_b.server_addr().to_ip().unwrap().port();
         let front_b = Arc::new(
-            Front::new(eng_b, None, None, Automation::Open, Identity::anonymous(), audit_b, Leases::open(&dir_b), false)
-                .with_webhooks(wh_arc),
+            Front::new(eng_b.clone(), None, None, Automation::Open, Identity::anonymous(), audit_b.clone(), Leases::open(&dir_b), false)
+                .with_webhooks(wh_arc.clone()),
         );
+        let srv_rl = Server::http("127.0.0.1:0").unwrap();
+        let port_rl = srv_rl.server_addr().to_ip().unwrap().port();
+        let front_rl = Arc::new(
+            Front::new(eng_b, None, None, Automation::Open, Identity::anonymous(), audit_b, Leases::open(&dir_b), false)
+                .with_webhooks(wh_arc)
+                .with_rate_limit(2),
+        );
+        thread::spawn(move || {
+            for req in srv_rl.incoming_requests() {
+                let f = front_rl.clone();
+                thread::spawn(move || handle(req, &f));
+            }
+        });
+        let base_rl = format!("http://127.0.0.1:{port_rl}");
         thread::spawn(move || {
             for req in srv_b.incoming_requests() {
                 let f = front_b.clone();
@@ -2059,11 +2077,13 @@ mod tests {
         assert_eq!(payload["state"]["bought"], json!(2));
         assert_eq!(payload["state"]["customerEmail"], json!("•••"), "@pii must be masked in outgoing webhook: {payload}");
 
-        // Incoming webhook: bad signature -> 401; stale timestamp -> 401; valid HMAC + delivery id -> 200 & once-only!
+        // Incoming webhook: bad signature -> 401; stale timestamp -> 401; exhausting `bad:{ip}`
+        // returns 429 to further invalid webhooks while a valid HMAC-signed webhook from the SAME
+        // IP still succeeds with 200 (`RW-2`, shared-proxy/NAT safety)!
         let wh_body = r#"{"id":"evt_paid_1"}"#;
         let now = crate::webhooks::now_secs();
         let bad_sig = agent
-            .post(&format!("{base_b}/webhooks/stripe"))
+            .post(&format!("{base_rl}/webhooks/stripe"))
             .set("Content-Type", "application/json")
             .set("X-TinyJump-Timestamp", &now.to_string())
             .set("X-TinyJump-Signature", "v1=0000000000000000000000000000000000000000000000000000000000000000")
@@ -2073,16 +2093,26 @@ mod tests {
         let stale_ts = now - 600;
         let stale_sig = crate::webhooks::sign_payload(wh_secret, stale_ts, wh_body.as_bytes());
         let stale = agent
-            .post(&format!("{base_b}/webhooks/stripe"))
+            .post(&format!("{base_rl}/webhooks/stripe"))
             .set("Content-Type", "application/json")
             .set("X-TinyJump-Timestamp", &stale_ts.to_string())
             .set("X-TinyJump-Signature", &stale_sig)
             .send_string(wh_body);
         assert!(matches!(stale, Err(ureq::Error::Status(401, _))), "{stale:?}");
 
+        // 3rd invalid request from same IP hits `bad:{ip}` rate limit (429)!
+        let bad_3 = agent
+            .post(&format!("{base_rl}/webhooks/stripe"))
+            .set("Content-Type", "application/json")
+            .set("X-TinyJump-Timestamp", &now.to_string())
+            .set("X-TinyJump-Signature", "v1=0000000000000000000000000000000000000000000000000000000000000000")
+            .send_string(wh_body);
+        assert!(matches!(bad_3, Err(ureq::Error::Status(429, _))), "exhausted bad:{{ip}} must return 429: {bad_3:?}");
+
+        // Valid HMAC-signed webhook from the SAME IP STILL succeeds with 200 (never locked out by `bad:{ip}`)!
         let good_sig = crate::webhooks::sign_payload(wh_secret, now, wh_body.as_bytes());
         let ok1 = agent
-            .post(&format!("{base_b}/webhooks/stripe"))
+            .post(&format!("{base_rl}/webhooks/stripe"))
             .set("Content-Type", "application/json")
             .set("X-TinyJump-Timestamp", &now.to_string())
             .set("X-TinyJump-Signature", &good_sig)
@@ -2094,7 +2124,7 @@ mod tests {
 
         // Replay exact same X-TinyJump-Delivery -> idempotent cached result (still 1, NOT 2)!
         let ok2 = agent
-            .post(&format!("{base_b}/webhooks/stripe"))
+            .post(&format!("{base_rl}/webhooks/stripe"))
             .set("Content-Type", "application/json")
             .set("X-TinyJump-Timestamp", &now.to_string())
             .set("X-TinyJump-Signature", &good_sig)

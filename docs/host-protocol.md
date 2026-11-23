@@ -396,3 +396,6 @@ Webhooks connect non-tinyjump systems to a server (`webhooks.json` next to `<app
   exponential-backoff retries (`redirects(0)`, `public_only`, and `TJ_FETCH_ALLOW` enforced).
   Outgoing webhooks whose roles can read `@pii` (or `emit` revealed data) are checked against
   compliance `transfers` and listed in `tj check --privacy --record`.
+- Both `remotes.json` and `webhooks.json` are loaded at `tj serve` startup (restart `tj serve`
+  to apply changes to either file; `tj reload` re-validates live webhook targets against the
+  new `.tj` bundle).
