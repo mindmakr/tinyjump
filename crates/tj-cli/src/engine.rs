@@ -379,7 +379,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Entropy { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Entropy { .. } | Input::Locale { .. } | Input::Tick => {}
     }
 }
 

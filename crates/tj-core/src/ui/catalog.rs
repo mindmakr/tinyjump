@@ -36,6 +36,8 @@ pub const KINDS: &[Kind] = &[
     Kind { name: "Image", props: &["src", "fit"], events: &[], content: Content::None },
     // A time, shown by the platform's own formatter in the viewer's language and zone.
     Kind { name: "Time", props: &["value", "show", "style", "zone"], events: &[], content: Content::None },
+    // A number, currency or percentage, formatted by the platform's own locale formatter.
+    Kind { name: "Format", props: &["value", "kind", "currency", "decimals", "locale"], events: &[], content: Content::None },
     Kind { name: "Tabs", props: &["items", "value"], events: &["onChange"], content: Content::None },
     Kind { name: "Icon", props: &["name"], events: &[], content: Content::None },
     Kind { name: "List", props: &["itemHeight", "horizontal"], events: &["onEndReached"], content: Content::Nodes },

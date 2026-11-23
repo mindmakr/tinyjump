@@ -18,7 +18,7 @@ const CSS = [
   '.tj-list-vh>*{content-visibility:auto;contain-intrinsic-size:auto var(--tj-item-h)}',
   '.tj-theme{background:var(--tj-surface,transparent);color:var(--tj-fg,inherit)}',
   '.tj-tabs{display:flex;flex-direction:row;align-items:stretch;gap:4px;border-bottom:1px solid var(--tj-border,#e5e7eb);box-sizing:border-box;min-height:44px;overflow-x:auto}',
-  '.tj-tab{min-height:44px;min-width:44px;padding:0 14px;border:none;border-bottom:2px solid transparent;background:transparent;color:inherit;font:inherit;cursor:pointer;white-space:nowrap}',
+  '.tj-tab{min-height:44px;min-width:44px;padding:0 14px;border:none;border-bottom:2px solid transparent;background:transparent;color:var(--tj-muted,inherit);font:inherit;cursor:pointer;white-space:nowrap}',
   '.tj-tab[aria-selected=true]{border-bottom-color:var(--tj-accent,#2563eb);color:var(--tj-accent,#2563eb);font-weight:600}',
   '.tj-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;line-height:0}',
   '.tj-native-missing{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px;border:1px dashed #9ca3af;color:#6b7280;font:12px/1.3 ui-monospace,monospace;box-sizing:border-box}',
@@ -66,7 +66,7 @@ const ICONS = {
   download: 'M12 4v11M8 11l4 4 4-4M5 19h14',
 };
 
-const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Tabs', 'Icon', 'List', 'Theme'];
+const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Format', 'Tabs', 'Icon', 'List', 'Theme'];
 const REGISTRY = new Map();
 
 /**
@@ -159,8 +159,10 @@ export async function start(opts) {
 
   const result = () => JSON.parse(readStr(ex.tj_out_ptr(), ex.tj_out_len()));
   const root = opts.root;
+  let activeLocale = opts.locale || (typeof navigator !== 'undefined' && navigator.language) || 'en';
+  const dirForLocale = (loc) => (RTL_LANGUAGES.indexOf(String(loc || '').split(/[-_]/)[0].toLowerCase()) >= 0 ? 'rtl' : 'ltr');
   // Right-to-left locales mirror the layout; the browser's flexbox follows `dir`.
-  root.setAttribute('dir', opts.dir || document.documentElement.dir || (RTL_LANGUAGES.indexOf((navigator.language || '').split('-')[0]) >= 0 ? 'rtl' : 'ltr'));
+  root.setAttribute('dir', opts.dir || document.documentElement.dir || dirForLocale(activeLocale));
   const nodes = new Map([[0, root]]);
   const components = new Map(REGISTRY);
   if (opts.components) {
@@ -504,6 +506,7 @@ export async function start(opts) {
       }
       case 'Image': el = document.createElement('img'); break;
       case 'Time': el = document.createElement('span'); el.className = 'tj-text'; el.__time = {}; break;
+      case 'Format': el = document.createElement('span'); el.className = 'tj-text'; el.__format = {}; break;
       case 'Tabs': el = document.createElement('div'); el.className = 'tj-tabs'; el.setAttribute('role', 'tablist'); el.__tabs = { items: [], value: null }; break;
       case 'Icon': el = document.createElement('span'); el.className = 'tj-icon'; el.setAttribute('aria-hidden', 'true'); el.__icon = { name: '', size: 20 }; break;
       case 'List': el = document.createElement('div'); el.className = 'tj-list'; el.__list = { horizontal: false, lastExtent: -1 }; break;
@@ -556,7 +559,32 @@ export async function start(opts) {
     const opts = { timeZone: t.zone || undefined };
     if (show !== 'time') { opts.year = 'numeric'; opts.month = 'short'; opts.day = 'numeric'; }
     if (show !== 'date') { opts.hour = 'numeric'; opts.minute = '2-digit'; }
-    return new Intl.DateTimeFormat(undefined, opts).format(new Date(t.value));
+    const loc = activeLocale && activeLocale.toLowerCase() !== 'pseudo' ? activeLocale : undefined;
+    try {
+      return new Intl.DateTimeFormat(loc, opts).format(new Date(t.value));
+    } catch (e) {
+      return new Intl.DateTimeFormat(undefined, opts).format(new Date(t.value));
+    }
+  }
+
+  // What a `<Format>` shows (number, currency or percent in the active locale).
+  function formatNumber(f) {
+    if (typeof f.value !== 'number' || !isFinite(f.value)) return '';
+    const rawLoc = f.locale || activeLocale || 'en';
+    const loc = String(rawLoc).toLowerCase() === 'pseudo' ? 'en' : rawLoc;
+    const kind = f.kind || 'number';
+    const o = { style: kind === 'currency' ? 'currency' : kind === 'percent' ? 'percent' : 'decimal' };
+    if (o.style === 'currency') o.currency = f.currency || 'USD';
+    if (typeof f.decimals === 'number' && isFinite(f.decimals) && f.decimals >= 0) {
+      const d = Math.min(20, Math.floor(f.decimals));
+      o.minimumFractionDigits = d;
+      o.maximumFractionDigits = d;
+    }
+    try {
+      return new Intl.NumberFormat(loc, o).format(f.value);
+    } catch (e) {
+      return String(f.value);
+    }
   }
 
   // A typed input's text as a value: milliseconds for dates and times (a time of day is
@@ -622,6 +650,11 @@ export async function start(opts) {
     if (kind === 'Time' && (k === 'value' || k === 'show' || k === 'style' || k === 'zone')) {
       el.__time[k] = none ? undefined : v;
       el.textContent = showTime(el.__time);
+      return;
+    }
+    if (kind === 'Format' && (k === 'value' || k === 'kind' || k === 'currency' || k === 'decimals' || k === 'locale')) {
+      el.__format[k] = none ? undefined : v;
+      el.textContent = formatNumber(el.__format);
       return;
     }
     if (kind === 'Input' && (k === 'type' || k === 'zone')) {
@@ -821,8 +854,8 @@ export async function start(opts) {
       const r = el ? el.getBoundingClientRect() : { x: 0, y: 0, width: 0, height: 0 };
       const visible = !!el && r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
       return Object.assign({}, n, {
-        // A time shows what the platform made of it, so agents read what people see.
-        props: el && el.__time ? Object.assign({}, n.props, { text: el.textContent }) : n.props,
+        // A time or formatted number shows what the platform made of it, so agents read what people see.
+        props: el && (el.__time || el.__format) ? Object.assign({}, n.props, { text: el.textContent }) : n.props,
         bounds: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
         visible,
         children: withBounds(n.children),
@@ -843,6 +876,16 @@ export async function start(opts) {
     return input;
   }
 
+  function setLocale(locale) {
+    activeLocale = locale || (typeof navigator !== 'undefined' && navigator.language) || 'en';
+    if (!opts.dir) root.setAttribute('dir', dirForLocale(activeLocale));
+    nodes.forEach((el) => {
+      if (el.__format) el.textContent = formatNumber(el.__format);
+      if (el.__time) el.textContent = showTime(el.__time);
+    });
+    send({ type: 'locale', locale: activeLocale });
+  }
+
   const api = {
     /** Semantic tree with bounds and viewport visibility, plus object states. */
     inspect: () => request({ type: 'inspect' }).then((s) => Object.assign(s, { tree: withBounds(s.tree), viewport: { w: window.innerWidth, h: window.innerHeight } })),
@@ -852,6 +895,7 @@ export async function start(opts) {
     get: (object) => request({ type: 'get', object }),
     /** Any protocol input (docs/host-protocol.md): those that take a reply resolve with it. */
     input: (i) => {
+      if (i && i.type === 'locale') { setLocale(i.locale); return Promise.resolve(null); }
       if (['call', 'get', 'ui', 'inspect'].indexOf(i.type) >= 0) return request(forAgent(Object.assign({}, i)));
       send(Object.assign({}, i));
       return Promise.resolve(null);
@@ -861,6 +905,8 @@ export async function start(opts) {
     setToken,
     /** Forgets the token, the replicas and every queued server call. */
     signOut: () => setToken(null, null, []),
+    /** Switches the active BCP-47 locale (or 'pseudo') and re-renders translations & formatters. */
+    setLocale,
     /** Registers a custom native component (`<Native name="..." />`) for this app instance. */
     registerComponent: (name, spec) => components.set(name, spec),
   };
@@ -888,6 +934,7 @@ export async function start(opts) {
   send({ type: 'entropy', bytes: Array.from(entropy, (b) => ('0' + b.toString(16)).slice(-2)).join('') });
   // Before any other input, so calls held from the last session are checked against it.
   if (opts.user !== undefined) send({ type: 'identity', user: opts.user || null, roles });
+  if (activeLocale && activeLocale.toLowerCase() !== 'en') send({ type: 'locale', locale: activeLocale });
   window.tinyjump = api;
   return api;
 }

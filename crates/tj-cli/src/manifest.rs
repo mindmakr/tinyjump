@@ -21,6 +21,22 @@ pub struct Manifest {
     pub json: Json,
 }
 
+/// Object names declared by built-in plugin modules (`tj:ui`, `tj:consent`, ...),
+/// excluded from `.tjb` manifests so they match `.tj` source manifests across reloads.
+fn builtin_plugin_objects() -> HashSet<String> {
+    let mut names = HashSet::new();
+    for &(_, src) in modules::BUILT_IN {
+        if let Ok(parsed) = tj_core::syntax::parse(src) {
+            for item in parsed.items {
+                if let Item::Object(o) = item {
+                    names.insert(o.name);
+                }
+            }
+        }
+    }
+    names
+}
+
 /// AST metadata for one user-declared object, complementing `Program`'s compiled `ObjectDef`.
 #[derive(Default)]
 struct AstObject {
@@ -67,11 +83,18 @@ impl Manifest {
 
         // For `.tj` source, include only the app's own objects (built-in plugin objects like
         // `tj:ui`'s Form/Actions are represented under `plugins.imported`). For precompiled AOT
-        // `.tjb` bundles (no AST), emit every compiled `ObjectDef` directly so `/_tj/manifest`
-        // and upgrade compatibility checks remain accurate.
+        // `.tjb` bundles (no AST), emit every compiled `ObjectDef` excluding built-in plugin
+        // objects so `/_tj/manifest` and upgrade compatibility checks stay consistent across
+        // `.tj` and `.tjb` reloads.
         let empty_ast = AstObject::default();
         let objects: Vec<Json> = if is_aot {
-            program.objects.iter().map(|o| object_json(o, &empty_ast)).collect()
+            let builtin_objs = builtin_plugin_objects();
+            program
+                .objects
+                .iter()
+                .filter(|o| !builtin_objs.contains(&*o.name))
+                .map(|o| object_json(o, &empty_ast))
+                .collect()
         } else {
             program.objects.iter().filter_map(|o| ast_objects.get(&*o.name).map(|ast| object_json(o, ast))).collect()
         };

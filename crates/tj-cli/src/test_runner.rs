@@ -14,6 +14,7 @@
 //!   get           { "do": "get", "object", "as"?, "expect"?, "expectContains"?,
 //!                   "expectError"?, "expectStatus"? }
 //!   ui            { "do": "ui", "target", "event", "value"?, "expectError"? }
+//!   locale        { "do": "locale", "locale": "ar" | "en" | "pseudo" | ... }
 //!   tick          { "do": "tick", "advanceMs" | "advance" }
 //!   privacy       { "do": "privacy", "action": "export"|"erase", "subject",
 //!                   "expect"?, "expectContains"?, "expectError"? }
@@ -84,6 +85,55 @@ type NodeTable = Rc<RefCell<HashMap<u32, (String, Map<String, Json>)>>>;
 
 struct TestMeasure(NodeTable);
 
+/// Deterministic offline formatter for `<Format>` nodes (used by `tj test` and offline `tj review`).
+pub(crate) fn format_display(props: &Map<String, Json>) -> String {
+    let Some(v) = props.get("value").and_then(Json::as_f64).filter(|n| n.is_finite()) else {
+        return String::new();
+    };
+    let kind = props.get("kind").and_then(Json::as_str).unwrap_or("number");
+    let decimals = props.get("decimals").and_then(Json::as_u64).map(|d| d.min(20) as usize);
+    match kind {
+        "currency" => {
+            let code = props.get("currency").and_then(Json::as_str).filter(|s| !s.is_empty()).unwrap_or("USD");
+            let d = decimals.unwrap_or(2);
+            format!("{code} {}", format_grouped(v, d))
+        }
+        "percent" => {
+            let d = decimals.unwrap_or(0);
+            format!("{}%", format_grouped(v * 100.0, d))
+        }
+        _ => match decimals {
+            Some(d) => format_grouped(v, d),
+            None if v.fract() == 0.0 => format_grouped(v, 0),
+            None => format_grouped(v, 2),
+        },
+    }
+}
+
+fn format_grouped(v: f64, decimals: usize) -> String {
+    let neg = v.is_sign_negative() && v != 0.0;
+    let formatted = format!("{:.*}", decimals, v.abs());
+    let (int_part, frac_part) = match formatted.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (formatted.as_str(), None),
+    };
+    let mut out = String::with_capacity(formatted.len() + int_part.len() / 3 + 1);
+    if neg {
+        out.push('-');
+    }
+    for (idx, ch) in int_part.chars().enumerate() {
+        if idx > 0 && (int_part.len() - idx) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if let Some(f) = frac_part {
+        out.push('.');
+        out.push_str(f);
+    }
+    out
+}
+
 impl Measure for TestMeasure {
     fn measure(&mut self, node: u32, max_width: Option<f32>) -> (f32, f32) {
         let map = self.0.borrow();
@@ -99,9 +149,14 @@ impl Measure for TestMeasure {
         let px = num_prop("px").unwrap_or(pad);
         let py = num_prop("py").unwrap_or(pad);
         match kind.as_str() {
-            "Text" | "Time" => {
+            "Text" | "Time" | "Format" => {
+                let formatted;
                 let text = match (kind.as_str(), str_prop("text")) {
                     ("Time", "") => "2026-11-22 14:30",
+                    ("Format", "") => {
+                        formatted = format_display(props);
+                        formatted.as_str()
+                    }
                     (_, t) => t,
                 };
                 let raw_w = text.chars().count() as f32 * char_w;
@@ -114,8 +169,14 @@ impl Measure for TestMeasure {
             }
             "Button" => {
                 let text = str_prop("text");
-                let w = (text.chars().count() as f32 * char_w + 32.0).max(44.0);
-                let w = max_width.map_or(w, |mw| w.min(mw));
+                let intrinsic = (text.chars().count() as f32 * char_w + 32.0).max(44.0);
+                // Buttons do not collapse to 0px on MinContent probes (`max_width == Some(0.0)`):
+                // a row of buttons whose labels outgrow the viewport (e.g. in German or pseudo-locale)
+                // must report its real width so `tj review` catches overflow.
+                let w = match max_width {
+                    Some(mw) if mw > 0.0 => intrinsic.min(mw.max(44.0)),
+                    _ => intrinsic,
+                };
                 let h = (line_h + 20.0).max(44.0);
                 (w.ceil(), h.ceil())
             }
@@ -583,6 +644,14 @@ impl Harness {
                 }
                 Ok(())
             }
+            "locale" => {
+                self.ensure_booted()?;
+                let locale = s["locale"].as_str().ok_or("\"locale\" step needs \"locale\" string")?.to_string();
+                let out = self.rt.as_mut().expect("booted").handle(self.now, Input::Locale { locale });
+                let mut replies = HashMap::new();
+                self.pump(out, &mut replies)?;
+                Ok(())
+            }
             "tick" => {
                 self.ensure_booted()?;
                 let delta = match (s["advanceMs"].as_f64(), s["advance"].as_str()) {
@@ -642,7 +711,8 @@ impl Harness {
                 check_reply(&format!("privacy {op} {subject}"), res, s, self.shadow)
             }
             "assertScreen" => {
-                let snap = self.inspect_snapshot()?;
+                let mut snap = self.inspect_snapshot()?;
+                attach_formatted_text(&mut snap["tree"]);
                 let outline = review::outline(&snap["tree"]);
                 for want in s["contains"].as_array().into_iter().flatten().filter_map(Json::as_str) {
                     if !outline.contains(want) {
@@ -708,7 +778,55 @@ impl Harness {
                     .ok_or_else(|| format!("inspect did not contain loaded object {object:?}"))?;
                 check_value(&format!("inspect {object}"), &found, s, self.shadow)
             }
-            other => Err(format!("unknown trace action {other:?}; expected boot, as, plugin, http, call, get, ui, tick, privacy, assertScreen, assertLayout, assertMetrics or assertInspect")),
+            other => Err(format!("unknown trace action {other:?}; expected boot, as, plugin, http, call, get, ui, locale, tick, privacy, assertScreen, assertLayout, assertMetrics or assertInspect")),
+        }
+    }
+}
+
+/// Offline multi-locale and pseudo-locale review sweep for `tj review <app.tj>`.
+pub(crate) struct LocaleReview {
+    pub locale: String,
+    pub rtl: bool,
+    pub snapshot: Json,
+    pub findings: Vec<review::Finding>,
+}
+
+/// Boots `source` once in memory and reviews its screen across every locale in `locales`
+/// (automatically setting `rtl` for RTL languages), returning the snapshots and findings.
+pub(crate) fn review_locales(source: &str, locales: &[String], width: f32, height: f32) -> Result<Vec<LocaleReview>, String> {
+    let mut runner = Harness::new(PathBuf::from("."), source.to_string(), HashMap::new());
+    runner.render = true;
+    runner.boot(false)?;
+    let mut results = Vec::with_capacity(locales.len());
+    for locale in locales {
+        let rtl = tj_core::i18n::is_rtl_locale(locale);
+        let out = runner.rt.as_mut().expect("booted").handle(runner.now, Input::Locale { locale: locale.clone() });
+        let mut replies = HashMap::new();
+        runner.pump(out, &mut replies)?;
+        let out = runner.rt.as_mut().expect("booted").handle(runner.now, Input::Layout { width, height, rtl });
+        runner.pump(out, &mut replies)?;
+        let mut snap = runner.inspect_snapshot()?;
+        snap["viewport"] = json!({ "w": width, "h": height });
+        attach_bounds(&mut snap["tree"], &runner.frames, 0.0, 0.0);
+        let findings = review::review(&snap);
+        results.push(LocaleReview { locale: locale.clone(), rtl, snapshot: snap, findings });
+    }
+    Ok(results)
+}
+
+fn attach_formatted_text(nodes: &mut Json) {
+    let Some(list) = nodes.as_array_mut() else { return };
+    for node in list {
+        if node["kind"].as_str() == Some("Format") {
+            if let Some(props) = node["props"].as_object_mut() {
+                if !props.contains_key("text") {
+                    let s = format_display(props);
+                    props.insert("text".into(), Json::String(s));
+                }
+            }
+        }
+        if let Some(children) = node.get_mut("children") {
+            attach_formatted_text(children);
         }
     }
 }
@@ -718,6 +836,14 @@ impl Harness {
 fn attach_bounds(nodes: &mut Json, frames: &HashMap<u32, Frame>, parent_x: f32, parent_y: f32) {
     let Some(list) = nodes.as_array_mut() else { return };
     for node in list {
+        if node["kind"].as_str() == Some("Format") {
+            if let Some(props) = node["props"].as_object_mut() {
+                if !props.contains_key("text") {
+                    let s = format_display(props);
+                    props.insert("text".into(), Json::String(s));
+                }
+            }
+        }
         let id = node["id"].as_u64().map(|n| n as u32);
         let (x, y) = match id.and_then(|i| frames.get(&i)) {
             Some(f) => {
@@ -1170,5 +1296,59 @@ function App() {
 "#;
         let r = run_trace(Path::new("."), src, "http_unreachable.trace.jsonl", trace, HashMap::new());
         assert!(r.passed(), "http mock unreachable parity failed: {:?}", r.error);
+    }
+
+    #[test]
+    fn locale_trace_step_format_and_multi_locale_pseudo_review() {
+        let app = r#"
+function App() {
+  return <Column padding={16} gap={8}>
+    <Text id="title">{t("title")}</Text>
+    <Format id="total" value={1234.5} kind="currency" currency="USD" />
+    <Format id="pct" value={0.25} kind="percent" />
+    <Button id="go" onPress={() => {}}>{t("go")}</Button>
+  </Column>
+}
+"#;
+        let bundle = tj_core::modules::bundle(&[
+            ("app.tj".into(), app.into()),
+            ("locales/en.json".into(), r#"{"title":"Checkout","go":"Pay"}"#.into()),
+            ("locales/ar.json".into(), r#"{"title":"الدفع","go":"ادفع"}"#.into()),
+        ]);
+        let trace = r#"
+{"do": "boot", "server": false}
+{"do": "assertScreen", "contains": ["Checkout", "USD 1,234.50", "25%", "Pay"]}
+{"do": "locale", "locale": "ar"}
+{"do": "assertScreen", "contains": ["الدفع", "ادفع"]}
+{"do": "assertLayout", "width": 390, "height": 844, "rtl": true, "review": true}
+{"do": "locale", "locale": "pseudo"}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+"#;
+        let r = run_trace(Path::new("."), &bundle, "i18n.trace.jsonl", trace, HashMap::new());
+        assert!(r.passed(), "i18n trace failed: {:?}", r.error);
+
+        // Multi-locale offline review sweeps every locale + pseudo, sets RTL for Arabic, and catches overflow in narrow screens!
+        let runs = review_locales(&bundle, &["en".into(), "ar".into(), "pseudo".into()], 390.0, 844.0).expect("review_locales");
+        assert_eq!(runs.len(), 3);
+        assert!(!runs[0].rtl && runs[1].rtl && !runs[2].rtl);
+        assert!(runs.iter().all(|run| run.findings.iter().all(|f| f.severity != Severity::Error)));
+
+        // A row of buttons that fits in English (<= 390px) overflows once pseudo-locale expands copy!
+        let tight_app = r#"
+function App() {
+  return <Row gap={8}>
+    <Button onPress={() => {}}>{t("a")}</Button>
+    <Button onPress={() => {}}>{t("b")}</Button>
+    <Button onPress={() => {}}>{t("c")}</Button>
+  </Row>
+}
+"#;
+        let tight_bundle = tj_core::modules::bundle(&[
+            ("app.tj".into(), tight_app.into()),
+            ("locales/en.json".into(), r#"{"a":"Continue","b":"Settings","c":"Checkout"}"#.into()),
+        ]);
+        let tight_runs = review_locales(&tight_bundle, &["en".into(), "pseudo".into()], 390.0, 844.0).expect("tight review");
+        assert!(!tight_runs[0].findings.iter().any(|f| f.check == "overflow"), "en should fit: {:?}", tight_runs[0].findings);
+        assert!(tight_runs[1].findings.iter().any(|f| f.check == "overflow" && f.severity == Severity::Error), "pseudo must overflow: {:?}", tight_runs[1].findings);
     }
 }

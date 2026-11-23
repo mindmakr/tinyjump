@@ -153,6 +153,7 @@ fn builtin(name: &str) -> Option<Ty> {
         "encodeURIComponent" => func(&[("text", Ty::Any, false)], None, Ty::Str),
         "Error" => func(&[("message", Ty::Any, true)], None, rec(&[("name", Ty::Str), ("message", Ty::Str)])),
         "check" => func(&[("ok", Ty::Bool, false), ("field", Ty::Str, false), ("message", Ty::Str, false)], None, Ty::Null),
+        "t" => func(&[("key", Ty::Str, false), ("params", Ty::Dict(Box::new(Ty::Any)), true)], None, Ty::Str),
         "fetch" => func(&[("url", Ty::Str, false), ("init", Ty::Any, true)], None, Ty::Any),
         "caller" => rec(&[("id", Ty::Str), ("roles", Ty::Arr(Box::new(Ty::Str)))]),
         "plugin" => func(&[("name", Ty::Str, false), ("method", Ty::Str, false), ("args", Ty::Any, true)], None, Ty::Any),
@@ -254,11 +255,18 @@ struct Checker<'a> {
     depth: usize,
     /// Where the annotation being resolved sits, for unknown-type errors.
     type_span: Span,
+    locales: &'a crate::i18n::Locales,
     errors: Vec<Diagnostic>,
 }
 
 /// Type-checks the top-level items of an app (all its files, in the order they run).
 pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
+    let empty = crate::i18n::Locales::default();
+    check_with_locales(items, &empty)
+}
+
+/// Like [`check`], also checking `t(key, params)` calls against `locales/*.json`.
+pub fn check_with_locales(items: &[&Item], locales: &crate::i18n::Locales) -> Vec<Diagnostic> {
     let mut c = Checker {
         aliases: HashMap::new(),
         objects: HashMap::new(),
@@ -271,6 +279,7 @@ pub fn check(items: &[&Item]) -> Vec<Diagnostic> {
         fns: Vec::new(),
         depth: 0,
         type_span: Span::default(),
+        locales,
         errors: Vec::new(),
     };
     for &item in items {
@@ -802,6 +811,11 @@ impl<'a> Checker<'a> {
                     self.method_call(&t, name, args, sp)
                 }
                 _ => {
+                    if let ExprKind::Ident(name) = &callee.kind {
+                        if name == "t" && self.var("t").is_none() {
+                            return self.check_translate(args, sp);
+                        }
+                    }
                     let t = self.expr(callee, None);
                     self.call(&t, args, sp)
                 }
@@ -1054,6 +1068,100 @@ impl<'a> Checker<'a> {
             }
             _ => Ty::Any,
         }
+    }
+
+    fn check_translate(&mut self, args: &[Expr], span: Span) -> Ty {
+        if args.is_empty() || args.len() > 2 {
+            self.error(format!("expected 1-2 arguments, got {}", args.len()), span);
+        }
+        if let Some(arg0) = args.first() {
+            self.check_value(arg0, &Ty::Str, "argument 'key'");
+        }
+        let params_ty = args
+            .get(1)
+            .map(|a| self.check_value(a, &Ty::Dict(Box::new(Ty::Any)), "argument 'params'"));
+        for extra in args.iter().skip(2) {
+            self.expr(extra, None);
+        }
+        let Some(base_table) = self.locales.base_table() else {
+            return Ty::Str;
+        };
+        let Some(arg0) = args.first() else {
+            return Ty::Str;
+        };
+        let ExprKind::Str(key) = &arg0.kind else {
+            return Ty::Str;
+        };
+        let Some(msg) = base_table.get(key.as_str()) else {
+            let keys: Vec<String> = base_table.entries.iter().map(|(k, _)| k.to_string()).collect();
+            self.errors.push(
+                Diagnostic::new(format!("unknown translation key '{key}'"), arg0.span)
+                    .hint(suggest(key, "translation keys", &keys)),
+            );
+            return Ty::Str;
+        };
+        let req = crate::i18n::required_placeholders(msg);
+        let is_plural = matches!(msg, crate::i18n::Message::Plural(_));
+        if !req.is_empty() {
+            let Some(arg1) = args.get(1) else {
+                let sample = req.iter().map(|p| format!("{p}: ...")).collect::<Vec<_>>().join(", ");
+                self.errors.push(
+                    Diagnostic::new(format!("translation '{key}' requires parameters: {}", req.join(", ")), span)
+                        .hint(format!("pass {{ {sample} }} as the second argument to t()")),
+                );
+                return Ty::Str;
+            };
+            if let Some(pt) = &params_ty {
+                match self.deref(pt) {
+                    Ty::Null => {
+                        self.errors.push(
+                            Diagnostic::new(format!("translation '{key}' requires parameters: {}", req.join(", ")), arg1.span)
+                                .hint("pass a record with the required placeholder values"),
+                        );
+                    }
+                    Ty::Rec(r) => {
+                        if !r.open {
+                            for p in &req {
+                                if !r.fields.contains_key(p.as_str()) {
+                                    self.errors.push(
+                                        Diagnostic::new(format!("missing placeholder '{p}' for translation '{key}'"), arg1.span)
+                                            .hint(format!("add `{p}` to the parameter record")),
+                                    );
+                                }
+                            }
+                            for k in r.fields.keys() {
+                                if !req.iter().any(|p| p == k.as_ref()) {
+                                    self.errors.push(
+                                        Diagnostic::new(format!("unknown placeholder '{k}' for translation '{key}'"), arg1.span)
+                                            .hint(suggest(k, "placeholders", &req)),
+                                    );
+                                }
+                            }
+                        }
+                        if is_plural {
+                            if let Some((ct, _)) = r.fields.get("count") {
+                                if !self.numeric(ct) {
+                                    self.error(format!("plural translation '{key}' requires numeric 'count', got {ct}"), arg1.span);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else if let (Some(arg1), Some(pt)) = (args.get(1), &params_ty) {
+            if let Ty::Rec(r) = self.deref(pt) {
+                if !r.open {
+                    if let Some(first) = r.fields.keys().next() {
+                        self.errors.push(
+                            Diagnostic::new(format!("translation '{key}' takes no placeholders, got '{first}'"), arg1.span)
+                                .hint(format!("remove the second argument: t({key:?})")),
+                        );
+                    }
+                }
+            }
+        }
+        Ty::Str
     }
 
     fn call(&mut self, callee: &Ty, args: &[Expr], span: Span) -> Ty {

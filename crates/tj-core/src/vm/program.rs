@@ -332,6 +332,8 @@ pub struct Program {
     pub main: Vec<u32>,
     /// Global slot of `function App()`, the UI root, if the program has one.
     pub app: Option<u32>,
+    /// Bundled translations from `locales/*.json` (empty when unused).
+    pub locales: crate::i18n::Locales,
     pub user_source: Rc<str>,
 }
 

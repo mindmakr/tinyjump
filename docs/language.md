@@ -431,6 +431,7 @@ Built-in components, drawn as real native widgets:
 | `Toggle` | `value` | `onChange(checked)` | text (label) |
 | `Image` | `src`, `fit` | | none |
 | `Time` | `value`, `show`, `style`, `zone` | | none |
+| `Format` | `value`, `kind`, `currency`, `decimals`, `locale` | | none |
 | `Tabs` | `items`, `value` | `onChange(value)` | none |
 | `Icon` | `name` | | none |
 | `List` | `itemHeight`, `horizontal` | `onEndReached()` | nodes |
@@ -467,6 +468,11 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   - `show="date" | "time" | "datetime"` (the default is `datetime`);
   - `zone="UTC"` instead of the viewer's zone;
   - `style="iso"` for `2026-12-01 14:30`.
+- `<Format value={amount} kind="number" | "currency" | "percent" currency="USD" decimals={2} locale="ar-SA" />`
+  formats numbers, currencies and percentages using the host's own locale formatter
+  (`Intl.NumberFormat` on web, `NumberFormat` on Android, `NumberFormatter` on iOS) with no
+  ICU data shipped in the runtime. `kind` defaults to `"number"`, `currency` defaults to
+  `"USD"`, and `locale` defaults to the viewer's active locale.
 - `<Input type="number" | "date" | "time" | "datetime">` opens the platform's own keypad or
   picker. Its `value` and what `onChange` receives are numbers, not text:
   - milliseconds for `date` and `datetime`;
@@ -516,7 +522,32 @@ const f = Form.get("profile")
 `console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/min/max/random/PI`,
 `JSON.stringify(v, null, 2)/parse`, `Object.keys/values/entries`, `Array.isArray`,
 `Date.now()`, `crypto.randomId/hmac/timingSafeEqual/idempotencyKey`, `String(x)`, `Number(x)`, `parseInt`,
-`parseFloat`, `encodeURIComponent`, `fetch`, `Error`.
+`parseFloat`, `encodeURIComponent`, `t(key, params?)`, `fetch`, `Error`.
+
+### Translations and locales (`t` and `locales/*.json`)
+
+Place plain JSON message files in a `locales/` folder next to your app (`locales/en.json`,
+`locales/ar.json`, `locales/fr.json`, ...). Each file maps keys to strings or CLDR plural
+objects (`zero`, `one`, `two`, `few`, `many`, `other` — `other` is required):
+
+```json
+{
+  "greeting": "Hello {name}",
+  "tasks.remaining": {
+    "zero": "All done",
+    "one": "1 task left",
+    "other": "{count} tasks left"
+  }
+}
+```
+
+- `t("tasks.remaining", { count })` looks up the key in the viewer's active locale (exact
+  tag, then base language, then the base locale `"en"`). Unknown keys, missing or extra
+  placeholders, and non-numeric `count` on plural keys are caught at compile time.
+- `tj check app.tj` warns about missing or mismatched keys across `locales/*.json`.
+- `tj review app.tj` checks the screen offline in every locale in `locales/*.json` plus a
+  built-in `"pseudo"` locale (accented text expanded ~35%) with automatic RTL mirroring for
+  Arabic, Hebrew, Persian, Urdu and other RTL scripts. Use `{{` / `}}` for literal braces.
 
 - Strings: `length`, `toUpperCase`, `toLowerCase`, `trim`, `trimStart`, `trimEnd`,
   `includes`, `startsWith`, `endsWith`, `indexOf`, `slice`, `substring`, `split`,

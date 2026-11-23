@@ -285,6 +285,8 @@ pub struct Runtime {
     pub(crate) consumed_alarms: Vec<((u16, Rc<str>), u64)>,
     /// True while evaluating an `@invariant` method (forbids state mutation and I/O).
     pub(crate) in_invariant: bool,
+    /// Active BCP-47 locale tag for `t()` translations (default `"en"`, or `"pseudo"`).
+    pub(crate) locale: Rc<str>,
     outputs: Vec<Output>,
     pub(crate) metrics: Metrics,
     stats: stats::Table,
@@ -378,6 +380,7 @@ impl Runtime {
             secret: None,
             consumed_alarms: Vec::new(),
             in_invariant: false,
+            locale: Rc::from("en"),
             outputs: Vec::new(),
             metrics: Metrics::default(),
             stats: stats::table(&program),
@@ -490,6 +493,16 @@ impl Runtime {
                 }
                 None => self.reply(None, Err(("entropy needs at least 32 bytes, as hex".into(), None))),
             },
+            Input::Locale { locale } => {
+                let next = locale.trim();
+                let next = if next.is_empty() { "en" } else { next };
+                if &*self.locale != next {
+                    self.locale = Rc::from(next);
+                    if self.render {
+                        self.render_app();
+                    }
+                }
+            }
             Input::Ui { target, event, value, reply } => {
                 let handler = self.tree.find(&target).and_then(|node| self.tree.handler(node, &event).cloned());
                 match handler {

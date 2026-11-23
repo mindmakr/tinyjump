@@ -803,8 +803,12 @@ impl Checker {
 
     fn jsx(&mut self, el: &JsxElement, fr: &mut Frame) {
         let mut props = Vec::new();
-        for (name, v) in &el.attrs {
-            let v = self.expr(v, fr);
+        let is_native = el.tag == "Native";
+        for (name, expr) in &el.attrs {
+            let v = self.expr(expr, fr);
+            if is_native && !matches!(name.as_str(), "name" | "id" | "key") {
+                self.sink(&v, expr.span, "a custom <Native> view (host code outside the privacy check)");
+            }
             props.push((name.clone(), v));
         }
         let mut children = Taint::default();

@@ -116,6 +116,9 @@ pub enum Input {
     /// Secure random bytes from the host (hex, at least 32 bytes), sent once right after
     /// boot. They are mixed into the generator behind `crypto.randomId()` and device ids.
     Entropy { bytes: String },
+    /// The viewer's active BCP-47 locale tag (e.g. `"en"`, `"ar"`, `"fr-CA"`, or `"pseudo"`
+    /// for pseudo-localization). Triggers a UI re-render when it changes.
+    Locale { locale: String },
     /// Time moved on; due timers run.
     Tick,
     /// The semantic tree and object states, for automation.
@@ -324,6 +327,7 @@ impl TryFrom<Json> for Input {
                 "online" => Input::Online,
                 "identity" => Input::Identity { user: f.opt_string("user")?, roles: f.roles()? },
                 "entropy" => Input::Entropy { bytes: f.string("bytes")? },
+                "locale" => Input::Locale { locale: f.string("locale")? },
                 "tick" => Input::Tick,
                 "inspect" => Input::Inspect { reply: f.opt_u64("reply")? },
                 other => return Err(format!("unknown type `{other}`")),
@@ -384,6 +388,7 @@ mod tests {
             Input::Identity { user: Some("user:ana".into()), roles: vec!["staff".into()] },
             Input::Identity { user: None, roles: Vec::new() },
             Input::Entropy { bytes: "ab".repeat(32) },
+            Input::Locale { locale: "ar-SA".into() },
             Input::Tick,
             Input::Inspect { reply: Some(5) },
         ];

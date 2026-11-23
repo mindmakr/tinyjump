@@ -43,7 +43,7 @@ pub fn facts(src: &str) -> Facts {
 #[cfg(feature = "check")]
 pub fn facts_with_remotes(src: &str, remote_dests: &HashMap<String, crate::flow::Destination>) -> Facts {
     let src = &*modules::with_built_ins(src);
-    let files = modules::files(src);
+    let files: Vec<_> = modules::files(src).into_iter().filter(|f| !crate::i18n::is_locale_file(&f.name)).collect();
     let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
     if parsed.len() != files.len() {
         return Facts::default();
@@ -60,7 +60,7 @@ pub fn check_remote_flows(src: &str, remote_dests: &HashMap<String, crate::flow:
         return Vec::new();
     }
     let src = &*modules::with_built_ins(src);
-    let files = modules::files(src);
+    let files: Vec<_> = modules::files(src).into_iter().filter(|f| !crate::i18n::is_locale_file(&f.name)).collect();
     let parsed: Vec<_> = files.iter().filter_map(|f| parse_range(src, f.start, f.end).ok()).collect();
     if parsed.len() != files.len() {
         return Vec::new();
@@ -83,9 +83,16 @@ pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     let prelude = parse(PRELUDE).expect("prelude parses");
     // Plugins that ship with tinyjump come with the compiler (see `modules::BUILT_IN`).
     let src = &*modules::with_built_ins(src);
-    // An app may be a bundle of files (see `modules`); each is parsed on its own.
-    let files = modules::files(src);
+    // An app may be a bundle of files (see `modules`); locale JSON files are parsed separately.
+    let (locale_files, files): (Vec<_>, Vec<_>) = modules::files(src).into_iter().partition(|f| crate::i18n::is_locale_file(&f.name));
     let mut errors = Vec::new();
+    let locales = match crate::i18n::parse_locale_files(src, &locale_files) {
+        Ok(l) => l,
+        Err(errs) => {
+            errors.extend(errs);
+            crate::i18n::Locales::default()
+        }
+    };
     let mut parsed = Vec::new();
     for f in &files {
         match parse_range(src, f.start, f.end) {
@@ -98,7 +105,7 @@ pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
     }
     let linked = modules::link(&files, &parsed, &mut errors);
     let all: Vec<&Item> = linked.order.iter().flat_map(|&i| &parsed[i].items).collect();
-    errors.extend(crate::typeck::check(&all));
+    errors.extend(crate::typeck::check_with_locales(&all, &locales));
     #[cfg(feature = "check")]
     {
         let named: Vec<(&str, &crate::syntax::ast::Program)> = linked.order.iter().map(|&i| (files[i].name.as_str(), &parsed[i])).collect();
@@ -135,6 +142,7 @@ pub fn compile(src: &str) -> Result<Program, Vec<Diagnostic>> {
         globals: c.global_names,
         main,
         app,
+        locales,
         user_source: Rc::from(src),
     })
 }

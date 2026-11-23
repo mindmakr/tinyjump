@@ -77,7 +77,17 @@ public final class TinyJump {
         tj.apply(out)
         let bytes = (0..<32).map { _ in UInt8.random(in: 0...255) }
         tj.send(["type": "entropy", "bytes": bytes.map { String(format: "%02x", $0) }.joined()])
+        if !tj.renderer.localeId.isEmpty && tj.renderer.localeId.lowercased() != "en" {
+            tj.send(["type": "locale", "locale": tj.renderer.localeId])
+        }
         return tj
+    }
+
+    /// Switches the active BCP-47 locale (or `"pseudo"`) and re-renders translations and formatters.
+    public func setLocale(_ locale: String) {
+        renderer.setLocale(locale)
+        send(["type": "locale", "locale": renderer.localeId])
+        layout()
     }
 
     /// The signed-in user's token for the server, their id and their roles as the server reports
