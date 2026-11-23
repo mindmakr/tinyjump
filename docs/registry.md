@@ -183,18 +183,25 @@ enterprise needs:
 - `tj retro <app.tj>` flags tampered, missing, or advisory-`flagged` locked packages as
   `[fix]` (`supply-chain`).
 
-**Not yet created (awaiting owner go-ahead / later steps):**
+**Live external registry (`https://github.com/mindmakr/tj-plugins`):**
 
-- The public external GitHub repository `mindmakr/tj-plugins` (index, request forms,
-  submission PR workflow, nightly re-scans, Sigstore/SLSA provenance, website).
+- Public index repository with Official packages (`money` pure-`.tj` integer minor-unit
+  currency library and `gdpr-eu` compliance pack) installable via `tj add <name>`,
+  structured GitHub Issue Forms (`request-library`, `request-port`, `request-bridge`),
+  and `.github/workflows/review.yml` running `tj registry check` on every pull request.
+
+**Later steps (post-v1):**
+
+- Sandboxed behaviour checks, Sigstore/SLSA provenance signing, nightly re-scans,
+  OpenAPI bridge generator, and registry search website.
 
 ## Order
 
 1. **`tj add`, `tj.lock`, `--min-trust` and `tj registry check` (done):** local & HTTPS
    registry client, hash pinning, static permission audit, typosquat & license validator.
-2. **The public registry repository (`mindmakr/tj-plugins`):** index, request forms,
-   official entries (`tj:ai`, `tj:agent`, GDPR pack), and PR submission pipeline running
+2. **The public registry repository (`mindmakr/tj-plugins`, done):** index, request forms,
+   official entries (`money`, `gdpr-eu`), and PR submission pipeline running
    `tj registry check`.
 3. **Sandboxed behaviour checks, signing (Sigstore/SLSA) and nightly re-scans.**
-4. **Bridges:** webhooks and outbound delivery first, then the OpenAPI generator.
+4. **Bridges:** webhooks and outbound delivery (done), then the OpenAPI generator.
 5. **The registry website, and the publisher programme.**

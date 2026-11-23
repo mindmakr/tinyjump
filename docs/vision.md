@@ -137,9 +137,10 @@ the goal; being in the market early, to gain momentum and contributors, is.
    - **Retried external effects (done):** `crypto.idempotencyKey(label)` with crash-stable
      HMAC derivation, pre-`await` flush rollback, and transient `fetch` `503` handling
      ([docs/retried-effects.md](retried-effects.md)).
-   - **Plugin and library registry (`docs/registry.md`):** CLI client (`tj add`, `tj.lock`,
-     `tj check --min-trust`, `tj registry check`, `tj retro` audit) is built; public
-     `mindmakr/tj-plugins` index repo awaits owner go-ahead.
+   - **Plugin and library registry (`docs/registry.md`, done):** CLI client (`tj add`, `tj.lock`,
+     `tj check --min-trust`, `tj registry check`, `tj retro` audit) and the public
+     [mindmakr/tj-plugins](https://github.com/mindmakr/tj-plugins) index repository (seeded with
+     Official packages, request issue forms, and PR `tj registry check` workflow).
 4. **Servers talking to each other (done):** server-to-server replicas (`remotes.json` over
    the durable outbox + `/api/events` SSE streams with API-key auth) and incoming HMAC-signed /
    outgoing retried webhooks (`webhooks.json`).
@@ -147,14 +148,15 @@ the goal; being in the market early, to gain momentum and contributors, is.
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 
-After that: **the UI catalog (`<Tabs>`, `<Icon>`, `<List>`, `<Theme>`, done) and native
+After that: **the UI catalog (`<Tabs>`, `<Icon>`, `<List>`, `<Theme>`, `<Format>`, done) and native
 components (`<Native name="MapView" ... />`, done)** (owner, 2026-11-20: a Kotlin or Java
 view, a Swift view or a web element registered under a name and used from `.tj` like any
 catalog component, with props and events through the protocol), **`tj build` (done: AOT
-`.tjb` bytecode serialization so devices skip the compiler, plus `--web`, `--linux`
-standalone executables with SHA-256-verified embedded bytecode, `--android` and `--ios`
-asset bundles)**, the rest of automation (golden images, run reports), translations and
-locale formats, and GPU/3D. Size: profile the device builds and cut what is really large
+`.tjb` bytecode serialization so devices skip the compiler, opt-out `compiler` feature /
+`cargo web-aot`, plus `--web`, `--linux` standalone executables with SHA-256-verified
+embedded bytecode, `--android` and `--ios` asset bundles)**, **golden-image screenshot diffs
+and `tj retro` run reports (done)**, **translations and locale formats (done)**, and GPU/3D
+(next). Size: profile the device builds and cut what is really large
 (a server-only split was measured at 1.2 KB and dropped,
 `feedback/2026-11-20-builder-004-size-split-measured.md`).
 
@@ -169,11 +171,11 @@ library can be small, typed, tested and checked against its rules.
   - **`fetch`** reaches any web API.
   - **Device plugins** wrap native code (maps, charts, camera) on each platform.
   - **Agents write small modules** on demand.
-- **Long term: a tinyjump registry of libraries ported by agents (`docs/registry.md`).**
-  The CLI client (`tj add`, `tj.lock`, `tj check --min-trust`, `tj registry check`) is built
-  with commit/SHA-256 pinning, trust marks, typosquat checks and static permission audits;
-  the public `mindmakr/tj-plugins` index repository comes next. Each port is checked
-  against the original library's tests and kept within the size budget. An optional
+- **Long term: a tinyjump registry of libraries ported by agents (`docs/registry.md`, live).**
+  The CLI client (`tj add`, `tj.lock`, `tj check --min-trust`, `tj registry check`) and the
+  public [mindmakr/tj-plugins](https://github.com/mindmakr/tj-plugins) index repository are
+  live with commit/SHA-256 pinning, trust marks, typosquat checks and static permission audits.
+  Each port is checked against the original library's tests and kept within the size budget. An optional
   JavaScript-engine plugin, to run existing JavaScript libraries unchanged, comes only if
   real demand appears: it doubles the runtimes and weakens the guarantees.
 - **For existing systems:** tinyjump runs next to them (it calls them; they call its API and
