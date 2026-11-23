@@ -5,7 +5,7 @@ TypeScript-shaped file. Durable **objects** hold state, timers and events. The U
 with **native widgets**. The same objects are your **backend API**. Every host has
 built-in **automation**, so AI agents can write, run and check apps in one loop.
 
-**[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/) · [Registry](https://github.com/mindmakr/tj-plugins)
+**[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/) · [Registry](https://mindmakr.github.io/tj-plugins/)
 
 > Status: early. The language, VM, runtime, web, Android and iOS hosts, and the
 > Linux/Windows/macOS server work. See [docs/vision.md](docs/vision.md).
@@ -59,8 +59,10 @@ Other commands: `tj docs` (the language reference, for agents), `tj check app.tj
 errors with fix hints, types, `--access`, `--privacy`, `--record`, `--compliance`,
 `--manifest`, `--against` schema compatibility, and `--min-trust`), `tj test app.tj`
 (deterministic trace runner), `tj build app.tj` (AOT `.tjb` bytecode plus `--web`,
-`--linux`, `--android` and `--ios` targets), `tj add <name>` (install SHA-256-pinned
-packages from [mindmakr/tj-plugins](https://github.com/mindmakr/tj-plugins) into `tj.lock`),
+`--linux`, turnkey `--android --assemble` APKs and `--ios --assemble` `.app` bundles),
+`tj search` / `tj info` / `tj add <name>` (discover and install SHA-256-pinned
+packages from [mindmakr.github.io/tj-plugins](https://mindmakr.github.io/tj-plugins/) into `tj.lock`),
+`tj bridge openapi <spec.json>` (generate typed `.tj` REST clients + draft registry manifests),
 `tj reload` / `tj rollback` (shadow-booted live reloads with health-gated rollback),
 `tj retro` (actionable refactor and health report), `tj bench app.tj` (timings and work
 counters), `tj audit verify` (tamper-evident audit log) and `tj serve app.tj` (backend with

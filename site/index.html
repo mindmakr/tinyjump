@@ -68,7 +68,7 @@
       <nav>
         <a href="demo/">demo</a>
         <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">language</a>
-        <a href="https://github.com/mindmakr/tj-plugins">registry</a>
+        <a href="https://mindmakr.github.io/tj-plugins/">registry</a>
         <a href="https://github.com/mindmakr/tinyjump/tree/main/docs">docs</a>
         <a href="https://github.com/mindmakr/tinyjump">github</a>
       </nav>
@@ -168,7 +168,7 @@
         <div class="num"><b>283 lines</b><span>full 4-platform booking app (web, Android, iOS, Linux, offline sync, alarms, <code>@pii</code> &amp; GDPR)</span></div>
         <div class="num"><b>0 KB ICU</b><span>translations, CLDR plurals, RTL layout and <code>&lt;Format&gt;</code>/<code>&lt;Time&gt;</code> use native formatters with zero ICU data in core</span></div>
         <div class="num"><b>0 B core</b><span>registry packages, audit log, encryption at rest and packaging add zero bytes to device runtimes</span></div>
-        <div class="num"><b>246</b><span>automated tests; iOS Simulator and turnkey AOT <code>.app</code> boot run on every pull request</span></div>
+        <div class="num"><b>249</b><span>automated tests; iOS Simulator and turnkey AOT <code>.app</code> boot run on every pull request</span></div>
         <div class="num"><b>Android 5</b><span>and up (<code>minSdk 21</code>), iOS 13 and up, and 2019-era browsers (plain ES2017, no build step)</span></div>
         <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM, plus single-file <code>tj build --linux</code> apps</span></div>
       </div>
@@ -177,7 +177,7 @@
     <section class="narrow">
       <h2>Starting fresh</h2>
       <p>tinyjump starts without decades of legacy packages. That is a cost, and also an advantage: every library can be small, typed, tested and audited against its declared permissions before it ever runs.</p>
-      <p>Apps reach existing services through MCP plugins, <code>fetch</code>, server-to-server object sync and HMAC-signed webhooks, while <code>&lt;Native&gt;</code> wraps platform views on the web, Android and iOS. The <a href="https://github.com/mindmakr/tj-plugins">tinyjump registry</a> (<code>tj add</code>, <code>tj.lock</code>, commit &amp; SHA-256 pinning, trust marks and static permission audits) is live for pure-<code>.tj</code> libraries, agent ports and compliance packs. Teams with existing systems can run tinyjump next to them and move one piece at a time.</p>
+      <p>Apps reach existing services through MCP plugins, <code>fetch</code>, typed OpenAPI bridges (<code>tj bridge openapi</code>), server-to-server object sync and HMAC-signed webhooks, while <code>&lt;Native&gt;</code> wraps platform views on the web, Android and iOS. The <a href="https://mindmakr.github.io/tj-plugins/">tinyjump registry</a> (<code>tj search</code>, <code>tj info</code>, <code>tj add</code>, <code>tj.lock</code>, commit &amp; SHA-256 pinning, trust marks and static permission audits) is live for pure-<code>.tj</code> libraries, agent ports and compliance packs. Teams with existing systems can run tinyjump next to them and move one piece at a time.</p>
     </section>
 
     <section class="two">
@@ -188,10 +188,10 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>OpenAPI bridge generator, CLI registry discovery (<code>tj search</code>), nightly re-scans, Sigstore/SLSA signing and a searchable registry site.</li>
           <li>Device capabilities (camera, location, notifications, files) and 1:1 / group voice and video calls (WebRTC) as opt-in plugins.</li>
           <li>Desktop native UI hosts (macOS AppKit and Linux desktop).</li>
           <li>Optional GPU graphics and 3D module (<code>tj-gfx</code> on <code>wgpu</code>) so apps without 3D stay small.</li>
+          <li>Registry publisher programme, sandboxed behaviour checks and Sigstore/SLSA provenance signing.</li>
         </ul>
       </div>
     </section>
@@ -200,6 +200,7 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>Registry discovery, searchable catalog and OpenAPI bridge generator.</b> <code>tj search</code> and <code>tj info</code> query <a href="https://mindmakr.github.io/tj-plugins/">mindmakr.github.io/tj-plugins</a> (seeded with Official <code>money</code>, <code>slug</code>, <code>csv</code>, <code>validate</code> libraries plus <code>gdpr-eu</code> and Saudi <code>pdpl-sa</code> compliance packs, nightly re-scans and community trust-mark gating). <code>tj bridge openapi spec.json</code> generates compile-checked, typed <code>.tj</code> REST clients with literal HTTPS host prefixes and verified draft registry manifests — with zero bytes added to device runtimes.</li>
           <li><b>Turnkey mobile and AOT web packaging.</b> <code>tj build app.tj --android --aot --assemble</code> generates a self-contained Gradle project and builds an installable native Android APK (531 KB for single-ABI arm64 AOT, zero AndroidX/Kotlin, env-var release signing); <code>--ios --aot --assemble</code> compiles and signs a zero-Xcode UIKit <code>.app</code> bundle on macOS (boot-verified on the iOS Simulator in CI); and <code>--web</code> auto-bundles the 215 KB gzipped AOT WASM runtime.</li>
           <li><b>Golden-image diffs and compiler-free AOT builds.</b> <code>tj review --target &lt;url&gt; --golden baseline.png</code> (or offline <code>--golden</code> + <code>--actual</code>) diffs PNG screenshots pixel-by-pixel with configurable <code>--threshold</code> and red-highlighted <code>--diff</code> output. Opt-out <code>compiler</code> feature builds (<code>cargo web-aot</code>, <code>--no-default-features</code>) strip the compiler out of AOT-only device runtimes: Web WASM drops 36% to 540 KB (215 KB gzipped) and Android drops 22–23%.</li>
           <li><b>Translations, locales and pseudo-locale sweeps.</b> Built-in <code>t("key", { count })</code> with <code>locales/*.json</code>, CLDR plural rules and compile-time key/placeholder checks; <code>&lt;Format&gt;</code> and <code>&lt;Time&gt;</code> format numbers, currencies, percentages and dates with the host's native formatter (zero ICU data in core); and <code>tj review app.tj</code> sweeps every locale plus an expanded <code>"pseudo"</code> locale offline to catch truncation and RTL overlap before release.</li>
