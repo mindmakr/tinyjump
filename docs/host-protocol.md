@@ -19,7 +19,10 @@ host ──Input + now──▶ Runtime ──Vec<Output>──▶ host
    format; for text-based host boundaries (`JsonHost::boot` on Web, Android and iOS, and
    `tj build` `--web` / `--android` / `--ios` asset bundles), the same bytecode is wrapped
    as a UTF-8 bundle `//# tjb:1:<base64>`, skipping the compiler on devices with no ABI
-   change. `tj` builds source bundles by following imports (`crates/tj-cli/src/app.rs`),
+   change. Device hosts built with `--no-default-features` (`cargo web-aot`, or Android/iOS
+   without the `compiler` feature) omit the lexer, parser, type-checker and compiler
+   entirely (~36% smaller WASM, ~23% smaller Android `.so`) and boot `//# tjb:1:` bundles
+   directly. `tj` builds source bundles by following imports (`crates/tj-cli/src/app.rs`),
    and `tj dev` serves them as `/app.tj`. Native demo apps bundle an example's folder.
 2. For every event, call `runtime.handle(now_ms, input)` and carry out the outputs in order.
 3. Every batch ends with `wake { at }`. Send `tick` at that time (or earlier). `null` means

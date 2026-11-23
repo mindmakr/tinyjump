@@ -1,9 +1,12 @@
 //! Translations and locales (`locales/*.json`, `t("key", { count })`, CLDR plurals,
 //! base-locale fallback, and pseudo-localization). Zero I/O and zero ICU data.
 
+#[cfg(feature = "compiler")]
 use crate::modules::File;
+#[cfg(feature = "compiler")]
 use crate::syntax::{Diagnostic, Span};
 use crate::vm::value::Record;
+#[cfg(feature = "compiler")]
 use serde_json::Value as Json;
 use std::rc::Rc;
 
@@ -44,11 +47,13 @@ pub struct Locales {
 }
 
 /// Maps a CLDR plural category name to its slot index in `PLURAL_FORMS`.
+#[cfg(feature = "compiler")]
 pub fn plural_index(name: &str) -> Option<usize> {
     PLURAL_FORMS.iter().position(|&f| f == name)
 }
 
 /// Extracts the locale tag from a bundle path like `"locales/en.json"` or `"locales/en-GB.json"`.
+#[cfg(feature = "compiler")]
 pub fn locale_tag_from_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("locales/")?;
     let tag = rest.strip_suffix(".json")?;
@@ -59,6 +64,7 @@ pub fn locale_tag_from_path(path: &str) -> Option<&str> {
 }
 
 /// Whether `path` is a locale message file inside a bundle (`locales/<tag>.json`).
+#[cfg(feature = "compiler")]
 pub fn is_locale_file(path: &str) -> bool {
     locale_tag_from_path(path).is_some()
 }
@@ -85,6 +91,7 @@ pub fn is_rtl_locale(locale: &str) -> bool {
 }
 
 /// Extracts unique `{placeholder}` names from a message template, respecting `{{` / `}}` escapes.
+#[cfg(feature = "compiler")]
 pub fn placeholders(template: &str) -> Vec<String> {
     let mut out = Vec::new();
     let bytes = template.as_bytes();
@@ -119,6 +126,7 @@ fn is_placeholder_name(name: &str) -> bool {
 }
 
 /// Every placeholder name required by `msg`. Plural messages always require `"count"`.
+#[cfg(feature = "compiler")]
 pub fn required_placeholders(msg: &Message) -> Vec<String> {
     match msg {
         Message::Text(s) => placeholders(s),
@@ -213,11 +221,13 @@ pub fn plural_category_index(locale: &str, n: f64) -> usize {
 }
 
 /// Selects the CLDR cardinal plural category name for `n` in `locale`.
+#[cfg(any(test, feature = "compiler"))]
 pub fn plural_category(locale: &str, n: f64) -> &'static str {
     PLURAL_FORMS[plural_category_index(locale, n)]
 }
 
 /// Parses every `locales/<tag>.json` file in a bundle into [`Locales`].
+#[cfg(feature = "compiler")]
 pub fn parse_locale_files(src: &str, files: &[File]) -> Result<Locales, Vec<Diagnostic>> {
     if files.is_empty() {
         return Ok(Locales::default());

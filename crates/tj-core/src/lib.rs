@@ -4,21 +4,26 @@
 //! carries out the [`Output`]s it returns (draw patches, run effects, persist,
 //! wake up later). Every host — web, Android, iOS, Linux server — embeds this crate.
 
+#[cfg(feature = "compiler")]
 pub mod compile;
 pub mod crypto;
 #[cfg(feature = "check")]
 pub mod flow;
 pub mod host;
 pub mod i18n;
+#[cfg(feature = "compiler")]
 pub mod modules;
 #[cfg(feature = "check")]
 pub mod lawful_basis;
 pub mod runtime;
+#[cfg(feature = "compiler")]
 pub mod syntax;
+#[cfg(feature = "compiler")]
 pub mod typeck;
 pub mod ui;
 pub mod vm;
 
+#[cfg(feature = "compiler")]
 pub use compile::compile;
 #[cfg(feature = "check")]
 pub use {
@@ -27,6 +32,7 @@ pub use {
 };
 
 /// Loads precompiled `//# tjb:1:...` bytecode directly, or compiles `.tj` source.
+#[cfg(feature = "compiler")]
 pub fn load(src: &str) -> Result<vm::program::Program, Vec<syntax::Diagnostic>> {
     if let Some(decoded) = vm::program::Program::from_bundle(src) {
         decoded.map_err(|m| vec![syntax::Diagnostic::new(m, syntax::Span::default()).hint("rebuild the .tjb bundle with `tj build`")])

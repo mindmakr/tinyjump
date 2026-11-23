@@ -13,5 +13,9 @@ publish = false
 # staticlib for Apple hosts (and any C/Swift/C++ host); rlib so the ABI is testable in Rust.
 crate-type = ["staticlib", "rlib"]
 
+[features]
+default = ["compiler"]
+compiler = ["tj-core/compiler"]
+
 [dependencies]
 tj-core = { workspace = true, features = ["layout"] }

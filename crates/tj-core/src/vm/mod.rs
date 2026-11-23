@@ -8,4 +8,5 @@ pub mod time;
 pub mod value;
 
 /// Library code compiled into every program.
+#[cfg(feature = "compiler")]
 pub const PRELUDE: &str = include_str!("prelude.tj");

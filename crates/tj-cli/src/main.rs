@@ -10,6 +10,7 @@ mod bytes;
 mod compat;
 mod compliance;
 mod engine;
+mod golden;
 mod http;
 mod identity;
 mod leases;
@@ -68,9 +69,10 @@ USAGE:
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
   tj dev   <app.tj> [options]    serve + the web host with live reload
-  tj review [<app.tj> [--locale <tag>]... [--width <n>] [--height <n>] | --target <url>]
-                                 check a running app (with --target) or an app file offline across every
-                                 locale in `locales/*.json` + pseudo-locale (RTL, overflow, a11y, contrast)
+  tj review [<app.tj> [--locale <tag>]... [--width <n>] [--height <n>] | --target <url> [--golden <file.png> [--update-golden] [--threshold <pct>] [--diff <out.png>]]]
+                                 check a running app (with --target, optional golden-image PNG screenshot
+                                 diffing, or offline --golden + --actual PNG comparison) or an app file
+                                 offline across every locale in `locales/*.json` + pseudo-locale
   tj stats  [--target <url>]     a running app's methods: calls, errors, refusals, VM steps and latency
   tj privacy export|erase <person id> [--target <url>]
                                  everything a running server holds about a person, or erase it
@@ -173,6 +175,11 @@ struct Args {
     review_pseudo: bool,
     width: Option<f32>,
     height: Option<f32>,
+    golden: Option<PathBuf>,
+    actual: Option<PathBuf>,
+    update_golden: bool,
+    threshold: Option<f64>,
+    diff_out: Option<PathBuf>,
 }
 
 impl Args {
@@ -185,7 +192,7 @@ fn parse_args() -> Result<Args, String> {
     let mut it = std::env::args().skip(1).peekable();
     let command = it.next().ok_or("missing command")?;
     let file = it.next_if(|a| !a.starts_with("--")).map(PathBuf::from);
-    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None, review_locales: Vec::new(), review_pseudo: false, width: None, height: None };
+    let mut args = Args { command, file, port: 4700, host: "127.0.0.1".into(), data: None, wasm: None, target: "http://127.0.0.1:4700".into(), budget: None, json: false, manifest: false, against: None, allow_breaking: false, access: false, privacy: false, record: false, record_file: None, compliance: None, web: false, as_user: None, keys: None, roles: Vec::new(), ops: None, plugins: Vec::new(), checkpoints: None, min_trust: None, review_locales: Vec::new(), review_pseudo: false, width: None, height: None, golden: None, actual: None, update_golden: false, threshold: None, diff_out: None };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
@@ -233,6 +240,17 @@ fn parse_args() -> Result<Args, String> {
                 }
                 args.height = Some(h);
             }
+            "--golden" => args.golden = Some(PathBuf::from(value()?)),
+            "--actual" => args.actual = Some(PathBuf::from(value()?)),
+            "--update-golden" => args.update_golden = true,
+            "--threshold" => {
+                let pct: f64 = value()?.parse().map_err(|_| "--threshold must be a percentage between 0 and 100")?;
+                if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                    return Err("--threshold must be a finite percentage between 0 and 100".into());
+                }
+                args.threshold = Some(pct);
+            }
+            "--diff" => args.diff_out = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -396,7 +414,13 @@ fn main() -> ExitCode {
 
 /// Prints the review of a running app or runs an offline multi-locale + pseudo-locale sweep.
 fn review_cmd(args: &Args) -> Result<(), String> {
+    if (args.actual.is_some() || args.update_golden || args.threshold.is_some() || args.diff_out.is_some()) && args.golden.is_none() {
+        return Err("--actual, --update-golden, --threshold and --diff require --golden <file.png>".into());
+    }
     if let Some(file) = &args.file {
+        if args.golden.is_some() {
+            return Err("golden screenshot diffing requires a live --target <url> (or --actual <file.png>), not an offline <app.tj> file".into());
+        }
         let width = args.width.unwrap_or(390.0);
         let height = args.height.unwrap_or(844.0);
         let src = read_source(file)?;
@@ -434,7 +458,54 @@ fn review_cmd(args: &Args) -> Result<(), String> {
     if !args.review_locales.is_empty() || args.review_pseudo || args.width.is_some() || args.height.is_some() {
         return Err("offline review flags (--locale, --pseudo, --width, --height) require an <app.tj> file".into());
     }
+    if let Some(golden_path) = &args.golden {
+        // Offline PNG-to-PNG diff when `--actual` is given; otherwise review live `--target` + `/_tj/screenshot`.
+        let mut review_err = None;
+        let actual_png = if let Some(actual_path) = &args.actual {
+            std::fs::read(actual_path).map_err(|e| format!("cannot read actual screenshot {}: {e}", actual_path.display()))?
+        } else {
+            if let Err(e) = review(&args.target) {
+                review_err = Some(e);
+            }
+            fetch_screenshot(&args.target)?
+        };
+        let threshold = args.threshold.unwrap_or(golden::DEFAULT_THRESHOLD_PCT);
+        let msg = golden::check_or_update(golden_path, &actual_png, args.update_golden, threshold, args.diff_out.as_deref())?;
+        println!("{msg}");
+        return match review_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+    }
     review(&args.target)
+}
+
+/// Fetches raw PNG bytes from a running host's `/_tj/screenshot` endpoint (capped at 32 MiB).
+fn fetch_screenshot(target: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    const MAX_SCREENSHOT_BYTES: u64 = 32 * 1024 * 1024;
+    let url = format!("{}/_tj/screenshot", target.trim_end_matches('/'));
+    let mut req = ureq::get(&url);
+    if let Some(h) = auth::client_header() {
+        req = req.set("Authorization", &h);
+    }
+    let resp = match req.call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let msg = r.into_string().unwrap_or_default();
+            return Err(format!("{url} returned HTTP {code}: {msg}"));
+        }
+        Err(e) => return Err(format!("cannot reach {url}: {e}")),
+    };
+    let mut bytes = Vec::new();
+    resp.into_reader()
+        .take(MAX_SCREENSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("failed reading screenshot from {url}: {e}"))?;
+    if bytes.len() as u64 > MAX_SCREENSHOT_BYTES {
+        return Err(format!("screenshot from {url} exceeds 32 MiB limit"));
+    }
+    Ok(bytes)
 }
 
 /// Prints the review of a running app; fails if it found errors, so CI can gate on it.

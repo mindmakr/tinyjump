@@ -3,7 +3,9 @@
 
 use crate::runtime::{Options, Runtime};
 use crate::ui::layout::Measure;
-use crate::{compile, Input, Store};
+#[cfg(feature = "compiler")]
+use crate::compile;
+use crate::{Input, Store};
 use serde_json::{json, Value as Json};
 
 /// The payload is the outputs array.
@@ -33,18 +35,30 @@ impl JsonHost {
                 }
             }
         } else {
-            match compile(src) {
-                Ok(p) => p,
-                Err(errs) => {
-                    let list: Vec<Json> = errs
-                        .iter()
-                        .map(|d| {
-                            let (line, col) = crate::syntax::line_col(src, d.span.start as usize);
-                            json!({ "message": d.message, "hint": d.hint, "line": line, "col": col, "text": d.render("app.tj", src) })
-                        })
-                        .collect();
-                    return (INVALID, Json::Array(list).to_string());
+            #[cfg(feature = "compiler")]
+            {
+                match compile(src) {
+                    Ok(p) => p,
+                    Err(errs) => {
+                        let list: Vec<Json> = errs
+                            .iter()
+                            .map(|d| {
+                                let (line, col) = crate::syntax::line_col(src, d.span.start as usize);
+                                json!({ "message": d.message, "hint": d.hint, "line": line, "col": col, "text": d.render("app.tj", src) })
+                            })
+                            .collect();
+                        return (INVALID, Json::Array(list).to_string());
+                    }
                 }
+            }
+            #[cfg(not(feature = "compiler"))]
+            {
+                let msg = "this AOT-only runtime boots precompiled .tjb bundles (`tj build`), not raw .tj source";
+                let hint = "compile the app with `tj build` or rebuild the host with the `compiler` feature enabled";
+                return (
+                    INVALID,
+                    Json::Array(vec![json!({ "message": msg, "hint": hint, "line": 1, "col": 1, "text": format!("error: {msg}\nhint: {hint}") })]).to_string(),
+                );
             }
         };
         // Foreign-language hosts are devices: `@server` objects are replicas.
