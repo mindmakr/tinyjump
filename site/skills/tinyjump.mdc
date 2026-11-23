@@ -1,0 +1,34 @@
+---
+description: Build, check, test, and package multi-platform apps using the tinyjump runtime (.tj files, durable @server objects, Web/Android/iOS/macOS/Linux builds).
+globs:
+  - "**/*.tj"
+  - "**/permissions.json"
+  - "**/locales/*.json"
+  - "**/tests/*.trace.jsonl"
+alwaysApply: false
+---
+
+# TinyJump Cursor Rule
+
+When creating, editing, testing, or packaging a tinyjump app:
+
+1. **Load the language spec first:** run `cargo tj docs` (or `tj docs`) before writing `.tj` code.
+2. **Strict language rules:**
+   - Use `===` / `!==` (never `==` / `!=`).
+   - Top-level declarations: `object`, `function`, `type`, `interface`, `let`, `const`; `function App()` is the UI root.
+   - Only an object's own methods may mutate its fields.
+   - `@server` objects with `@allow(...)` must declare `@read(...)`. Use `@exclusive` on check-and-act `async` methods and `@invariant` for atomic rollback guards.
+   - Mark personal data with `@pii("category", "purpose")` and `reveal(value, "purpose")` before outbound calls.
+   - Built-in UI components: `Column`, `Row`, `Scroll`, `List`, `Spacer`, `Theme`, `Text`, `Button`, `Input` (no `disabled` prop), `Toggle`, `Image`, `Time`, `Format`, `Tabs`, `Icon`, `Native`. Give interactive controls an `id` prop.
+3. **Closed verification loop (always run before finishing):**
+   - `cargo tj check <app.tj> --access --privacy`
+   - `cargo tj test <app.tj>` (add deterministic `tests/*.trace.jsonl` traces)
+   - `cargo tj review <app.tj> --pseudo` (layout, contrast, RTL & +35% text expansion)
+   - `cargo tj bench <app.tj>`
+4. **Multi-platform build & run targets:**
+   - **Web:** `cargo web && cargo tj dev <app.tj>` | production AOT: `cargo web-aot && cargo tj build <app.tj> --web --out dist/web`
+   - **Android (531 KB arm64 APK):** `cargo tj build <app.tj> --android --aot --app-id com.example.app --title "App" --abis arm64-v8a --assemble --out dist/android`
+   - **iOS (zero-Xcode UIKit `.app`):** `cargo tj build <app.tj> --ios --aot --app-id com.example.app --title "App" --assemble --out dist/ios`
+   - **macOS AppKit:** `bash scripts/macos.sh && target/macos/TinyJump.app/Contents/MacOS/TinyJump --app <app.tj>`
+   - **Linux GTK 3 (3.1 MB, zero dev headers):** `bash scripts/linux.sh && hosts/linux/target/release/tinyjump-linux --app <app.tj>`
+   - **Self-hosted server:** `cargo tj serve <app.tj> --port 4700` or `cargo tj build <app.tj> --linux --out dist/app`

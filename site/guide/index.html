@@ -1,0 +1,757 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23111114'/%3E%3Cpath d='M9 22L16 9l7 13h-4.2L16 16.5 13.2 22z' fill='%23ff6b2c'/%3E%3C/svg%3E">
+  <title>Agent Skills &amp; Multi-Platform App Guide — tinyjump</title>
+  <meta name="description" content="Install the tinyjump skill into Claude Code, Antigravity, Codex, or Cursor and build verified multi-platform apps for Web, Android, iOS, macOS, Linux Desktop, and self-hosted servers.">
+  <style>
+    :root {
+      --bg: #fafaf8;
+      --bg-elev: #ffffff;
+      --bg-subtle: #f2f1ec;
+      --bg-tint: rgba(234, 88, 12, 0.06);
+      --fg: #111114;
+      --fg-2: #3b3b44;
+      --muted: #62626e;
+      --line: #e4e2da;
+      --line-strong: #cfccc2;
+      --accent: #d9480f;
+      --accent-soft: rgba(217, 72, 15, 0.10);
+      --accent-glow: rgba(217, 72, 15, 0.16);
+      --ok: #0f7b4b;
+      --ok-soft: rgba(15, 123, 75, 0.10);
+      --code-bg: #131318;
+      --code-header: #1b1b22;
+      --code-border: #282832;
+      --code-fg: #e8e6df;
+      --shadow-sm: 0 1px 2px rgba(17, 17, 20, 0.04), 0 1px 1px rgba(17, 17, 20, 0.03);
+      --shadow-md: 0 10px 30px -12px rgba(17, 17, 20, 0.12), 0 2px 6px rgba(17, 17, 20, 0.05);
+      --radius: 12px;
+      --radius-lg: 18px;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #0b0b0e;
+        --bg-elev: #131318;
+        --bg-subtle: #191920;
+        --bg-tint: rgba(255, 107, 44, 0.08);
+        --fg: #f3f2ed;
+        --fg-2: #c9c7be;
+        --muted: #8e8d98;
+        --line: #23232c;
+        --line-strong: #353542;
+        --accent: #ff7338;
+        --accent-soft: rgba(255, 115, 56, 0.14);
+        --accent-glow: rgba(255, 115, 56, 0.18);
+        --ok: #34d399;
+        --ok-soft: rgba(52, 211, 153, 0.12);
+        --code-bg: #0f0f14;
+        --code-header: #16161d;
+        --code-border: #252530;
+        --code-fg: #ebe9e1;
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+        --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #0b0b0e;
+      --bg-elev: #131318;
+      --bg-subtle: #191920;
+      --bg-tint: rgba(255, 107, 44, 0.08);
+      --fg: #f3f2ed;
+      --fg-2: #c9c7be;
+      --muted: #8e8d98;
+      --line: #23232c;
+      --line-strong: #353542;
+      --accent: #ff7338;
+      --accent-soft: rgba(255, 115, 56, 0.14);
+      --accent-glow: rgba(255, 115, 56, 0.18);
+      --ok: #34d399;
+      --ok-soft: rgba(52, 211, 153, 0.12);
+      --code-bg: #0f0f14;
+      --code-header: #16161d;
+      --code-border: #252530;
+      --code-fg: #ebe9e1;
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; overflow-x: clip; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font-sans);
+      font-size: 16px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: clip;
+    }
+    a { color: inherit; }
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.87em;
+      background: var(--bg-subtle);
+      border: 1px solid var(--line);
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+    pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 0 24px; }
+
+    /* Top bar */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
+    }
+    .topbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      height: 64px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      text-decoration: none;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 17px;
+      letter-spacing: -0.03em;
+    }
+    .brand-mark {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      background: var(--fg);
+      color: var(--bg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .brand-text span { color: var(--accent); }
+    .nav { display: flex; align-items: center; gap: 20px; }
+    .nav a { text-decoration: none; font-size: 14px; font-weight: 500; color: var(--muted); }
+    .nav a:hover { color: var(--fg); }
+    .nav-actions { display: flex; align-items: center; gap: 10px; }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 9px 16px;
+      border-radius: 9px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      color: var(--fg);
+      cursor: pointer;
+      transition: transform 0.12s ease, border-color 0.15s ease;
+    }
+    .btn:hover { border-color: var(--fg); transform: translateY(-1px); }
+    .btn.primary { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+    .btn.accent { background: var(--accent); color: #ffffff; border-color: var(--accent); }
+    .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 8px; }
+    .icon-btn {
+      width: 34px; height: 34px; padding: 0; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--bg-elev); color: var(--muted);
+      display: inline-flex; align-items: center; justify-content: center; cursor: pointer;
+    }
+    .icon-btn:hover { color: var(--fg); border-color: var(--line-strong); }
+
+    /* Hero */
+    .hero {
+      padding: 56px 0 40px;
+      background: radial-gradient(60% 55% at 72% 10%, var(--accent-glow), transparent 65%), linear-gradient(to bottom, transparent, var(--bg));
+      border-bottom: 1px solid var(--line);
+    }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 5px 12px; border-radius: 999px;
+      border: 1px solid var(--line-strong); background: var(--bg-elev);
+      font-family: var(--font-mono); font-size: 12px; font-weight: 500; color: var(--fg-2);
+      margin-bottom: 16px;
+    }
+    h1 { font-size: clamp(30px, 4.2vw, 46px); line-height: 1.08; letter-spacing: -0.03em; margin: 0 0 14px; }
+    h1 .hl { color: var(--accent); }
+    .lede { font-size: 17px; color: var(--fg-2); max-width: 760px; margin: 0 0 24px; }
+    .cta-row { display: flex; flex-wrap: wrap; gap: 10px; }
+
+    /* Sections */
+    .sec { padding: 56px 0; border-bottom: 1px solid var(--line); }
+    .sec.tinted { background: var(--bg-subtle); }
+    .kicker {
+      display: inline-flex; align-items: center; gap: 8px;
+      font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent);
+      margin-bottom: 8px;
+    }
+    .num-pill {
+      padding: 2px 7px; border-radius: 6px; background: var(--accent-soft); color: var(--accent);
+    }
+    h2 { font-size: clamp(24px, 3vw, 32px); line-height: 1.15; letter-spacing: -0.025em; margin: 0 0 10px; }
+    .sec-sub { color: var(--fg-2); max-width: 740px; margin: 0 0 26px; font-size: 15.5px; }
+
+    /* Cards & Grids */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+    .card {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 22px;
+      box-shadow: var(--shadow-sm);
+    }
+    .card h3 { margin: 0 0 8px; font-size: 17px; }
+    .card p { margin: 0 0 12px; color: var(--fg-2); font-size: 14.5px; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+    .mini-tag {
+      font-family: var(--font-mono); font-size: 11.5px; padding: 3px 8px; border-radius: 6px;
+      background: var(--bg-subtle); border: 1px solid var(--line); color: var(--fg-2);
+    }
+    .mini-tag.ok { background: var(--ok-soft); border-color: transparent; color: var(--ok); font-weight: 600; }
+
+    /* Tabs */
+    .tabs-bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+    .tab-btn {
+      padding: 8px 14px; border-radius: 9px; border: 1px solid var(--line-strong);
+      background: var(--bg-elev); color: var(--fg-2); font-size: 13.5px; font-weight: 600; cursor: pointer;
+    }
+    .tab-btn[aria-selected="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+
+    /* Code blocks */
+    .code-box {
+      background: var(--code-bg);
+      border: 1px solid var(--code-border);
+      border-radius: 12px;
+      overflow: hidden;
+      margin: 12px 0;
+    }
+    .code-head {
+      display: flex; justify-content: space-between; align-items: center; gap: 12px;
+      padding: 8px 14px; background: var(--code-header); border-bottom: 1px solid var(--code-border);
+      font-family: var(--font-mono); font-size: 11.5px; color: #a1a1b0;
+    }
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.08); color: #f3f2ed;
+      border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 6px;
+      padding: 3px 9px; font-family: var(--font-mono); font-size: 11px; cursor: pointer;
+    }
+    .copy-btn:hover { background: rgba(255, 255, 255, 0.18); }
+    .code-box pre {
+      margin: 0; padding: 14px 16px; overflow-x: auto;
+      font-family: var(--font-mono); font-size: 12.5px; line-height: 1.6; color: var(--code-fg);
+    }
+
+    /* Prompt callout */
+    .prompt-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      border-left: 4px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 16px 20px;
+      margin-bottom: 14px;
+    }
+    .prompt-card .label {
+      font-family: var(--font-mono); font-size: 11.5px; font-weight: 700;
+      color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 6px;
+    }
+    .prompt-card p { margin: 0; font-size: 15px; color: var(--fg); }
+
+    /* Table */
+    table.matrix {
+      width: 100%; border-collapse: collapse; font-size: 14px;
+      background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden;
+    }
+    table.matrix th, table.matrix td {
+      text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top;
+    }
+    table.matrix th {
+      font-family: var(--font-mono); font-size: 12px; color: var(--muted); background: var(--bg-subtle);
+    }
+    table.matrix tr:last-child td { border-bottom: 0; }
+    .stat-ok { color: var(--ok); font-weight: 700; font-family: var(--font-mono); font-size: 12.5px; }
+
+    footer { padding: 36px 0 52px; color: var(--muted); font-size: 14px; }
+    .footer-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; }
+    .footer-links { display: flex; flex-wrap: wrap; gap: 18px; font-family: var(--font-mono); font-size: 13px; }
+    .footer-links a { text-decoration: none; color: var(--muted); }
+    .footer-links a:hover { color: var(--fg); }
+
+    @media (max-width: 860px) {
+      .nav { display: none; }
+      .grid-2, .grid-3 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="../">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M5 19L12 5l7 14h-3.6L12 12.2 8.6 19H5z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">tiny<span>jump</span></span>
+      </a>
+      <nav class="nav" aria-label="Guide sections">
+        <a href="#install">Install Skills</a>
+        <a href="#mcp">MCP Setup</a>
+        <a href="#workflow">Use the Skill</a>
+        <a href="#platforms">Multi-Platform Build</a>
+        <a href="../">← Home</a>
+      </nav>
+      <div class="nav-actions">
+        <a class="btn sm" href="../demo/">Live demo</a>
+        <a class="btn sm primary" href="https://github.com/mindmakr/tinyjump">GitHub</a>
+        <button class="icon-btn" id="theme-toggle" type="button" title="Switch light or dark theme" aria-label="Switch theme">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="wrap">
+        <div class="eyebrow">Agent Skills · Claude Code · Antigravity · Codex · Cursor · 6 Supported Platforms</div>
+        <h1>Give your AI coding agent the <span class="hl">tinyjump skill</span> and build across 6 platforms.</h1>
+        <p class="lede">Install one lightweight skill into your agent so it automatically loads <code>tj docs</code>, writes strict TypeScript-shaped <code>.tj</code> apps, proves access &amp; privacy rules with <code>tj check</code>, runs deterministic <code>tj test</code> &amp; RTL layout sweeps, and packages native builds for <strong>Web, Android, iOS, macOS, Linux Desktop, and self-hosted servers</strong>.</p>
+        <div class="cta-row">
+          <a class="btn accent" href="#install">Install into your agent</a>
+          <a class="btn" href="../skills/tinyjump/SKILL.md" download="SKILL.md">Download tinyjump SKILL.md</a>
+          <a class="btn" href="../skills/tinyjump-review/SKILL.md" download="SKILL.md">Download Critic SKILL.md</a>
+          <a class="btn" href="../skills/tinyjump.mdc" download="tinyjump.mdc">Download Cursor .mdc</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- 01: INSTALL SKILLS -->
+    <section id="install" class="sec">
+      <div class="wrap">
+        <div class="kicker"><span class="num-pill">01</span> Install Agent Skills</div>
+        <h2>One command to teach your agent tinyjump</h2>
+        <p class="sec-sub">Choose your agent below. We publish two open-format skills: <strong><code>tinyjump</code></strong> (Builder + Multi-Platform Packager) and an optional companion <strong><code>tinyjump-review</code></strong> (Independent Critic &amp; QA Auditor).</p>
+
+        <div class="tabs-bar" role="tablist" aria-label="Choose your AI agent">
+          <button class="tab-btn" role="tab" aria-selected="true" aria-controls="ag-claude" id="t-claude" type="button">Claude Code</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ag-agy" id="t-agy" type="button">Antigravity / Gemini CLI</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ag-codex" id="t-codex" type="button">OpenAI Codex CLI</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ag-cursor" id="t-cursor" type="button">Cursor</button>
+        </div>
+
+        <!-- Claude Code -->
+        <div class="tab-panel" role="tabpanel" id="ag-claude" aria-labelledby="t-claude">
+          <div class="card">
+            <h3>Claude Code (macOS / Linux / WSL)</h3>
+            <p>Installs both the <code>tinyjump</code> builder skill and the optional <code>tinyjump-review</code> critic skill globally into <code>~/.claude/skills/</code>. Swap <code>~/.claude/skills</code> for <code>.claude/skills</code> inside a project to keep it repo-scoped.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>mkdir -p ~/.claude/skills/tinyjump ~/.claude/skills/tinyjump-review
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump/SKILL.md \
+  -o ~/.claude/skills/tinyjump/SKILL.md
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump-review/SKILL.md \
+  -o ~/.claude/skills/tinyjump-review/SKILL.md</pre>
+            </div>
+            <p style="margin-bottom:0;font-size:13.5px;color:var(--muted);">Then invoke directly in Claude Code with <code>/tinyjump</code> (or just ask: <em>"Use the tinyjump skill to build…"</em>).</p>
+          </div>
+        </div>
+
+        <!-- Antigravity / Gemini CLI -->
+        <div class="tab-panel" role="tabpanel" id="ag-agy" aria-labelledby="t-agy" hidden>
+          <div class="grid-2">
+            <div class="card">
+              <h3>Antigravity / Gemini CLI (macOS / Linux)</h3>
+              <p>Installs into <code>~/.gemini/config/skills/</code> so every Antigravity session discovers both skills automatically.</p>
+              <div class="code-box">
+                <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>mkdir -p ~/.gemini/config/skills/tinyjump ~/.gemini/config/skills/tinyjump-review
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump/SKILL.md \
+  -o ~/.gemini/config/skills/tinyjump/SKILL.md
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump-review/SKILL.md \
+  -o ~/.gemini/config/skills/tinyjump-review/SKILL.md</pre>
+              </div>
+            </div>
+            <div class="card">
+              <h3>Antigravity / Gemini CLI (Windows PowerShell)</h3>
+              <p>Downloads both skills straight into <code>%USERPROFILE%\.gemini\config\skills\</code>.</p>
+              <div class="code-box">
+                <div class="code-head"><span>powershell</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>$base = "$env:USERPROFILE\.gemini\config\skills"
+New-Item -ItemType Directory -Force "$base\tinyjump","$base\tinyjump-review" | Out-Null
+irm https://mindmakr.github.io/tinyjump/skills/tinyjump/SKILL.md -OutFile "$base\tinyjump\SKILL.md"
+irm https://mindmakr.github.io/tinyjump/skills/tinyjump-review/SKILL.md -OutFile "$base\tinyjump-review\SKILL.md"</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Codex CLI -->
+        <div class="tab-panel" role="tabpanel" id="ag-codex" aria-labelledby="t-codex" hidden>
+          <div class="card">
+            <h3>OpenAI Codex CLI (macOS / Linux / WSL)</h3>
+            <p>Installs into <code>~/.codex/skills/</code> (or use <code>.agents/skills/</code> inside your project directory).</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>mkdir -p ~/.codex/skills/tinyjump ~/.codex/skills/tinyjump-review
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump/SKILL.md \
+  -o ~/.codex/skills/tinyjump/SKILL.md
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump-review/SKILL.md \
+  -o ~/.codex/skills/tinyjump-review/SKILL.md</pre>
+            </div>
+            <p style="margin-bottom:0;font-size:13.5px;color:var(--muted);">Invoke with <code>$tinyjump</code> or <code>$tinyjump-review</code> in Codex.</p>
+          </div>
+        </div>
+
+        <!-- Cursor -->
+        <div class="tab-panel" role="tabpanel" id="ag-cursor" aria-labelledby="t-cursor" hidden>
+          <div class="card">
+            <h3>Cursor Project Rule (<code>.cursor/rules/tinyjump.mdc</code>)</h3>
+            <p>Drop our pre-formatted <code>.mdc</code> rule into any workspace so Cursor automatically activates tinyjump rules whenever you edit <code>.tj</code>, <code>permissions.json</code>, <code>locales/*.json</code>, or <code>.trace.jsonl</code> files.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash (inside your project)</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>mkdir -p .cursor/rules
+curl -fsSL https://mindmakr.github.io/tinyjump/skills/tinyjump.mdc \
+  -o .cursor/rules/tinyjump.mdc</pre>
+            </div>
+            <p style="margin-bottom:0;font-size:13.5px;color:var(--muted);">Windows PowerShell: <code>New-Item -ItemType Directory -Force .cursor\rules; irm https://mindmakr.github.io/tinyjump/skills/tinyjump.mdc -OutFile .cursor\rules\tinyjump.mdc</code></p>
+          </div>
+        </div>
+
+        <!-- Prerequisites + MCP -->
+        <div id="mcp" class="grid-2" style="margin-top:24px;">
+          <div class="card">
+            <h3>Prerequisites (one-time setup)</h3>
+            <p>Clone tinyjump once so your agent has the <code>tj</code> CLI, WASM runtime, and native hosts locally:</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>git clone https://github.com/mindmakr/tinyjump
+cd tinyjump
+rustup target add wasm32-unknown-unknown
+cargo web
+cargo build --release -p tj-cli</pre>
+            </div>
+            <p style="margin-bottom:0;font-size:13.5px;color:var(--muted);">Tip: add <code>target/release</code> to your <code>PATH</code> (or invoke via <code>cargo tj ...</code>).</p>
+          </div>
+
+          <div class="card">
+            <h3>Optional: Connect <code>tj mcp</code> for live UI driving</h3>
+            <p>Give Claude Code, Antigravity, or Cursor direct MCP tools to inspect the live semantic tree, click buttons, check layouts, and record <code>.trace.jsonl</code> tests against a running app:</p>
+            <div class="code-box">
+              <div class="code-head"><span>mcp.json (Claude Code / Cursor / Antigravity)</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>{
+  "mcpServers": {
+    "tinyjump": {
+      "command": "tj",
+      "args": ["mcp", "--target", "http://127.0.0.1:4700"]
+    }
+  }
+}</pre>
+            </div>
+            <p style="margin-bottom:0;font-size:13.5px;color:var(--muted);">Point <code>--target</code> to <code>:4700</code> (Web), <code>:4701</code> (Android/iOS debug), <code>:4702</code> (macOS AppKit), or <code>:4703</code> (Linux GTK 3).</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02: HOW TO USE THE SKILL -->
+    <section id="workflow" class="sec tinted">
+      <div class="wrap">
+        <div class="kicker"><span class="num-pill">02</span> How to Use the Skill</div>
+        <h2>Prompt your agent — it handles the entire build &amp; proof loop</h2>
+        <p class="sec-sub">Once the skill is installed, describe the app you want in plain language. The skill directs your agent to read <code>tj docs</code> first, write idiomatic <code>.tj</code> modules, create deterministic <code>.trace.jsonl</code> tests, run multi-locale RTL checks, and package your target builds.</p>
+
+        <div class="prompt-card">
+          <div class="label">Starter Prompt · Multi-Platform App</div>
+          <p>"Use the tinyjump skill to build a shared habit &amp; expense tracker in <code>my-app/app.tj</code> with offline-first <code>@server</code> sync, <code>@pii</code>-protected profile fields, English + Arabic RTL locales, and deterministic <code>tests/*.trace.jsonl</code> tests. Verify with <code>tj check --access --privacy</code>, <code>tj test</code>, and <code>tj review --pseudo</code>, then build a static Web bundle and an Android APK."</p>
+        </div>
+
+        <div class="prompt-card">
+          <div class="label">Optional Second Pass · Blind Critic Review</div>
+          <p>"Use the <code>tinyjump-review</code> skill to independently audit <code>my-app/app.tj</code> for access-control holes, <code>@pii</code> leaks, missing <code>@exclusive</code> guards, RTL overflow, and offline restart bugs."</p>
+        </div>
+
+        <div class="grid-3" style="margin-top:22px;">
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">Step 1 · Learn &amp; Write</span></div>
+            <h3>Single-page spec, zero guessing</h3>
+            <p>The skill forces your agent to run <code>tj docs</code> before writing code, avoiding common TypeScript-vs-<code>.tj</code> traps (strict <code>===</code>, closed-by-default <code>@read</code>+<code>@allow</code>, stable widget <code>id</code>s, and <code>tj:ui</code> forms).</p>
+          </div>
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">Step 2 · Prove &amp; Replay</span></div>
+            <h3>Compiler + trace + RTL sweep</h3>
+            <p>Your agent proves types, access matrix, and PII flow with <code>tj check --access --privacy</code>, replays deterministic <code>.trace.jsonl</code> tests in milliseconds with <code>tj test</code>, and catches clipping/contrast bugs with <code>tj review --pseudo</code>.</p>
+          </div>
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">Step 3 · Package &amp; Ship</span></div>
+            <h3>One codebase → 6 native targets</h3>
+            <p>With the exact same <code>app.tj</code>, your agent builds AOT Web WASM, Android APKs, zero-Xcode iOS <code>.app</code> bundles, macOS AppKit, Linux GTK 3, and self-hosted server binaries.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03: MULTI-PLATFORM BUILD GUIDE -->
+    <section id="platforms" class="sec">
+      <div class="wrap">
+        <div class="kicker"><span class="num-pill">03</span> Multi-Platform App Guide</div>
+        <h2>Build &amp; run your app on every supported platform</h2>
+        <p class="sec-sub">Every target below is built, tested, and working today — using the exact same <code>app.tj</code> source (and precompiled AOT <code>.tjb</code> bytecode where supported).</p>
+
+        <table class="matrix" style="margin-bottom:26px;">
+          <thead>
+            <tr>
+              <th>Platform</th>
+              <th>Native Engine</th>
+              <th>Measured Size / Target</th>
+              <th>Automation Endpoint</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Web</strong></td>
+              <td>WASM + native DOM (plain ES2017)</td>
+              <td><span class="stat-ok">215 KB gz</span> AOT WASM (540 KB raw)</td>
+              <td><code>http://127.0.0.1:4700</code></td>
+            </tr>
+            <tr>
+              <td><strong>Android</strong></td>
+              <td>Plain Java Views (zero AndroidX/Kotlin)</td>
+              <td><span class="stat-ok">531 KB</span> arm64 AOT APK · <code>minSdk 21</code></td>
+              <td><code>http://127.0.0.1:4701</code></td>
+            </tr>
+            <tr>
+              <td><strong>iOS</strong></td>
+              <td>Native Swift UIKit (zero Xcode project)</td>
+              <td><span class="stat-ok">iOS 13+</span> flat <code>.app</code> (Simulator CI verified)</td>
+              <td><code>http://127.0.0.1:4701</code></td>
+            </tr>
+            <tr>
+              <td><strong>macOS Desktop</strong></td>
+              <td>Native Swift AppKit (<code>hosts/macos</code>)</td>
+              <td><span class="stat-ok">macOS 12+</span> Apple Silicon &amp; Intel <code>.app</code></td>
+              <td><code>http://127.0.0.1:4702</code></td>
+            </tr>
+            <tr>
+              <td><strong>Linux Desktop</strong></td>
+              <td>Native GTK 3 via <code>dlopen</code> (<code>hosts/linux</code>)</td>
+              <td><span class="stat-ok">3.1 MB</span> stripped · zero <code>-dev</code> headers</td>
+              <td><code>http://127.0.0.1:4703</code></td>
+            </tr>
+            <tr>
+              <td><strong>Self-Hosted Server</strong></td>
+              <td><code>tj serve</code> / <code>tj build --linux</code></td>
+              <td><span class="stat-ok">1 static binary</span> · AES-256-GCM + audit log</td>
+              <td><code>http://127.0.0.1:4700</code></td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div class="grid-2">
+          <!-- Web -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">1. Web</span><span class="mini-tag">215 KB gz AOT</span><span class="mini-tag">ES2017</span></div>
+            <h3>Web (Live Dev &amp; Static AOT Bundle)</h3>
+            <p>Run locally with hot reload, or package a self-contained static folder (HTML + JS + compiler-free AOT WASM + <code>.tjb</code>) ready for any CDN or static host.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre># Live reload dev server (http://127.0.0.1:4700)
+cargo web
+cargo tj dev my-app/app.tj
+
+# Production static bundle (215 KB gz AOT WASM)
+cargo web-aot
+cargo tj build my-app/app.tj --web --out dist/web</pre>
+            </div>
+          </div>
+
+          <!-- Android -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">2. Android</span><span class="mini-tag">531 KB arm64 APK</span><span class="mini-tag">minSdk 21</span></div>
+            <h3>Android (Turnkey Native APK)</h3>
+            <p>Generates a self-contained plain-Java Gradle project (automatically merging any declared <code>permissions.json</code> device permissions) and assembles an installable APK. Needs Android SDK, NDK, <code>cargo-ndk</code>, and JDK 17.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>cargo tj build my-app/app.tj --android --aot \
+  --app-id com.example.myapp \
+  --title "My App" --version 1.0.0 \
+  --abis arm64-v8a \
+  --server http://10.0.2.2:4700 \
+  --assemble --out dist/android
+
+# Install on connected phone or emulator:
+adb install -r dist/android/app/build/outputs/apk/debug/app-debug.apk</pre>
+            </div>
+          </div>
+
+          <!-- iOS -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">3. iOS</span><span class="mini-tag">Native UIKit</span><span class="mini-tag">Zero Xcode</span></div>
+            <h3>iOS (Turnkey Flat <code>.app</code> Bundle)</h3>
+            <p>Emits <code>Info.plist</code> (with automatic camera/location/microphone usage keys), <code>AppDelegate.swift</code>, and precompiled <code>app.tjb</code>, then compiles a runnable iOS Simulator <code>.app</code> on macOS without opening Xcode.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash (macOS)</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>cargo tj build my-app/app.tj --ios --aot \
+  --app-id com.example.myapp \
+  --title "My App" --version 1.0.0 \
+  --server http://127.0.0.1:4700 \
+  --assemble --out dist/ios
+
+# Install &amp; launch on booted iOS Simulator:
+xcrun simctl install booted "dist/ios/My App.app"
+xcrun simctl launch booted com.example.myapp</pre>
+            </div>
+          </div>
+
+          <!-- macOS -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">4. macOS Desktop</span><span class="mini-tag">Native AppKit</span><span class="mini-tag">macOS 12+</span></div>
+            <h3>macOS Desktop (Native AppKit Host)</h3>
+            <p>Compiles a pure Swift AppKit <code>.app</code> over <code>crates/tj-ffi</code> with full UI catalog support, RTL mirroring, <code>@server</code> SSE sync, and live PNG screenshot review on <code>:4702</code>.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash (macOS)</span><button class="copy-btn" type="button">Copy</button></div>
+<pre># Build target/macos/TinyJump.app
+bash scripts/macos.sh
+
+# Launch your app natively on macOS
+target/macos/TinyJump.app/Contents/MacOS/TinyJump \
+  --app my-app/app.tj \
+  --server http://127.0.0.1:4700</pre>
+            </div>
+          </div>
+
+          <!-- Linux Desktop -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">5. Linux Desktop</span><span class="mini-tag">3.1 MB GTK 3</span><span class="mini-tag">Zero -dev headers</span></div>
+            <h3>Linux Desktop (Native GTK 3 Host)</h3>
+            <p>Dynamically loads runtime <code>libgtk-3.so.0</code> (no <code>libgtk-3-dev</code> required at compile time), runs <code>.tj</code> or binary AOT <code>.tjb</code> apps, stores data in <code>$XDG_DATA_HOME/tinyjump</code>, and exposes <code>/_tj/screenshot</code> on <code>:4703</code>.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash (Linux / WSL2)</span><button class="copy-btn" type="button">Copy</button></div>
+<pre># Build hosts/linux/target/release/tinyjump-linux (3.1 MB)
+bash scripts/linux.sh
+
+# Launch your .tj or precompiled .tjb app natively
+hosts/linux/target/release/tinyjump-linux \
+  --app my-app/app.tj \
+  --server http://127.0.0.1:4700</pre>
+            </div>
+          </div>
+
+          <!-- Self-Hosted Server -->
+          <div class="card">
+            <div class="pill-row"><span class="mini-tag ok">6. Backend Server</span><span class="mini-tag">Single Binary</span><span class="mini-tag">AES-256-GCM</span></div>
+            <h3>Self-Hosted Server &amp; Live Reload</h3>
+            <p>Serve your <code>@server</code> objects, HTTP API, SSE realtime streams, encryption at rest, and tamper-evident audit logs from one binary — with shadow-booted <code>tj reload</code> upgrades.</p>
+            <div class="code-box">
+              <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre># Run directly with scoped API keys
+cargo tj key alice --keys keys.json --role staff
+TJ_KEYS=keys.json cargo tj serve my-app/app.tj \
+  --host 0.0.0.0 --port 4700 --data ./data
+
+# Or ship a single standalone Linux executable with embedded bytecode
+cargo tj build my-app/app.tj --linux --out dist/my-app-server</pre>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="margin-top:22px;">
+          <h3>Add Optional Capabilities from the Registry (0 KB overhead when unused)</h3>
+          <p>Browse and pin audited Official packages from <a href="https://mindmakr.github.io/tj-plugins/"><code>mindmakr/tj-plugins</code></a> (utility modules, regional GDPR/PDPL compliance packs, opt-in device plugins for <code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>, and WebRTC <code>webrtc</code> video calls) or generate a typed bridge from any OpenAPI 3.x spec:</p>
+          <div class="code-box">
+            <div class="code-head"><span>bash</span><button class="copy-btn" type="button">Copy</button></div>
+<pre>cargo tj search                         # browse all 11 Official packages
+cargo tj add money --dir my-app         # pin commit + SHA-256 in tj.lock
+cargo tj add camera --dir my-app        # opt-in native camera plugin
+cargo tj bridge openapi api.json --out my-app/api.tj</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-inner">
+      <div>
+        <strong style="color:var(--fg);">tinyjump</strong> · Created by Asif Raja (<a href="https://github.com/mindmakr">mindmakr</a>) · Dual-licensed MIT / Apache-2.0
+      </div>
+      <div class="footer-links">
+        <a href="../">Home</a>
+        <a href="../demo/">Demo</a>
+        <a href="../skills/tinyjump/SKILL.md">SKILL.md</a>
+        <a href="https://mindmakr.github.io/tj-plugins/">Registry</a>
+        <a href="https://github.com/mindmakr/tinyjump">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      var root = document.documentElement;
+      try {
+        var saved = localStorage.getItem('tj-site-theme');
+        if (saved === 'light' || saved === 'dark') { root.setAttribute('data-theme', saved); }
+      } catch (e) {}
+      var toggle = document.getElementById('theme-toggle');
+      if (toggle) {
+        toggle.addEventListener('click', function () {
+          var isDark = root.getAttribute('data-theme') === 'dark' ||
+            (!root.getAttribute('data-theme') && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var next = isDark ? 'light' : 'dark';
+          root.setAttribute('data-theme', next);
+          try { localStorage.setItem('tj-site-theme', next); } catch (e) {}
+        });
+      }
+
+      var tabs = document.querySelectorAll('[role="tab"]');
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].addEventListener('click', function (ev) {
+          var target = ev.currentTarget;
+          var panelId = target.getAttribute('aria-controls');
+          for (var j = 0; j < tabs.length; j++) {
+            var active = tabs[j] === target;
+            tabs[j].setAttribute('aria-selected', active ? 'true' : 'false');
+            var p = document.getElementById(tabs[j].getAttribute('aria-controls'));
+            if (p) { p.hidden = !active; }
+          }
+          var chosen = document.getElementById(panelId);
+          if (chosen) { chosen.hidden = false; }
+        });
+      }
+
+      var copyBtns = document.querySelectorAll('.copy-btn');
+      for (var k = 0; k < copyBtns.length; k++) {
+        copyBtns[k].addEventListener('click', function (ev) {
+          var btn = ev.currentTarget;
+          var box = btn.closest('.code-box');
+          var pre = box && box.querySelector('pre');
+          var text = pre ? (pre.textContent || '') : '';
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+              btn.textContent = 'Copied!';
+              setTimeout(function () { btn.textContent = 'Copy'; }, 1600);
+            });
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>

@@ -23,6 +23,12 @@ cp site/demo/index.html "$out/demo/"
 cp hosts/web/tinyjump.js "$out/demo/"
 cp target/wasm32-unknown-unknown/small/tj_wasm.wasm "$out/demo/tinyjump.wasm"
 cp examples/todo/app.tj "$out/demo/app.tj"
+if [[ -d site/guide ]]; then
+  cp -R site/guide "$out/guide"
+fi
+if [[ -d site/skills ]]; then
+  cp -R site/skills "$out/skills"
+fi
 touch "$out/.nojekyll"
 echo "site built in $out"
 
