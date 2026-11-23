@@ -130,7 +130,21 @@ impl Measure for TestMeasure {
                 (w.ceil(), 44.0)
             }
             "Image" => (num_prop("width").unwrap_or(120.0).ceil(), num_prop("height").unwrap_or(120.0).ceil()),
-            _ => (0.0, 0.0),
+            "Tabs" => {
+                let count = props.get("items").and_then(Json::as_array).map_or(0, Vec::len).max(1) as f32;
+                let w = (count * 80.0).max(44.0);
+                let w = max_width.map_or(w, |mw| w.min(mw));
+                (w.ceil(), 44.0)
+            }
+            "Icon" => {
+                let s = num_prop("size").unwrap_or(20.0);
+                (s.ceil(), s.ceil())
+            }
+            _ => {
+                let w = num_prop("width").unwrap_or(120.0);
+                let w = if props.contains_key("width") { w } else { max_width.map_or(w, |mw| w.min(mw)) };
+                (w.ceil(), num_prop("height").unwrap_or(80.0).ceil())
+            }
         }
     }
 }

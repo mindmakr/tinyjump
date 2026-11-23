@@ -69,6 +69,25 @@ widget. When the user acts, send `ui { target: { node: id }, event, value }`, bu
 for events listed on that node. Hosts should only write a widget's `value` when it
 differs from what the widget already shows, so typing is never interrupted.
 
+### Custom native components
+
+`<Native name="MapView" lat={51.5} onSelect={fn} />` emits a normal `create` patch whose
+`kind` is `"MapView"` (with `name` removed from `props`), custom data props in `props`,
+and `on<Upper>...` handlers in `events`. Register the native implementation before booting:
+
+- **Web (`hosts/web/tinyjump.js`):** `registerComponent("MapView", { create(props, emit), update?(el, props, changed), container?(el), destroy?(el) })` or `start({ ..., components: { MapView: ... } })`.
+- **Android (`hosts/android`):** `TinyJump.registerComponent("MapView", new NativeComponent() { View create(Context, JSONObject props, EventSink emit); void update(View, JSONObject props, JSONObject changed); ... })`.
+- **iOS (`hosts/ios`):** `TinyJump.registerComponent("MapView", NativeComponent(create: { props, emit in ... }, update: { view, props, changed in ... }))`.
+
+Calling `emit(event, value)` sends `{ type: "ui", target: { node: id }, event, value }` back
+into the runtime. On Android and iOS, `emit` must be called on the main thread (and calls
+fired synchronously inside `create` or `update` are ignored to prevent re-entrant patch
+handling). Shared layout/style/accessibility props (`id`, `label`, `background`, `radius`,
+`border`, plus layout props on Web) are applied by the host to the native view, so custom
+props should avoid built-in `COMMON_PROPS` names. Leaf custom native nodes (no children) are
+measured via the host's `measure` callback like built-in leaves; nodes with children lay out
+their children via the optional `container` view.
+
 ## Layout (native hosts)
 
 The core lays native screens out with CSS flexbox (`crates/tj-core/src/ui/layout.rs`),
@@ -83,7 +102,8 @@ rules. The cycle has three steps:
    `dir`, or the browser language), and the browser mirrors.
 2. The core answers with `frames { frames: [{ id, x, y, w, h, content? }] }`. These are
    only the nodes that moved, positioned relative to their parent. `content` is the
-   scrollable height of a `Scroll`.
+   scrollable height of a `Scroll` or vertical `List`, or the scrollable width of a
+   horizontal `List`.
 3. While computing, the core calls the host's **measure** callback for leaf widgets (text,
    buttons, inputs, toggles, images). The callback returns the natural size at a maximum
    width. Leaves draw their own padding, so it is included. Round sizes up, so text never

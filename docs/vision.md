@@ -147,13 +147,13 @@ the goal; being in the market early, to gain momentum and contributors, is.
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
 
-After that: the UI catalog (navigation, long lists, forms, icons, themes), **native
-components** (owner, 2026-11-20: a Kotlin or Java view, a Swift view or a web element
-registered under a name and used from `.tj` like any catalog component, with props and
-events through the protocol), `tj build`, the rest of automation (golden images, run
-reports), translations and locale formats, and GPU/3D. Size: profile the device builds and
-cut what is really large (a server-only split was measured at 1.2 KB and dropped,
-`feedback/2026-11-20-builder-004-size-split-measured.md`).
+After that: **the UI catalog (`<Tabs>`, `<Icon>`, `<List>`, `<Theme>`, done) and native
+components (`<Native name="MapView" ... />`, done)** (owner, 2026-11-20: a Kotlin or Java
+view, a Swift view or a web element registered under a name and used from `.tj` like any
+catalog component, with props and events through the protocol), `tj build`, the rest of
+automation (golden images, run reports), translations and locale formats, and GPU/3D. Size:
+profile the device builds and cut what is really large (a server-only split was measured at
+1.2 KB and dropped, `feedback/2026-11-20-builder-004-size-split-measured.md`).
 
 ## The ecosystem: filling the gap of missing libraries (agreed)
 

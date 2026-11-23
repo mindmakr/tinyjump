@@ -36,19 +36,39 @@ pub const KINDS: &[Kind] = &[
     Kind { name: "Image", props: &["src", "fit"], events: &[], content: Content::None },
     // A time, shown by the platform's own formatter in the viewer's language and zone.
     Kind { name: "Time", props: &["value", "show", "style", "zone"], events: &[], content: Content::None },
+    Kind { name: "Tabs", props: &["items", "value"], events: &["onChange"], content: Content::None },
+    Kind { name: "Icon", props: &["name"], events: &[], content: Content::None },
+    Kind { name: "List", props: &["itemHeight", "horizontal"], events: &["onEndReached"], content: Content::Nodes },
+    Kind { name: "Theme", props: &["mode", "accent", "surface", "muted"], events: &[], content: Content::Nodes },
+    // A host-registered native view (Web element, Android View, iOS UIView) with arbitrary props and `on<Upper>...` events.
+    Kind { name: "Native", props: &["name"], events: &[], content: Content::Nodes },
 ];
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().find(|k| k.name == name)
 }
 
+/// Whether `name` is a valid custom native component name (e.g. `"MapView"`):
+/// starts with an ASCII capital letter, uses ASCII letters/digits/`_`, and does not shadow a built-in.
+pub fn valid_native_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && kind(name).is_none()
+}
+
+/// Whether `prop` follows the `on<Upper>...` event handler convention on `<Native>`.
+pub fn is_native_event(prop: &str) -> bool {
+    prop.len() > 2 && prop.starts_with("on") && prop.as_bytes()[2].is_ascii_uppercase()
+}
+
 impl Kind {
     pub fn allows(&self, prop: &str) -> bool {
-        COMMON_PROPS.contains(&prop) || self.props.contains(&prop) || self.events.contains(&prop)
+        self.name == "Native" || COMMON_PROPS.contains(&prop) || self.props.contains(&prop) || self.events.contains(&prop)
     }
 
     pub fn is_event(&self, prop: &str) -> bool {
-        self.events.contains(&prop)
+        self.events.contains(&prop) || (self.name == "Native" && is_native_event(prop))
     }
 
     /// Every prop name this component accepts, for error hints.

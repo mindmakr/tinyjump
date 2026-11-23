@@ -9,10 +9,19 @@ const MAX_TIMEOUT = 2147483647;
 const RTL_LANGUAGES = ['ar', 'he', 'fa', 'ur', 'ps', 'sd', 'ug', 'yi', 'dv', 'ku'];
 
 const CSS = [
-  '.tj-column,.tj-row,.tj-scroll{display:flex;box-sizing:border-box;min-width:0}',
-  '.tj-column,.tj-scroll{flex-direction:column}',
+  '.tj-column,.tj-row,.tj-scroll,.tj-list,.tj-theme{display:flex;box-sizing:border-box;min-width:0}',
+  '.tj-column,.tj-scroll,.tj-list,.tj-theme{flex-direction:column}',
   '.tj-row{flex-direction:row;align-items:center}',
-  '.tj-scroll{overflow:auto}',
+  '.tj-scroll,.tj-list{overflow:auto}',
+  '.tj-list-h{flex-direction:row}',
+  '.tj-list-h>*{flex-shrink:0}',
+  '.tj-list-vh>*{content-visibility:auto;contain-intrinsic-size:auto var(--tj-item-h)}',
+  '.tj-theme{background:var(--tj-surface,transparent);color:var(--tj-fg,inherit)}',
+  '.tj-tabs{display:flex;flex-direction:row;align-items:stretch;gap:4px;border-bottom:1px solid var(--tj-border,#e5e7eb);box-sizing:border-box;min-height:44px;overflow-x:auto}',
+  '.tj-tab{min-height:44px;min-width:44px;padding:0 14px;border:none;border-bottom:2px solid transparent;background:transparent;color:inherit;font:inherit;cursor:pointer;white-space:nowrap}',
+  '.tj-tab[aria-selected=true]{border-bottom-color:var(--tj-accent,#2563eb);color:var(--tj-accent,#2563eb);font-weight:600}',
+  '.tj-icon{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;line-height:0}',
+  '.tj-native-missing{display:inline-flex;align-items:center;justify-content:center;min-height:44px;padding:8px;border:1px dashed #9ca3af;color:#6b7280;font:12px/1.3 ui-monospace,monospace;box-sizing:border-box}',
   '.tj-spacer{flex:1}',
   '.tj-text{white-space:pre-wrap}',
   '.tj-toggle{display:inline-flex;gap:8px;align-items:center}',
@@ -23,11 +32,51 @@ const CSS = [
   // Each text reads in its own script's direction (English stays "3 left" in an Arabic
   // screen) while aligning to the layout's start, like Android and iOS.
   '.tj-text,.tj-input,.tj-toggle span,.tj-input::placeholder{unicode-bidi:plaintext;text-align:left}',
-  '.tj-button{unicode-bidi:plaintext}',
+  '.tj-button,.tj-tab{unicode-bidi:plaintext}',
   '[dir=rtl] .tj-text,[dir=rtl] .tj-input,[dir=rtl] .tj-toggle span,[dir=rtl] .tj-input::placeholder{text-align:right}',
   '.tj-error{position:fixed;left:8px;right:8px;bottom:8px;padding:12px;background:#2b0d0d;color:#ffd7d7;',
   'font:13px/1.4 ui-monospace,monospace;white-space:pre-wrap;border-radius:8px;z-index:99999;max-height:40vh;overflow:auto}',
 ].join('');
+
+// 24x24 stroke icons for `<Icon name="..." />` (no icon font or asset pipeline needed).
+const ICONS = {
+  check: 'M5 13l4 4L19 7',
+  plus: 'M12 5v14M5 12h14',
+  close: 'M6 6l12 12M18 6L6 18',
+  search: 'M11 4a7 7 0 1 0 0 14a7 7 0 1 0 0-14M20 20l-4.2-4.2',
+  home: 'M3 11l9-7 9 7M5 10v10h14V10',
+  user: 'M12 4a4 4 0 1 0 0 8a4 4 0 1 0 0-8M4 20c1.5-4 14.5-4 16 0',
+  settings: 'M12 9a3 3 0 1 0 0 6a3 3 0 1 0 0-6M12 3v3M12 18v3M3 12h3M18 12h3M5.6 5.6l2.1 2.1M16.3 16.3l2.1 2.1M18.4 5.6l-2.1 2.1M7.7 16.3l-2.1 2.1',
+  back: 'M15 6l-6 6 6 6',
+  next: 'M9 6l6 6-6 6',
+  edit: 'M4 20h4l11-11-4-4L4 16v4',
+  trash: 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13',
+  calendar: 'M4 6h16v14H4zM8 3v4M16 3v4M4 10h16',
+  clock: 'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M12 7v5l3 2',
+  bell: 'M18 16H6l1-2v-4a5 5 0 0 1 10 0v4l1 2M10 19a2 2 0 0 0 4 0',
+  mail: 'M4 6h16v12H4zM4 7l8 6 8-6',
+  star: 'M12 3l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.8 6.2 20.9l1.1-6.5L2.6 9.8l6.5-.9z',
+  heart: 'M12 20s-7-4.5-8.5-9A4.8 4.8 0 0 1 12 6.8 4.8 4.8 0 0 1 20.5 11C19 15.5 12 20 12 20z',
+  info: 'M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18M12 11v5M12 8h.01',
+  warning: 'M12 4L3 20h18L12 4zM12 10v4M12 17h.01',
+  lock: 'M6 11h12v9H6zM8 11V8a4 4 0 0 1 8 0v3',
+  menu: 'M4 7h16M4 12h16M4 17h16',
+  share: 'M12 4v11M8 8l4-4 4 4M5 14v6h14v-6',
+  refresh: 'M20 12a8 8 0 1 1-2.3-5.7M20 4v5h-5',
+  download: 'M12 4v11M8 11l4 4 4-4M5 19h14',
+};
+
+const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Tabs', 'Icon', 'List', 'Theme'];
+const REGISTRY = new Map();
+
+/**
+ * Registers a custom native web component (`<Native name="MapView" ... />`) globally before `start()`.
+ * @param {string} name
+ * @param {{create: (props: object, emit: (event: string, value?: any) => void) => HTMLElement, update?: (el: HTMLElement, props: object, changed: object) => void, container?: (el: HTMLElement) => HTMLElement, destroy?: (el: HTMLElement) => void}} spec
+ */
+export function registerComponent(name, spec) {
+  REGISTRY.set(name, spec);
+}
 
 function px(v) {
   return typeof v === 'number' ? v + 'px' : v;
@@ -113,6 +162,10 @@ export async function start(opts) {
   // Right-to-left locales mirror the layout; the browser's flexbox follows `dir`.
   root.setAttribute('dir', opts.dir || document.documentElement.dir || (RTL_LANGUAGES.indexOf((navigator.language || '').split('-')[0]) >= 0 ? 'rtl' : 'ltr'));
   const nodes = new Map([[0, root]]);
+  const components = new Map(REGISTRY);
+  if (opts.components) {
+    Object.keys(opts.components).forEach((k) => components.set(k, opts.components[k]));
+  }
   const pending = new Map();
   let nextReply = 1;
   let wakeTimer = null;
@@ -332,8 +385,113 @@ export async function start(opts) {
 
   // ---------- native widgets ----------
 
-  function create(kind, props) {
+  function renderTabs(el) {
+    const items = Array.isArray(el.__tabs.items) ? el.__tabs.items : [];
+    const current = el.__tabs.value === null || el.__tabs.value === undefined ? null : String(el.__tabs.value);
+    while (el.firstChild) el.removeChild(el.firstChild);
+    items.forEach((raw) => {
+      const val = raw && typeof raw === 'object' ? String(raw.value !== undefined && raw.value !== null ? raw.value : (raw.label !== undefined && raw.label !== null ? raw.label : '')) : String(raw === null || raw === undefined ? '' : raw);
+      const label = raw && typeof raw === 'object' ? String(raw.label !== undefined && raw.label !== null ? raw.label : val) : val;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tj-tab';
+      btn.setAttribute('role', 'tab');
+      btn.dataset.tjVal = val;
+      btn.setAttribute('aria-selected', current !== null && val === current ? 'true' : 'false');
+      btn.textContent = label;
+      btn.addEventListener('click', () => {
+        if (el.__tj && !el.__quiet && el.__tj.events.indexOf('onChange') >= 0) {
+          send({ type: 'ui', target: { node: el.__tj.id }, event: 'onChange', value: val });
+        }
+      });
+      el.appendChild(btn);
+    });
+  }
+
+  function updateTabSelection(el) {
+    const current = el.__tabs.value === null || el.__tabs.value === undefined ? null : String(el.__tabs.value);
+    for (let i = 0; i < el.childNodes.length; i++) {
+      const btn = el.childNodes[i];
+      if (btn && btn.dataset) {
+        btn.setAttribute('aria-selected', current !== null && btn.dataset.tjVal === current ? 'true' : 'false');
+      }
+    }
+  }
+
+  function renderIcon(el) {
+    const name = el.__icon.name || '';
+    const size = typeof el.__icon.size === 'number' && el.__icon.size > 0 ? el.__icon.size : 20;
+    const d = Object.prototype.hasOwnProperty.call(ICONS, name) ? ICONS[name] : 'M12 5a7 7 0 1 0 0 14a7 7 0 1 0 0-14';
+    const ns = 'http://www.w3.org/2000/svg';
+    let svg = el.firstChild;
+    if (!svg) {
+      svg = document.createElementNS(ns, 'svg');
+      svg.setAttribute('viewBox', '0 0 24 24');
+      svg.setAttribute('fill', 'none');
+      svg.setAttribute('stroke', 'currentColor');
+      svg.setAttribute('stroke-width', '2');
+      svg.setAttribute('stroke-linecap', 'round');
+      svg.setAttribute('stroke-linejoin', 'round');
+      svg.appendChild(document.createElementNS(ns, 'path'));
+      el.appendChild(svg);
+    }
+    svg.setAttribute('width', String(size));
+    svg.setAttribute('height', String(size));
+    svg.firstChild.setAttribute('d', d);
+    el.style.width = size + 'px';
+    el.style.height = size + 'px';
+  }
+
+  function applyTheme(el) {
+    const t = el.__theme;
+    const dark = t.mode === 'dark' || (t.mode === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    const mode = dark ? 'dark' : 'light';
+    el.setAttribute('data-tj-theme', mode);
+    el.style.colorScheme = t.mode ? mode : '';
+    const surface = t.surface || (t.mode ? (dark ? '#111827' : '#ffffff') : '');
+    const fg = t.color || (t.mode ? (dark ? '#f9fafb' : '#111827') : '');
+    const muted = t.muted || (t.mode ? (dark ? '#9ca3af' : '#6b7280') : '');
+    const border = t.mode ? (dark ? '#374151' : '#e5e7eb') : '';
+    const setVar = (name, val) => { if (val) el.style.setProperty(name, val); else el.style.removeProperty(name); };
+    setVar('--tj-surface', surface);
+    setVar('--tj-fg', fg);
+    setVar('--tj-accent', t.accent || '');
+    setVar('--tj-muted', muted);
+    setVar('--tj-border', border);
+    setVar('--tj-radius', t.radius !== undefined ? px(t.radius) : '');
+  }
+
+  function create(id, kind, props) {
     let el;
+    if (BUILTIN_KINDS.indexOf(kind) < 0) {
+      const spec = components.get(kind);
+      let creating = true;
+      const emit = (event, value) => {
+        if (!creating && el && el.__tj && !el.__quiet && el.__tj.events.indexOf(event) >= 0) {
+          send({ type: 'ui', target: { node: id }, event, value: value === undefined ? null : value });
+        }
+      };
+      if (spec && typeof spec.create === 'function') {
+        el = spec.create(Object.assign({}, props), emit);
+        creating = false;
+        const container = typeof spec.container === 'function' ? spec.container(el) : null;
+        if (container) {
+          container.style.display = 'flex';
+          container.style.flexDirection = 'column';
+          container.style.boxSizing = 'border-box';
+          container.style.minWidth = '0';
+        }
+        el.__native = { spec, props: Object.assign({}, props), container };
+      } else {
+        creating = false;
+        el = document.createElement('div');
+        el.className = 'tj-native-missing';
+        el.setAttribute('data-tj-native', kind);
+        el.textContent = '<' + kind + '>';
+        el.__native = { spec: null, props: Object.assign({}, props), container: null };
+      }
+      return el;
+    }
     switch (kind) {
       case 'Button': el = document.createElement('button'); el.type = 'button'; el.className = 'tj-button'; break;
       case 'Input': el = document.createElement(props.multiline ? 'textarea' : 'input'); el.className = 'tj-input'; break;
@@ -346,6 +504,25 @@ export async function start(opts) {
       }
       case 'Image': el = document.createElement('img'); break;
       case 'Time': el = document.createElement('span'); el.className = 'tj-text'; el.__time = {}; break;
+      case 'Tabs': el = document.createElement('div'); el.className = 'tj-tabs'; el.setAttribute('role', 'tablist'); el.__tabs = { items: [], value: null }; break;
+      case 'Icon': el = document.createElement('span'); el.className = 'tj-icon'; el.setAttribute('aria-hidden', 'true'); el.__icon = { name: '', size: 20 }; break;
+      case 'List': el = document.createElement('div'); el.className = 'tj-list'; el.__list = { horizontal: false, lastExtent: -1 }; break;
+      case 'Theme': {
+        el = document.createElement('div');
+        el.className = 'tj-theme';
+        el.__theme = {};
+        if (window.matchMedia) {
+          const mq = window.matchMedia('(prefers-color-scheme: dark)');
+          const onChange = () => { if (el.__theme.mode === 'system') applyTheme(el); };
+          if (mq.addEventListener) mq.addEventListener('change', onChange);
+          else if (mq.addListener) mq.addListener(onChange);
+          el.__themeCleanup = () => {
+            if (mq.removeEventListener) mq.removeEventListener('change', onChange);
+            else if (mq.removeListener) mq.removeListener(onChange);
+          };
+        }
+        break;
+      }
       default: el = document.createElement('div'); el.className = 'tj-' + kind.toLowerCase();
     }
     return el;
@@ -418,6 +595,29 @@ export async function start(opts) {
   function setProp(el, kind, k, v) {
     const s = el.style;
     const none = v === null || v === undefined;
+    if (el.__native) {
+      // Custom native components own their custom props via spec.create/update; only apply shared layout/style/a11y props.
+      const cs = (el.__native.container || el).style;
+      switch (k) {
+        case 'id': if (none) delete el.dataset.tjId; else el.dataset.tjId = v; break;
+        case 'label': if (none) el.removeAttribute('aria-label'); else el.setAttribute('aria-label', v); break;
+        case 'padding': cs.padding = none ? '' : px(v); break;
+        case 'margin': s.margin = none ? '' : px(v); break;
+        case 'gap': cs.gap = none ? '' : px(v); break;
+        case 'align': cs.alignItems = none ? '' : (ALIGN[v] || v); break;
+        case 'justify': cs.justifyContent = none ? '' : (JUSTIFY[v] || v); break;
+        case 'grow': s.flexGrow = none ? '' : String(v); break;
+        case 'width': s.width = none ? '' : px(v); break;
+        case 'height': s.height = none ? '' : px(v); break;
+        case 'color': s.color = none ? '' : v; break;
+        case 'background': s.background = none ? '' : v; break;
+        case 'radius': s.borderRadius = none ? '' : px(v); break;
+        case 'size': s.fontSize = none ? '' : px(v); break;
+        case 'weight': s.fontWeight = none ? '' : String(v); break;
+        case 'border': s.border = none ? '' : (typeof v === 'number' ? v + 'px solid currentColor' : v); break;
+      }
+      return;
+    }
     if (kind === 'Input' && k === 'value') el.__value = v;
     if (kind === 'Time' && (k === 'value' || k === 'show' || k === 'style' || k === 'zone')) {
       el.__time[k] = none ? undefined : v;
@@ -434,6 +634,45 @@ export async function start(opts) {
       const text = typedText(el.__type, el.__zone, v);
       if (el.value !== text) el.value = text;
       return;
+    }
+    if (kind === 'Tabs' && (k === 'items' || k === 'value')) {
+      el.__tabs[k] = none ? (k === 'items' ? [] : null) : v;
+      return;
+    }
+    if (kind === 'Icon') {
+      if (k === 'name' || k === 'size') {
+        el.__icon[k] = none ? (k === 'size' ? 20 : '') : v;
+        renderIcon(el);
+        return;
+      }
+      if (k === 'label') {
+        if (none) { el.removeAttribute('aria-label'); el.removeAttribute('role'); el.setAttribute('aria-hidden', 'true'); }
+        else { el.setAttribute('aria-label', v); el.setAttribute('role', 'img'); el.removeAttribute('aria-hidden'); }
+        return;
+      }
+    }
+    if (kind === 'List') {
+      if (k === 'horizontal') {
+        el.__list.horizontal = !none && !!v;
+        el.classList.toggle('tj-list-h', el.__list.horizontal);
+        el.__list.lastExtent = -1;
+        return;
+      }
+      if (k === 'itemHeight') {
+        if (!none && typeof v === 'number' && v > 0) {
+          el.style.setProperty('--tj-item-h', v + 'px');
+          el.classList.add('tj-list-vh');
+        } else {
+          el.style.removeProperty('--tj-item-h');
+          el.classList.remove('tj-list-vh');
+        }
+        return;
+      }
+    }
+    if (kind === 'Theme' && ['mode', 'accent', 'surface', 'muted', 'color', 'radius'].indexOf(k) >= 0) {
+      if (none) delete el.__theme[k]; else el.__theme[k] = v;
+      applyTheme(el);
+      if (k === 'mode' || k === 'accent' || k === 'surface' || k === 'muted') return;
     }
     switch (k) {
       case 'text':
@@ -487,26 +726,71 @@ export async function start(opts) {
       });
     }
     if (kind === 'Toggle') el.firstChild.addEventListener('change', () => fire('onChange', el.firstChild.checked));
+    if (kind === 'List') {
+      el.addEventListener('scroll', () => {
+        if (el.__tj.events.indexOf('onEndReached') < 0) return;
+        const horiz = el.__list && el.__list.horizontal;
+        const extent = horiz ? el.scrollWidth : el.scrollHeight;
+        const view = horiz ? el.clientWidth : el.clientHeight;
+        const offset = horiz ? Math.abs(el.scrollLeft) : el.scrollTop;
+        if (extent < el.__list.lastExtent) el.__list.lastExtent = -1;
+        if (extent > view && extent - offset - view <= 120 && el.__list.lastExtent !== extent) {
+          el.__list.lastExtent = extent;
+          fire('onEndReached', null);
+        }
+      });
+    }
+  }
+
+  function applyProps(el, kind, props, isCreate) {
+    const keys = Object.keys(props);
+    el.__quiet = true;
+    try {
+      keys.forEach((k) => setProp(el, kind, k, props[k]));
+      if (kind === 'Tabs') {
+        if (isCreate || Object.prototype.hasOwnProperty.call(props, 'items')) renderTabs(el);
+        else if (Object.prototype.hasOwnProperty.call(props, 'value')) updateTabSelection(el);
+      }
+      if (kind === 'Icon' && isCreate && !Object.prototype.hasOwnProperty.call(props, 'name') && !Object.prototype.hasOwnProperty.call(props, 'size')) {
+        renderIcon(el);
+      }
+      if (!isCreate && el.__native) {
+        keys.forEach((k) => {
+          if (props[k] === null) delete el.__native.props[k];
+          else el.__native.props[k] = props[k];
+        });
+        if (el.__native.spec && typeof el.__native.spec.update === 'function') {
+          el.__native.spec.update(el, Object.assign({}, el.__native.props), Object.assign({}, props));
+        }
+      }
+    } finally {
+      el.__quiet = false;
+    }
   }
 
   function patch(op) {
     switch (op.op) {
       case 'create': {
-        const el = create(op.kind, op.props);
+        const el = create(op.id, op.kind, op.props);
         el.__tj = { id: op.id, kind: op.kind, events: op.events };
-        Object.keys(op.props).forEach((k) => setProp(el, op.kind, k, op.props[k]));
+        applyProps(el, op.kind, op.props, true);
         listen(el, op.id, op.kind);
         nodes.set(op.id, el);
         break;
       }
       case 'update': {
         const el = nodes.get(op.id);
-        Object.keys(op.props).forEach((k) => setProp(el, el.__tj.kind, k, op.props[k]));
+        if (!el) break;
         if (op.events) el.__tj.events = op.events;
+        applyProps(el, el.__tj.kind, op.props, false);
         break;
       }
       case 'children': {
-        const parent = nodes.get(op.id);
+        const rawParent = nodes.get(op.id);
+        if (!rawParent) break;
+        if (rawParent.__native && !rawParent.__native.container) break;
+        const parent = rawParent.__native ? rawParent.__native.container : rawParent;
+        if (rawParent.__list && op.ids.length < parent.childNodes.length) rawParent.__list.lastExtent = -1;
         op.ids.forEach((cid, i) => {
           const child = nodes.get(cid);
           if (parent.childNodes[i] !== child) parent.insertBefore(child, parent.childNodes[i] || null);
@@ -516,6 +800,10 @@ export async function start(opts) {
       }
       case 'remove': {
         const el = nodes.get(op.id);
+        if (el && el.__themeCleanup) el.__themeCleanup();
+        if (el && el.__native && el.__native.spec && typeof el.__native.spec.destroy === 'function') {
+          el.__native.spec.destroy(el);
+        }
         if (el && el.parentNode) el.parentNode.removeChild(el);
         nodes.delete(op.id);
         break;
@@ -573,6 +861,8 @@ export async function start(opts) {
     setToken,
     /** Forgets the token, the replicas and every queued server call. */
     signOut: () => setToken(null, null, []),
+    /** Registers a custom native component (`<Native name="..." />`) for this app instance. */
+    registerComponent: (name, spec) => components.set(name, spec),
   };
 
   // ---------- boot ----------

@@ -4,12 +4,50 @@ public struct BootError: Error, CustomStringConvertible {
     public let description: String
 }
 
+/// A custom native UIKit view registered under a name (e.g. `"MapView"`) via
+/// `TinyJump.registerComponent(_:_:)` and used from `.tj` as `<Native name="MapView" ... />`.
+public struct NativeComponent {
+    public typealias EventSink = (_ event: String, _ value: Any?) -> Void
+    public let create: (_ props: [String: Any], _ emit: @escaping EventSink) -> UIView
+    public let update: (_ view: UIView, _ props: [String: Any], _ changed: [String: Any]) -> Void
+    public let container: ((_ view: UIView) -> UIView?)?
+    public let destroy: ((_ view: UIView) -> Void)?
+
+    public init(
+        create: @escaping (_ props: [String: Any], _ emit: @escaping EventSink) -> UIView,
+        update: @escaping (_ view: UIView, _ props: [String: Any], _ changed: [String: Any]) -> Void = { _, _, _ in },
+        container: ((_ view: UIView) -> UIView?)? = nil,
+        destroy: ((_ view: UIView) -> Void)? = nil
+    ) {
+        self.create = create
+        self.update = update
+        self.container = container
+        self.destroy = destroy
+    }
+}
+
 /// Runs a tinyjump app on iOS: boots the runtime, draws its view tree with UIKit,
 /// performs effects, wakes it for timers, syncs `@server` objects and (in debug builds)
 /// serves automation. Use from the main thread only.
 public final class TinyJump {
     /// Receives the reply to a request: `ok` on success, otherwise `error`.
     public typealias Reply = (Any?, String?) -> Void
+
+    private static var components: [String: NativeComponent] = [:]
+
+    /// Registers a custom native UIKit view used from `.tj` as `<Native name="..." />`.
+    /// Call on the main thread before `start(...)` so the initial render finds it.
+    public static func registerComponent(_ name: String, _ component: NativeComponent?) {
+        if let component = component {
+            components[name] = component
+        } else {
+            components.removeValue(forKey: name)
+        }
+    }
+
+    static func nativeComponent(_ name: String) -> NativeComponent? {
+        components[name]
+    }
 
     private let native: NativeRuntime
     let renderer: Renderer
@@ -74,6 +112,7 @@ public final class TinyJump {
         wake?.cancel()
         sync.stop()
         automation?.stop()
+        renderer.destroy()
     }
 
     /// Sends an input that expects a reply (call, get, ui, inspect).

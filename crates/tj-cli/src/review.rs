@@ -29,7 +29,7 @@ struct Walk {
 pub fn review(snapshot: &Json) -> Vec<Finding> {
     let mut w = Walk { viewport_w: snapshot["viewport"]["w"].as_f64(), findings: Vec::new() };
     match snapshot["tree"].as_array() {
-        Some(tree) if !tree.is_empty() => w.nodes(tree, "#ffffff", false),
+        Some(tree) if !tree.is_empty() => w.nodes(tree, "#ffffff", false, false),
         // Nothing drawn means nothing checked: say so, rather than "No findings".
         _ => w.findings.push(Finding {
             severity: Severity::Error,
@@ -81,17 +81,26 @@ impl Walk {
         self.findings.push(Finding { severity, check, node: describe(n), message });
     }
 
-    fn nodes(&mut self, list: &[Json], background: &str, in_scroll: bool) {
+    fn nodes(&mut self, list: &[Json], background: &str, in_scroll: bool, in_h_scroll: bool) {
         for n in list {
-            self.node(n, background, in_scroll);
+            self.node(n, background, in_scroll, in_h_scroll);
         }
         self.overlaps(list);
     }
 
-    fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool) {
+    fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool, in_h_scroll: bool) {
         let kind = n["kind"].as_str().unwrap_or("");
-        let background = prop(n, "background").unwrap_or(inherited_bg).to_string();
-        let interactive = matches!(kind, "Button" | "Input" | "Toggle");
+        let theme_bg = if kind == "Theme" {
+            prop(n, "surface").or_else(|| match prop(n, "mode") {
+                Some("dark") => Some("#111827"),
+                Some("light") => Some("#ffffff"),
+                _ => None,
+            })
+        } else {
+            None
+        };
+        let background = prop(n, "background").or(theme_bg).unwrap_or(inherited_bg).to_string();
+        let interactive = matches!(kind, "Button" | "Input" | "Toggle" | "Tabs");
 
         // Accessibility: everything a person can act on must say what it is.
         let named = prop(n, "text").is_some() || prop(n, "label").is_some();
@@ -99,6 +108,9 @@ impl Walk {
             "Button" | "Toggle" if !named => self.add(Severity::Error, "a11y", n, "has no text or label, so screen readers cannot name it".into()),
             "Input" if !named && prop(n, "placeholder").is_none() => self.add(Severity::Warning, "a11y", n, "has no label or placeholder".into()),
             "Image" if prop(n, "label").is_none() => self.add(Severity::Warning, "a11y", n, "has no label (alt text)".into()),
+            "Tabs" if props(n).get("items").and_then(Json::as_array).map_or(true, Vec::is_empty) => {
+                self.add(Severity::Warning, "a11y", n, "has no tab items".into());
+            }
             _ => {}
         }
 
@@ -106,9 +118,11 @@ impl Walk {
             if interactive && n["visible"].as_bool() != Some(false) && (r.h < MIN_TOUCH || (kind == "Button" && r.w < MIN_TOUCH)) {
                 self.add(Severity::Warning, "touch", n, format!("touch target is {:.0}x{:.0}; make it at least {MIN_TOUCH:.0}x{MIN_TOUCH:.0}", r.w, r.h));
             }
-            if let Some(vw) = self.viewport_w {
-                if r.x + r.w > vw + 1.0 || r.x < -1.0 {
-                    self.add(Severity::Error, "overflow", n, format!("spans x {:.0}..{:.0} but the screen is {vw:.0} wide", r.x, r.x + r.w));
+            if !in_h_scroll {
+                if let Some(vw) = self.viewport_w {
+                    if r.x + r.w > vw + 1.0 || r.x < -1.0 {
+                        self.add(Severity::Error, "overflow", n, format!("spans x {:.0}..{:.0} but the screen is {vw:.0} wide", r.x, r.x + r.w));
+                    }
                 }
             }
         }
@@ -131,7 +145,8 @@ impl Walk {
         }
 
         if let Some(children) = n["children"].as_array() {
-            self.nodes(children, &background, in_scroll || kind == "Scroll");
+            let h_scroll = in_h_scroll || (kind == "List" && props(n).get("horizontal").and_then(Json::as_bool) == Some(true));
+            self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List", h_scroll);
         }
     }
 
@@ -265,5 +280,31 @@ mod tests {
         let white = luminance("#fff").unwrap();
         let black = luminance("black").unwrap();
         assert!(((white + 0.05) / (black + 0.05) - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn theme_background_and_tabs_are_reviewed() {
+        // Light text inside a dark Theme passes contrast; empty Tabs warns.
+        let tree = json!([node(1, "Theme", json!({ "mode": "dark" }), [0.0, 0.0, 390.0, 200.0], vec![
+            node(2, "Text", json!({ "text": "Hello", "color": "#f9fafb" }), [16.0, 16.0, 100.0, 24.0], vec![]),
+            node(3, "Tabs", json!({ "items": ["A", "B"], "value": "A" }), [16.0, 50.0, 200.0, 44.0], vec![]),
+        ])]);
+        assert!(review(&json!({ "tree": tree, "viewport": { "w": 390, "h": 800 } })).is_empty());
+
+        let bad_tabs = json!([node(1, "Tabs", json!({ "items": [] }), [0.0, 0.0, 200.0, 30.0], vec![])]);
+        let found = checks(&json!({ "tree": bad_tabs, "viewport": { "w": 390, "h": 800 } }));
+        assert!(found.contains(&"a11y") && found.contains(&"touch"), "{found:?}");
+
+        // Horizontal List descendants may extend past viewport width; vertical List still flags horizontal overflow.
+        let hlist = json!([node(1, "List", json!({ "horizontal": true }), [0.0, 0.0, 390.0, 80.0], vec![
+            node(2, "Text", json!({ "text": "card 1" }), [0.0, 0.0, 240.0, 60.0], vec![]),
+            node(3, "Text", json!({ "text": "card 2" }), [250.0, 0.0, 240.0, 60.0], vec![]),
+        ])]);
+        assert!(review(&json!({ "tree": hlist, "viewport": { "w": 390, "h": 800 } })).is_empty());
+
+        let vlist = json!([node(1, "List", json!({}), [0.0, 0.0, 390.0, 200.0], vec![
+            node(2, "Text", json!({ "text": "too wide" }), [0.0, 0.0, 450.0, 40.0], vec![]),
+        ])]);
+        assert!(checks(&json!({ "tree": vlist, "viewport": { "w": 390, "h": 800 } })).contains(&"overflow"));
     }
 }
