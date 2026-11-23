@@ -40,6 +40,7 @@ use crate::bytes::{hex, random};
 use crate::identity::{sha256_hex, Identity};
 use crate::leases::Leases;
 use crate::mailbox::{Event, Mailbox};
+use crate::webhooks::{now_secs, Webhooks};
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -262,6 +263,8 @@ pub struct Front {
     pub leases: Leases,
     /// Configured entry `.tj` file, reloaded when `POST /_tj/reload` omits `"source"`.
     pub app_file: Option<PathBuf>,
+    /// Incoming HMAC-signed webhook endpoints (`webhooks.json`).
+    pub webhooks: Arc<Webhooks>,
     /// Refuse requests that carry credentials, as this server only speaks plain HTTP and
     /// nobody said a proxy in front of it terminates TLS (see [`credentials_need_tls`]).
     pub credentials_need_tls: bool,
@@ -278,11 +281,16 @@ impl Front {
         let trust_proxy = std::env::var("TJ_TRUST_PROXY").is_ok_and(|v| v == "1");
         let default_rate = if dev.is_some() { 0 } else { DEFAULT_RATE_LIMIT };
         let limit = std::env::var(RATE_LIMIT_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(default_rate);
-        Front { engine, web, dev, automation, identity, audit, leases, app_file: None, credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default(), rate: RateLimiter::new(limit) }
+        Front { engine, web, dev, automation, identity, audit, leases, app_file: None, webhooks: Arc::default(), credentials_need_tls, trust_proxy, streams: Mutex::default(), tickets: Mutex::default(), rate: RateLimiter::new(limit) }
     }
 
     pub fn with_app_file(mut self, path: PathBuf) -> Front {
         self.app_file = Some(path);
+        self
+    }
+
+    pub fn with_webhooks(mut self, webhooks: Arc<Webhooks>) -> Front {
+        self.webhooks = webhooks;
         self
     }
 
@@ -386,6 +394,109 @@ fn read_json(req: &mut Request) -> Result<Json, Failure> {
     serde_json::from_str(&body).map_err(|e| (400, format!("body is not JSON: {e}")))
 }
 
+/// Raw JSON request bytes (capped at `MAX_BODY`) for HMAC-signed incoming webhooks, where the
+/// signature must be verified over the exact wire bytes before parsing.
+fn read_raw_json_bytes(req: &mut Request) -> Result<Vec<u8>, Failure> {
+    if !header_value(req, "Content-Type").is_some_and(|t| t.trim_start().to_ascii_lowercase().starts_with("application/json")) {
+        return Err((415, "send the body as JSON, with `Content-Type: application/json`".into()));
+    }
+    let mut body = Vec::new();
+    req.as_reader().take(MAX_BODY + 1).read_to_end(&mut body).map_err(|e| (400, format!("cannot read body: {e}")))?;
+    if body.len() as u64 > MAX_BODY {
+        return Err((413, "body too large".into()));
+    }
+    Ok(body)
+}
+
+/// Handles `POST /webhooks/{name}`: verifies `X-TinyJump-Timestamp` + `X-TinyJump-Signature`
+/// (constant-time HMAC-SHA256 over `"{timestamp}.{raw_body}"`), enforces replay window and rate
+/// limits, and dispatches the payload to the configured `@server` object method as the webhook's
+/// named caller under `@allow` rules.
+fn handle_webhook(req: &mut Request, front: &Front, name: &str, started: Instant) -> Body {
+    let ip = client_ip(req, front.trust_proxy);
+    let bad_key = format!("bad:{ip}");
+    if front.rate.limit > 0 {
+        if let Some(retry_after) = front.rate.is_exhausted(&bad_key, started) {
+            return json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
+                .with_header(header("Retry-After", &retry_after.to_string()));
+        }
+    }
+    let raw = match read_raw_json_bytes(req) {
+        Ok(b) => b,
+        Err((s, e)) => return json_response(s, &json!({ "error": e })),
+    };
+    let ts = header_value(req, "X-TinyJump-Timestamp");
+    let sig = header_value(req, "X-TinyJump-Signature");
+    let hook = match front.webhooks.verify_incoming(name, ts.as_deref(), sig.as_deref(), &raw, now_secs()) {
+        Ok(h) => h,
+        Err((status, msg)) => {
+            if front.rate.limit > 0 {
+                let _ = front.rate.check(&bad_key, started);
+            }
+            if status == 401 {
+                let _ = front.audit.security(
+                    Entry::new("refused")
+                        .who(Actor::Invalid)
+                        .text("request", "webhook")
+                        .text("webhook", name)
+                        .num("status", u64::from(status)),
+                );
+            }
+            return json_response(status, &json!({ "error": msg }));
+        }
+    };
+    if front.rate.limit > 0 {
+        let wh_key = format!("wh:{name}");
+        if let Err((retry_after, audit_now)) = front.rate.check(&wh_key, started) {
+            if audit_now {
+                front.audit.record(
+                    Entry::new("refused")
+                        .who(Actor::id(Some(&hook.caller)))
+                        .text("request", "rate limit")
+                        .text("webhook", name)
+                        .num("status", 429),
+                );
+            }
+            return json_response(429, &json!({ "error": "rate limit exceeded; slow down and try again shortly" }))
+                .with_header(header("Retry-After", &retry_after.to_string()));
+        }
+    }
+    let body_json: Json = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => return json_response(400, &json!({ "error": format!("body is not JSON: {e}") })),
+    };
+    let delivery = header_value(req, "X-TinyJump-Delivery").or_else(|| header_value(req, "Idempotency-Key")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let call_id = match delivery {
+        Some(id) => {
+            let scoped = format!("wh:{name}:{id}");
+            if scoped.len() > 128 {
+                return json_response(400, &json!({ "error": "X-TinyJump-Delivery header is too long" }));
+            }
+            Some(scoped)
+        }
+        None => None,
+    };
+    let caller = Caller::Remote { id: hook.caller.clone(), roles: hook.roles.clone() };
+    let res = front.engine.request_with_field(Input::Call {
+        object: hook.object.clone(),
+        method: hook.method.clone(),
+        args: vec![body_json],
+        reply: None,
+        call: call_id,
+        caller: Some(caller),
+    });
+    if let Err((status @ (401 | 403), _, _)) = &res {
+        let _ = front.audit.security(
+            Entry::new("refused")
+                .who(Actor::id(Some(&hook.caller)))
+                .text("request", "webhook")
+                .text("webhook", name)
+                .num("status", u64::from(*status)),
+        );
+    }
+    call_response(res)
+}
+
 /// `tj dev` answers only requests addressed to `localhost` or to an IP address, so a web page
 /// cannot reach it through a DNS name of its own that points at this machine (DNS
 /// rebinding). Devices and emulators still connect by address (e.g. 10.0.2.2).
@@ -412,8 +523,8 @@ fn handle(mut req: Request, front: &Front) {
     let mut ops_access: Option<OpsAccess> = None;
     let early = if front.dev.is_some() && !trusted_host(&req) {
         Some(("host", 403, "tj dev answers only localhost and IP addresses, not other host names".to_string()))
-    } else if front.credentials_need_tls && authorization.is_some() {
-        Some(("plain http", 403, format!("credentials are refused over plain HTTP, where anyone on the way can read them; put this server behind a proxy that terminates TLS and set {TLS_TERMINATED_ENV}=1")))
+    } else if front.credentials_need_tls && (authorization.is_some() || segs.first() == Some(&"webhooks")) {
+        Some(("plain http", 403, format!("credentials and webhooks are refused over plain HTTP, where anyone on the way can read them; put this server behind a proxy that terminates TLS and set {TLS_TERMINATED_ENV}=1")))
     } else if admin {
         match front.automation.authenticate(authorization.as_deref(), &front.identity) {
             Ok(access) => {
@@ -498,6 +609,7 @@ fn handle(mut req: Request, front: &Front) {
     let mut asked: Option<Asked> = None;
     let mut take_verified = || api_verified.take().unwrap_or_else(|| front.identity.verify(authorization.as_deref()));
     let response = match (&method, segs.as_slice()) {
+        (Method::Post, ["webhooks", name]) => handle_webhook(&mut req, front, name, started),
         (Method::Get, ["api", "events"]) => return stream(req, front, authorization, api_verified),
         (Method::Post, ["api", "events", "ticket"]) => {
             asked = Some(("ticket", None, None));
@@ -1708,6 +1820,276 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.into_string().unwrap(), "{\"ok\":\"v2-ok\"}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_to_server_replicas_and_webhooks_work_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("tj-s2s-webhooks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dir_a = dir.join("server-a");
+        let dir_b = dir.join("server-b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        // 1. Server A (Inventory): owns Stock, protected by a real API key with role "service".
+        let keys_a = dir_a.join("keys.json");
+        let svc_key = crate::identity::new_key("shop-svc", &["service".into()], None, &keys_a).unwrap();
+        let src_a = r#"
+@server @read("service") object Stock {
+  count: number = 0
+  @allow("service") seed(n: number): number { this.count = n; return this.count }
+  @allow("service") reserve(n: number): number {
+    check(this.count >= n, "count", "out of stock")
+    this.count -= n
+    return this.count
+  }
+}
+"#
+        .to_string();
+        let audit_a = Audit::start(&dir_a).unwrap().0;
+        let eng_a = Engine::start(src_a, dir_a.clone(), false, true, Arc::default(), audit_a.clone()).unwrap();
+        let id_a = Identity::from_key_file(&keys_a).unwrap();
+        let srv_a = Server::http("127.0.0.1:0").unwrap();
+        let port_a = srv_a.server_addr().to_ip().unwrap().port();
+        let front_a = Arc::new(Front::new(eng_a, None, None, Automation::Open, id_a, audit_a, Leases::open(&dir_a), false));
+        thread::spawn(move || {
+            for req in srv_a.incoming_requests() {
+                let f = front_a.clone();
+                thread::spawn(move || handle(req, &f));
+            }
+        });
+        let base_a = format!("http://127.0.0.1:{port_a}");
+
+        // 2. Outgoing webhook mock receiver: rejects FIRST delivery with 503 (testing retries!),
+        // accepts subsequent deliveries with 200 and records headers + body!
+        let wh_secret = b"webhook-e2e-shared-secret-32-bytes";
+        let wh_srv = Server::http("127.0.0.1:0").unwrap();
+        let wh_port = wh_srv.server_addr().to_ip().unwrap().port();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let recv_ref = received.clone();
+        thread::spawn(move || {
+            let mut first = true;
+            for mut req in wh_srv.incoming_requests() {
+                let mut body = String::new();
+                let _ = req.as_reader().read_to_string(&mut body);
+                let delivery = header_value(&req, "X-TinyJump-Delivery").unwrap_or_default();
+                let ts = header_value(&req, "X-TinyJump-Timestamp").unwrap_or_default();
+                let sig = header_value(&req, "X-TinyJump-Signature").unwrap_or_default();
+                recv_ref.lock().unwrap().push((delivery, ts, sig, body));
+                if first {
+                    first = false;
+                    let _ = req.respond(Response::from_string("try again").with_status_code(503));
+                } else {
+                    let _ = req.respond(Response::from_string("ok").with_status_code(200));
+                }
+            }
+        });
+
+        // 3. Server B (Shop): treats `Stock` as a remote replica on Server A, has incoming
+        // HMAC-signed webhook `stripe` and outgoing retried webhook `fulfillment`.
+        let src_b = r#"
+@server @read("service") object Stock {
+  count: number = 0
+  @allow("service") reserve(n: number): number { return 0 }
+}
+@server @read("anyone") object Order {
+  @pii("contact", "orders") customerEmail: string = ""
+  bought: number = 0
+  webhooks: number = 0
+  lastEvent: string = ""
+  @allow("anyone") async buy(sku: string, n: number, email: string): number {
+    this.customerEmail = email
+    const left = await Stock.get(sku).reserve(n)
+    this.bought += n
+    this.emit("placed", { sku, n })
+    return left
+  }
+  @allow("anyone") stockLeft(sku: string): number {
+    return Stock.get(sku).count
+  }
+  @allow("webhook") onStripe(evt: any): number {
+    this.webhooks += 1
+    this.lastEvent = evt.id
+    return this.webhooks
+  }
+}
+"#
+        .to_string();
+        let remotes_b = Arc::new(crate::remotes::Remotes::from_targets(vec![(
+            "Stock".into(),
+            crate::remotes::RemoteTarget {
+                url: base_a.clone(),
+                key_env: Some("TEST_STOCK_KEY".into()),
+                api_key: Some(svc_key.clone()),
+            },
+        )]));
+        let outgoing_b = vec![crate::webhooks::OutgoingWebhook {
+            name: "fulfillment".into(),
+            url: format!("http://127.0.0.1:{wh_port}/hook"),
+            secret: wh_secret.to_vec(),
+            objects: vec!["Order/*".into()],
+            on_changed: true,
+            on_emit: false,
+            caller: "webhook:fulfillment".into(),
+            roles: vec!["webhook".into()],
+            max_retries: 3,
+        }];
+        let mut wh_cfg = crate::webhooks::Webhooks { incoming: HashMap::new(), outgoing: outgoing_b.clone() };
+        wh_cfg.incoming.insert(
+            "stripe".into(),
+            crate::webhooks::IncomingWebhook {
+                secret: wh_secret.to_vec(),
+                object: "Order/o1".into(),
+                method: "onStripe".into(),
+                caller: "webhook:stripe".into(),
+                roles: vec!["webhook".into()],
+                max_age_secs: 300,
+            },
+        );
+        let audit_b = Audit::start(&dir_b).unwrap().0;
+        let eng_b = Engine::start_with_integrations(
+            src_b,
+            dir_b.clone(),
+            false,
+            true,
+            Arc::default(),
+            audit_b.clone(),
+            None,
+            remotes_b,
+            outgoing_b,
+        )
+        .unwrap();
+        let srv_b = Server::http("127.0.0.1:0").unwrap();
+        let port_b = srv_b.server_addr().to_ip().unwrap().port();
+        let front_b = Arc::new(
+            Front::new(eng_b, None, None, Automation::Open, Identity::anonymous(), audit_b, Leases::open(&dir_b), false)
+                .with_webhooks(Arc::new(wh_cfg)),
+        );
+        thread::spawn(move || {
+            for req in srv_b.incoming_requests() {
+                let f = front_b.clone();
+                thread::spawn(move || handle(req, &f));
+            }
+        });
+        let base_b = format!("http://127.0.0.1:{port_b}");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+
+        // Seed Stock/sku-1 = 5 on Server A using the real service API key.
+        let seed_resp = agent
+            .post(&format!("{base_a}/api/Stock/sku-1/seed"))
+            .set("Content-Type", "application/json")
+            .set("Authorization", &format!("Bearer {svc_key}"))
+            .send_string("[5]")
+            .unwrap();
+        assert_eq!(seed_resp.status(), 200);
+
+        // Call Order/o1.buy("sku-1", 2, "ana@example.com") on Server B -> calls Server A with
+        // Bearer key + Idempotency-Key -> returns 3 remaining!
+        let buy_resp = agent
+            .post(&format!("{base_b}/api/Order/o1/buy"))
+            .set("Content-Type", "application/json")
+            .send_string(r#"["sku-1", 2, "ana@example.com"]"#)
+            .unwrap();
+        assert_eq!(buy_resp.status(), 200);
+        assert_eq!(buy_resp.into_string().unwrap(), r#"{"ok":3}"#);
+
+        // Wait for Server B's RemoteHub SSE stream to sync Stock/sku-1.count == 3!
+        let mut synced = false;
+        for _ in 0..40 {
+            let r = agent
+                .post(&format!("{base_b}/api/Order/o1/stockLeft"))
+                .set("Content-Type", "application/json")
+                .send_string(r#"["sku-1"]"#)
+                .unwrap()
+                .into_string()
+                .unwrap();
+            if r == r#"{"ok":3}"# {
+                synced = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(synced, "Server B replica must sync Stock/sku-1 = 3 via SSE from Server A");
+
+        // Over-reserving preserves `field: "count"` refusal from Server A!
+        let over = agent
+            .post(&format!("{base_b}/api/Order/o1/buy"))
+            .set("Content-Type", "application/json")
+            .send_string(r#"["sku-1", 99, "ana@example.com"]"#);
+        let Err(ureq::Error::Status(400, resp)) = over else { panic!("expected 400 out of stock, got {over:?}") };
+        let err_json: Json = serde_json::from_str(&resp.into_string().unwrap()).unwrap();
+        assert_eq!(err_json["field"], json!("count"), "{err_json}");
+
+        // Outgoing webhook: wait for retry (attempt 1 -> 503, attempt 2 -> 200) and final bought=2
+        // delivery; verify per-target FIFO order, HMAC signature, same X-TinyJump-Delivery id
+        // across retries, AND @pii customerEmail masked!
+        let mut delivered = Vec::new();
+        for _ in 0..40 {
+            let snap = received.lock().unwrap().clone();
+            if snap.len() >= 3 {
+                delivered = snap;
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(delivered.len() >= 3, "expected 503 retry + 200 delivery + bought=2 change, got {delivered:?}");
+        assert_eq!(delivered[0].0, delivered[1].0, "retried webhook must keep same X-TinyJump-Delivery in FIFO order");
+        let (del_id, ts_str, sig, body_str) = delivered.last().unwrap();
+        assert!(del_id.starts_with("whd_"), "{del_id}");
+        let ts_val: i64 = ts_str.parse().unwrap();
+        assert_eq!(*sig, crate::webhooks::sign_payload(wh_secret, ts_val, body_str.as_bytes()));
+        let payload: Json = serde_json::from_str(body_str).unwrap();
+        assert_eq!(payload["event"], json!("changed"));
+        assert_eq!(payload["object"], json!("Order/o1"));
+        assert_eq!(payload["state"]["bought"], json!(2));
+        assert_eq!(payload["state"]["customerEmail"], json!("•••"), "@pii must be masked in outgoing webhook: {payload}");
+
+        // Incoming webhook: bad signature -> 401; stale timestamp -> 401; valid HMAC + delivery id -> 200 & once-only!
+        let wh_body = r#"{"id":"evt_paid_1"}"#;
+        let now = crate::webhooks::now_secs();
+        let bad_sig = agent
+            .post(&format!("{base_b}/webhooks/stripe"))
+            .set("Content-Type", "application/json")
+            .set("X-TinyJump-Timestamp", &now.to_string())
+            .set("X-TinyJump-Signature", "v1=0000000000000000000000000000000000000000000000000000000000000000")
+            .send_string(wh_body);
+        assert!(matches!(bad_sig, Err(ureq::Error::Status(401, _))), "{bad_sig:?}");
+
+        let stale_ts = now - 600;
+        let stale_sig = crate::webhooks::sign_payload(wh_secret, stale_ts, wh_body.as_bytes());
+        let stale = agent
+            .post(&format!("{base_b}/webhooks/stripe"))
+            .set("Content-Type", "application/json")
+            .set("X-TinyJump-Timestamp", &stale_ts.to_string())
+            .set("X-TinyJump-Signature", &stale_sig)
+            .send_string(wh_body);
+        assert!(matches!(stale, Err(ureq::Error::Status(401, _))), "{stale:?}");
+
+        let good_sig = crate::webhooks::sign_payload(wh_secret, now, wh_body.as_bytes());
+        let ok1 = agent
+            .post(&format!("{base_b}/webhooks/stripe"))
+            .set("Content-Type", "application/json")
+            .set("X-TinyJump-Timestamp", &now.to_string())
+            .set("X-TinyJump-Signature", &good_sig)
+            .set("X-TinyJump-Delivery", "del-99")
+            .send_string(wh_body)
+            .unwrap();
+        assert_eq!(ok1.status(), 200);
+        assert_eq!(ok1.into_string().unwrap(), r#"{"ok":1}"#);
+
+        // Replay exact same X-TinyJump-Delivery -> idempotent cached result (still 1, NOT 2)!
+        let ok2 = agent
+            .post(&format!("{base_b}/webhooks/stripe"))
+            .set("Content-Type", "application/json")
+            .set("X-TinyJump-Timestamp", &now.to_string())
+            .set("X-TinyJump-Signature", &good_sig)
+            .set("X-TinyJump-Delivery", "del-99")
+            .send_string(wh_body)
+            .unwrap();
+        assert_eq!(ok2.status(), 200);
+        assert_eq!(ok2.into_string().unwrap(), r#"{"ok":1}"#);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

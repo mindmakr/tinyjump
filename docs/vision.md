@@ -134,13 +134,15 @@ the goal; being in the market early, to gain momentum and contributors, is.
      (`tj test`) and `tj mcp` trace recording (`record_trace`), `tj check --against` and
      `@invariant` with atomic rollback, shadow boot with live reload and automatic rollback
      (`tj reload`, `tj rollback`), size/rate/fetch/AI-budget caps, and `tj retro`.
-   - Then a design note on effects that already happened outside when a call is retried
-     after a crash ([docs/retried-effects.md](retried-effects.md): deterministic per-call
-     idempotency keys passed to `fetch`/`plugin` + checkpointed object state vs a VM replay
-     journal; design note written).
-   - The plugin and library registry (`docs/registry.md`, the public `mindmakr/tj-plugins`)
-     follows.
-4. **Servers talking to each other:** replicas of another server's objects, then webhooks.
+   - **Retried external effects (done):** `crypto.idempotencyKey(label)` with crash-stable
+     HMAC derivation, pre-`await` flush rollback, and transient `fetch` `503` handling
+     ([docs/retried-effects.md](retried-effects.md)).
+   - **Plugin and library registry (`docs/registry.md`):** CLI client (`tj add`, `tj.lock`,
+     `tj check --min-trust`, `tj registry check`, `tj retro` audit) is built; public
+     `mindmakr/tj-plugins` index repo awaits owner go-ahead.
+4. **Servers talking to each other (done):** server-to-server replicas (`remotes.json` over
+   the durable outbox + `/api/events` SSE streams with API-key auth) and incoming HMAC-signed /
+   outgoing retried webhooks (`webhooks.json`).
 5. Alongside: **rewrite the marketing site (done)** as one plain page for three readers (founders,
    developers, agent-driven coders), with real code, measured numbers, the decisions and
    why, and an honest status and roadmap.
@@ -324,11 +326,12 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 - **Messaging, agreed with the owner (2026-11-20):**
   - **Access control:** done with API keys (`docs/access-control.md`). Sign-in tokens from
     OpenID Connect providers come next.
-  - **Objects on different servers and apps talking to each other:** wanted. A server holds
-    replicas of another server's objects and calls them through the same outbox, change
-    streams and once-only calls that devices use, authenticated with API keys. Webhooks
-    connect systems that are not tinyjump (incoming: a signed request becomes a method
-    call; outgoing: change subscriptions delivered by HTTP with retries).
+  - **Objects on different servers and apps talking to each other (done):** a server holds
+    replicas of another server's objects (`remotes.json`) and calls them through the same
+    outbox, change streams and once-only calls that devices use, authenticated with API keys.
+    Webhooks (`webhooks.json`) connect systems that are not tinyjump (incoming: HMAC-signed
+    `POST /webhooks/{name}` becomes a method call under `@allow` rules; outgoing: `@read` /
+    `@pii`-masked change subscriptions delivered durably by HTTP with retries).
   - **Topics across objects** (`Room/*`): add when an app needs them.
 - **Plugins and the agent loop (agreed; plugins and `tj:ai` done):** plugins are typed
   `.tj` modules backed by MCP servers (`docs/plugins.md`). The durable cart has a shop
