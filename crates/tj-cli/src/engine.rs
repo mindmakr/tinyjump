@@ -118,7 +118,8 @@ pub(crate) fn parse_fetch_allow(spec: &str) -> Result<Vec<String>, String> {
             || s.contains('/')
             || s.contains('?')
             || s.contains('#')
-            || s.chars().any(char::is_whitespace);
+            || s.chars().any(|c| c.is_whitespace() || c.is_control())
+            || !s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'*'));
         // Reject `host:port` (unless the whole entry is a valid bare IPv6 address).
         let has_port = s.contains(':') && s.parse::<std::net::Ipv6Addr>().is_err();
         let bad_wild = s.starts_with('*') && !s.strip_prefix("*.").is_some_and(|d| !d.is_empty() && !d.contains('*'));
@@ -1167,7 +1168,16 @@ pub(crate) fn public_only(netloc: &str) -> std::io::Result<Vec<std::net::SocketA
     Ok(public)
 }
 
-fn is_public(ip: std::net::IpAddr) -> bool {
+pub(crate) fn public_or_loopback(netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let ok: Vec<_> = netloc.to_socket_addrs()?.filter(|a| is_public(a.ip()) || a.ip().is_loopback()).collect();
+    if ok.is_empty() {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{netloc} is a private or link-local address")));
+    }
+    Ok(ok)
+}
+
+pub(crate) fn is_public(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v) => {

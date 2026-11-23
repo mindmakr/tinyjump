@@ -5,6 +5,7 @@ mod app;
 mod audit;
 mod auth;
 mod bench;
+mod bridge;
 mod build;
 mod bytes;
 mod compat;
@@ -57,6 +58,13 @@ USAGE:
   tj add <name> [--registry <url-or-dir>] [--dir <app-dir>] [--min-trust community|verified|official]
                                  install a package from the registry into `.tj-packages/` and pin its
                                  commit and SHA-256 in `tj.lock` after verifying declared permissions
+  tj search [<query>] [--kind <kind>] [--min-trust <level>] [--registry <url-or-dir>] [--json]
+                                 search available packages in the registry (`mindmakr/tj-plugins` or local)
+  tj info <name> [--registry <url-or-dir>] [--json]
+                                 inspect a registry package's metadata, trust mark and permissions
+  tj bridge openapi <spec.json> [--out <file.tj>] [--base-url <https://...>] [--manifest <file.json>]
+                                 generate a typed `.tj` client module (and optional registry manifest) from
+                                 an OpenAPI 3.x JSON specification
   tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]
                                  validate a registry manifest (schema, license, typosquats, commit/hash pin,
                                  static permission audit)
@@ -109,7 +117,7 @@ OPTIONS:
   --compliance <pack.json>
                   `serve`: refuse to start while a control of the pack is not met
   --min-trust <community|verified|official>
-                  `check` / `serve` / `add`: refuse locked packages below this trust mark or flagged
+                  `check` / `serve` / `build` / `add` / `search`: filter or enforce package trust marks
   --web           `serve`: also serve the web app, with a sign-in bar for API keys
   --as <name:role,role>
                   `dev` only: requests without credentials act as this user (dev:<name>)
@@ -144,7 +152,7 @@ ENVIRONMENT (tj serve):
                   the audit log's key (made on first start; default: audit.key in the data
                   folder). Keep it apart from the data, and back it up
   TJ_AUDIT_DAYS   days of audit log kept (default 365)
-  TJ_REGISTRY     registry base URL or local directory for `tj add` (default: official index URL)
+  TJ_REGISTRY     registry base URL or local directory for `tj add` / `search` / `info` (default: official index URL)
 ";
 
 struct Args {
@@ -283,11 +291,14 @@ fn main() -> ExitCode {
         }
     }
     // `tj`, `tj --help`, `tj help` and `--help` after any command print the usage.
-    if raw.iter().skip(1).any(|a| matches!(a.as_str(), "--version" | "-V" | "version")) {
+    if raw.get(1).is_some_and(|a| matches!(a.as_str(), "--version" | "-V" | "version")) {
         println!("tj {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    if raw.len() < 2 || raw.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
+    if raw.len() < 2
+        || raw.get(1).is_some_and(|a| a == "help")
+        || raw.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h"))
+    {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -356,6 +367,33 @@ fn main() -> ExitCode {
     }
     if raw.get(1).map(String::as_str) == Some("add") {
         return match registry::run_add(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("search") {
+        return match registry::run_search(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("info") {
+        return match registry::run_info(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("bridge") {
+        return match bridge::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");

@@ -926,8 +926,8 @@ fn extract_https_host(s: &str, must_end_authority: bool) -> Option<String> {
         return None;
     }
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // Reject userinfo (`@`), backslashes (`\`, WHATWG treats as `/`), and whitespace.
-    if authority.is_empty() || authority.contains('@') || authority.contains('\\') || authority.chars().any(char::is_whitespace) {
+    // Reject userinfo (`@`), backslashes (`\`, WHATWG treats as `/`), control chars, and whitespace.
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') || authority.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return None;
     }
     let host = if let Some(v6) = authority.strip_prefix('[') {
@@ -1317,16 +1317,25 @@ fn resolve_redirect_url(current: &str, location: &str) -> Result<String, String>
 
 fn fetch_bytes_https(url: &str, allow_loopback: bool) -> Result<Vec<u8>, String> {
     let initial_https = url.starts_with("https://");
-    let allow_private = allow_loopback || std::env::var("TJ_ALLOW_PRIVATE_FETCH").as_deref() == Ok("1");
+    let allow_private = std::env::var("TJ_ALLOW_PRIVATE_FETCH").as_deref() == Ok("1");
     let mut builder = ureq::AgentBuilder::new().timeout(FETCH_TIMEOUT).redirects(0);
     if !allow_private {
-        builder = builder.resolver(crate::engine::public_only);
+        if allow_loopback {
+            builder = builder.resolver(crate::engine::public_or_loopback);
+        } else {
+            builder = builder.resolver(crate::engine::public_only);
+        }
     }
     let agent = builder.build();
     let mut current = url.to_string();
     let mut final_resp = None;
     for hop in 0..=5 {
-        if (initial_https && !current.starts_with("https://")) || !is_safe_remote_url(&current, allow_loopback && !initial_https) {
+        let hop_ok = if initial_https {
+            current.starts_with("https://") && is_safe_remote_url(&current, false)
+        } else {
+            allow_loopback && (is_loopback_http(&current) || (current.starts_with("https://") && is_safe_remote_url(&current, false)))
+        };
+        if !hop_ok {
             return Err(format!("registry URL {current:?} was refused (must use https:// and a safe host)"));
         }
         let r = agent.get(&current).call().map_err(|e| format!("cannot fetch {current}: {e}"))?;
@@ -1474,7 +1483,13 @@ pub fn add_package(name: &str, registry: &str, app_dir: &Path, min_trust: Option
     );
     write_lockfile(app_dir, &lock)?;
 
-    let fmt_list = |xs: &[String]| if xs.is_empty() { "none".to_string() } else { xs.join(", ") };
+    let fmt_list = |xs: &[String]| {
+        if xs.is_empty() {
+            "none".to_string()
+        } else {
+            xs.iter().map(|s| clean_display(s)).collect::<Vec<_>>().join(", ")
+        }
+    };
     let mut out = format!(
         "added tj:{} {}  [{}]\n  kind:        {}\n  publisher:   {} ({})\n  commit:      {}\n  sha256:      {}\n  permissions: network=[{}], plugins=[{}], pii=[{}], device=[{}]\n  installed:   {}\n  lockfile:    {}\n",
         m.name,
@@ -1524,6 +1539,318 @@ pub fn run_add(args: &[String]) -> Result<(), String> {
     let report = add_package(&name, &registry, &app_dir, min_trust, allow_flagged)?;
     print!("{report}");
     Ok(())
+}
+
+/// CLI entry point for `tj search [<query>] [--kind <kind>] [--min-trust <level>] [--registry <url-or-dir>] [--json]`.
+pub fn run_search(args: &[String]) -> Result<(), String> {
+    let usage = "usage: tj search [<query>] [--kind <kind>] [--min-trust community|verified|official] [--registry <url-or-dir>] [--json]";
+    let mut query: Option<String> = None;
+    let mut kind_filter: Option<String> = None;
+    let mut min_trust: Option<Trust> = None;
+    let mut registry = std::env::var(REGISTRY_ENV).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    let mut json_out = false;
+
+    let mut it = args.iter().peekable();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--kind" => {
+                let k = value()?.clone();
+                if !ALLOWED_KINDS.contains(&k.as_str()) {
+                    return Err(format!("unknown --kind {k:?}; expected one of {}", ALLOWED_KINDS.join(", ")));
+                }
+                kind_filter = Some(k);
+            }
+            "--min-trust" => min_trust = Some(Trust::parse(value()?)?),
+            "--registry" => registry = value()?.clone(),
+            "--json" => json_out = true,
+            other if !other.starts_with("--") && query.is_none() => query = Some(other.to_string()),
+            other => return Err(format!("unknown option {other}\n\n{usage}")),
+        }
+    }
+
+    let entries = load_catalog(&registry)?;
+    let q_lower = query.as_deref().map(str::to_ascii_lowercase);
+    let matches: Vec<CatalogEntry> = entries
+        .into_iter()
+        .filter(|e| {
+            if let Some(ref k) = kind_filter {
+                if &e.kind != k {
+                    return false;
+                }
+            }
+            if let Some(min) = min_trust {
+                if e.trust < min {
+                    return false;
+                }
+            }
+            if let Some(ref q) = q_lower {
+                let hay = format!("{} {} {} {}", e.name, e.kind, e.publisher, e.summary).to_ascii_lowercase();
+                if !hay.contains(q) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    if json_out {
+        let arr: Vec<Json> = matches.iter().map(CatalogEntry::to_json).collect();
+        println!("{}", serde_json::to_string_pretty(&json!({ "registry": registry, "packages": arr })).expect("json"));
+    } else if matches.is_empty() {
+        println!("no matching packages in {}", clean_display(&registry));
+    } else {
+        for e in &matches {
+            let flag_tag = match &e.flagged {
+                Some(reason) => format!("  [FLAGGED: {}]", clean_display(reason)),
+                None => String::new(),
+            };
+            println!(
+                "  {:16} {:8} [{:9}] {:15} {}{}",
+                clean_display(&e.name),
+                clean_display(&e.version),
+                e.trust.label(),
+                clean_display(&e.kind),
+                clean_display(&e.summary),
+                flag_tag,
+            );
+        }
+        println!("\nInstall with `tj add <name>` or inspect with `tj info <name>`.");
+    }
+    Ok(())
+}
+
+/// CLI entry point for `tj info <name> [--registry <url-or-dir>] [--json]`.
+pub fn run_info(args: &[String]) -> Result<(), String> {
+    let usage = "usage: tj info <name> [--registry <url-or-dir>] [--json]";
+    let mut name: Option<String> = None;
+    let mut registry = std::env::var(REGISTRY_ENV).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    let mut json_out = false;
+
+    let mut it = args.iter().peekable();
+    while let Some(arg) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{arg} needs a value"));
+        match arg.as_str() {
+            "--registry" => registry = value()?.clone(),
+            "--json" => json_out = true,
+            other if !other.starts_with("--") && name.is_none() => name = Some(other.to_string()),
+            other => return Err(format!("unknown option {other}\n\n{usage}")),
+        }
+    }
+    let name = name.ok_or_else(|| format!("`tj info` needs a package name\n\n{usage}"))?;
+    let m = fetch_manifest_only(&registry, &name)?;
+    if json_out {
+        let mut map = Map::new();
+        map.insert("name".into(), json!(m.name));
+        map.insert("kind".into(), json!(m.kind));
+        map.insert("version".into(), json!(m.version));
+        map.insert("trust".into(), json!(m.trust.as_str()));
+        map.insert("source".into(), json!(m.source));
+        map.insert("entry".into(), json!(m.entry));
+        if let Some(u) = &m.url {
+            map.insert("url".into(), json!(u));
+        }
+        map.insert("commit".into(), json!(m.commit));
+        map.insert("sha256".into(), json!(m.sha256));
+        map.insert("license".into(), json!(m.license));
+        map.insert("publisher".into(), json!(m.publisher));
+        map.insert("permissions".into(), m.permissions.to_json());
+        if let Some(p) = &m.port {
+            map.insert("port".into(), json!({ "of": p.of, "tests": p.tests }));
+        }
+        if let Some(f) = &m.flagged {
+            map.insert("flagged".into(), json!(f));
+        }
+        println!("{}", serde_json::to_string_pretty(&Json::Object(map)).expect("json"));
+    } else {
+        let fmt_list = |xs: &[String]| {
+            if xs.is_empty() {
+                "none".to_string()
+            } else {
+                xs.iter().map(|s| clean_display(s)).collect::<Vec<_>>().join(", ")
+            }
+        };
+        println!("tj:{} {}  [{}]", clean_display(&m.name), clean_display(&m.version), m.trust.label());
+        println!("  kind:        {}", clean_display(&m.kind));
+        println!("  publisher:   {} ({})", clean_display(&m.publisher), clean_display(&m.license));
+        println!("  source:      {} ({})", clean_display(&m.source), clean_display(&m.entry));
+        if let Some(u) = &m.url {
+            println!("  url:         {}", clean_display(u));
+        }
+        println!("  commit:      {}", clean_display(&m.commit));
+        println!("  sha256:      {}", clean_display(&m.sha256));
+        println!(
+            "  permissions: network=[{}], plugins=[{}], pii=[{}], device=[{}]",
+            fmt_list(&m.permissions.network),
+            fmt_list(&m.permissions.plugins),
+            fmt_list(&m.permissions.pii),
+            fmt_list(&m.permissions.device),
+        );
+        if let Some(p) = &m.port {
+            println!("  port of:     {} ({})", clean_display(&p.of), clean_display(&p.tests));
+        }
+        if let Some(f) = &m.flagged {
+            println!("  FLAGGED:     {}", clean_display(f));
+        }
+        if m.kind == "compliance-pack" {
+            println!("  install:     tj add {}", m.name);
+            println!("  use:         tj check app.tj --compliance .tj-packages/{}/pack.json", m.name);
+        } else {
+            println!("  install:     tj add {}", m.name);
+            println!("  import:      import {{ ... }} from \"tj:{}\"", m.name);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct CatalogEntry {
+    name: String,
+    kind: String,
+    version: String,
+    trust: Trust,
+    license: String,
+    publisher: String,
+    summary: String,
+    permissions: Permissions,
+    flagged: Option<String>,
+}
+
+impl CatalogEntry {
+    fn from_json(v: &Json) -> Result<Self, String> {
+        let obj = v.as_object().ok_or("catalog entry must be a JSON object")?;
+        let trust = match opt_str(obj, "trust")? {
+            Some(s) => Trust::parse(&s)?,
+            None => Trust::Community,
+        };
+        Ok(CatalogEntry {
+            name: req_str(obj, "name")?,
+            kind: req_str(obj, "kind")?,
+            version: req_str(obj, "version")?,
+            trust,
+            license: opt_str(obj, "license")?.unwrap_or_default(),
+            publisher: opt_str(obj, "publisher")?.unwrap_or_default(),
+            summary: opt_str(obj, "summary")?.unwrap_or_default(),
+            permissions: Permissions::from_json(obj.get("permissions").unwrap_or(&Json::Null))?,
+            flagged: opt_str(obj, "flagged")?,
+        })
+    }
+
+    fn to_json(&self) -> Json {
+        let mut map = Map::new();
+        map.insert("name".into(), json!(self.name));
+        map.insert("kind".into(), json!(self.kind));
+        map.insert("version".into(), json!(self.version));
+        map.insert("trust".into(), json!(self.trust.as_str()));
+        map.insert("license".into(), json!(self.license));
+        map.insert("publisher".into(), json!(self.publisher));
+        map.insert("summary".into(), json!(self.summary));
+        map.insert("permissions".into(), self.permissions.to_json());
+        if let Some(f) = &self.flagged {
+            map.insert("flagged".into(), json!(f));
+        }
+        Json::Object(map)
+    }
+}
+
+fn clean_display(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+}
+
+fn fetch_manifest_only(registry: &str, name: &str) -> Result<PackageManifest, String> {
+    valid_package_name(name)?;
+    let is_remote = registry.starts_with("https://") || registry.starts_with("http://");
+    let (raw, allow_local, origin) = if is_remote {
+        let allow_loopback = is_loopback_http(registry);
+        let url = format!("{}/index/{name}.json", registry.trim_end_matches('/'));
+        (fetch_bytes_https(&url, allow_loopback)?, allow_loopback, url)
+    } else {
+        let root = Path::new(registry);
+        if !root.is_dir() {
+            return Err(format!("local registry directory {} does not exist", root.display()));
+        }
+        let path = root.join("index").join(format!("{name}.json"));
+        let bytes = std::fs::read(&path).map_err(|e| format!("package {name:?} not found at {}: {e}", path.display()))?;
+        (bytes, true, path.display().to_string())
+    };
+    let val: Json = serde_json::from_slice(&raw).map_err(|e| format!("invalid JSON at {origin}: {e}"))?;
+    let m = PackageManifest::from_json(&val).map_err(|e| format!("invalid manifest at {origin}: {e}"))?;
+    if m.name != name {
+        return Err(format!("manifest at {origin} names {:?}, expected {name:?}", m.name));
+    }
+    let errs = validate_manifest(&m, None, allow_local);
+    if !errs.is_empty() {
+        return Err(format!("invalid registry manifest for {name}:\n  {}", errs.join("\n  ")));
+    }
+    Ok(m)
+}
+
+fn load_catalog(registry: &str) -> Result<Vec<CatalogEntry>, String> {
+    let is_remote = registry.starts_with("https://") || registry.starts_with("http://");
+    if is_remote {
+        let allow_loopback = is_loopback_http(registry);
+        let url = format!("{}/catalog.json", registry.trim_end_matches('/'));
+        let raw = fetch_bytes_https(&url, allow_loopback)?;
+        return parse_catalog_json(&raw, &url);
+    }
+    let root = Path::new(registry);
+    if !root.is_dir() {
+        return Err(format!("local registry directory {} does not exist", root.display()));
+    }
+    let cat_file = root.join("catalog.json");
+    if cat_file.is_file() {
+        let raw = std::fs::read(&cat_file).map_err(|e| format!("cannot read {}: {e}", cat_file.display()))?;
+        return parse_catalog_json(&raw, &cat_file.display().to_string());
+    }
+    let index_dir = root.join("index");
+    let entries = std::fs::read_dir(&index_dir).map_err(|e| format!("cannot read {}: {e}", index_dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+        let Ok(raw) = std::fs::read(&p) else { continue };
+        let Ok(val) = serde_json::from_slice::<Json>(&raw) else { continue };
+        let Ok(m) = PackageManifest::from_json(&val) else { continue };
+        if m.name != stem || !validate_manifest(&m, None, true).is_empty() {
+            continue;
+        }
+        out.push(CatalogEntry {
+            name: m.name,
+            kind: m.kind,
+            version: m.version,
+            trust: m.trust,
+            license: m.license,
+            publisher: m.publisher,
+            summary: String::new(),
+            permissions: m.permissions,
+            flagged: m.flagged,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+fn parse_catalog_json(raw: &[u8], origin: &str) -> Result<Vec<CatalogEntry>, String> {
+    let val: Json = serde_json::from_slice(raw).map_err(|e| format!("invalid JSON at {origin}: {e}"))?;
+    let arr = val
+        .get("packages")
+        .and_then(Json::as_array)
+        .ok_or_else(|| format!("catalog at {origin} missing \"packages\" array"))?;
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let e = CatalogEntry::from_json(item).map_err(|err| format!("invalid catalog entry at {origin}: {err}"))?;
+        if valid_package_name(&e.name).is_ok()
+            && ALLOWED_KINDS.contains(&e.kind.as_str())
+            && valid_semver(&e.version)
+        {
+            out.push(e);
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 /// CLI entry point for `tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]`.
@@ -2026,6 +2353,62 @@ mod tests {
             "expected tj:stripe in facts.transfers, got {:?}",
             facts.transfers
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_and_info_read_catalog_and_index_manifests() {
+        let dir = temp_dir("search-info");
+        let index = dir.join("index");
+        std::fs::create_dir_all(&index).unwrap();
+        let src = b"export function hi(): string { return \"hi\" }\n";
+        let m = PackageManifest {
+            name: "greet".into(),
+            kind: "library".into(),
+            version: "1.0.0".into(),
+            trust: Trust::Official,
+            source: "https://github.com/mindmakr/tj-plugins".into(),
+            entry: "packages/greet/plugin.tj".into(),
+            url: None,
+            commit: "b".repeat(40),
+            sha256: sha256_bytes(src),
+            license: "MIT".into(),
+            publisher: "mindmakr".into(),
+            permissions: Permissions::default(),
+            port: None,
+            flagged: None,
+        };
+        std::fs::write(index.join("greet.json"), serde_json::to_string_pretty(&m.to_json()).unwrap()).unwrap();
+
+        // Fallback scan of local index/*.json when catalog.json is absent.
+        let list = load_catalog(dir.to_str().unwrap()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "greet");
+        assert_eq!(list[0].trust, Trust::Official);
+
+        // Explicit catalog.json is preferred when present and preserves summaries.
+        let cat = json!({
+            "version": 1,
+            "packages": [{
+                "name": "greet",
+                "kind": "library",
+                "version": "1.0.0",
+                "trust": "official",
+                "license": "MIT",
+                "publisher": "mindmakr",
+                "summary": "Friendly greeting helper",
+                "permissions": { "network": [], "plugins": [], "pii": [], "device": [] }
+            }]
+        });
+        std::fs::write(dir.join("catalog.json"), serde_json::to_string_pretty(&cat).unwrap()).unwrap();
+        let list2 = load_catalog(dir.to_str().unwrap()).unwrap();
+        assert_eq!(list2[0].summary, "Friendly greeting helper");
+
+        let info = fetch_manifest_only(dir.to_str().unwrap(), "greet").unwrap();
+        assert_eq!(info.name, "greet");
+        assert_eq!(info.version, "1.0.0");
+        assert!(fetch_manifest_only(dir.to_str().unwrap(), "missing").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
