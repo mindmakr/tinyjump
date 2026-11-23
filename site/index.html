@@ -68,6 +68,7 @@
       <nav>
         <a href="demo/">demo</a>
         <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">language</a>
+        <a href="https://github.com/mindmakr/tj-plugins">registry</a>
         <a href="https://github.com/mindmakr/tinyjump/tree/main/docs">docs</a>
         <a href="https://github.com/mindmakr/tinyjump">github</a>
       </nav>
@@ -161,19 +162,19 @@
     <section>
       <h2>Measured, not claimed</h2>
       <div class="numbers">
-        <div class="num"><b>781 KB</b><span>web runtime, compiler included (298 KB compressed)</span></div>
-        <div class="num"><b>~1 MB</b><span>native library per Android CPU type (743 KB on 32-bit ARM)</span></div>
+        <div class="num"><b>842 KB</b><span>web runtime, compiler included (317 KB compressed); 540 KB AOT-only (215 KB compressed)</span></div>
+        <div class="num"><b>~1.1 MB</b><span>arm64 Android library (782 KB on 32-bit ARM; 845 KB / 606 KB AOT-only)</span></div>
         <div class="num"><b>&lt;0.2 ms</b><span>to boot each example app on a laptop (<code>tj bench</code>)</span></div>
-        <div class="num"><b>194</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
+        <div class="num"><b>245</b><span>automated tests; iOS is run on the Simulator for every pull request</span></div>
         <div class="num"><b>Android 5</b><span>and up, iOS 13 and up, and 2019-era browsers</span></div>
-        <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM</span></div>
+        <div class="num"><b>Static</b><span>Linux binaries for x86_64, 64-bit ARM and 32-bit ARM, plus single-file <code>tj build --linux</code> apps</span></div>
       </div>
     </section>
 
     <section class="narrow">
       <h2>Starting fresh</h2>
-      <p>tinyjump has no package ecosystem yet. That is a cost, and also an advantage: there is no legacy to carry, and every library can be small, typed, tested and covered by the access rules.</p>
-      <p>Today, apps reach existing services through MCP plugins and <code>fetch</code>, device plugins wrap native code such as maps and cameras, and agents write small modules on demand. Next comes a registry of libraries that agents port, each checked against the original's tests. Teams with existing systems can run tinyjump next to them and move one piece at a time.</p>
+      <p>tinyjump starts without decades of legacy packages. That is a cost, and also an advantage: every library can be small, typed, tested and audited against its declared permissions before it ever runs.</p>
+      <p>Apps reach existing services through MCP plugins, <code>fetch</code>, server-to-server object sync and HMAC-signed webhooks, while <code>&lt;Native&gt;</code> wraps platform views on the web, Android and iOS. The <a href="https://github.com/mindmakr/tj-plugins">tinyjump registry</a> (<code>tj add</code>, <code>tj.lock</code>, commit &amp; SHA-256 pinning, trust marks and static permission audits) is live for pure-<code>.tj</code> libraries, agent ports and compliance packs. Teams with existing systems can run tinyjump next to them and move one piece at a time.</p>
     </section>
 
     <section class="two">
@@ -184,11 +185,11 @@
       <div>
         <h2>Where it is heading</h2>
         <ul>
-          <li>Living-app tooling: app manifests, scoped agent keys, deterministic trace tests (<code>tj test</code>), schema compatibility checks, <code>@invariant</code>, shadow boot with rollback, and <code>tj retro</code>.</li>
-          <li>A registry of small, typed, agent-ported libraries.</li>
-          <li>Servers that talk to each other (replicated objects) and webhooks.</li>
-          <li>More native components (navigation, long lists, custom native views), translations, and one-command app builds (<code>tj build</code>).</li>
-          <li>Device capabilities and calls as plugins, plus optional GPU graphics and 3D (<code>wgpu</code>).</li>
+          <li>Turnkey mobile packaging: assemble signed Android APKs and iOS <code>.app</code> bundles directly from <code>tj build</code>.</li>
+          <li>Device capabilities (camera, location, notifications, files) and 1:1 / group voice and video calls (WebRTC) as opt-in plugins.</li>
+          <li>OpenAPI bridge generator, sandboxed registry behaviour checks, Sigstore/SLSA signing and a searchable registry site.</li>
+          <li>Desktop native UI hosts (macOS AppKit and Linux desktop).</li>
+          <li>Optional GPU graphics and 3D module (<code>tj-gfx</code> on <code>wgpu</code>) so apps without 3D stay small.</li>
         </ul>
       </div>
     </section>
@@ -197,6 +198,11 @@
       <div>
         <h2>Latest</h2>
         <ul class="log">
+          <li><b>Golden-image diffs and compiler-free AOT builds.</b> <code>tj review --target &lt;url&gt; --golden baseline.png</code> (or offline <code>--golden</code> + <code>--actual</code>) diffs PNG screenshots pixel-by-pixel with configurable <code>--threshold</code> and red-highlighted <code>--diff</code> output. Opt-out <code>compiler</code> feature builds (<code>cargo web-aot</code>, <code>--no-default-features</code>) strip the compiler out of AOT-only device runtimes: Web WASM drops 36% to 540 KB (215 KB gzipped) and Android drops 22–23%.</li>
+          <li><b>Translations, locales and pseudo-locale sweeps.</b> Built-in <code>t("key", { count })</code> with <code>locales/*.json</code>, CLDR plural rules and compile-time key/placeholder checks; <code>&lt;Format&gt;</code> and <code>&lt;Time&gt;</code> format numbers, currencies, percentages and dates with the host's native formatter (zero ICU data in core); and <code>tj review app.tj</code> sweeps every locale plus an expanded <code>"pseudo"</code> locale offline to catch truncation and RTL overlap before release.</li>
+          <li><b>AOT builds, UI catalog and custom native views.</b> <code>tj build</code> compiles apps to validated <code>.tjb</code> bytecode and emits static <code>--web</code> bundles, standalone SHA-256-verified <code>--linux</code> executables and <code>--android</code> / <code>--ios</code> asset bundles. Added <code>&lt;Tabs&gt;</code>, <code>&lt;Icon&gt;</code>, <code>&lt;List&gt;</code>, <code>&lt;Theme&gt;</code> and <code>&lt;Native name="..." /&gt;</code> across the web, Android and iOS hosts.</li>
+          <li><b>Server-to-server sync, webhooks and the package registry.</b> Servers replicate objects from other tinyjump servers (<code>remotes.json</code>) and exchange HMAC-signed incoming / durably retried outgoing webhooks (<code>webhooks.json</code>). The <a href="https://github.com/mindmakr/tj-plugins"><code>mindmakr/tj-plugins</code></a> registry and <code>tj add</code> / <code>tj.lock</code> / <code>tj registry check</code> ship with commit + SHA-256 pinning, typosquat guards, trust marks and static permission audits.</li>
+          <li><b>Living-app tooling and retried external effects.</b> Scoped operational keys (<code>--ops observe|test|maintain</code>), canonical app manifests (<code>/_tj/manifest</code>), work leases, deterministic trace testing (<code>tj test</code> + <code>tj mcp record_trace</code>), schema compatibility checks (<code>tj check --against</code>), <code>@invariant</code> atomic rollback, shadow-booted live reloads with health-gated rollback (<code>tj reload</code> / <code>tj rollback</code>), size/rate/AI caps, <code>tj retro</code>, and crash-stable <code>crypto.idempotencyKey(label)</code>.</li>
           <li><b>Milestone 1 booking app, across all four platforms.</b> A 283-line booking app (<code>examples/booking/app.tj</code>) proven through three blind build/review rounds — staff publish slots, customers book and cancel with <code>@exclusive</code> double-booking guards, external check webhooks, keyed reminder alarms, offline queuing and full subject rights — verified live on the web, Android emulator, iOS Simulator and Linux <code>tj serve</code>.</li>
           <li><b>Forms, dates, queries, per-field rules and deletion.</b> Built-in <code>Time</code> arithmetic and typed date/number inputs, <code>Class.all()</code> live queries, <code>this.delete()</code>, keyed alarms (<code>this.schedule("remind", ...)</code>), per-field <code>@read</code> rules with <code>"self"</code> presence masking and <code>"none"</code> server-only fields, <code>Form</code>/<code>FormInput</code>/<code>Actions</code> in <code>tj:ui</code>, and <code>check()</code> validation errors that keep their field name across server RPCs and retries.</li>
           <li><b>Personal-data flow checks, retention, per-person keys and compliance packs.</b> Compile-time flow checking tracks <code>@pii</code> across functions, components and <code>tj:ui</code> so personal data cannot reach <code>fetch</code>, logs, errors or plugins without <code>reveal(value, purpose)</code>, while letting a person view their own <code>exportData(caller.id)</code> on screen. Includes <code>@retain</code>, <code>@legalHold</code>, per-person encryption keys (crypto-shredded on erase), <code>@by</code> shared lists, <code>tj:consent</code> with <code>@needs</code>, <code>const lawfulBasis</code>, GDPR article 30 records (<code>tj check --privacy --record</code>), and extensible data-only compliance packs (<code>tj check --compliance</code>, <code>tj serve --compliance</code>).</li>

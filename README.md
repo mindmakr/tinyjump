@@ -5,7 +5,7 @@ TypeScript-shaped file. Durable **objects** hold state, timers and events. The U
 with **native widgets**. The same objects are your **backend API**. Every host has
 built-in **automation**, so AI agents can write, run and check apps in one loop.
 
-**[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/)
+**[Try it in your browser](https://mindmakr.github.io/tinyjump/demo/)** · [Site](https://mindmakr.github.io/tinyjump/) · [Registry](https://github.com/mindmakr/tj-plugins)
 
 > Status: early. The language, VM, runtime, web, Android and iOS hosts, and the
 > Linux/Windows/macOS server work. See [docs/vision.md](docs/vision.md).
@@ -56,16 +56,26 @@ browsers. `Room` is an `@server` object: it lives on the server, and each device
 live, offline-cached replica of it.
 
 Other commands: `tj docs` (the language reference, for agents), `tj check app.tj` (compile
-errors with fix hints, types, `--access`, `--privacy`, `--record` and `--compliance`),
-`tj bench app.tj` (timings and work counters), `tj audit verify` (tamper-evident audit log)
-and `tj serve app.tj` (backend, plus `--web` to serve the browser app; add `--host 0.0.0.0`
-to expose it; its automation needs `TJ_ADMIN_KEY`). Apps can span several files with
-`import { Cart } from "./cart"`.
+errors with fix hints, types, `--access`, `--privacy`, `--record`, `--compliance`,
+`--manifest`, `--against` schema compatibility, and `--min-trust`), `tj test app.tj`
+(deterministic trace runner), `tj build app.tj` (AOT `.tjb` bytecode plus `--web`,
+`--linux`, `--android` and `--ios` targets), `tj add <name>` (install SHA-256-pinned
+packages from [mindmakr/tj-plugins](https://github.com/mindmakr/tj-plugins) into `tj.lock`),
+`tj reload` / `tj rollback` (shadow-booted live reloads with health-gated rollback),
+`tj retro` (actionable refactor and health report), `tj bench app.tj` (timings and work
+counters), `tj audit verify` (tamper-evident audit log) and `tj serve app.tj` (backend with
+optional `remotes.json` server-to-server sync, `webhooks.json` HMAC webhooks, `--ops` scoped
+agent keys, and `--web` to serve the browser app; add `--host 0.0.0.0` to expose it; its
+automation needs `TJ_ADMIN_KEY` or an `--ops` key). Apps can span several files with
+`import { Cart } from "./cart"` and ship translations in `locales/*.json` with `t("key")`.
 
-Testing and agents: `tj review --target <url>` checks a running app for layout,
-accessibility and contrast problems and prints its work counters. `tj mcp --target <url>`
-lets any MCP-capable coding agent inspect, drive, screenshot and review it. Targets are
-`tj serve` (:4700), or Android and iOS debug builds (:4701).
+Testing and agents: `tj review app.tj` sweeps every locale in `locales/*.json` plus a
+built-in `"pseudo"` locale offline for overflow, overlap and missing translations;
+`tj review --target <url>` checks a running app for layout, accessibility and contrast
+problems, diffs screenshots against `--golden <baseline.png>`, and prints its work counters.
+`tj mcp --target <url>` lets any MCP-capable coding agent inspect, drive, record traces,
+screenshot and review it. Targets are `tj serve` (:4700), or Android and iOS debug builds
+(:4701).
 
 ### iOS
 
@@ -117,8 +127,8 @@ docs/            vision, language, host protocol
 
 - [Vision and guardrails](docs/vision.md)
 - [Language](docs/language.md), written for people and AI agents
-- [Access control](docs/access-control.md), [Personal data](docs/privacy.md), [Compliance](docs/compliance.md) and [Trust](docs/trust.md)
-- [Plugins](docs/plugins.md) and [Host protocol](docs/host-protocol.md), for building a host on a new platform
+- [Access control](docs/access-control.md), [Personal data](docs/privacy.md), [Compliance](docs/compliance.md), [Trust](docs/trust.md) and [Retried external effects](docs/retried-effects.md)
+- [Registry](docs/registry.md) ([mindmakr/tj-plugins](https://github.com/mindmakr/tj-plugins)), [Plugins](docs/plugins.md) and [Host protocol](docs/host-protocol.md), for building a host on a new platform
 
 ## Develop
 
