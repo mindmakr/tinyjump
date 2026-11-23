@@ -538,8 +538,8 @@ fn validate_manifest_inner(m: &PackageManifest, index_dir: Option<&Path>, allow_
         }
     }
     for dev in &m.permissions.device {
-        if dev.trim().is_empty() || has_control(dev) {
-            errors.push(format!("invalid device permission {dev:?}"));
+        if let Err(e) = crate::device_perms::validate_device_permission(dev) {
+            errors.push(e);
         }
     }
     if let Some(flag) = &m.flagged {

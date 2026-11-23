@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -38,6 +39,7 @@ public final class TinyJump {
     private static final int MAX_RESPONSE = 10 << 20;
     private static final int HTTP_TIMEOUT_MS = 30000;
     private static final Map<String, NativeComponent> COMPONENTS = new HashMap<>();
+    private static final Map<String, DevicePlugin> PLUGINS = new HashMap<>();
 
     /**
      * Registers a custom native view used from {@code .tj} as {@code <Native name="..." />}.
@@ -51,6 +53,18 @@ public final class TinyJump {
         return COMPONENTS.get(name);
     }
 
+    /**
+     * Registers a device capability plugin invoked from {@code .tj} plugin modules via
+     * {@code plugin(name, method, args)} (docs/device-plugins.md). Pass {@code null} to unregister.
+     */
+    public static synchronized void registerPlugin(String name, DevicePlugin plugin) {
+        if (plugin == null) PLUGINS.remove(name); else PLUGINS.put(name, plugin);
+    }
+
+    static synchronized DevicePlugin devicePlugin(String name) {
+        return PLUGINS.get(name);
+    }
+
     final Handler main = new Handler(Looper.getMainLooper());
     final ExecutorService io = Executors.newFixedThreadPool(4);
     final Renderer renderer;
@@ -58,6 +72,7 @@ public final class TinyJump {
     private final Map<Long, Reply> pending = new HashMap<>();
     private long nextReply = 1;
     private Automation automation;
+    private volatile boolean stopped = false;
     private final Runnable tick = new Runnable() {
         @Override
         public void run() {
@@ -163,6 +178,7 @@ public final class TinyJump {
     }
 
     public void stop() {
+        stopped = true;
         main.removeCallbacks(tick);
         sync.stop();
         io.shutdownNow();
@@ -184,6 +200,7 @@ public final class TinyJump {
 
     void send(JSONObject input) {
         assertMain();
+        if (stopped) return;
         int code = Native.handle(now(), input.toString());
         String out = Native.out();
         if (code != 0) {
@@ -285,9 +302,16 @@ public final class TinyJump {
     }
 
     private void runEffect(final int id, final JSONObject effect) {
+        if (stopped) return;
+        String kind = effect.optString("kind");
+        if ("plugin".equals(kind)) {
+            runPluginEffect(id, effect);
+            return;
+        }
         io.execute(new Runnable() {
             @Override
             public void run() {
+                if (stopped) return;
                 Object ok = null;
                 String error = null;
                 String field = null;
@@ -301,25 +325,85 @@ public final class TinyJump {
                     // A server call without an answer is retried by the runtime.
                     unreachable = call && !(e instanceof Sync.CallFailed);
                 }
-                final JSONObject done = input("effectDone");
-                try {
-                    done.put("id", id);
-                    if (error == null) {
-                        done.put("ok", ok == null ? JSONObject.NULL : ok);
-                    } else {
-                        done.put("error", error);
-                        if (field != null) done.put("field", field);
-                    }
-                    if (unreachable) done.put("unreachable", true);
-                } catch (JSONException e) {
-                    throw new IllegalStateException(e);
+                deliverEffectDone(id, ok, error, field, unreachable);
+            }
+        });
+    }
+
+    private void runPluginEffect(final int id, final JSONObject effect) {
+        if (stopped) return;
+        final String name = effect.optString("plugin", "");
+        final String method = effect.optString("method", "");
+        final DevicePlugin plugin = devicePlugin(name);
+        if (plugin == null) {
+            deliverEffectDone(id, null, "no device plugin registered for " + name, null, false);
+            return;
+        }
+        final JSONObject rawArgs = effect.optJSONObject("args");
+        final JSONObject argsCopy;
+        try {
+            argsCopy = rawArgs == null ? new JSONObject() : new JSONObject(rawArgs.toString());
+        } catch (JSONException e) {
+            deliverEffectDone(id, null, "invalid plugin arguments: " + e.getMessage(), null, false);
+            return;
+        }
+        // Capture Context on the main thread before hopping to the worker pool.
+        final Context ctx = renderer.root.getContext();
+        final AtomicBoolean replied = new AtomicBoolean(false);
+        final Reply onceReply = new Reply() {
+            @Override
+            public void done(Object ok, String error) {
+                if (!stopped && replied.compareAndSet(false, true)) {
+                    deliverEffectDone(id, ok, error, null, false);
                 }
-                main.post(new Runnable() {
-                    @Override
-                    public void run() {
-                        send(done);
+            }
+        };
+        io.execute(new Runnable() {
+            @Override
+            public void run() {
+                if (stopped) return;
+                try {
+                    plugin.call(ctx, method, argsCopy, onceReply);
+                } catch (Exception e) {
+                    onceReply.done(null, String.valueOf(e.getMessage() != null ? e.getMessage() : e));
+                }
+            }
+        });
+    }
+
+    private void deliverEffectDone(final int id, Object ok, String error, String field, boolean unreachable) {
+        if (stopped) return;
+        final JSONObject done = input("effectDone");
+        try {
+            done.put("id", id);
+            if (error == null) {
+                Object wrapped = ok == null ? JSONObject.NULL : JSONObject.wrap(ok);
+                if (wrapped == null) {
+                    done.put("error", "plugin returned non-JSON value");
+                } else {
+                    try {
+                        done.put("ok", wrapped);
+                        if (done.toString() == null) {
+                            done.remove("ok");
+                            done.put("error", "plugin returned non-JSON value");
+                        }
+                    } catch (JSONException badValue) {
+                        done.remove("ok");
+                        done.put("error", "plugin returned non-JSON value: " + badValue.getMessage());
                     }
-                });
+                }
+            } else {
+                done.put("error", error);
+                if (field != null) done.put("field", field);
+            }
+            if (unreachable) done.put("unreachable", true);
+        } catch (JSONException e) {
+            throw new IllegalStateException(e);
+        }
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                if (!stopped) send(done);
             }
         });
     }

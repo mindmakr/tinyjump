@@ -1976,6 +1976,7 @@ mod tests {
             None,
             remotes_b,
             wh_arc.clone(),
+            std::collections::BTreeMap::new(),
         )
         .unwrap();
         let srv_b = Server::http("127.0.0.1:0").unwrap();

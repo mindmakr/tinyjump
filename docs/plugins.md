@@ -68,12 +68,15 @@ answer becomes an error. Why MCP:
   answers are listed in a file. Tests then stay deterministic and free. The durable cart
   ships `fake-ai.json`.
 
-## Device plugins (later)
+## Device plugins (`docs/device-plugins.md`)
 
-Cameras, sensors, files and notifications must run inside the app, so on devices a plugin
-is native code registered with the host (Java, Swift or JavaScript) under the same name. It
-answers the same effect. The app's side does not change. These come with the device
-capabilities work.
+Cameras, sensors, files and notifications run inside the app on the device, so on devices a
+plugin is native code registered with the host under the same name (`registerPlugin` in
+`hosts/web/tinyjump.js`, `TinyJump.registerPlugin` in Java and Swift). It answers the same
+`{ kind: "plugin", plugin, method, args }` effect and declares its capabilities in
+`permissions.device` / `permissions.json`, which `tj build --android` and `--ios` wire
+automatically into `AndroidManifest.xml` and `Info.plist`. See
+[docs/device-plugins.md](device-plugins.md).
 
 ## The agent loop, as a plugin and a library
 

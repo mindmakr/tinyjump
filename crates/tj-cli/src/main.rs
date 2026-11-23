@@ -10,6 +10,7 @@ mod build;
 mod bytes;
 mod compat;
 mod compliance;
+mod device_perms;
 mod engine;
 mod golden;
 mod http;
@@ -643,9 +644,11 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                 for w in warnings {
                     eprintln!("warning: {w}");
                 }
+                let dev_perms = device_perms::load_app_device_permissions(app_dir)?;
                 let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
                 let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-                let m = manifest::Manifest::build(&src, &program, &refs);
+                let mut m = manifest::Manifest::build(&src, &program, &refs);
+                m.with_device_permissions(&dev_perms);
                 println!("{}", serde_json::to_string_pretty(&m.json).expect("JSON serializes"));
                 return Ok(());
             }
@@ -674,6 +677,9 @@ fn check(file: &Path, show_manifest: bool, as_json: bool, against: Option<&Path>
                             }
                         }
                         Err(e) => failures.push(e),
+                    }
+                    if let Err(e) = device_perms::load_app_device_permissions(app_dir) {
+                        failures.push(e);
                     }
                     let j = serde_json::json!({
                         "compatible": !compat::has_breaking(&findings),
@@ -723,10 +729,18 @@ fn print_check_reports(file: &Path, app_dir: &Path, src: &str, program: &tj_core
         }
         Err(e) => failures.push(e),
     }
+    let dev_perms = match device_perms::load_app_device_permissions(app_dir) {
+        Ok(p) => p,
+        Err(e) => {
+            failures.push(e);
+            std::collections::BTreeMap::new()
+        }
+    };
     if show_manifest {
         let configured = plugins::load(file, &[]).map(|p| p.names().into_iter().map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
         let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
-        let m = manifest::Manifest::build(src, program, &refs);
+        let mut m = manifest::Manifest::build(src, program, &refs);
+        m.with_device_permissions(&dev_perms);
         print!("{}", m.text());
     }
     if access {
@@ -815,6 +829,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     for w in lock_warnings {
         eprintln!("warning: {w}");
     }
+    let dev_perms = device_perms::load_app_device_permissions(app_dir)?;
     let source = read_source(file)?;
     let is_bytecode = source.starts_with(tj_core::vm::bytecode::BUNDLE_PREFIX);
     if is_bytecode && args.compliance.is_some() {
@@ -878,6 +893,7 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
         compliance_gate,
         remotes.clone(),
         webhooks.clone(),
+        dev_perms,
     )?;
     let addr = format!("{}:{}", args.host, args.port);
     let automation = if dev_mode { auth::Automation::Open } else { auth::Automation::for_serve()? };
@@ -944,7 +960,7 @@ fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
     let plugins = Arc::new(plugins::Plugins::default());
     let remotes = Arc::new(remotes::Remotes::default());
     let webhooks = Arc::new(webhooks::Webhooks::default());
-    let engine = Engine::start_with_integrations(source, data.clone(), false, false, plugins, audit.clone(), None, remotes, webhooks.clone())?;
+    let engine = Engine::start_with_integrations(source, data.clone(), false, false, plugins, audit.clone(), None, remotes, webhooks.clone(), std::collections::BTreeMap::new())?;
     let addr = format!("{host}:{port}");
     let automation = auth::Automation::for_serve()?;
     let leases = leases::Leases::open(&data);

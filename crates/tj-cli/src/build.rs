@@ -4,8 +4,9 @@
 //! Devices and standalone servers boot `.tjb` bytecode directly via `Program::from_bytes` /
 //! `Program::from_bundle`, skipping the lexer, parser, type-checker and compiler at startup.
 
-use crate::{app, registry, remotes, webhooks};
+use crate::{app, device_perms, registry, remotes, webhooks};
 use serde_json::{json, Value as Json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -556,6 +557,8 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
     let objects: Vec<&str> = program.objects.iter().map(|o| &*o.name).collect();
     let has_ui = program.app.is_some();
     let has_server_objects = program.objects.iter().any(|o| o.server);
+    let dev_perms = device_perms::load_app_device_permissions(app_dir)?;
+    let dev_perm_names: Vec<&str> = dev_perms.keys().map(String::as_str).collect();
     let mut notes: Vec<String> = Vec::new();
     let mut artifact_path: Option<PathBuf> = None;
 
@@ -609,6 +612,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
                 "bundleBytes": bundle.len(),
                 "objects": objects,
                 "hasUi": has_ui,
+                "devicePermissions": dev_perm_names,
             });
             fs::write(dest.join("manifest.json"), serde_json::to_string_pretty(&manifest).expect("json"))
                 .map_err(|e| format!("cannot write manifest.json: {e}"))?;
@@ -653,6 +657,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
                 opts.server_url,
                 opts.aot,
                 &abis,
+                &dev_perms,
                 &mut notes,
             )?;
             let apk = if opts.assemble {
@@ -673,6 +678,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
                 "aot": opts.aot,
                 "abis": abis,
                 "minSdk": 21,
+                "devicePermissions": dev_perm_names,
                 "sha256": sha_hex,
                 "bytecodeBytes": bytes.len(),
                 "bundleBytes": bundle.len(),
@@ -701,6 +707,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
                 opts.server_url,
                 opts.aot,
                 opts.release,
+                &dev_perms,
                 &mut notes,
             )?;
             let app_bundle = if opts.assemble {
@@ -721,6 +728,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
                 "versionCode": version_code,
                 "aot": opts.aot,
                 "minIos": "13.0",
+                "devicePermissions": dev_perm_names,
                 "sha256": sha_hex,
                 "bytecodeBytes": bytes.len(),
                 "bundleBytes": bundle.len(),
@@ -763,6 +771,7 @@ fn generate_android_project(
     server_url: Option<&str>,
     aot: bool,
     abis: &[String],
+    dev_perms: &BTreeMap<String, device_perms::DevicePermission>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let assets = dest.join("assets");
@@ -855,7 +864,10 @@ fn generate_android_project(
     );
     fs::write(res_values.join("strings.xml"), strings_xml).map_err(|e| format!("cannot write strings.xml: {e}"))?;
 
-    let manifest_xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n    <application\n        android:allowBackup=\"false\"\n        android:supportsRtl=\"true\"\n        android:usesCleartextTraffic=\"${cleartext}\"\n        android:label=\"@string/app_name\"\n        android:theme=\"@android:style/Theme.Material.Light.NoActionBar\">\n        <activity\n            android:name=\".MainActivity\"\n            android:exported=\"true\"\n            android:windowSoftInputMode=\"adjustResize\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n";
+    let perm_xml = device_perms::android_manifest_xml(dev_perms);
+    let manifest_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<manifest xmlns:android=\"http://schemas.android.com/apk/res/android\">\n{perm_xml}    <application\n        android:allowBackup=\"false\"\n        android:supportsRtl=\"true\"\n        android:usesCleartextTraffic=\"${{cleartext}}\"\n        android:label=\"@string/app_name\"\n        android:theme=\"@android:style/Theme.Material.Light.NoActionBar\">\n        <activity\n            android:name=\".MainActivity\"\n            android:exported=\"true\"\n            android:windowSoftInputMode=\"adjustResize\">\n            <intent-filter>\n                <action android:name=\"android.intent.action.MAIN\" />\n                <category android:name=\"android.intent.category.LAUNCHER\" />\n            </intent-filter>\n        </activity>\n    </application>\n</manifest>\n"
+    );
     fs::write(app_mod.join("src/main/AndroidManifest.xml"), manifest_xml)
         .map_err(|e| format!("cannot write AndroidManifest.xml: {e}"))?;
 
@@ -979,6 +991,7 @@ fn generate_ios_project(
     server_url: Option<&str>,
     aot: bool,
     release: bool,
+    dev_perms: &BTreeMap<String, device_perms::DevicePermission>,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let resources = dest.join("Resources");
@@ -990,8 +1003,9 @@ fn generate_ios_project(
     } else {
         "    <key>NSAppTransportSecurity</key>\n    <dict>\n        <key>NSAllowsLocalNetworking</key>\n        <true/>\n    </dict>\n".to_string()
     };
+    let ios_perms_xml = device_perms::ios_plist_xml(dev_perms, title, escape_xml);
     let plist = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>CFBundleIdentifier</key>\n    <string>{}</string>\n    <key>CFBundleName</key>\n    <string>{}</string>\n    <key>CFBundleDisplayName</key>\n    <string>{}</string>\n    <key>CFBundleExecutable</key>\n    <string>{}</string>\n    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n    <key>CFBundleShortVersionString</key>\n    <string>{}</string>\n    <key>CFBundleVersion</key>\n    <string>{}</string>\n    <key>MinimumOSVersion</key>\n    <string>13.0</string>\n    <key>UIDeviceFamily</key>\n    <array>\n        <integer>1</integer>\n        <integer>2</integer>\n    </array>\n    <key>UILaunchScreen</key>\n    <dict/>\n{}</dict>\n</plist>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n    <key>CFBundleIdentifier</key>\n    <string>{}</string>\n    <key>CFBundleName</key>\n    <string>{}</string>\n    <key>CFBundleDisplayName</key>\n    <string>{}</string>\n    <key>CFBundleExecutable</key>\n    <string>{}</string>\n    <key>CFBundlePackageType</key>\n    <string>APPL</string>\n    <key>CFBundleShortVersionString</key>\n    <string>{}</string>\n    <key>CFBundleVersion</key>\n    <string>{}</string>\n    <key>MinimumOSVersion</key>\n    <string>13.0</string>\n    <key>UIDeviceFamily</key>\n    <array>\n        <integer>1</integer>\n        <integer>2</integer>\n    </array>\n    <key>UILaunchScreen</key>\n    <dict/>\n{}{}</dict>\n</plist>\n",
         escape_xml(app_id),
         escape_xml(exec_name),
         escape_xml(title),
@@ -999,6 +1013,7 @@ fn generate_ios_project(
         escape_xml(version),
         version_code,
         ats,
+        ios_perms_xml,
     );
     fs::write(dest.join("Info.plist"), plist).map_err(|e| format!("cannot write Info.plist: {e}"))?;
 
@@ -1306,7 +1321,12 @@ function App() {
         let web_bundle = fs::read_to_string(web_dir.join("app.tjb")).unwrap();
         assert!(Program::from_bundle(&web_bundle).unwrap().is_ok());
 
-        // 3. Turnkey Android project: Gradle files, strings.xml (safe against placeholders/@), AndroidManifest, MainActivity.
+        // 3. Turnkey Android project: Gradle files, strings.xml (safe against placeholders/@), AndroidManifest, MainActivity, device permissions.
+        fs::write(
+            dir.join("permissions.json"),
+            r#"{ "device": { "camera": "Scan QR & receipts", "notifications": true } }"#,
+        )
+        .unwrap();
         let and_dir = dir.join("android");
         build_app(
             &app_file,
@@ -1326,6 +1346,8 @@ function App() {
         assert!(Program::from_bundle(&fs::read_to_string(and_dir.join("assets/app.tjb")).unwrap()).unwrap().is_ok());
         let and_manifest = fs::read_to_string(and_dir.join("app/src/main/AndroidManifest.xml")).unwrap();
         assert!(and_manifest.contains("android:label=\"@string/app_name\""));
+        assert!(and_manifest.contains("android.permission.CAMERA"));
+        assert!(and_manifest.contains("android.permission.POST_NOTIFICATIONS"));
         let strings_xml = fs::read_to_string(and_dir.join("app/src/main/res/values/strings.xml")).unwrap();
         assert!(strings_xml.contains("\\@Notes &amp; ${foo}\\'s"), "{strings_xml}");
         let root_gradle = fs::read_to_string(and_dir.join("build.gradle.kts")).unwrap();
@@ -1368,6 +1390,8 @@ function App() {
         assert!(plist.contains("<string>com.example.my-notes</string>"));
         assert!(plist.contains("<string>Notes &amp; Tasks</string>"));
         assert!(plist.contains("<string>2.0.1</string>"));
+        assert!(plist.contains("<key>NSCameraUsageDescription</key>"));
+        assert!(plist.contains("<string>Scan QR &amp; receipts</string>"));
         assert!(!plist.contains("NSAllowsLocalNetworking"), "release Info.plist must omit local cleartext exception");
         let swift = fs::read_to_string(ios_dir.join("AppDelegate.swift")).unwrap();
         assert!(swift.contains("defaultServer: String? = \"https://api.example.com\""));

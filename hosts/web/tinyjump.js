@@ -68,6 +68,7 @@ const ICONS = {
 
 const BUILTIN_KINDS = ['Column', 'Row', 'Scroll', 'Spacer', 'Text', 'Button', 'Input', 'Toggle', 'Image', 'Time', 'Format', 'Tabs', 'Icon', 'List', 'Theme'];
 const REGISTRY = new Map();
+const PLUGINS = new Map();
 
 /**
  * Registers a custom native web component (`<Native name="MapView" ... />`) globally before `start()`.
@@ -75,7 +76,17 @@ const REGISTRY = new Map();
  * @param {{create: (props: object, emit: (event: string, value?: any) => void) => HTMLElement, update?: (el: HTMLElement, props: object, changed: object) => void, container?: (el: HTMLElement) => HTMLElement, destroy?: (el: HTMLElement) => void}} spec
  */
 export function registerComponent(name, spec) {
-  REGISTRY.set(name, spec);
+  if (spec == null) REGISTRY.delete(name); else REGISTRY.set(name, spec);
+}
+
+/**
+ * Registers a device capability plugin (`plugin(name, method, args)`) globally before `start()`.
+ * Handler returns a JSON-serializable value or a Promise (docs/device-plugins.md).
+ * @param {string} name
+ * @param {((method: string, args: object) => any) | null} handler
+ */
+export function registerPlugin(name, handler) {
+  if (handler == null) PLUGINS.delete(name); else PLUGINS.set(name, handler);
 }
 
 function px(v) {
@@ -108,7 +119,7 @@ function localStore(prefix) {
 
 /**
  * Boots an app.
- * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean, token?: string, user?: string}} opts
+ * @param {{wasm: string, source: string, root: HTMLElement, server?: string, store?: object, seed?: number, devOverlay?: boolean, token?: string, user?: string, components?: object, plugins?: object}} opts
  *   server: base URL of a `tj serve` backend for `@server` objects ('' = same origin).
  *   token, user: the signed-in user's token for the server and their id (see setToken).
  *   seed: for replaying a run; by default it comes from crypto.getRandomValues.
@@ -167,6 +178,13 @@ export async function start(opts) {
   const components = new Map(REGISTRY);
   if (opts.components) {
     Object.keys(opts.components).forEach((k) => components.set(k, opts.components[k]));
+  }
+  // Per-instance plugin overrides only (storing `null` explicitly disables a global plugin on this instance).
+  const plugins = new Map();
+  if (opts.plugins) {
+    Object.keys(opts.plugins).forEach((k) => {
+      plugins.set(k, opts.plugins[k] == null ? null : opts.plugins[k]);
+    });
   }
   const pending = new Map();
   let nextReply = 1;
@@ -370,6 +388,32 @@ export async function start(opts) {
   function runEffect(id, effect) {
     if (effect.kind === 'call') {
       serverCall(id, effect);
+      return;
+    }
+    if (effect.kind === 'plugin') {
+      const name = String(effect.plugin || '');
+      const handler = plugins.has(name) ? plugins.get(name) : PLUGINS.get(name);
+      if (typeof handler !== 'function') {
+        Promise.resolve().then(() => send({ type: 'effectDone', id, error: 'no device plugin registered for ' + name }));
+        return;
+      }
+      const rawArgs = effect.args;
+      const argsCopy = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs) ? Object.assign({}, rawArgs) : {};
+      Promise.resolve()
+        .then(() => handler(String(effect.method || ''), argsCopy))
+        .then(
+          (ok) => {
+            let safeOk = ok === undefined ? null : ok;
+            try {
+              JSON.stringify(safeOk);
+            } catch (e) {
+              send({ type: 'effectDone', id, error: 'plugin returned non-JSON value: ' + String(e && e.message || e) });
+              return;
+            }
+            send({ type: 'effectDone', id, ok: safeOk });
+          },
+          (e) => send({ type: 'effectDone', id, error: String(e && e.message || e) })
+        );
       return;
     }
     if (effect.kind !== 'http') {
@@ -908,7 +952,9 @@ export async function start(opts) {
     /** Switches the active BCP-47 locale (or 'pseudo') and re-renders translations & formatters. */
     setLocale,
     /** Registers a custom native component (`<Native name="..." />`) for this app instance. */
-    registerComponent: (name, spec) => components.set(name, spec),
+    registerComponent: (name, spec) => (spec == null ? components.delete(name) : components.set(name, spec)),
+    /** Registers (or with null disables) a device capability plugin (`plugin(name, method, args)`) for this app instance. */
+    registerPlugin: (name, handler) => plugins.set(name, handler == null ? null : handler),
   };
 
   // ---------- boot ----------

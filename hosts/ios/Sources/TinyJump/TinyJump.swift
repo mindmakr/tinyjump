@@ -33,7 +33,13 @@ public final class TinyJump {
     /// Receives the reply to a request: `ok` on success, otherwise `error`.
     public typealias Reply = (Any?, String?) -> Void
 
+    /// Native device capability plugin registered via `TinyJump.registerPlugin(_:_:)`
+    /// and invoked from `.tj` plugin modules via `plugin(name, method, args)` (docs/device-plugins.md).
+    public typealias DevicePlugin = (_ method: String, _ args: [String: Any], _ done: @escaping Reply) -> Void
+
     private static var components: [String: NativeComponent] = [:]
+    private static var plugins: [String: DevicePlugin] = [:]
+    private static let pluginsLock = NSLock()
 
     /// Registers a custom native UIKit view used from `.tj` as `<Native name="..." />`.
     /// Call on the main thread before `start(...)` so the initial render finds it.
@@ -49,6 +55,24 @@ public final class TinyJump {
         components[name]
     }
 
+    /// Registers a device capability plugin invoked from `.tj` plugin modules via `plugin(name, method, args)`.
+    /// Pass `nil` to unregister.
+    public static func registerPlugin(_ name: String, _ plugin: DevicePlugin?) {
+        pluginsLock.lock()
+        defer { pluginsLock.unlock() }
+        if let plugin = plugin {
+            plugins[name] = plugin
+        } else {
+            plugins.removeValue(forKey: name)
+        }
+    }
+
+    static func devicePlugin(_ name: String) -> DevicePlugin? {
+        pluginsLock.lock()
+        defer { pluginsLock.unlock() }
+        return plugins[name]
+    }
+
     private let native: NativeRuntime
     let renderer: Renderer
     private var sync: Sync!
@@ -56,6 +80,7 @@ public final class TinyJump {
     private var nextReply = 1
     private var wake: DispatchWorkItem?
     private var automation: Automation?
+    private var stopped = false
 
     private init(root: UIView, bridge: HostBridge) {
         native = NativeRuntime(bridge: bridge)
@@ -119,6 +144,7 @@ public final class TinyJump {
     }
 
     public func stop() {
+        stopped = true
         wake?.cancel()
         sync.stop()
         automation?.stop()
@@ -135,7 +161,10 @@ public final class TinyJump {
     }
 
     func send(_ input: [String: Any]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: input), let json = String(data: data, encoding: .utf8) else {
+        guard !stopped else { return }
+        guard JSONSerialization.isValidJSONObject(input),
+              let data = try? JSONSerialization.data(withJSONObject: input),
+              let json = String(data: data, encoding: .utf8) else {
             NSLog("tinyjump: input is not JSON")
             return
         }
@@ -212,6 +241,7 @@ public final class TinyJump {
     }
 
     private func effectDone(_ id: Int, _ ok: Any?, _ error: String?, field: String? = nil, unreachable: Bool = false) {
+        guard !stopped else { return }
         var done: [String: Any] = ["type": "effectDone", "id": id]
         if let error = error {
             done["error"] = error
@@ -219,18 +249,54 @@ public final class TinyJump {
             if unreachable { done["unreachable"] = true }
         } else {
             done["ok"] = ok ?? NSNull()
+            if !JSONSerialization.isValidJSONObject(done) {
+                done.removeValue(forKey: "ok")
+                done["error"] = "plugin returned non-JSON value"
+            }
         }
         send(done)
     }
 
     private func runEffect(id: Int, effect: [String: Any]) {
+        guard !stopped else { return }
         switch effect["kind"] as? String {
         case "call":
             sync.call(effect) { [weak self] ok, error, field, unreachable in self?.effectDone(id, ok, error, field: field, unreachable: unreachable) }
         case "http":
             http(effect) { [weak self] ok, error in self?.effectDone(id, ok, error) }
+        case "plugin":
+            runPluginEffect(id: id, effect: effect)
         default:
             effectDone(id, nil, "unsupported effect \(effect["kind"] ?? "")")
+        }
+    }
+
+    private func runPluginEffect(id: Int, effect: [String: Any]) {
+        let name = effect["plugin"] as? String ?? ""
+        let method = effect["method"] as? String ?? ""
+        guard let handler = TinyJump.devicePlugin(name) else {
+            DispatchQueue.main.async { [weak self] in
+                self?.effectDone(id, nil, "no device plugin registered for \(name)")
+            }
+            return
+        }
+        let args = effect["args"] as? [String: Any] ?? [:]
+        let lock = NSLock()
+        var replied = false
+        let onceDone: Reply = { [weak self] ok, error in
+            lock.lock()
+            let first = !replied
+            replied = true
+            lock.unlock()
+            guard first else { return }
+            DispatchQueue.main.async {
+                guard let self = self, !self.stopped else { return }
+                self.effectDone(id, ok, error)
+            }
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, !self.stopped else { return }
+            handler(method, args, onceDone)
         }
     }
 
