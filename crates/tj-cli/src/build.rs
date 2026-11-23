@@ -443,6 +443,11 @@ fn find_web_device_plugins_js() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn find_web_webrtc_js() -> Option<PathBuf> {
+    let candidates = [workspace_dir().join("hosts/web/plugins/webrtc.js"), PathBuf::from("hosts/web/plugins/webrtc.js")];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 /// Resolves the WASM runtime for `--web`. Returns `(path, used_aot, stale_aot_note)`.
 fn find_wasm(explicit: Option<&Path>, require_aot: bool) -> (Option<PathBuf>, bool, Option<String>) {
     if let Some(p) = explicit {
@@ -612,10 +617,21 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             } else if stale_plugins_js.exists() {
                 let _ = fs::remove_file(&stale_plugins_js);
             }
+            let has_video_call = device_perms::uses_video_call(&program, &dev_perms);
+            let stale_webrtc_js = dest.join("webrtc-plugin.js");
+            if has_video_call {
+                if let Some(wjs) = find_web_webrtc_js() {
+                    fs::copy(&wjs, &stale_webrtc_js).map_err(|e| format!("cannot copy {}: {e}", wjs.display()))?;
+                } else {
+                    notes.push("hosts/web/plugins/webrtc.js not found in workspace; copy it as webrtc-plugin.js into this folder".into());
+                }
+            } else if stale_webrtc_js.exists() {
+                let _ = fs::remove_file(&stale_webrtc_js);
+            }
             if has_server_objects && opts.server_url.is_none() {
                 notes.push("this app has @server objects; pass --server <url> (or '' for same-origin) so the web host knows where `tj serve` runs".into());
             }
-            let html = web_index_html(title, opts.server_url, &host_plugins);
+            let html = web_index_html(title, opts.server_url, &host_plugins, has_video_call);
             fs::write(dest.join("index.html"), html).map_err(|e| format!("cannot write index.html: {e}"))?;
             let manifest = json!({
                 "target": "web",
@@ -1206,7 +1222,7 @@ fn strip_win_unc(p: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
 }
 
-fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str]) -> String {
+fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], video_call: bool) -> String {
     let escaped = escape_xml(title);
     let server_opt = match server {
         Some(url) => {
@@ -1228,8 +1244,16 @@ fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str]) -> S
             format!(", plugins: createDevicePlugins({caps})"),
         )
     };
+    let (webrtc_import, webrtc_opt) = if video_call {
+        (
+            "import { createVideoCallComponents } from './webrtc-plugin.js';\n".to_string(),
+            ", components: createVideoCallComponents()".to_string(),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt} }}));\n</script>\n</body>\n</html>\n"
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}{webrtc_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt}{webrtc_opt} }}));\n</script>\n</body>\n</html>\n"
     )
 }
 
@@ -1602,6 +1626,22 @@ function App() {
         assert!(!ios_dev.join("DevicePlugins.swift").exists());
         assert!(!fs::read_to_string(ios_dev.join("AppDelegate.swift")).unwrap().contains("DevicePlugins"));
         assert!(!fs::read_to_string(ios_dev.join("build.sh")).unwrap().contains("DevicePlugins.swift"));
+
+        // 4. WebRTC VideoCall component is bundled ONLY when camera/microphone + VideoCall are used.
+        assert!(!web_dev.join("webrtc-plugin.js").exists());
+        fs::write(&app_file, "function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }\n").unwrap();
+        fs::write(dir.join("permissions.json"), r#"{ "device": { "camera": "Video", "microphone": "Audio" } }"#).unwrap();
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
+        assert!(web_dev.join("webrtc-plugin.js").exists());
+        let webrtc_html = fs::read_to_string(web_dev.join("index.html")).unwrap();
+        assert!(webrtc_html.contains("import { createVideoCallComponents } from './webrtc-plugin.js';"));
+        assert!(webrtc_html.contains("components: createVideoCallComponents()"));
+
+        // Rebuilding without VideoCall cleans up stale webrtc-plugin.js.
+        fs::write(&app_file, "function App() { return <Column><Text>hi</Text></Column> }\n").unwrap();
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
+        assert!(!web_dev.join("webrtc-plugin.js").exists());
+        assert!(!fs::read_to_string(web_dev.join("index.html")).unwrap().contains("webrtc-plugin.js"));
 
         let _ = fs::remove_dir_all(&dir);
     }

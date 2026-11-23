@@ -26,6 +26,7 @@
   <script type="module">
     import { start } from './tinyjump.js';
     import { createDevicePlugins } from './device-plugins.js';
+    import { createVideoCallComponents } from './webrtc-plugin.js';
 
     const KEY = 'tj:key';
 
@@ -47,7 +48,8 @@
       let me = await whoami(token).catch(() => { token = null; return whoami(null); });
       // The server is also the backend for `@server` objects.
       const plugins = Array.isArray(me.devicePlugins) && me.devicePlugins.length ? createDevicePlugins(me.devicePlugins) : undefined;
-      const app = await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), server: '', devOverlay: me.dev, token, user: me.id || null, roles: me.roles, plugins });
+      const components = me.videoCall ? createVideoCallComponents() : undefined;
+      const app = await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), server: '', devOverlay: me.dev, token, user: me.id || null, roles: me.roles, plugins, components });
       if (me.dev) devTools(app);
       else signInBar(app, me);
     }
