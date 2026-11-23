@@ -4368,3 +4368,150 @@ function App() {
     let _ = lrt.handle(4.0, Input::Layout { width: 390.0, height: 844.0, rtl: false });
     assert!(calls.get() > after_first, "locale change must invalidate layout measurement cache");
 }
+
+#[test]
+fn scene_3d_catalog_frame_hook_math_trig_layout_and_aot_roundtrip() {
+    let src = r##"
+object Anim {
+  angle: number = 0
+  steps: number = 0
+  @invariant bounded(): boolean { return this.angle >= 0 }
+  @frame step(dt: number) {
+    this.angle += dt * 2
+    this.steps += 1
+  }
+  @frame count() {
+    this.steps += 10
+  }
+  breakIt() { this.angle = -1 }
+  trig(): number {
+    return Math.round((Math.sin(0) + Math.cos(0) + Math.tan(0) + Math.atan2(0, 1)) * 100) / 100
+  }
+}
+
+function App() {
+  const a = Anim.get("main")
+  return <Column padding={10}>
+    <Text id="lbl">{a.steps}</Text>
+    <Scene id="sc" clear="#0f172a" ambient={0.25} height={240}>
+      <Camera position={[0, 2, 5]} target={[0, 0, 0]} fov={45} />
+      <Light kind="directional" direction={[0, -1, -1]} color="#ffffff" intensity={1} />
+      <Mesh id="box" geometry="box" rotation={[0, a.angle, 0]} color="#ef4444" onPress={() => a.breakIt()} />
+    </Scene>
+  </Column>
+}
+"##;
+    let prog = compile(src).expect("3d scene compiles");
+    assert!(prog.uses_scene());
+    assert!(prog.has_frame());
+
+    // Round-trip through AOT `.tjb` binary format (TJB v3) and verify `uses_scene`/`has_frame` survive.
+    let bytes = prog.to_bytes().expect("encode tjb");
+    let decoded = tj_core::vm::program::Program::from_bytes(&bytes).expect("decode tjb");
+    assert!(decoded.uses_scene());
+    assert!(decoded.has_frame());
+
+    let (mut rt, boot_out) = Runtime::boot(decoded, Box::new(MemStore::default()), Options::new(1000.0, 1)).expect("boot");
+    assert!(boot_out.iter().any(|o| matches!(o, Output::Patch { ops } if ops.iter().any(|op| matches!(op, tj_core::PatchOp::Create { kind, .. } if kind == "Scene")))));
+
+    // Trig builtins work accurately.
+    let trig_out = rt.handle(1001.0, Input::Call { object: "Anim/main".into(), method: "trig".into(), args: vec![], reply: Some(1), call: None, caller: None });
+    assert_eq!(reply(&trig_out).unwrap(), json!(1));
+
+    // Layout treats `<Scene>` as a 2D leaf box and does not lay out its 3D children (`Mesh`, `Camera`, `Light`).
+    struct FixedMeasure;
+    impl tj_core::ui::layout::Measure for FixedMeasure {
+        fn measure(&mut self, _node: u32, max_width: Option<f32>) -> (f32, f32) {
+            (max_width.unwrap_or(100.0), 30.0)
+        }
+    }
+    rt.set_measure(Box::new(FixedMeasure));
+    let layout_out = rt.handle(1002.0, Input::Layout { width: 320.0, height: 480.0, rtl: false });
+    let frames: Vec<_> = layout_out
+        .iter()
+        .filter_map(|o| match o {
+            Output::Frames { frames } => Some(frames.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    // Only Column, Text, Scene get 2D frames (3 nodes), NOT Camera/Light/Mesh!
+    assert_eq!(frames.len(), 3, "expected 3 2D frames (Column, Text, Scene), got {frames:?}");
+    assert!(frames.iter().any(|f| (f.h - 240.0).abs() < 0.5), "Scene respects explicit height=240: {frames:?}");
+
+    // `Input::Frame` runs both 1-arg and 0-arg `@frame` hooks and emits updated patches.
+    let frame_out = rt.handle(1016.0, Input::Frame { dt: 0.5 });
+    assert_eq!(state(&mut rt, 1016.0, "Anim/main")["angle"], json!(1));
+    assert_eq!(state(&mut rt, 1016.0, "Anim/main")["steps"], json!(11));
+    assert!(frame_out.iter().any(|o| matches!(o, Output::Patch { ops } if !ops.is_empty())));
+
+    // Negative, NaN, and Infinite dt are rejected cleanly without mutating state.
+    for bad_dt in [-0.1, f64::NAN, f64::INFINITY] {
+        let bad_out = rt.handle(1017.0, Input::Frame { dt: bad_dt });
+        assert!(bad_out.iter().any(|o| matches!(o, Output::Error { message, .. } if message.contains("finite non-negative"))));
+    }
+    assert_eq!(state(&mut rt, 1017.0, "Anim/main")["steps"], json!(11));
+
+    // `@invariant` rollback during `@frame`, `this.delete()` during `@frame`, multi-object deterministic ordering, and server no-op.
+    let edge_src = r##"
+object Log {
+  entries: string[] = []
+  push(s: string) { this.entries.push(s) }
+}
+object Mover {
+  x: number = 0
+  failNext: boolean = false
+  dieNext: boolean = false
+  @invariant nonNeg(): boolean { return this.x >= 0 }
+  @frame step(dt: number) {
+    Log.get("main").push(this.id)
+    if (this.dieNext) {
+      this.delete()
+      return
+    }
+    if (this.failNext) {
+      this.x = -5
+      return
+    }
+    this.x += dt
+  }
+  armFail() { this.failNext = true }
+  armDie() { this.dieNext = true }
+}
+"##;
+    let edge_prog = compile(edge_src).expect("edge compiles");
+    let (mut ert, _) = Runtime::boot(edge_prog, Box::new(MemStore::default()), Options::new(1000.0, 1)).expect("boot");
+    let _ = ert.handle(1001.0, Input::Get { object: "Mover/b".into(), reply: Some(1), caller: None });
+    let _ = ert.handle(1002.0, Input::Get { object: "Mover/a".into(), reply: Some(2), caller: None });
+    let _ = ert.handle(1003.0, Input::Frame { dt: 1.0 });
+    assert_eq!(state(&mut ert, 1004.0, "Log/main")["entries"], json!(["a", "b"]), "deterministic id order");
+    assert_eq!(state(&mut ert, 1004.0, "Mover/a")["x"], json!(1));
+    // Trigger invariant failure on Mover/a during @frame -> atomic rollback leaves x unchanged!
+    let _ = ert.handle(1005.0, Input::Call { object: "Mover/a".into(), method: "armFail".into(), args: vec![], reply: Some(3), call: None, caller: None });
+    let inv_out = ert.handle(1006.0, Input::Frame { dt: 1.0 });
+    assert!(inv_out.iter().any(|o| matches!(o, Output::Error { message, .. } if message.contains("invariant"))));
+    assert_eq!(state(&mut ert, 1007.0, "Mover/a")["x"], json!(1), "failed @frame rolled back");
+    // Delete Mover/b during @frame -> subsequent frames skip it cleanly.
+    let _ = ert.handle(1008.0, Input::Call { object: "Mover/b".into(), method: "armDie".into(), args: vec![], reply: Some(4), call: None, caller: None });
+    let _ = ert.handle(1009.0, Input::Frame { dt: 1.0 });
+    let _ = ert.handle(1010.0, Input::Frame { dt: 1.0 });
+    let entries = state(&mut ert, 1011.0, "Log/main")["entries"].as_array().unwrap().clone();
+    assert_eq!(entries.iter().filter(|e| e.as_str() == Some("b")).count(), 3, "deleted Mover/b stops running @frame");
+
+    // Server runtimes ignore Input::Frame cleanly.
+    let srv_prog = compile(edge_src).unwrap();
+    let (mut srt, _) = Runtime::boot(srv_prog, Box::new(MemStore::default()), Options { server: true, ..Options::new(1000.0, 1) }).unwrap();
+    let _ = srt.handle(1001.0, Input::Get { object: "Mover/a".into(), reply: Some(1), caller: Some(Caller::trusted()) });
+    let _ = srt.handle(1002.0, Input::Frame { dt: 1.0 });
+    let got = srt.handle(1003.0, Input::Get { object: "Mover/a".into(), reply: Some(2), caller: Some(Caller::trusted()) });
+    assert_eq!(reply(&got).unwrap()["x"], json!(0));
+
+    // Compile-time & type-check rejections for `@frame`.
+    assert!(errors("@server @read(\"anyone\") object S { @frame f(dt: number) {} }").contains("@server"));
+    assert!(errors("object A { @frame f(a: number, b: number) {} }").contains("at most one parameter"));
+    assert!(errors("object A { @frame f(dt: string) {} }").contains("must accept number"));
+    assert!(errors("object A { @frame(\"1s\") f() {} }").contains("takes no arguments"));
+    assert!(errors("object A { @frame async f() { await fetch(\"https://example.com\") } }").contains("await"));
+    assert!(errors("object A { @frame @every(\"1s\") f() {} }").contains("cannot also have"));
+    assert!(errors("object A { @frame @invariant f(): boolean { return true } }").contains("cannot also have"));
+}

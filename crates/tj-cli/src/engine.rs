@@ -95,6 +95,8 @@ pub struct Engine {
     fetch_allowlist: bool,
     device_plugins: Arc<Mutex<Vec<&'static str>>>,
     video_call: Arc<AtomicBool>,
+    gfx: Arc<AtomicBool>,
+    has_frame: Arc<AtomicBool>,
 }
 
 pub fn now_ms() -> f64 {
@@ -152,6 +154,8 @@ struct Booted {
     max_objects: usize,
     max_object_bytes: usize,
     video_call: bool,
+    gfx: bool,
+    has_frame: bool,
 }
 
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
@@ -167,6 +171,8 @@ fn boot(
 ) -> Result<Booted, String> {
     let program = tj_core::load(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let video_call = crate::device_perms::uses_video_call(&program, device_perms);
+    let has_frame = program.has_frame();
+    let gfx = program.uses_scene() || has_frame;
     let mut manifest = Manifest::build(source, &program, configured_plugins);
     manifest.with_device_permissions(device_perms);
     let snap = Snapshot::build(source, &program);
@@ -195,7 +201,7 @@ fn boot(
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
-    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call })
+    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call, gfx, has_frame })
 }
 
 struct EngineSyncSink(Sender<Msg>);
@@ -246,6 +252,10 @@ impl Engine {
         let device_plugins_ref = device_plugins.clone();
         let video_call = Arc::new(AtomicBool::new(false));
         let video_call_ref = video_call.clone();
+        let gfx = Arc::new(AtomicBool::new(false));
+        let gfx_ref = gfx.clone();
+        let has_frame = Arc::new(AtomicBool::new(false));
+        let has_frame_ref = has_frame.clone();
         let remote_classes = remotes.classes();
         let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
         let fetch_allow_arc = Arc::new(fetch_allow);
@@ -255,15 +265,17 @@ impl Engine {
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call: has_vc }) => {
+                    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call: has_vc, gfx: has_gfx, has_frame: hf }) => {
                         video_call_ref.store(has_vc, Ordering::Relaxed);
+                        gfx_ref.store(has_gfx, Ordering::Relaxed);
+                        has_frame_ref.store(hf, Ordering::Relaxed);
                         let shared = Arc::new(Mutex::new(manifest));
                         if let Ok(mut r) = shared_ref.lock() {
                             *r = Some(shared.clone());
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms, device_plugins_ref, video_call_ref);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms, device_plugins_ref, video_call_ref, gfx_ref, has_frame_ref);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -277,7 +289,7 @@ impl Engine {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
-        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist, device_plugins, video_call })
+        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist, device_plugins, video_call, gfx, has_frame })
     }
 
     /// Opt-in host device plugins (`files`, `notifications`, `location`, `camera`) enabled by the app's permissions.
@@ -288,6 +300,16 @@ impl Engine {
     /// Whether the app opts into the WebRTC `<Native name="VideoCall" />` component.
     pub fn has_video_call(&self) -> bool {
         self.video_call.load(Ordering::Relaxed)
+    }
+
+    /// Whether the app opts into the 3D `<Scene>` renderer or `@frame` animation loop.
+    pub fn has_gfx(&self) -> bool {
+        self.gfx.load(Ordering::Relaxed)
+    }
+
+    /// Whether the app declares any `@frame` animation hook.
+    pub fn has_frame(&self) -> bool {
+        self.has_frame.load(Ordering::Relaxed)
     }
 
     /// Sends an input and waits for its reply, if the input kind has one.
@@ -419,7 +441,7 @@ fn has_reply(input: &Input) -> bool {
 fn set_reply(input: &mut Input, id: u64) {
     match input {
         Input::Call { reply, .. } | Input::Get { reply, .. } | Input::Ui { reply, .. } | Input::Inspect { reply, .. } => *reply = Some(id),
-        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Entropy { .. } | Input::Locale { .. } | Input::Tick => {}
+        Input::EffectDone { .. } | Input::Sync { .. } | Input::Layout { .. } | Input::Online | Input::Identity { .. } | Input::Entropy { .. } | Input::Locale { .. } | Input::Frame { .. } | Input::Tick => {}
     }
 }
 
@@ -609,6 +631,8 @@ fn run(
     mut device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
     device_plugins: Arc<Mutex<Vec<&'static str>>>,
     video_call: Arc<AtomicBool>,
+    gfx: Arc<AtomicBool>,
+    has_frame: Arc<AtomicBool>,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
@@ -732,7 +756,7 @@ fn run(
                 let next_perms = updated_perms.as_ref().unwrap_or(&device_perms);
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs, &remote_classes, next_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
                         if let Some(p) = updated_perms {
                             if let Ok(mut dp) = device_plugins.lock() {
                                 *dp = crate::device_perms::bundled_host_plugins(&p);
@@ -740,6 +764,8 @@ fn run(
                             device_perms = p;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        gfx.store(has_gfx, Ordering::Relaxed);
+                        has_frame.store(hf, Ordering::Relaxed);
                         let new_sha = sha256_hex(&source);
                         previous = Some((current_source, current_sha));
                         current_source = source.clone();
@@ -787,7 +813,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&req.source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, video_call: has_vc, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
                         let prev_source = std::mem::replace(&mut current_source, req.source.clone());
                         let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
                         previous = Some((prev_source.clone(), prev_sha.clone()));
@@ -796,6 +822,8 @@ fn run(
                             *s = req.source;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        gfx.store(has_gfx, Ordering::Relaxed);
+                        has_frame.store(hf, Ordering::Relaxed);
                         rt = new_rt;
                         d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
@@ -847,7 +875,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
                         current_source = prev_source.clone();
                         previous = None;
@@ -856,6 +884,8 @@ fn run(
                             *s = prev_source;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        gfx.store(has_gfx, Ordering::Relaxed);
+                        has_frame.store(hf, Ordering::Relaxed);
                         rt = new_rt;
                         d.on_swap(&rt);
                         if let Ok(mut m) = manifest.lock() {
@@ -892,7 +922,7 @@ fn run(
                     d.stats.set_watch_until(0);
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                     match boot(&w.prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                        Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, video_call: has_vc, .. }) => {
+                        Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
                             current_source = w.prev_source.clone();
                             current_sha = w.prev_sha.clone();
                             previous = None;
@@ -901,6 +931,8 @@ fn run(
                                 *s = w.prev_source;
                             }
                             video_call.store(has_vc, Ordering::Relaxed);
+                            gfx.store(has_gfx, Ordering::Relaxed);
+                            has_frame.store(hf, Ordering::Relaxed);
                             rt = prev_rt;
                             d.on_swap(&rt);
                             if let Ok(mut m) = manifest.lock() {

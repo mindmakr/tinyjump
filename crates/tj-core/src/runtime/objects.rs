@@ -25,7 +25,7 @@ pub(crate) const CALL_RECORD_MS: f64 = 72.0 * 3_600_000.0;
 pub(crate) struct Instance {
     pub(crate) handle: Rc<ObjRef>,
     /// A device-side replica of an `@server` object: methods run on the server.
-    remote: bool,
+    pub(crate) remote: bool,
     pub(crate) state: Rc<RefCell<Record>>,
     pub(crate) alarms: Vec<Alarm>,
     /// The change number of the current state: assigned here for objects this runtime owns,

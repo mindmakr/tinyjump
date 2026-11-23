@@ -573,6 +573,13 @@ impl Runtime {
                 }
             }
             Input::Online => self.retry_calls_now(),
+            Input::Frame { dt } => {
+                if !dt.is_finite() || dt < 0.0 {
+                    self.reply(None, Err(("frame dt must be a finite non-negative number".into(), None)));
+                } else {
+                    self.run_frame(dt);
+                }
+            }
             Input::Tick => {}
             Input::Inspect { reply } => {
                 let snapshot = self.inspect();
@@ -999,6 +1006,40 @@ impl Runtime {
             (Some(id), Err((e, field))) => self.outputs.push(Output::Reply { reply: id, ok: None, error: Some(e), field, status }),
             (None, Err((e, _))) => self.outputs.push(Output::Error { message: e, trace: Vec::new() }),
             (None, Ok(_)) => {}
+        }
+    }
+
+    /// Runs `@frame` hooks on every loaded local object instance in deterministic order.
+    fn run_frame(&mut self, dt: f64) {
+        if self.server || !self.program.has_frame() {
+            return;
+        }
+        // Reuse `Vec<String>::sort` (already instantiated in `objects.rs`) to avoid extra codegen in device builds.
+        let mut keys: Vec<String> = self
+            .instances
+            .values()
+            .filter(|i| !i.remote && self.program.objects[i.handle.class as usize].methods.values().any(|m| m.frame))
+            .map(|i| i.handle.key())
+            .collect();
+        keys.sort();
+        for key in keys {
+            let Ok(obj) = self.resolve_object(&key) else { continue };
+            if self.is_gone(&obj) {
+                continue;
+            }
+            let methods: Vec<(Rc<str>, bool)> = self.program.objects[obj.class as usize]
+                .methods
+                .iter()
+                .filter(|(_, m)| m.frame)
+                .map(|(n, m)| (n.clone(), !m.params.is_empty()))
+                .collect();
+            for (method, takes_dt) in methods {
+                if self.is_gone(&obj) {
+                    break;
+                }
+                let args = if takes_dt { vec![Value::Num(dt)] } else { Vec::new() };
+                self.invoke(obj.clone(), &method, args, false, None, Entry::new(self.local()));
+            }
         }
     }
 

@@ -262,6 +262,9 @@ impl Manifest {
                 if m["invariant"].as_bool() == Some(true) {
                     tags.push("invariant".into());
                 }
+                if m["frame"].as_bool() == Some(true) {
+                    tags.push("frame".into());
+                }
                 if let Some(ms) = m["everyMs"].as_f64() {
                     tags.push(format!("every {}", format_ms(ms)));
                 }
@@ -342,6 +345,9 @@ fn object_json(o: &ObjectDef, ast: &AstObject) -> Json {
             obj.insert("exclusive".into(), json!(m.exclusive));
             if m.invariant {
                 obj.insert("invariant".into(), json!(true));
+            }
+            if m.frame {
+                obj.insert("frame".into(), json!(true));
             }
             if let Some(ms) = m.every {
                 obj.insert("everyMs".into(), json!(ms));

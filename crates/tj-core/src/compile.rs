@@ -193,6 +193,7 @@ struct FnCtx {
     try_depth: usize,
     is_main: bool,
     is_invariant: bool,
+    is_frame: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -205,8 +206,8 @@ enum Var {
 #[derive(Clone, Copy)]
 enum FnKind<'a> {
     Plain,
-    /// A method, with the consents it needs (`@needs`) and whether it is an `@invariant`.
-    Method(&'a [String], bool),
+    /// A method, with the consents it needs (`@needs`), whether it is `@invariant`, and whether it is `@frame`.
+    Method(&'a [String], bool, bool),
 }
 
 struct Compiler {
@@ -605,6 +606,7 @@ impl Compiler {
             let mut allow = None;
             let mut exclusive = false;
             let mut invariant = false;
+            let mut frame = false;
             let mut needs: Vec<String> = Vec::new();
             for d in &m.decorators {
                 match d.name.as_str() {
@@ -632,13 +634,26 @@ impl Compiler {
                         invariant = true;
                     }
                     "invariant" if !invariant => self.error(Diagnostic::new("@invariant takes no arguments", d.span).hint("write @invariant on its own")),
-                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object), @invariant (checked before saving) and @needs(\"consent:<purpose>\")")),
+                    "frame" if !frame && d.args.is_empty() => {
+                        if server {
+                            self.error(Diagnostic::new("@frame cannot be used on @server objects", d.span).hint("put animation state on a plain device object; servers do not run render frames"));
+                        }
+                        if m.func.params.len() > 1 {
+                            self.error(Diagnostic::new("@frame methods take at most one parameter (`dt: number`)", m.func.span).hint("write `@frame step(dt: number) { ... }` or `@frame step() { ... }`"));
+                        }
+                        frame = true;
+                    }
+                    "frame" if !frame => self.error(Diagnostic::new("@frame takes no arguments", d.span).hint("write @frame on its own")),
+                    other => self.error(Diagnostic::new(format!("unknown or repeated decorator @{other}"), d.span).hint("supported: @every(\"5s\"), @frame, @allow(...) (who may call it remotely), @exclusive (one exclusive call at a time per object), @invariant (checked before saving) and @needs(\"consent:<purpose>\")")),
                 }
             }
-            if invariant && (allow.is_some() || every.is_some() || exclusive || !needs.is_empty()) {
-                self.error(Diagnostic::new("@invariant methods cannot also have @allow, @every, @exclusive or @needs", m.func.span).hint("invariants run automatically before saving and must be pure synchronous checks"));
+            if invariant && (allow.is_some() || every.is_some() || exclusive || frame || !needs.is_empty()) {
+                self.error(Diagnostic::new("@invariant methods cannot also have @allow, @every, @exclusive, @frame or @needs", m.func.span).hint("invariants run automatically before saving and must be pure synchronous checks"));
             }
-            let proto = self.function(&m.func, FnKind::Method(&needs, invariant));
+            if frame && (allow.is_some() || every.is_some() || exclusive || !needs.is_empty()) {
+                self.error(Diagnostic::new("@frame methods cannot also have @allow, @every, @exclusive or @needs", m.func.span).hint("@frame runs synchronously on each animation frame"));
+            }
+            let proto = self.function(&m.func, FnKind::Method(&needs, invariant, frame));
             let params = m.func.params.iter().map(|p| {
                 let name = match &p.pattern {
                     Pattern::Ident(n, _) => Rc::from(n.as_str()),
@@ -647,7 +662,7 @@ impl Compiler {
                 (name, p.optional || p.default.is_some(), p.ty.as_ref().map_or(ArgTy::Any, |t| self.arg_ty(t, 0)))
             });
             let params = params.collect();
-            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive, invariant, params });
+            methods.insert(Rc::from(name), MethodDef { proto, private: m.private, every, allow, exclusive, invariant, frame, params });
         }
         let def = &mut self.objects[class];
         def.fields = fields;
@@ -765,6 +780,7 @@ impl Compiler {
             try_depth: 0,
             is_main,
             is_invariant: false,
+            is_frame: false,
         });
     }
 
@@ -776,8 +792,9 @@ impl Compiler {
 
     fn function(&mut self, f: &FnDecl, kind: FnKind) -> u32 {
         self.begin_fn(&f.name, nested_names(f), false);
-        if let FnKind::Method(needs, invariant) = kind {
+        if let FnKind::Method(needs, invariant, frame) = kind {
             self.cur().is_invariant = invariant;
+            self.cur().is_frame = frame;
             let (this, _) = self.declare_local("this", false, f.span);
             // Checked before anything else runs, on every path into the method.
             for purpose in needs {
@@ -1413,6 +1430,9 @@ impl Compiler {
             ExprKind::Await(x) => {
                 if self.fns.iter().any(|f| f.is_invariant) {
                     self.error(Diagnostic::new("@invariant methods cannot use `await`", sp).hint("invariants must be pure synchronous checks before saving"));
+                }
+                if self.fns.iter().any(|f| f.is_frame) {
+                    self.error(Diagnostic::new("@frame methods cannot use `await`", sp).hint("@frame runs synchronously on each animation frame"));
                 }
                 self.expr(x);
                 self.emit(Op::Await, sp);

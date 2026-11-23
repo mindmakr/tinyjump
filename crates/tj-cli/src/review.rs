@@ -90,6 +90,9 @@ impl Walk {
 
     fn node(&mut self, n: &Json, inherited_bg: &str, in_scroll: bool, in_h_scroll: bool) {
         let kind = n["kind"].as_str().unwrap_or("");
+        if tj_core::ui::catalog::is_3d_child(kind) {
+            return;
+        }
         let theme_bg = if kind == "Theme" {
             prop(n, "surface").or_else(|| match prop(n, "mode") {
                 Some("dark") => Some("#111827"),
@@ -144,9 +147,11 @@ impl Walk {
             }
         }
 
-        if let Some(children) = n["children"].as_array() {
-            let h_scroll = in_h_scroll || (kind == "List" && props(n).get("horizontal").and_then(Json::as_bool) == Some(true));
-            self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List", h_scroll);
+        if kind != "Scene" {
+            if let Some(children) = n["children"].as_array() {
+                let h_scroll = in_h_scroll || (kind == "List" && props(n).get("horizontal").and_then(Json::as_bool) == Some(true));
+                self.nodes(children, &background, in_scroll || kind == "Scroll" || kind == "List", h_scroll);
+            }
         }
     }
 

@@ -44,7 +44,17 @@ pub const KINDS: &[Kind] = &[
     Kind { name: "Theme", props: &["mode", "accent", "surface", "muted"], events: &[], content: Content::Nodes },
     // A host-registered native view (Web element, Android View, iOS UIView) with arbitrary props and `on<Upper>...` events.
     Kind { name: "Native", props: &["name"], events: &[], content: Content::Nodes },
+    // Opt-in 3D scene graph (rendered by `tj-gfx` on wgpu or WebGL2; hosts without 3D stay small).
+    Kind { name: "Scene", props: &["clear", "ambient", "antialias"], events: &["onPointerDown", "onPointerMove", "onPointerUp"], content: Content::Nodes },
+    Kind { name: "Mesh", props: &["geometry", "position", "rotation", "scale", "metallic", "roughness", "wireframe", "visible"], events: &["onPress"], content: Content::Nodes },
+    Kind { name: "Camera", props: &["position", "target", "up", "fov", "near", "far", "projection"], events: &[], content: Content::None },
+    Kind { name: "Light", props: &["kind", "position", "direction", "intensity"], events: &[], content: Content::None },
 ];
+
+/// Whether `kind` is a 3D scene-graph child (lives inside `<Scene>`, not 2D flexbox layout).
+pub fn is_3d_child(kind: &str) -> bool {
+    matches!(kind, "Mesh" | "Camera" | "Light")
+}
 
 pub fn kind(name: &str) -> Option<&'static Kind> {
     KINDS.iter().find(|k| k.name == name)

@@ -1,11 +1,11 @@
 {
   "files": {
-    "target/wasm32-unknown-unknown/small/tj_wasm.wasm": 844,
-    "target/aarch64-linux-android/small/libtj_android.so": 1100,
-    "target/armv7-linux-androideabi/small/libtj_android.so": 783,
-    "target/i686-linux-android/small/libtj_android.so": 1315,
-    "target/x86_64-linux-android/small/libtj_android.so": 1301,
-    "target/release/tj": 9700
+    "target/wasm32-unknown-unknown/small/tj_wasm.wasm": 859,
+    "target/aarch64-linux-android/small/libtj_android.so": 1107,
+    "target/armv7-linux-androideabi/small/libtj_android.so": 788,
+    "target/i686-linux-android/small/libtj_android.so": 1322,
+    "target/x86_64-linux-android/small/libtj_android.so": 1309,
+    "target/release/tj": 9740
   },
   "apps": {
     "examples/chat/app.tj": { "boot_ms": 5, "tick_ms": 1, "vm_steps": 180, "patch_ops": 15, "renders": 1 },

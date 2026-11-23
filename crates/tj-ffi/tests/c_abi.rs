@@ -123,7 +123,7 @@ fn lays_out_through_the_measure_callback() {
     }
 }
 
-/// Builds a minimal valid `//# tjb:1:<base64>` (`TJB\x02`) bytecode bundle for
+/// Builds a minimal valid `//# tjb:1:<base64>` (`TJB\x03`) bytecode bundle for
 /// `object Counter { n = 0; inc() { this.n += 1; return this.n } }` without using the compiler,
 /// so `cargo test -p tj-ffi --no-default-features` proves AOT-only execution end to end.
 fn counter_aot_bundle() -> String {
@@ -137,7 +137,7 @@ fn counter_aot_bundle() -> String {
         b.extend_from_slice(&(s.len() as u32).to_le_bytes());
         b.extend_from_slice(s.as_bytes());
     };
-    b.extend_from_slice(b"TJB\x02");
+    b.extend_from_slice(b"TJB\x03");
     b.extend_from_slice(&(builtins.len() as u16).to_le_bytes());
     // globals: 21 builtins + Counter (slot 21)
     b.extend_from_slice(&((builtins.len() + 1) as u32).to_le_bytes());
@@ -220,6 +220,7 @@ fn counter_aot_bundle() -> String {
     b.push(0); // allow = None
     b.push(0); // exclusive = false
     b.push(0); // invariant = false
+    b.push(0); // frame = false
     b.extend_from_slice(&0u32.to_le_bytes()); // params
     // main: [2], app: None, locales: base="", tables=[]
     b.extend_from_slice(&1u32.to_le_bytes());

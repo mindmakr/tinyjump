@@ -652,6 +652,28 @@ impl Harness {
                 self.pump(out, &mut replies)?;
                 Ok(())
             }
+            "frame" => {
+                self.ensure_booted()?;
+                let dt = s["dt"].as_f64().ok_or("\"frame\" step needs numeric \"dt\" (seconds)")?;
+                if !dt.is_finite() || dt < 0.0 {
+                    return Err("frame dt must be a finite non-negative number".into());
+                }
+                let count = s["count"].as_u64().unwrap_or(1);
+                if count == 0 || count > 10_000 {
+                    return Err("frame count must be between 1 and 10000".into());
+                }
+                self.last_errors.clear();
+                for _ in 0..count {
+                    self.now += dt * 1000.0;
+                    let out = self.rt.as_mut().expect("booted").handle(self.now, Input::Frame { dt });
+                    let mut replies = HashMap::new();
+                    self.pump(out, &mut replies)?;
+                    if !self.last_errors.is_empty() {
+                        return Err(format!("frame produced app error: {}", std::mem::take(&mut self.last_errors).join("; ")));
+                    }
+                }
+                Ok(())
+            }
             "tick" => {
                 self.ensure_booted()?;
                 let delta = match (s["advanceMs"].as_f64(), s["advance"].as_str()) {

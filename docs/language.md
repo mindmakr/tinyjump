@@ -437,6 +437,10 @@ Built-in components, drawn as real native widgets:
 | `List` | `itemHeight`, `horizontal` | `onEndReached()` | nodes |
 | `Theme` | `mode`, `accent`, `surface`, `muted` | | nodes |
 | `Native` | `name`, plus any custom props | any `on<Upper>...` | nodes |
+| `Scene` | `clear`, `ambient`, `antialias` | `onPointerDown`, `onPointerMove`, `onPointerUp` | nodes (`Mesh`, `Camera`, `Light`) |
+| `Mesh` | `geometry`, `position`, `rotation`, `scale`, `metallic`, `roughness`, `wireframe`, `visible` | `onPress()` | nodes (child `Mesh`) |
+| `Camera` | `position`, `target`, `up`, `fov`, `near`, `far`, `projection` | | none |
+| `Light` | `kind`, `position`, `direction`, `intensity` | | none |
 
 Every built-in component also accepts `id` (the automation handle), `key` (list identity),
 `label` (accessibility), and the layout and style props `padding`, `margin`, `gap`,
@@ -462,6 +466,16 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   as JSON, and any `on<Upper>...` prop becomes a native event handler. Wrap `<Native>` in a
   typed `.tj` function (`function MapView(props: { lat: number, lng: number }) { return <Native name="MapView" ... /> }`)
   so callers get full static type-checking (`docs/host-protocol.md`).
+- **Opt-in 3D scenes (`tj-gfx`, `docs/gfx.md`):** `<Scene clear="#0f172a" ambient={0.25} antialias={true} height={360}>`
+  declares a GPU-rendered 3D viewport containing `<Camera>`, `<Light>`, and `<Mesh>` nodes
+  (nested `<Mesh>` nodes inherit their parent's transform). `geometry` is `"box"`, `"sphere"`,
+  `"plane"`, `"pyramid"`, or `"cylinder"`; `position` / `rotation` (radians) / `scale` are
+  `[x, y, z]` triples; `<Camera>` accepts `projection="perspective" | "orthographic"`, `fov`
+  (degrees), `near`, `far`, `position`, `target`, `up`; `<Light>` accepts `kind="directional" | "point" | "ambient"`,
+  `direction`, `position`, `color`, `intensity`. Add `@frame` to a synchronous method on a
+  device object (`@frame step(dt: number) { this.angle += dt }`) to update animation state
+  once per frame (hosts send `{ type: "frame", dt }`). Apps that do not use `<Scene>` or
+  `@frame` pay 0 bytes for 3D rendering.
 
 - `<Time value={ms} />` shows a time the way the viewer's phone or browser writes it, in
   their language and time zone. Options:
@@ -519,7 +533,7 @@ const f = Form.get("profile")
 
 ## Built-ins
 
-`console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/min/max/random/PI`,
+`console.log/warn/error`, `Math.floor/ceil/round/trunc/abs/sign/sqrt/pow/sin/cos/tan/atan2/min/max/random/PI`,
 `JSON.stringify(v, null, 2)/parse`, `Object.keys/values/entries`, `Array.isArray`,
 `Date.now()`, `crypto.randomId/hmac/timingSafeEqual/idempotencyKey`, `String(x)`, `Number(x)`, `parseInt`,
 `parseFloat`, `encodeURIComponent`, `t(key, params?)`, `fetch`, `Error`.

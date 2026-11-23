@@ -21,10 +21,11 @@ pub struct Layout {
     cache: HashMap<(u32, u64, i32), (f32, f32)>,
 }
 
-/// A widget the host measures: every catalog component that holds no child nodes, apart
-/// from `Spacer`, which only fills space. From the catalog, so a new component is measured.
+/// A widget the host measures: every catalog component that holds no child nodes (apart
+/// from `Spacer`, which only fills space), plus `<Scene>`, whose children live in 3D space
+/// rather than 2D flexbox layout.
 fn is_leaf(kind: &str) -> bool {
-    crate::ui::catalog::kind(kind).is_some_and(|k| k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer")
+    kind == "Scene" || crate::ui::catalog::kind(kind).is_some_and(|k| k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer")
 }
 
 /// Custom native components (`<Native name="MapView" />`) are measured when they have no
@@ -318,7 +319,8 @@ mod tests {
         assert_eq!(f[1].w, 88.0, "measured like text");
         assert_eq!(f[2].x, 88.0);
         for k in crate::ui::catalog::KINDS {
-            assert_eq!(is_leaf(k.name), k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer", "{}", k.name);
+            let want = k.name == "Scene" || (k.content != crate::ui::catalog::Content::Nodes && k.name != "Spacer");
+            assert_eq!(is_leaf(k.name), want, "{}", k.name);
         }
     }
 
