@@ -12,5 +12,9 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+default = ["compiler"]
+compiler = ["tj-core/compiler"]
+
 [dependencies]
 tj-core.workspace = true

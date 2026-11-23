@@ -19,16 +19,20 @@ time = { version = "0.3", default-features = false }
 taffy = { version = "0.15", default-features = false, features = ["std", "flexbox", "taffy_tree", "content_size"], optional = true }
 
 [features]
-default = ["layout"]
+default = ["layout", "compiler"]
+# The `.tj` lexer, parser, type-checker, compiler and built-in plugin sources.
+# Leave it out (`--no-default-features`) for smaller AOT-only device builds that boot
+# precompiled `.tjb` bundles from `tj build`.
+compiler = []
 # The flexbox layout engine, for native hosts. The web build leaves it out.
 layout = ["dep:taffy"]
 # Checks that only the command line runs (`tj check`, `dev`, `serve`): the personal-data
 # flow check (flow.rs), about 60 KB that devices, which run apps the CLI checked, leave out.
-check = []
+check = ["compiler"]
 # What only `tj serve` runs: exporting and erasing people, and the retention sweep. Devices
 # leave it out.
 server = []
 
 [dev-dependencies]
 # The core's own tests cover the checks and the server parts too.
-tj-core = { path = ".", features = ["check", "server"] }
+tj-core = { path = ".", features = ["compiler", "check", "server"] }

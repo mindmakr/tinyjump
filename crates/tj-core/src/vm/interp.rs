@@ -594,10 +594,13 @@ impl Runtime {
                         if self.program.user_source.is_empty() {
                             format!("bytecode+{off}")
                         } else {
+                            #[cfg(feature = "compiler")]
                             match crate::modules::locate(&self.program.user_source, off as usize) {
                                 (Some(file), line, col) => format!("{file}:{line}:{col}"),
                                 (None, line, col) => format!("{line}:{col}"),
                             }
+                            #[cfg(not(feature = "compiler"))]
+                            format!("bytecode+{off}")
                         }
                     }
                     Source::Prelude => "prelude".into(),

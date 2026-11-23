@@ -19,3 +19,5 @@ tiny_http = "0.12"
 ureq = "2"
 ring = "0.17"
 jsonwebtoken = { version = "9", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+crc32fast = "1"

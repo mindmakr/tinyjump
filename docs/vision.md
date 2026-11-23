@@ -209,7 +209,10 @@ local time, number and currency formats.
   reviews use a fixed deterministic formatter.
 - **Testing (done):** `tj review <app.tj>` sweeps every locale in `locales/*.json` plus a
   built-in `"pseudo"` locale (accented text expanded ~35%) with automatic RTL mirroring to
-  catch truncation, overflow, overlap and missing translations before release.
+  catch truncation, overflow, overlap and missing translations before release. For live
+  devices and simulators, `tj review --target <url> --golden <baseline.png>` (or offline
+  `--golden` + `--actual`) diffs screenshots pixel-by-pixel with configurable `--threshold`
+  and writes red-highlighted `--diff <out.png>` images on regressions.
 
 ## Modules and app builds
 
@@ -226,8 +229,9 @@ In order:
    change.
 2. **Ahead-of-time bytecode (done):** `tj build` emits validated `.tjb` bytecode (and
    `//# tjb:1:<base64>` bundles) so devices and servers skip the compiler at startup and do
-   not ship `.tj` source. An opt-out compiler feature for smaller AOT-only device binaries
-   comes with binary-size profiling.
+   not ship `.tj` source. The opt-out `compiler` feature (`--no-default-features`,
+   `cargo web-aot`) strips the lexer, parser, type-checker, compiler and built-in `.tj`
+   sources out of AOT-only device builds.
 3. **Packaging (in progress):** `tj build --linux` produces a single executable with
    SHA-256-verified embedded bytecode; `--web` emits a static web bundle; `--android` and
    `--ios` stage `assets/app.tjb` / `Resources/app.tjb` for host projects (full turnkey
@@ -360,11 +364,22 @@ Raised by the owner. To be discussed and critiqued before any work starts:
 | Linux desktop UI | after mobile |
 | Microcontrollers | out of scope for now |
 
-## Size work to do
+## Measured device binary sizes
 
-- Server-only parts of the core (access checks, call records, stream catch-up) are compiled
-  into device builds too, about 30 KB of the web runtime. Put them behind a `server` feature,
-  as layout is, and lower the budget again.
+Default builds are enforced on every change by `scripts/budget.sh` (`scripts/budget.json`);
+AOT-only builds (`--no-default-features`, e.g. `cargo web-aot` -> `target/aot/...`) are
+built on demand when packaging precompiled `.tjb` apps:
+
+| Build | Default (compiler + VM) | AOT-only (`--no-default-features`) | Savings |
+|---|---|---|---|
+| Web WASM (`tj_wasm.wasm`) | 842 KB | 540 KB (`cargo web-aot`) | -302 KB (-36%) |
+| Android `arm64-v8a` (`libtj_android.so`) | 1098 KB | 845 KB | -253 KB (-23%) |
+| Android `armeabi-v7a` (`libtj_android.so`) | 782 KB | 606 KB | -176 KB (-22%) |
+
+Splitting `server` privacy/retention out of device builds is already done (`check` and
+`server` features in `crates/tj-core/Cargo.toml`); the remaining server access/call-record
+logic was measured at <15 KB and kept shared so server-to-server and device replicas share
+one protocol (`feedback/2026-11-20-builder-004-size-split-measured.md`).
 
 ## Old devices are in scope
 
