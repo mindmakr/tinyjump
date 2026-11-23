@@ -2,8 +2,17 @@ plugins {
     id("com.android.library")
 }
 
-val repo: File = rootDir.resolve("../..").canonicalFile
-val rustLibs = layout.buildDirectory.dir("rust/jniLibs")
+val repo: File = projectDir.resolve("../../..").canonicalFile
+val tjAot: Boolean = project.findProperty("tjAot")?.toString()?.equals("true", ignoreCase = true) == true
+val allowedAbis = setOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+val tjAbis: List<String> = (project.findProperty("tjAbis")?.toString() ?: "armeabi-v7a,arm64-v8a,x86,x86_64")
+    .split(",")
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+require(tjAbis.isNotEmpty() && tjAbis.all { it in allowedAbis }) {
+    "invalid tjAbis=$tjAbis; expected comma-separated subset of $allowedAbis"
+}
+val rustLibs = layout.buildDirectory.dir(if (tjAot) "rust-aot/jniLibs" else "rust/jniLibs")
 
 android {
     namespace = "com.mindmakr.tinyjump"
@@ -22,19 +31,34 @@ android {
     sourceSets["main"].jniLibs.srcDir(rustLibs)
 }
 
-// Builds the Rust runtime (crates/tj-android) for every ABI old and new devices use.
+// Builds the Rust runtime (crates/tj-android) for the requested ABIs (default: all 4).
+// Pass `-PtjAot=true` to strip the compiler (`--no-default-features`) for AOT `.tjb` apps.
 val cargoNdk by tasks.registering(Exec::class) {
     workingDir = repo
     environment("ANDROID_HOME", android.sdkDirectory.absolutePath)
-    commandLine(
-        "cargo", "ndk", "--platform", "21",
-        "-t", "armeabi-v7a", "-t", "arm64-v8a", "-t", "x86", "-t", "x86_64",
+    inputs.property("tjAot", tjAot)
+    inputs.property("tjAbis", tjAbis.joinToString(","))
+    inputs.dir(repo.resolve("crates"))
+    inputs.file(repo.resolve("Cargo.toml"))
+    inputs.file(repo.resolve("Cargo.lock"))
+    outputs.dir(rustLibs)
+    doFirst {
+        val outDir = rustLibs.get().asFile
+        outDir.deleteRecursively()
+        outDir.mkdirs()
+    }
+    val args = mutableListOf("cargo", "ndk", "--platform", "21")
+    for (abi in tjAbis) {
+        args += listOf("-t", abi)
+    }
+    args += listOf(
         "-o", rustLibs.get().asFile.absolutePath,
         "build", "--profile", "small", "-p", "tj-android",
     )
-    inputs.dir(repo.resolve("crates"))
-    inputs.file(repo.resolve("Cargo.lock"))
-    outputs.dir(rustLibs)
+    if (tjAot) {
+        args += listOf("--no-default-features", "--target-dir", repo.resolve("target/aot").absolutePath)
+    }
+    commandLine(args)
 }
 
 tasks.named("preBuild") { dependsOn(cargoNdk) }

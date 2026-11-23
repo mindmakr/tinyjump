@@ -62,9 +62,9 @@ USAGE:
                                  static permission audit)
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
-  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--wasm <file>] [--server <url>] [--runner <file>] [--json]
-                                 compile AOT bytecode (.tjb) or package a static web bundle, a standalone
-                                 executable with embedded bytecode, or Android/iOS AOT asset bundles
+  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--app-id <id>] [--title <name>] [--version <x.y.z>] [--version-code <n>] [--server <url>] [--aot] [--release] [--assemble] [--abis <csv>] [--wasm <file>] [--runner <file>] [--min-trust <level>] [--json]
+                                 compile AOT bytecode (.tjb) or package a static web bundle, standalone
+                                 executable, or turnkey Android (.apk) / iOS (.app) project
   tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
