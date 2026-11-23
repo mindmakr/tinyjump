@@ -152,9 +152,18 @@ struct Booted {
 
 /// Compiles and boots `source`, rendering compile errors for a terminal. `explain` says why
 /// requests are refused (`tj dev` only).
-fn boot(source: &str, data: &Path, render: bool, explain: bool, configured_plugins: &[&str], remote_classes: &[String]) -> Result<Booted, String> {
+fn boot(
+    source: &str,
+    data: &Path,
+    render: bool,
+    explain: bool,
+    configured_plugins: &[&str],
+    remote_classes: &[String],
+    device_perms: &std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
+) -> Result<Booted, String> {
     let program = tj_core::load(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
-    let manifest = Manifest::build(source, &program, configured_plugins);
+    let mut manifest = Manifest::build(source, &program, configured_plugins);
+    manifest.with_device_permissions(device_perms);
     let snap = Snapshot::build(source, &program);
     // Objects that belong to a person get keys of their own, so erasing them reaches backups.
     // Remote replicas are owned by another server and skipped by local erasure (C-050.13).
@@ -199,10 +208,10 @@ impl Engine {
     /// Starts the runtime thread; fails if the app does not compile or boot.
     #[cfg(test)]
     pub fn start(source: String, data: PathBuf, render: bool, explain: bool, plugins: Arc<Plugins>, audit: Audit) -> Result<Engine, String> {
-        Self::start_with_integrations(source, data, render, explain, plugins, audit, None, Arc::default(), Arc::default())
+        Self::start_with_integrations(source, data, render, explain, plugins, audit, None, Arc::default(), Arc::default(), std::collections::BTreeMap::new())
     }
 
-    /// Starts the runtime thread with compliance, server-to-server remotes, and webhooks.
+    /// Starts the runtime thread with compliance, server-to-server remotes, webhooks, and device permissions.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_integrations(
         source: String,
@@ -214,6 +223,7 @@ impl Engine {
         compliance: Option<ComplianceGate>,
         remotes: Arc<Remotes>,
         webhooks: Arc<Webhooks>,
+        device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
     ) -> Result<Engine, String> {
         let (tx, rx) = channel();
         let (ready_tx, ready_rx) = channel();
@@ -235,7 +245,7 @@ impl Engine {
             .name("tj-runtime".into())
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&source, &data, render, explain, &refs, &remote_classes) {
+                match boot(&source, &data, render, explain, &refs, &remote_classes, &device_perms) {
                     Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes }) => {
                         let shared = Arc::new(Mutex::new(manifest));
                         if let Ok(mut r) = shared_ref.lock() {
@@ -243,7 +253,7 @@ impl Engine {
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -567,6 +577,7 @@ fn run(
     remotes: Arc<Remotes>,
     webhook_cfg: Arc<Webhooks>,
     webhooks: WebhookSender,
+    device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
 ) {
     // `tj dev` (which explains refusals) reaches local services; a server only public ones.
     let private_fetch = explain || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
@@ -688,7 +699,7 @@ fn run(
             }
             Ok(Msg::Reload(source)) => {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&source, &data, render, explain, &refs, &remote_classes) {
+                match boot(&source, &data, render, explain, &refs, &remote_classes, &device_perms) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let new_sha = sha256_hex(&source);
                         previous = Some((current_source, current_sha));
@@ -736,7 +747,7 @@ fn run(
                 };
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&req.source, &data, render, explain, &refs, &remote_classes) {
+                match boot(&req.source, &data, render, explain, &refs, &remote_classes, &device_perms) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, .. }) => {
                         let prev_source = std::mem::replace(&mut current_source, req.source.clone());
                         let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
@@ -795,7 +806,7 @@ fn run(
                 drain_inflight(&mut rt, &mut d, &rx, &mut pending);
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                match boot(&prev_source, &data, render, explain, &refs, &remote_classes) {
+                match boot(&prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
                     Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, .. }) => {
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
                         current_source = prev_source.clone();
@@ -839,7 +850,7 @@ fn run(
                     let w = watch.take().expect("checked");
                     d.stats.set_watch_until(0);
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
-                    match boot(&w.prev_source, &data, render, explain, &refs, &remote_classes) {
+                    match boot(&w.prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
                         Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, .. }) => {
                             current_source = w.prev_source.clone();
                             current_sha = w.prev_sha.clone();

@@ -139,6 +139,7 @@ impl Manifest {
                 "imported": imported_plugins.into_iter().collect::<Vec<_>>(),
                 "configured": configured,
             },
+            "devicePermissions": [],
             "privacy": {
                 "lawfulBasis": lawful_basis,
                 "reveals": reveals,
@@ -150,6 +151,11 @@ impl Manifest {
             json["aot"] = json!(true);
         }
         Manifest { json }
+    }
+
+    /// Attaches validated device capability permissions (from `tj.lock` and optional `permissions.json`).
+    pub fn with_device_permissions(&mut self, perms: &BTreeMap<String, crate::device_perms::DevicePermission>) {
+        self.json["devicePermissions"] = json!(crate::device_perms::manifest_json(perms));
     }
 
     /// The static manifest plus live server health and active work leases (for `GET /_tj/manifest`).
@@ -181,6 +187,25 @@ impl Manifest {
                 parts.push(format!("configured: {}", configured.join(", ")));
             }
             out.push_str(&format!("plugins: {}\n", parts.join("; ")));
+        }
+        if let Some(dev_perms) = j["devicePermissions"].as_array() {
+            if !dev_perms.is_empty() {
+                let items: Vec<String> = dev_perms
+                    .iter()
+                    .filter_map(|p| {
+                        let name = p["name"].as_str()?;
+                        let srcs: Vec<&str> = p["sources"].as_array().map(|a| a.iter().filter_map(Json::as_str).collect()).unwrap_or_default();
+                        if srcs.is_empty() {
+                            Some(name.to_string())
+                        } else {
+                            Some(format!("{name} ({})", srcs.join(", ")))
+                        }
+                    })
+                    .collect();
+                if !items.is_empty() {
+                    out.push_str(&format!("device permissions: {}\n", items.join(", ")));
+                }
+            }
         }
 
         let objs = j["objects"].as_array().map(Vec::as_slice).unwrap_or(&[]);
