@@ -30,12 +30,19 @@
 {"do": "get", "object": "BoardStroke/studio:000002", "expectContains": {"points": []}}
 {"do": "get", "object": "BoardStroke/other:000001", "expectContains": {"author": "Eve"}}
 
-# Switch to Board as a guest (before entering a name) and draw via onStroke, then undo via onUndo
+# Switch to Board as a guest (before entering a name) and draw via onStroke, then test pen controls, undo, and clear
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
 {"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
+{"do": "ui", "target": "#whiteboard", "event": "onColorChange", "value": "#1d4ed8"}
+{"do": "ui", "target": "#whiteboard", "event": "onWidthChange", "value": 8}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"penColor": "#1d4ed8", "penWidth": 8}}
 {"do": "ui", "target": "#whiteboard", "event": "onStroke", "value": {"color": "#0f766e", "width": 4, "points": [40, 40, 220, 180]}}
 {"do": "assertScreen", "contains": ["Strokes (studio): 1"]}
 {"do": "ui", "target": "#whiteboard", "event": "onUndo"}
+{"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
+{"do": "ui", "target": "#whiteboard", "event": "onStroke", "value": {"color": "#1d4ed8", "width": 8, "points": [20, 20, 160, 140]}}
+{"do": "assertScreen", "contains": ["Strokes (studio): 1"]}
+{"do": "ui", "target": "#whiteboard", "event": "onClear"}
 {"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
 {"do": "assertLayout", "width": 390, "height": 844, "review": true}
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "chat"}
@@ -50,6 +57,23 @@
 {"do": "ui", "target": "#join-audio", "event": "onPress"}
 {"do": "assertScreen", "contains": ["End Call", "Share Screen", "Peers: Carol"]}
 {"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": true, "videoEnabled": false}}
+{"do": "ui", "target": "#video-call", "event": "onMediaMode", "value": "audio-only"}
+{"do": "ui", "target": "#video-call", "event": "onNotice", "value": "Camera unavailable — joined audio-only"}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"mediaMode": "audio-only", "callNotice": "Camera unavailable — joined audio-only"}}
+{"do": "assertScreen", "contains": ["Camera unavailable"]}
+{"do": "call", "object": "StudioRoom/studio", "method": "join", "args": ["Alice"], "expect": ["Carol", "Alice"]}
+{"do": "call", "object": "StudioRoom/studio", "method": "setScreenShare", "args": ["Alice", true], "expect": "Alice"}
+{"do": "ui", "target": "#toggle-screen", "event": "onPress"}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"screenShare": false, "lastError": "Alice is already sharing their screen"}}
+{"do": "assertScreen", "contains": ["Alice is already sharing"]}
+{"do": "call", "object": "StudioRoom/studio", "method": "setScreenShare", "args": ["Alice", false], "expect": ""}
+{"do": "call", "object": "StudioRoom/studio", "method": "leave", "args": ["Alice"], "expect": ["Carol"]}
+{"do": "ui", "target": "#video-call", "event": "onScreenShare", "value": true}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"screenShare": true}}
+{"do": "get", "object": "StudioRoom/studio", "expectContains": {"screenSharer": "Carol"}}
+{"do": "ui", "target": "#video-call", "event": "onScreenShare", "value": false}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"screenShare": false}}
+{"do": "get", "object": "StudioRoom/studio", "expectContains": {"screenSharer": ""}}
 {"do": "ui", "target": "#toggle-screen", "event": "onPress"}
 {"do": "get", "object": "StudioLocal/me", "expectContains": {"screenShare": true}}
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
@@ -61,7 +85,9 @@
 {"do": "ui", "target": "#leave-call", "event": "onPress"}
 {"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": false}}
 
+{"do": "call", "object": "StudioRoom/studio", "method": "undoStroke", "args": ["12345678901234567890123456789012345678901"], "expectError": "1-40 characters"}
+
 # Restart persistence over the same store keeps topic entries and activity
 {"do": "boot", "restart": true, "now": 1800000005000, "seed": 1, "server": true, "render": true}
 {"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"text": "Hello studio"}}
-{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 14}}
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 22}}

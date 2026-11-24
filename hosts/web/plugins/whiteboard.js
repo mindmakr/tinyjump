@@ -304,6 +304,7 @@ export function createWhiteboardComponent() {
         undoBtn.style.display = showUndo ? 'inline-flex' : 'none';
         clearBtn.style.display = showClear ? 'inline-flex' : 'none';
         actionsRow.style.display = showUndo || showClear ? 'inline-flex' : 'none';
+        canvas.style.cursor = ro ? 'not-allowed' : (st.tool === 'eraser' ? 'cell' : 'crosshair');
       }
 
       function rebuildPalette(palette) {
@@ -361,14 +362,12 @@ export function createWhiteboardComponent() {
         if (st.destroyed || st.props.readOnly) return;
         st.tool = 'pen';
         applyButtonState();
-        canvas.style.cursor = 'crosshair';
       });
 
       eraserBtn.addEventListener('click', function () {
         if (st.destroyed || st.props.readOnly) return;
         st.tool = 'eraser';
         applyButtonState();
-        canvas.style.cursor = 'cell';
       });
 
       undoBtn.addEventListener('click', function () {
@@ -527,7 +526,6 @@ export function createWhiteboardComponent() {
 
         rebuildPalette(sanitizePalette(st.props.palette));
         applyButtonState();
-        canvas.style.cursor = st.props.readOnly ? 'not-allowed' : (st.tool === 'eraser' ? 'cell' : 'crosshair');
 
         const raw = Array.isArray(st.props.strokes) ? st.props.strokes : [];
         const start = Math.max(0, raw.length - MAX_STROKES);

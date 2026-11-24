@@ -198,7 +198,9 @@ function isHexColor(c: string): boolean {
   }
 
   @allow("anyone") undoStroke(peerId: string): boolean {
-    const actor = peerId.trim() === "" ? "Guest" : peerId.trim()
+    const rawId = peerId.trim()
+    check(rawId.length <= 40, "peerId", "enter a name (1-40 characters)")
+    const actor = rawId === "" ? "Guest" : rawId
     const strokes = BoardStroke.all(`${this.id}:`)
     for (let i = strokes.length - 1; i >= 0; i -= 1) {
       if (strokes[i].points.length > 0 && strokes[i].author === actor) {
@@ -299,9 +301,14 @@ object StudioLocal {
     try { await room.leave(me) } catch (e) { }
   }
 
-  toggleScreen() {
+  toggleScreen(currentSharer: string) {
     this.lastError = ""
     this.callNotice = ""
+    const me = this.peerName.trim()
+    if (!this.screenShare && currentSharer !== "" && currentSharer !== me) {
+      this.lastError = `${currentSharer} is already sharing their screen`
+      return
+    }
     this.screenShare = !this.screenShare
   }
 
@@ -428,7 +435,7 @@ function App() {
           {local.videoEnabled && <Button id="toggle-camera" grow={1} onPress={() => local.toggleCamera()}>{local.cameraOff ? "Cam On" : "Cam Off"}</Button>}
         </Row>
         <Row gap={8}>
-          <Button id="toggle-screen" grow={1} onPress={() => local.toggleScreen()}>
+          <Button id="toggle-screen" grow={1} onPress={() => local.toggleScreen(room.screenSharer)}>
             {local.screenShare ? "Stop Share" : "Share Screen"}
           </Button>
           <Button id="leave-call" grow={1} onPress={() => local.leaveRoom(roomKey, remote)}>End Call</Button>
