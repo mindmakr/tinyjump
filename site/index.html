@@ -1052,7 +1052,7 @@
               </a>
               <a class="btn" href="demo/">Try live WASM demo</a>
               <a class="btn" href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Language (1 page)</a>
-              <a class="btn" href="https://mindmakr.github.io/tj-plugins/">Registry (11 Official)</a>
+              <a class="btn" href="https://mindmakr.github.io/tj-plugins/">Registry (12 Official)</a>
             </div>
             <div class="hero-trust">
               <span><i>✓</i> Closed by default</span>
@@ -1103,8 +1103,8 @@
 
         <div class="proof-strip" aria-label="Measured runtime benchmarks">
           <div class="proof-item">
-            <b>219 KB</b>
-            <span>AOT Web WASM gzipped (553 KB raw, compiler-free)</span>
+            <b>220 KB</b>
+            <span>AOT Web WASM gzipped (555 KB raw, compiler-free)</span>
           </div>
           <div class="proof-item">
             <b>531 KB</b>
@@ -1120,7 +1120,7 @@
           </div>
           <div class="proof-item">
             <b>0 B core</b>
-            <span>Device plugins, WebRTC, desktop hosts &amp; 11 registry pkgs</span>
+            <span>Device plugins, WebRTC, desktop hosts &amp; 12 registry pkgs</span>
           </div>
         </div>
       </div>
@@ -1369,8 +1369,8 @@
 
         <div class="numbers-grid" aria-label="Detailed runtime measurements">
           <div class="num-card">
-            <b>219 KB gz</b>
-            <span>Compiler-free AOT web runtime (<code>553 KB</code> raw via <code>cargo web-aot</code>; <code>858 KB</code> / <code>322 KB</code> gz with compiler).</span>
+            <b>220 KB gz</b>
+            <span>Compiler-free AOT web runtime (<code>555 KB</code> raw via <code>cargo web-aot</code>; <code>860 KB</code> / <code>323 KB</code> gz with compiler).</span>
           </div>
           <div class="num-card">
             <b>531 KB APK</b>
@@ -1386,7 +1386,7 @@
           </div>
           <div class="num-card">
             <b>0 B wgpu cost</b>
-            <span>Opt-in <code>tj-gfx</code> (<code>wgpu</code>), <code>gfx.js</code>, device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC calls, desktop hosts, audit log, and encryption add zero bytes to non-opting-in apps.</span>
+            <span>Opt-in <code>tj-gfx</code> (<code>wgpu</code>), <code>gfx.js</code>, device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC screen sharing, Whiteboard canvas, desktop hosts, audit log, and encryption add zero bytes to non-opting-in apps.</span>
           </div>
           <div class="num-card">
             <b>6 native targets</b>
@@ -1778,19 +1778,36 @@
             </div>
           </article>
 
+          <article class="tl-item done">
+            <div class="tl-head">
+              <h3>Phase 7 · Topic Groups, Durable Messaging &amp; Collab Studio Showcase</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 24, 2026</span>
+                <span class="badge done">Shipped</span>
+              </div>
+            </div>
+            <p>Shipped on-demand prefix topic streams (<code>Class.all(prefix?)</code> &rarr; <code>Class/prefix*</code> across all 5 hosts, SSE, webhooks, and remote sync), durable atomic cross-object server messaging (<code>this.deliver(target, "method", ...args)</code> with privacy-flow checks and GDPR erasure pruning), WebRTC screen sharing, the opt-in ES2017 Whiteboard plugin + <code>tj:whiteboard</code> library (12 Official packages in <code>mindmakr/tj-plugins</code>), and the <code>examples/collab-studio</code> showcase.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">Class/prefix* topics</span>
+              <span class="mini-tag">this.deliver(...)</span>
+              <span class="mini-tag">WebRTC screen share</span>
+              <span class="mini-tag">Whiteboard &amp; collab-studio</span>
+            </div>
+          </article>
+
           <article class="tl-item active">
             <div class="tl-head">
-              <h3>Next · UI Craft, Cross-Object Messaging &amp; Realtime Showcase</h3>
+              <h3>Next · UI Craft &amp; Ecosystem Polish</h3>
               <div class="tl-badges">
                 <span class="badge date">Up next</span>
                 <span class="badge doing">Next milestone</span>
               </div>
             </div>
-            <p>Polishing <code>tj:ui</code> and starter apps (<code>examples/booking</code>), adding on-demand topic groups (<code>Room/*</code>) and durable object-to-object messaging, and building a compact realtime media &amp; collaborative drawing showcase.</p>
+            <p>Polishing <code>tj:ui</code> components and starter apps (<code>examples/booking</code>) from real mobile design patterns, plus Sigstore provenance and OCI app units.</p>
             <div class="tl-pills">
               <span class="mini-tag">tj:ui polish</span>
-              <span class="mini-tag">Room/* topics</span>
-              <span class="mini-tag">Realtime media showcase</span>
+              <span class="mini-tag">examples/booking</span>
+              <span class="mini-tag">OCI app units</span>
             </div>
           </article>
         </div>
@@ -1821,8 +1838,8 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></svg>
             </div>
             <h3>Realtime Media &amp; Canvas Demo</h3>
-            <p>A compact showcase uniting live chat, WebRTC audio/video calls, screen sharing, and a collaborative drawing board on one durable runtime.</p>
-            <div class="card-meta">Backlog · Showcase app</div>
+            <p>A compact showcase uniting live chat, WebRTC audio/video calls, screen sharing, and an opt-in collaborative drawing board on one durable runtime.</p>
+            <div class="card-meta">Shipped · examples/collab-studio</div>
           </div>
 
           <div class="card">
@@ -1830,8 +1847,8 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.5 7.5L6.5 16.5M13.5 7.5l4 9"/></svg>
             </div>
             <h3>Topics &amp; Cross-Object Messaging</h3>
-            <p>Topic groups across objects (<code>Room/*</code>) and durable server object-to-object messaging — added cleanly as real apps pressure-test them.</p>
-            <div class="card-meta">On-demand · Messaging</div>
+            <p>Prefix topic groups across objects (<code>Class.all(prefix?)</code> / <code>Class/prefix*</code>) and durable atomic server object-to-object messaging via <code>this.deliver(...)</code>.</p>
+            <div class="card-meta">Shipped · Class/prefix* + deliver()</div>
           </div>
 
           <div class="card">
@@ -1839,7 +1856,7 @@
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
             </div>
             <h3>Verified Agentic Ecosystem</h3>
-            <p>11 Official packages live today in <code>mindmakr/tj-plugins</code> — growing toward Sigstore/SLSA publisher provenance, sealed OCI units, and <code>tj migrate</code>.</p>
+            <p>12 Official packages live today in <code>mindmakr/tj-plugins</code> — growing toward Sigstore/SLSA publisher provenance, sealed OCI units, and <code>tj migrate</code>.</p>
             <div class="card-meta">Growing · mindmakr/tj-plugins</div>
           </div>
         </div>

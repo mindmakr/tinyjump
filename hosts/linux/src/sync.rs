@@ -60,14 +60,11 @@ impl SyncClient {
         if self.server.is_none() || self.replicas.contains_key(&key) {
             return;
         }
-        if !key.ends_with("/*") {
-            let class_all = format!("{}/*", key.split('/').next().unwrap_or(""));
-            if self.replicas.contains_key(&class_all) {
-                return;
-            }
-        } else {
-            let prefix = key.trim_end_matches('*').to_string();
-            self.replicas.retain(|k, _| !k.starts_with(&prefix));
+        if self.replicas.keys().any(|pat| covers(pat, &key)) {
+            return;
+        }
+        if key.ends_with('*') {
+            self.replicas.retain(|k, _| !covers(&key, k));
         }
         self.replicas.insert(key, seq);
         self.cursor = self.replicas.values().copied().min().unwrap_or(0);
@@ -83,10 +80,10 @@ impl SyncClient {
 
     pub fn record_seq(&mut self, key: &str, seq: u64) {
         self.cursor = self.cursor.max(seq);
-        let whole = format!("{}/*", key.split('/').next().unwrap_or(""));
-        let entry = if self.replicas.contains_key(&whole) { whole } else { key.to_string() };
-        if let Some(have) = self.replicas.get_mut(&entry) {
-            *have = (*have).max(seq);
+        for (entry, have) in &mut self.replicas {
+            if entry == key || covers(entry, key) {
+                *have = (*have).max(seq);
+            }
         }
     }
 
@@ -291,6 +288,12 @@ pub fn sign_in_async(server: String, key: String, done: impl FnOnce(String, Vec<
         }
         eprintln!("tinyjump-linux: sign-in failed");
     });
+}
+
+fn covers(pattern: &str, key: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .is_some_and(|pref| pref.contains('/') && key.starts_with(pref))
 }
 
 fn percent_encode(s: &str) -> String {

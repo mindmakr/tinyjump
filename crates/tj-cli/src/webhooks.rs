@@ -84,8 +84,11 @@ impl OutgoingWebhook {
         if !ev_ok {
             return false;
         }
-        let class = object.split('/').next().unwrap_or("");
-        self.objects.iter().any(|p| p == object || p.strip_suffix("/*").is_some_and(|c| c == class))
+        self.objects.iter().any(|p| {
+            p == object
+                || p.strip_suffix('*')
+                    .is_some_and(|pref| pref.contains('/') && object.starts_with(pref))
+        })
     }
 
     /// Always a remote caller (never `Caller::trusted()`), so `@read` and `@pii` field masking
@@ -133,7 +136,7 @@ impl Webhooks {
                     .ok_or_else(|| format!("{label}: incoming {name:?} needs \"object\" (\"Class/id\")"))?;
                 let (class, id) = object
                     .split_once('/')
-                    .filter(|(c, i)| !c.is_empty() && !i.is_empty() && *i != "*" && !i.contains('/'))
+                    .filter(|(c, i)| !c.is_empty() && !i.is_empty() && !i.contains('*') && !i.contains('/'))
                     .ok_or_else(|| format!("{label}: incoming {name:?} \"object\" must be \"Class/id\", got {object:?}"))?;
                 let cid = program.object(class).ok_or_else(|| format!("{label}: incoming {name:?} names unknown class {class:?}"))?;
                 let def = &program.objects[cid as usize];
@@ -206,8 +209,16 @@ impl Webhooks {
                     let s = item.as_str().ok_or_else(|| format!("{label}: outgoing {name:?} \"objects\" entries must be strings"))?;
                     let (class, id) = s
                         .split_once('/')
-                        .filter(|(c, i)| !c.is_empty() && !i.is_empty() && !i.contains('/'))
-                        .ok_or_else(|| format!("{label}: outgoing {name:?} pattern {s:?} must be \"Class/id\" or \"Class/*\""))?;
+                        .filter(|(c, i)| {
+                            !c.is_empty()
+                                && !i.is_empty()
+                                && !i.contains('/')
+                                && match i.strip_suffix('*') {
+                                    Some(pref) => !pref.contains('*') && !pref.chars().any(char::is_control),
+                                    None => !i.contains('*') && !i.chars().any(char::is_control),
+                                }
+                        })
+                        .ok_or_else(|| format!("{label}: outgoing {name:?} pattern {s:?} must be \"Class/id\", \"Class/*\", or \"Class/prefix*\""))?;
                     let cid = program.object(class).ok_or_else(|| format!("{label}: outgoing {name:?} names unknown class {class:?}"))?;
                     if !program.objects[cid as usize].server {
                         return Err(format!("{label}: outgoing {name:?} class {class:?} must be @server"));
@@ -800,6 +811,33 @@ object Local { x: number = 0 }
         )
         .unwrap_err();
         assert!(err.contains("https://"), "{err}");
+
+        // Topic prefix wildcard `Class/prefix*` is allowed and matches strictly; malformed wildcards reject.
+        let topic_wh = Webhooks::parse(
+            r#"{"outgoing":{"f":{"url":"https://hooks.example.com/in","secretEnv":"S_SEC","objects":["Billing/eu:*"]}}}"#,
+            "webhooks.json",
+            &prog,
+            &[],
+            false,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(topic_wh.outgoing[0].matches("Billing/eu:1", "changed"));
+        assert!(!topic_wh.outgoing[0].matches("Billing/us:1", "changed"));
+        for bad_pat in ["Billing/eu:**", "Billing/*eu", "Billing/a/b*"] {
+            let err = Webhooks::parse(
+                &format!(r#"{{"outgoing":{{"f":{{"url":"https://hooks.example.com/in","secretEnv":"S_SEC","objects":["{bad_pat}"]}}}}}}"#),
+                "webhooks.json",
+                &prog,
+                &[],
+                false,
+                false,
+                &[],
+            )
+            .unwrap_err();
+            assert!(err.contains("Class/prefix*"), "{bad_pat}: {err}");
+        }
 
         // Direct HMAC verification & replay window (including C-050.4 overflow & canonical digits).
         let secret = b"super-secret-webhook-key-32-bytes";

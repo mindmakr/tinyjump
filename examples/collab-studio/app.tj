@@ -1,0 +1,495 @@
+// Tiny Realtime Media & Collaboration Studio
+// Showcases WebRTC audio/video + screen sharing, topic-partitioned chat & whiteboard strokes
+// (`Class.all(prefix)` -> `Class/prefix*` streams), and durable cross-object server messaging
+// (`this.deliver(...)`) in one compact app.
+//
+// Note: uses `@allow("anyone")` and `@read("anyone")` for zero-config multi-browser testing
+// in `tj dev`. For production deployments, enable auth and narrow rules to `@allow("signedIn")`
+// / `@read("signedIn")`.
+//
+//   cargo tj dev examples/collab-studio/app.tj
+
+type Signal = {
+  seq: number,
+  from: string,
+  to: string,
+  kind: string,
+  payload: string,
+}
+
+type ActivityItem = {
+  seq: number,
+  actor: string,
+  kind: string,
+  detail: string,
+  at: number,
+}
+
+function pad6(n: number): string {
+  return String(Math.floor(n)).padStart(6, "0")
+}
+
+function isHexColor(c: string): boolean {
+  if ((c.length !== 4 && c.length !== 7) || !c.startsWith("#")) { return false }
+  const hex = "0123456789abcdefABCDEF"
+  for (let i = 1; i < c.length; i += 1) {
+    if (!hex.includes(c.charAt(i))) { return false }
+  }
+  return true
+}
+
+@server @read("anyone") object ChatEntry {
+  author: string = ""
+  text: string = ""
+  at: number = 0
+
+  create(author: string, text: string, at: number) {
+    this.author = author
+    this.text = text
+    this.at = at
+  }
+}
+
+@server @read("anyone") object BoardStroke {
+  author: string = ""
+  color: string = "#111114"
+  width: number = 3
+  points: number[] = []
+
+  create(author: string, color: string, width: number, points: number[]) {
+    this.author = author
+    this.color = color
+    this.width = width
+    this.points = points
+  }
+
+  remove() {
+    if (this.points.length > 0) {
+      this.delete()
+    }
+  }
+}
+
+@server @read("anyone") object RoomActivity {
+  entries: ActivityItem[] = []
+  nextSeq: number = 1
+
+  record(actor: string, kind: string, detail: string) {
+    const seq = this.nextSeq
+    this.nextSeq += 1
+    this.entries.push({ seq, actor, kind, detail, at: Date.now() })
+    if (this.entries.length > 20) {
+      this.entries = this.entries.slice(this.entries.length - 20)
+    }
+  }
+}
+
+@server @read("anyone") object StudioRoom {
+  peers: string[] = []
+  signals: Signal[] = []
+  nextSeq: number = 1
+  screenSharer: string = ""
+  chatSeq: number = 0
+  strokeSeq: number = 0
+
+  @allow("anyone") join(peerId: string): string[] {
+    const id = peerId.trim()
+    check(id.length > 0 && id.length <= 40, "peerId", "enter a name (1-40 characters)")
+    if (!this.peers.includes(id)) {
+      check(this.peers.length < 2, "room", "this studio room already has two participants")
+      this.peers.push(id)
+      this.deliver(RoomActivity.get(this.id), "record", id, "join", "joined the room")
+    }
+    return this.peers
+  }
+
+  @allow("anyone") leave(peerId: string): string[] {
+    const id = peerId.trim()
+    const wasIn = this.peers.includes(id)
+    this.peers = this.peers.filter((p) => p !== id)
+    this.signals = this.signals.filter((s) => s.from !== id && s.to !== id)
+    if (this.screenSharer === id) { this.screenSharer = "" }
+    if (this.peers.length === 0) {
+      this.signals = []
+      this.screenSharer = ""
+    }
+    if (wasIn) {
+      this.deliver(RoomActivity.get(this.id), "record", id, "leave", "left the room")
+    }
+    return this.peers
+  }
+
+  @allow("anyone") reset(): boolean {
+    this.peers = []
+    this.signals = []
+    this.screenSharer = ""
+    return true
+  }
+
+  @allow("anyone") sendSignal(from: string, to: string, kind: string, payload: string): number {
+    const f = from.trim()
+    const t = to.trim()
+    check(f !== t, "to", "cannot send a call signal to yourself")
+    check(this.peers.includes(f), "from", "join the room before sending call signals")
+    check(this.peers.includes(t), "to", "recipient is not in this studio room")
+    check(kind === "offer" || kind === "answer" || kind === "ice" || kind === "bye", "kind", "unsupported WebRTC signal kind")
+    const maxLen = kind === "ice" ? 8192 : kind === "bye" ? 256 : 65536
+    check(payload.length <= maxLen, "payload", "signal payload is too large")
+    const seq = this.nextSeq
+    this.nextSeq += 1
+    this.signals.push({ seq, from: f, to: t, kind, payload })
+    if (this.signals.length > 60) {
+      this.signals = this.signals.slice(this.signals.length - 60)
+    }
+    return seq
+  }
+
+  @allow("anyone") setScreenShare(peerId: string, sharing: boolean): string {
+    const id = peerId.trim()
+    check(id.length > 0 && id.length <= 40, "peerId", "enter a name (1-40 characters)")
+    check(this.peers.includes(id), "peerId", "join the call before sharing your screen")
+    if (sharing) {
+      check(this.screenSharer === "" || this.screenSharer === id, "screen", `${this.screenSharer} is already sharing their screen`)
+      if (this.screenSharer !== id) {
+        this.screenSharer = id
+        this.deliver(RoomActivity.get(this.id), "record", id, "screen", "started screen sharing")
+      }
+    } else if (this.screenSharer === id) {
+      this.screenSharer = ""
+      this.deliver(RoomActivity.get(this.id), "record", id, "screen", "stopped screen sharing")
+    }
+    return this.screenSharer
+  }
+
+  @allow("anyone") postChat(peerId: string, text: string): number {
+    const author = peerId.trim()
+    const body = text.trim()
+    check(author.length > 0 && author.length <= 40, "peerId", "enter a name (1-40 characters)")
+    check(body.length > 0 && body.length <= 280, "chat", "message must be 1-280 characters")
+    this.chatSeq += 1
+    const seq = this.chatSeq
+    const key = `${this.id}:${pad6(seq)}`
+    ChatEntry.get(key).create(author, body, Date.now())
+    const preview = body.length > 48 ? `${body.slice(0, 48)}...` : body
+    this.deliver(RoomActivity.get(this.id), "record", author, "chat", preview)
+    return seq
+  }
+
+  @allow("anyone") addStroke(peerId: string, color: string, width: number, points: number[]): number {
+    const author = peerId.trim()
+    const c = color.trim()
+    check(author.length > 0 && author.length <= 40, "peerId", "enter a name (1-40 characters)")
+    check(isHexColor(c), "color", "color must be #rrggbb hex")
+    check(width >= 1 && width <= 24 && Math.floor(width) === width, "width", "stroke width must be 1-24")
+    check(points.length >= 2 && points.length <= 240 && points.length % 2 === 0, "points", "stroke needs 1-120 coordinate pairs")
+    for (const coord of points) {
+      check(coord >= 0 && coord <= 1000, "points", "stroke coordinates must be 0-1000")
+    }
+    this.strokeSeq += 1
+    const seq = this.strokeSeq
+    const key = `${this.id}:${pad6(seq)}`
+    BoardStroke.get(key).create(author, c, width, points)
+    if (seq > 120) {
+      const oldKey = `${this.id}:${pad6(seq - 120)}`
+      this.deliver(BoardStroke.get(oldKey), "remove")
+    }
+    this.deliver(RoomActivity.get(this.id), "record", author, "draw", `added stroke #${seq}`)
+    return seq
+  }
+
+  @allow("anyone") clearBoard(peerId: string): number {
+    const author = peerId.trim()
+    check(author.length > 0 && author.length <= 40, "peerId", "enter a name (1-40 characters)")
+    const strokes = BoardStroke.all(`${this.id}:`)
+    for (const s of strokes) {
+      this.deliver(s, "remove")
+    }
+    this.deliver(RoomActivity.get(this.id), "record", author, "clear", `cleared ${strokes.length} stroke(s)`)
+    return strokes.length
+  }
+}
+
+object StudioLocal {
+  roomName: string = "studio"
+  peerName: string = ""
+  tab: string = "call"
+  inCall: boolean = false
+  joining: boolean = false
+  videoEnabled: boolean = true
+  muted: boolean = false
+  cameraOff: boolean = false
+  screenShare: boolean = false
+  callState: string = "idle"
+  penColor: string = "#111114"
+  penWidth: number = 3
+  chatDraft: string = ""
+  lastError: string = ""
+
+  setRoom(v: string) { this.roomName = v }
+  setName(v: string) { this.peerName = v }
+  setTab(v: string) { this.tab = v }
+  setPenColor(c: string) { this.penColor = c }
+  setPenWidth(w: number) { this.penWidth = w }
+  setChatDraft(v: string) { this.chatDraft = v }
+  toggleMute() { this.muted = !this.muted }
+  toggleCamera() { this.cameraOff = !this.cameraOff }
+  setState(s: string) { this.callState = s }
+  setError(e: string) { this.lastError = e }
+
+  async joinRoom(roomKey: string, video: boolean) {
+    const me = this.peerName.trim()
+    if (me === "") {
+      this.lastError = "Enter your name before joining."
+      return
+    }
+    this.joining = true
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).join(me)
+      this.videoEnabled = video
+      this.muted = false
+      this.cameraOff = !video
+      this.screenShare = false
+      this.inCall = true
+    } catch (e) {
+      this.lastError = e.message || "could not join room"
+      this.inCall = false
+    }
+    this.joining = false
+  }
+
+  async leaveRoom(roomKey: string, remote: string) {
+    const me = this.peerName.trim()
+    this.inCall = false
+    this.screenShare = false
+    this.callState = "idle"
+    this.lastError = ""
+    const room = StudioRoom.get(roomKey)
+    if (remote !== "") {
+      try { await room.sendSignal(me, remote, "bye", "") } catch (e) { }
+    }
+    try { await room.leave(me) } catch (e) { }
+  }
+
+  async toggleScreen(roomKey: string) {
+    const me = this.peerName.trim()
+    const next = !this.screenShare
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).setScreenShare(me, next)
+      this.screenShare = next
+    } catch (e) {
+      this.lastError = e.message || "could not toggle screen share"
+    }
+  }
+
+  async onScreenChanged(roomKey: string, active: boolean) {
+    if (this.screenShare === active) { return }
+    this.screenShare = active
+    const me = this.peerName.trim()
+    if (me !== "" && this.inCall) {
+      try { await StudioRoom.get(roomKey).setScreenShare(me, active) } catch (e) { }
+    }
+  }
+
+  async sendChat(roomKey: string) {
+    const me = this.peerName.trim()
+    if (me === "") {
+      this.lastError = "Enter your name before chatting."
+      return
+    }
+    const text = this.chatDraft.trim()
+    if (text === "") { return }
+    this.chatDraft = ""
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).postChat(me, text)
+    } catch (e) {
+      this.chatDraft = text
+      this.lastError = e.message || "could not send message"
+    }
+  }
+
+  async commitStroke(roomKey: string, stroke: { color: string, width: number, points: number[] }) {
+    const me = this.peerName.trim()
+    if (me === "") {
+      this.lastError = "Enter your name before drawing."
+      return
+    }
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).addStroke(me, stroke.color, stroke.width, stroke.points)
+    } catch (e) {
+      this.lastError = e.message || "could not save stroke"
+    }
+  }
+
+  async clearBoard(roomKey: string) {
+    const me = this.peerName.trim()
+    if (me === "") {
+      this.lastError = "Enter your name before clearing."
+      return
+    }
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).clearBoard(me)
+    } catch (e) {
+      this.lastError = e.message || "could not clear board"
+    }
+  }
+}
+
+function clock(ms: number): string {
+  const s = Math.floor(ms / 1000) % 86400
+  const two = (n: number) => String(n).padStart(2, "0")
+  return `${two(Math.floor(s / 3600))}:${two(Math.floor(s / 60) % 60)}`
+}
+
+function App() {
+  const local = StudioLocal.get("me")
+  const rawRoom = local.roomName.trim().replaceAll("/", "").replaceAll("*", "").slice(0, 120)
+  const roomKey = rawRoom === "" ? "studio" : rawRoom
+  const room = StudioRoom.get(roomKey)
+  const activity = RoomActivity.get(roomKey)
+  const strokes = BoardStroke.all(`${roomKey}:`)
+  const chats = ChatEntry.all(`${roomKey}:`)
+  const me = local.peerName.trim()
+  const remote = room.peers.find((p) => p !== me) || ""
+  const initiator = local.inCall && remote !== "" && room.peers.length >= 2 && room.peers[0] === me
+  const sharerNote = room.screenSharer === "" ? "No screen shared" : `Sharing: ${room.screenSharer}`
+
+  return <Scroll padding={16} gap={12} background="#fafaf8">
+    <Text size={22} weight="bold" color="#111114">TinyJump Studio</Text>
+    <Text size={13} color="#52525b">{`Room ${roomKey} · Peers ${room.peers.length}/2 · ${sharerNote}`}</Text>
+
+    {!local.inCall && <Column gap={8}>
+      <Input id="room-input" label="Room" value={local.roomName} placeholder="Room (e.g. studio)" onChange={(v) => local.setRoom(v)} />
+      <Input id="name-input" label="Your name" value={local.peerName} placeholder="Your name (e.g. Alice)" onChange={(v) => local.setName(v)} />
+    </Column>}
+
+    <Tabs
+      id="tabs"
+      label="Studio sections"
+      value={local.tab}
+      items={[
+        { value: "call", label: "Call" },
+        { value: "board", label: "Board" },
+        { value: "chat", label: "Chat" },
+        { value: "activity", label: "Feed" },
+      ]}
+      onChange={(v) => local.setTab(v)}
+    />
+
+    {local.lastError !== "" && <Text id="error" size={14} color="#b91c1c">{local.lastError}</Text>}
+
+    {local.tab === "call" && <Column gap={10}>
+      {!local.inCall && <Row gap={8}>
+        <Button id="join-video" grow={1} disabled={local.joining} onPress={() => local.joinRoom(roomKey, true)}>
+          {local.joining ? "Joining..." : "Join Video"}
+        </Button>
+        <Button id="join-audio" grow={1} disabled={local.joining} onPress={() => local.joinRoom(roomKey, false)}>
+          Voice Only
+        </Button>
+      </Row>}
+      {!local.inCall && room.peers.length > 0 && <Button id="reset-room" onPress={() => room.reset()}>Clear Room</Button>}
+
+      {local.inCall && <Column gap={8}>
+        <Row gap={8}>
+          <Button id="toggle-mute" grow={1} onPress={() => local.toggleMute()}>{local.muted ? "Unmute" : "Mute"}</Button>
+          {local.videoEnabled && <Button id="toggle-camera" grow={1} onPress={() => local.toggleCamera()}>{local.cameraOff ? "Cam On" : "Cam Off"}</Button>}
+        </Row>
+        <Row gap={8}>
+          <Button id="toggle-screen" grow={1} onPress={() => local.toggleScreen(roomKey)}>
+            {local.screenShare ? "Stop Share" : "Share Screen"}
+          </Button>
+          <Button id="leave-call" grow={1} onPress={() => local.leaveRoom(roomKey, remote)}>End Call</Button>
+        </Row>
+      </Column>}
+
+      <Text id="call-status" size={13} color="#3f3f46">
+        {`Peers: ${room.peers.join(", ") || "none"} · State: ${local.callState}`}
+      </Text>
+    </Column>}
+
+    {(local.tab === "call" || local.inCall) && <Native
+      name="VideoCall"
+      id="video-call"
+      label="Studio video call"
+      height={local.tab === "call" ? 260 : 72}
+      active={local.inCall}
+      peerId={me}
+      remotePeerId={remote}
+      initiator={initiator}
+      audio={true}
+      video={local.videoEnabled}
+      muted={local.muted}
+      cameraOff={local.cameraOff}
+      screenShare={local.screenShare}
+      signals={room.signals}
+      onSignal={(sig) => {
+        if (local.inCall && sig && sig.to) {
+          room.sendSignal(me, sig.to, sig.kind, sig.payload || "")
+        }
+      }}
+      onState={(s) => local.setState(s)}
+      onScreenShare={(on) => local.onScreenChanged(roomKey, on)}
+      onError={(e) => local.setError(e)}
+    />}
+
+    {local.tab === "board" && <Column gap={10}>
+      <Row gap={8}>
+        <Button id="color-ink" grow={1} background="#111114" color="#ffffff" onPress={() => local.setPenColor("#111114")}>Ink</Button>
+        <Button id="color-rust" grow={1} background="#9a3412" color="#ffffff" onPress={() => local.setPenColor("#9a3412")}>Rust</Button>
+        <Button id="color-teal" grow={1} background="#0f766e" color="#ffffff" onPress={() => local.setPenColor("#0f766e")}>Teal</Button>
+        <Button id="color-blue" grow={1} background="#1d4ed8" color="#ffffff" onPress={() => local.setPenColor("#1d4ed8")}>Blue</Button>
+      </Row>
+      <Row gap={8} align="center">
+        <Button id="width-thin" grow={1} onPress={() => local.setPenWidth(2)}>Thin</Button>
+        <Button id="width-bold" grow={1} onPress={() => local.setPenWidth(6)}>Bold</Button>
+        <Button id="clear-board" grow={1} onPress={() => local.clearBoard(roomKey)}>Clear</Button>
+      </Row>
+      <Text id="board-status" size={13} color="#3f3f46">
+        {`Strokes (${roomKey}): ${strokes.length} · Pen: ${local.penColor} (${local.penWidth}px)`}
+      </Text>
+      <Native
+        name="Whiteboard"
+        id="whiteboard"
+        label="Collaborative drawing board"
+        height={260}
+        color={local.penColor}
+        width={local.penWidth}
+        readOnly={me === ""}
+        strokes={strokes.map((s) => ({ id: s.id, author: s.author, color: s.color, width: s.width, points: s.points }))}
+        onStroke={(st) => local.commitStroke(roomKey, st)}
+      />
+    </Column>}
+
+    {local.tab === "chat" && <Column gap={10}>
+      <Column gap={6} padding={10} background="#ffffff" border="1px #e4e2da" radius={8}>
+        {chats.map((m) => <Row key={m.id} gap={8}>
+          <Text weight="bold" color="#111114">{m.author}</Text>
+          <Text grow={1} color="#27272a">{m.text}</Text>
+          <Text size={12} color="#52525b">{clock(m.at)}</Text>
+        </Row>)}
+        {chats.length === 0 && <Text color="#52525b">No messages in this room yet.</Text>}
+      </Column>
+      <Row gap={8}>
+        <Input id="chat-input" label="Chat message" grow={1} value={local.chatDraft} placeholder="Message"
+          onChange={(v) => local.setChatDraft(v)} onSubmit={() => local.sendChat(roomKey)} />
+        <Button id="chat-send" onPress={() => local.sendChat(roomKey)}>Send</Button>
+      </Row>
+    </Column>}
+
+    {local.tab === "activity" && <Column gap={8}>
+      <Text size={14} weight="bold" color="#111114">Durable Room Activity</Text>
+      <Column id="activity-list" gap={6} padding={10} background="#ffffff" border="1px #e4e2da" radius={8}>
+        {activity.entries.map((a) => <Row key={a.seq} gap={8}>
+          <Text weight="bold" color="#111114">{a.actor}</Text>
+          <Text grow={1} color="#27272a">{`${a.kind}: ${a.detail}`}</Text>
+          <Text size={12} color="#52525b">{clock(a.at)}</Text>
+        </Row>)}
+        {activity.entries.length === 0 && <Text color="#52525b">No room activity yet.</Text>}
+      </Column>
+    </Column>}
+  </Scroll>
+}

@@ -65,10 +65,10 @@ impl Who {
 pub type Rule = Rc<[Rc<str>]>;
 
 /// Whether the caller with id `caller_id` owns the object with id `object_id`: the object
-/// is theirs. Anonymous callers own nothing, even an object with an empty id.
+/// is theirs. Anonymous callers own nothing, even an object with an empty id, and wildcards
+/// (`*`, `prefix*`) are never owned.
 pub fn owns(caller_id: &str, object_id: &str) -> bool {
-    // `*` is a whole class (`Slot/*`), which nobody owns.
-    !caller_id.is_empty() && object_id != "*" && caller_id == object_id
+    !caller_id.is_empty() && !object_id.contains('*') && caller_id == object_id
 }
 
 /// Whether `rule` lets `who` act on the object with id `object_id`.
@@ -116,6 +116,14 @@ impl Runtime {
     /// The rule that guards reading `key` (no method) or calling its method, and the object id.
     fn rule_for<'k>(&self, key: &'k str, method: Option<&str>) -> Result<(Rule, &'k str), String> {
         let (class, id) = key.split_once('/').ok_or_else(|| format!("{key:?} is not \"Class/id\""))?;
+        if id.contains('*') {
+            if method.is_some() {
+                return Err(format!("cannot call wildcard {key:?}"));
+            }
+            if Self::stream_prefix(key).is_none() {
+                return Err(format!("invalid wildcard {key:?}"));
+            }
+        }
         let def = self.program.object(class).map(|c| &self.program.objects[c as usize]).ok_or_else(|| format!("no object type {class}"))?;
         let rule = match method {
             None => def.read.clone().ok_or_else(|| format!("{class} has no @read rule"))?,

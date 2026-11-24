@@ -68,15 +68,17 @@ object Cart {
 ```
 
 - `Cart.get(id)` returns the instance, creating it with the defaults if needed.
-  Ids are strings of 1–128 characters without `/`, and not `*`. A new object takes a new
+  Ids are strings of 1–128 characters without `/` or `*`. A new object takes a new
   id: `Slot.get(crypto.randomId())`, with no counter to keep.
-- `Cart.all()` lists every object of the class, in id order. Filter it like any list
-  (`Slot.all().filter(s => s.open)`), so each fact is kept once and found when needed,
+- `Cart.all(prefix?)` lists every object of the class (or those whose id starts with
+  `prefix`), in id order. Filter it like any list (`Slot.all().filter(s => s.open)`,
+  `ChatEntry.all(`${room}:`)`), so each fact is kept once and found when needed,
   not copied into a second object.
   - On a server it reads the store, leaving out erased objects.
   - On a device, a `@server` class's list starts with the copies kept on the device (so
-    it shows offline) and fills as the server sends the class (the first call subscribes
-    to `Slot/*`). When another user signs in, it starts over.
+    it shows offline) and fills as the server sends the class or topic prefix (the first
+    call subscribes to `Slot/*` or `ChatEntry/room:*`). When another user signs in, it
+    starts over.
   - A class whose `@read` rule lets each person read only their own objects (`"owner"`)
     is listed only to roles the rule names; query it in a server method instead.
 - Fields are saved after every change and survive restarts. When you add a field, its
@@ -87,12 +89,18 @@ object Cart {
   changes a copy (`room.messages.slice()`, `[...room.messages]`).
 - `@pii(category, purpose) @by("customer", "at")` marks a list holding several people's
   entries, each belonging to the person its `customer` field names (docs/privacy.md).
-- `this.id` is the instance id. `id`, `emit`, `schedule`, `unschedule` and `delete` are
-  reserved names.
+- `this.id` is the instance id. `id`, `emit`, `schedule`, `unschedule`, `delete` and
+  `deliver` are reserved names.
 - `this.delete()`, in the object's own methods, deletes it: it goes back to its defaults
   with no alarms or timers, `Class.all()` leaves it out, and devices drop their copies.
   The method still runs to its end, and a retried call is still answered once. Writing to
   it again (`Slot.get(id).open(...)`) brings it back as new.
+- `this.deliver(target, "method", ...args)`, inside non-`@invariant` `@server` object
+  methods, stages a durable cross-object server message that commits atomically with the
+  caller's turn and runs the target `@server` object's method independently after commit,
+  surviving restarts and running as the caller (`caller`). Target errors never roll back
+  the sender. Use `this.deliver` for fan-out or cross-object side effects when you do not
+  need the target's return value synchronously.
 - `this.schedule(ms, "method", ...args)` calls the named method of this object after `ms`
   milliseconds (0 or more), with the arguments given. It survives restarts and runs once.
   - Pass a key first — `this.schedule("remind", ms, "method", ...args)` — to replace any
@@ -465,7 +473,9 @@ Colors are `#rgb` or `#rrggbb`. A component may return `null` to show nothing.
   `name` must start with a capital letter and not shadow a built-in component. Props are sent
   as JSON, and any `on<Upper>...` prop becomes a native event handler. Wrap `<Native>` in a
   typed `.tj` function (`function MapView(props: { lat: number, lng: number }) { return <Native name="MapView" ... /> }`)
-  so callers get full static type-checking (`docs/host-protocol.md`).
+  so callers get full static type-checking (`docs/host-protocol.md`). Built-in opt-in native
+  components include `<Native name="VideoCall" ... />` (`docs/webrtc.md`) and
+  `<Native name="Whiteboard" ... />` (`docs/whiteboard.md`).
 - **Opt-in 3D scenes (`tj-gfx`, `docs/gfx.md`):** `<Scene clear="#0f172a" ambient={0.25} antialias={true} height={360}>`
   declares a GPU-rendered 3D viewport containing `<Camera>`, `<Light>`, and `<Mesh>` nodes
   (nested `<Mesh>` nodes inherit their parent's transform). `geometry` is `"box"`, `"sphere"`,

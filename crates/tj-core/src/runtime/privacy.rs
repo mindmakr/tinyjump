@@ -320,6 +320,7 @@ impl Runtime {
             }
             self.save_erasures().map_err(|e| (503, format!("the erasure was done, but the objects under a legal hold could not be put on the list to erase later: {e}; try again")))?;
         }
+        self.drop_messages_of(subject, &held).map_err(|e| (503, format!("the erasure was done, but pending durable messages could not be pruned: {e}; try again")))?;
         Ok(Erasure { erased, held, outputs: std::mem::take(&mut self.outputs) })
     }
 
@@ -346,6 +347,30 @@ impl Runtime {
             }
             self.touched.insert(key);
         }
+    }
+
+    /// Drops pending durable cross-object messages belonging to `subject` or referencing
+    /// a personal object whose id matches `subject` (except targets retained under `@legalHold`).
+    fn drop_messages_of(&mut self, subject: &str, held: &[(String, f64)]) -> Result<(), String> {
+        let is_person_key = |key: &str| {
+            let Some((cls, id)) = key.split_once('/') else { return false };
+            id == subject && self.program.object(cls).is_some_and(|c| self.program.objects[c as usize].belongs_to_a_person())
+        };
+        let should_drop = |m: &super::objects::DurableMessage| {
+            if held.iter().any(|(k, _)| k == &m.to) {
+                return false;
+            }
+            let by_subject = matches!(&m.caller, Some(crate::runtime::protocol::Caller::Remote { id, .. }) if id == subject);
+            by_subject || is_person_key(&m.to) || is_person_key(&m.from)
+        };
+        self.staged_messages.retain(|m| !should_drop(m));
+        let before = self.messages.len();
+        self.messages.retain(|m| !should_drop(m));
+        if self.messages.len() < before {
+            let text = serde_json::to_string(&self.messages).expect("messages serialize");
+            self.store.save(super::objects::MESSAGES_KEY, &text)?;
+        }
+        Ok(())
     }
 
     fn save_erasures(&mut self) -> Result<(), String> {

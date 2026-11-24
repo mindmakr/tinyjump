@@ -115,9 +115,16 @@ serves its own page and calls `setToken` instead.
 - `@read(...)` on an object decides who may read its state remotely: `GET /api/...`, its
   change stream, its events (`emit`) and device replicas. Event data is exactly as public
   as the state.
+- Wildcard topic subscriptions (`Class/*` and `Class/prefix*`) fail closed: `"owner"` never
+  matches any wildcard (`owns` rejects ids containing `*`), malformed wildcards (`Class/a**`,
+  `Class/*a`, extra `/`) and calls (`Input::Call`) on wildcards are refused (`403`),
+  `GET /api/Class/prefix*` (`Input::Get` on readable wildcards) returns `400`, and
+  per-field `@read` / `@pii` rules mask each delivered object individually.
 - `@allow(...)` on a method decides who may call it remotely.
 - **Without a rule, nobody outside the server may.** Server code calling another object,
-  timers and alarms are never checked.
+  timers, alarms and durable cross-object `this.deliver` messages are never checked by
+  `@allow` (while preserving `caller` across `this.deliver` so owner/data checks inside the
+  target method still hold).
 - A rule is a list; any match allows:
   - `"anyone"`: every caller, including anonymous ones;
   - `"signedIn"`: any caller with a valid credential;
@@ -139,8 +146,8 @@ Inside a method, `caller` is the record of whoever made the request: `{ id, role
 It belongs to the call: it lives on that call's fiber, survives `await`s, and passes
 through calls into other objects. Two interleaved calls never see each other's caller.
 
-- An alarm set with `this.schedule` runs as the caller who scheduled it, so data rules
-  such as a ban list still hold.
+- An alarm set with `this.schedule` and a durable message sent with `this.deliver` run as
+  the caller who started them, so data rules such as a ban list still hold.
 - `@every` timers and boot run as `{ id: "system", roles: ["system"] }`.
 - On a device, local code (the UI and its handlers) runs as `{ id, roles }` of the user the
   host signed in (the `identity` input, `setToken` on the web), or `{ id: "", roles: [] }`

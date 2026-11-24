@@ -26,12 +26,15 @@ final class Sync: NSObject, URLSessionDataDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
+    private static func covers(_ pattern: String, _ key: String) -> Bool {
+        pattern.hasSuffix("*") && key.hasPrefix(String(pattern.dropLast()))
+    }
+
     func subscribe(_ key: String, seq: UInt64) {
         guard server != nil, replicas[key] == nil else { return }
-        if !key.hasSuffix("/*"), replicas[String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"] != nil { return }
-        if key.hasSuffix("/*") {
-            let prefix = String(key.dropLast())
-            replicas = replicas.filter { !$0.key.hasPrefix(prefix) }
+        if replicas.keys.contains(where: { Sync.covers($0, key) }) { return }
+        if key.hasSuffix("*") {
+            replicas = replicas.filter { !Sync.covers(key, $0.key) }
         }
         replicas[key] = seq
         cursor = replicas.values.min() ?? 0
@@ -83,11 +86,13 @@ final class Sync: NSObject, URLSessionDataDelegate {
     }
 
     private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
+        var matched = false
+        for (entry, have) in replicas where entry == key || Sync.covers(entry, key) {
+            replicas[entry] = max(have, seq)
+            matched = true
+        }
+        guard matched else { return }
         cursor = max(cursor, seq)
-        let whole = String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"
-        let entry = replicas[whole] != nil ? whole : key
-        guard let have = replicas[entry] else { return }
-        replicas[entry] = max(have, seq)
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 

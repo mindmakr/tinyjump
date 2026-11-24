@@ -54,12 +54,12 @@ id and it fails, the runtime reports the failure as an `error` output.
 |---|---|
 | `patch` | `ops` to apply to the native view tree (below) |
 | `effect` | `{ id, effect }`. Perform it, then send `effectDone`. For `{ kind: "http", url, method, headers, body }`, answer `ok: { status, headers, body }` (on a server, set `unreachable: true` on transient transport errors so the call returns `503` without caching `400`). For `{ kind: "call", object, method, args, call }`, `POST /api/{object}/{method}` with `args` and the header `Idempotency-Key: {call}`, and answer with its `ok`. Failures are `error: "message"` (with `field` when the server returned one). If no answer came (offline, a 5xx, an unreadable reply), add `unreachable: true` (see Reliable server calls). For `{ kind: "plugin", plugin, method, args }`, servers invoke the configured MCP server (`docs/plugins.md`) and device hosts invoke the native handler registered via `registerPlugin` (`docs/device-plugins.md`) |
-| `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams). `Class/*` asks for the whole class (`Class.all()`): keep every object of that class the stream sends, including ones the device has not seen. Track one change number for the class (`Class/*`), the highest seen, and none for the objects it covers, so a reconnect resumes and its address stays short |
+| `subscribe` | `{ object, seq }`: keep this replica of an `@server` object current. `seq` is the change number of its cached state (0 if none). Stream `/api/events?object=…&since=N` and send `sync` for every `changed` event (see Change streams). `Class/*` (whole class, `Class.all()`) or `Class/prefix*` (topic prefix, `Class.all(prefix)`) keeps matching objects of that class, including new ones not seen yet; hosts track one highest-seen change number per wildcard pattern and prune narrower covered entries so reconnects resume cleanly |
 | `emit` | `{ object, name, data }`: realtime event |
 | `changed` | `{ object, state, seq }`: state after a persisted change, with its change number. `state` is `null` when the object was deleted (`this.delete()`) or erased; pass it on to `sync` unchanged |
 | `reply` | `{ reply, ok }` or `{ reply, error, field?, status? }`. `field` comes from `check(ok, field, message)`. `status` marks a refused request: 400, 403, 422 or 503 |
 | `log` | `{ level, message }` |
-| `ran` | Servers only: `{ object, method, by, caller?, ok, ms }` when a call nobody requested ends. `by` is `timer`, `alarm` or `invoke`; `caller` is who it ran as (none: the system). For the audit log; never arguments, results or error text |
+| `ran` | Servers only: `{ object, method, by, caller?, ok, ms }` when a call nobody requested ends. `by` is `timer`, `alarm`, `message` or `invoke`; `caller` is who it ran as (none: the system). For the audit log; never arguments, results or error text |
 | `error` | `{ message, trace }`: uncaught error in a handler, timer or render |
 | `wake` | `{ at }` |
 
@@ -192,10 +192,11 @@ Every persisted change of an object gets a **change number** (`seq`). Numbers gr
 every change the runtime makes and keep growing across restarts. The counter is stored,
 and it starts from the clock, so it grows even if the store is lost.
 
-`GET /api/events?object=Class/id&object=…&since=N` first sends a `changed` event for each
-listed object whose current state is newer than `N`, oldest first. Then it streams live
-changes. Each `changed` event has `id: <seq>`, so a browser's `EventSource` resumes by
-itself (`Last-Event-ID` wins over `since`).
+`GET /api/events?object=Class/id&object=…&since=N` (each `object` may also be a wildcard
+`Class/*` or `Class/prefix*`) first sends a `changed` event for each matching object whose
+current state is newer than `N`, oldest first. Then it streams live changes. Each `changed`
+event has `id: <seq>`, so a browser's `EventSource` resumes by itself (`Last-Event-ID` wins
+over `since`). `GET /api/Class/prefix*` is refused (`400`; stream wildcards via `/api/events`).
 
 A host keeps one stream for all its replicas:
 

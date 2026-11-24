@@ -532,41 +532,32 @@ fn run_sse_worker(
     }
 }
 
-/// Registers `object` in `objs`, deduplicating `Class/id` against an existing `Class/*` stream
-/// (and pruning redundant per-instance entries when `Class/*` is added) to avoid O(N^2) SSE
-/// reconnect storms during `Class.all()` catch-up. Returns `true` when the active SSE query
-/// must reconnect.
+fn covers_pattern(pattern: &str, key: &str) -> bool {
+    pattern
+        .strip_suffix('*')
+        .is_some_and(|pref| pref.contains('/') && key.starts_with(pref))
+}
+
+/// Registers `object` in `objs`, deduplicating `Class/id` and narrower prefixes against an
+/// existing `Class/*` or broader `Class/prefix*` stream (and pruning narrower entries when a
+/// broader pattern is added) to avoid O(N^2) SSE reconnect storms during `Class.all(prefix?)`
+/// catch-up. Returns `true` when the active SSE query must reconnect.
 fn register_subscription(objs: &mut BTreeMap<String, u64>, object: String, seq: u64) -> bool {
-    if let Some(class) = object.strip_suffix("/*") {
-        let prefix = format!("{class}/");
-        objs.retain(|k, _| k == &object || !k.starts_with(&prefix));
-        match objs.get(&object) {
-            Some(&existing) if existing >= seq => false,
-            Some(_) => {
-                objs.insert(object, seq);
-                false
-            }
-            None => {
-                objs.insert(object, seq);
-                true
-            }
+    if objs.keys().any(|existing| existing != &object && covers_pattern(existing, &object)) {
+        return false;
+    }
+    if object.ends_with('*') {
+        objs.retain(|k, _| k == &object || !covers_pattern(&object, k));
+    }
+    match objs.get(&object) {
+        Some(&existing) if existing >= seq => false,
+        Some(_) => {
+            objs.insert(object, seq);
+            false
         }
-    } else {
-        if let Some((class, _)) = object.split_once('/') {
-            if objs.contains_key(&format!("{class}/*")) {
-                return false;
-            }
-        }
-        match objs.get(&object) {
-            Some(&existing) if existing >= seq => false,
-            Some(_) => {
-                objs.insert(object, seq);
-                false
-            }
-            None => {
-                objs.insert(object, seq);
-                true
-            }
+        None => {
+            objs.insert(object, seq);
+            true
         }
     }
 }
@@ -612,11 +603,8 @@ fn handle_sse_event(event: &str, data: &str, stream: &TargetStream, sink: &dyn S
             let Some(seq) = j.get("seq").and_then(Json::as_u64) else { return };
             let state = j.get("state").cloned().unwrap_or(Json::Null);
             if let Ok(mut objs) = stream.objects.lock() {
-                if let Some(s) = objs.get_mut(obj) {
-                    *s = (*s).max(seq);
-                }
-                if let Some(class) = obj.split('/').next() {
-                    if let Some(s) = objs.get_mut(&format!("{class}/*")) {
+                for (pat, s) in objs.iter_mut() {
+                    if pat == obj || covers_pattern(pat, obj) {
                         *s = (*s).max(seq);
                     }
                 }
@@ -685,5 +673,17 @@ object LocalOnly { x: number = 0 }
         assert!(!register_subscription(&mut subs, "Stock/s2".into(), 0));
         assert!(!register_subscription(&mut subs, "Stock/s3".into(), 0));
         assert_eq!(subs.len(), 1);
+
+        // Topic prefixes (`Class/prefix*`) deduplicate narrower streams/ids and are pruned by `Class/*`.
+        let mut topic_subs = BTreeMap::new();
+        assert!(register_subscription(&mut topic_subs, "Stock/eu:1".into(), 0));
+        assert!(register_subscription(&mut topic_subs, "Stock/eu:*".into(), 0));
+        assert_eq!(topic_subs.keys().cloned().collect::<Vec<_>>(), vec!["Stock/eu:*"]);
+        assert!(!register_subscription(&mut topic_subs, "Stock/eu:2".into(), 0));
+        assert!(!register_subscription(&mut topic_subs, "Stock/eu:sub:*".into(), 0));
+        assert!(register_subscription(&mut topic_subs, "Stock/us:*".into(), 0));
+        assert_eq!(topic_subs.keys().cloned().collect::<Vec<_>>(), vec!["Stock/eu:*", "Stock/us:*"]);
+        assert!(register_subscription(&mut topic_subs, "Stock/*".into(), 0));
+        assert_eq!(topic_subs.keys().cloned().collect::<Vec<_>>(), vec!["Stock/*"]);
     }
 }

@@ -656,7 +656,7 @@ impl Runtime {
                 let caller_this = f.frames.last().and_then(|fr| fr.this.clone());
                 let own = caller_this.as_deref() == Some(&**o);
                 match name {
-                    "emit" | "schedule" | "unschedule" | "delete" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
+                    "emit" | "schedule" | "unschedule" | "delete" | "deliver" if !own => Err(Exc::msg(format!("{name}() can only be called inside {}'s own methods", o.class_name))),
                     "emit" => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
@@ -684,6 +684,21 @@ impl Runtime {
                         f.stack.push(gone);
                         Ok(())
                     }
+                    "deliver" => {
+                        #[cfg(feature = "server")]
+                        {
+                            let args = f.stack.split_off(pos + 1);
+                            f.stack.truncate(pos);
+                            self.deliver_message(o, &args, &f.caller)?;
+                            f.stack.push(Value::Null);
+                            Ok(())
+                        }
+                        #[cfg(not(feature = "server"))]
+                        {
+                            f.stack.truncate(pos);
+                            Err(Exc::msg("deliver() is only available inside @server objects"))
+                        }
+                    }
                     _ if self.is_remote(o) => {
                         let args = f.stack.split_off(pos + 1);
                         f.stack.truncate(pos);
@@ -705,8 +720,13 @@ impl Runtime {
             }
             Value::Class(c) => {
                 if name == "all" {
+                    let prefix = match (argc, f.stack.get(pos + 1)) {
+                        (0, _) | (1, Some(Value::Null)) => String::new(),
+                        (1, Some(Value::Str(s))) => s.to_string(),
+                        _ => return Err(Exc::msg("all(prefix?) takes an optional string prefix")),
+                    };
                     f.stack.truncate(pos);
-                    let list = self.all_objects(*c)?.into_iter().map(Value::Obj).collect();
+                    let list = self.all_objects(*c, &prefix)?.into_iter().map(Value::Obj).collect();
                     f.stack.push(Value::arr(list));
                     return Ok(());
                 }

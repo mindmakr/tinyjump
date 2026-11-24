@@ -735,8 +735,8 @@ fn handle(mut req: Request, front: &Front) {
             asked = Some(("whoami", None, None));
             take_verified()
         }.map(|v| match v.caller {
-            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
-            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
+            Caller::Remote { id, roles } => json!({ "id": id, "roles": roles, "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "whiteboard": engine.has_whiteboard(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
+            Caller::Trusted(_) => json!({ "id": "", "roles": [], "dev": front.dev.is_some(), "devicePlugins": engine.device_plugins(), "videoCall": engine.has_video_call(), "whiteboard": engine.has_whiteboard(), "gfx": engine.has_gfx(), "hasFrame": engine.has_frame() }),
         })),
         // Prometheus and Grafana: the same statistics, without the tree and object states.
         (Method::Get, ["_tj", "metrics"]) => {
@@ -900,6 +900,15 @@ fn handle(mut req: Request, front: &Front) {
                             .with_header(header("Cache-Control", "no-store"))
                     } else {
                         file(web.web_dir.join("plugins/webrtc.js"), "text/javascript; charset=utf-8")
+                    }
+                }
+                ["whiteboard-plugin.js"] => {
+                    if !engine.has_whiteboard() {
+                        Response::from_data("export function createWhiteboardComponents(){return{};}\n")
+                            .with_header(header("Content-Type", "text/javascript; charset=utf-8"))
+                            .with_header(header("Cache-Control", "no-store"))
+                    } else {
+                        file(web.web_dir.join("plugins/whiteboard.js"), "text/javascript; charset=utf-8")
                     }
                 }
                 ["gfx-plugin.js"] => {
@@ -2194,16 +2203,19 @@ mod tests {
         let who1: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port1}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
         assert_eq!(who1["ok"]["devicePlugins"], json!([]));
         assert_eq!(who1["ok"]["videoCall"], json!(false));
+        assert_eq!(who1["ok"]["whiteboard"], json!(false));
         assert_eq!(who1["ok"]["gfx"], json!(false));
         let dev_stub = agent.get(&format!("http://127.0.0.1:{port1}/device-plugins.js")).call().unwrap().into_string().unwrap();
         assert!(dev_stub.len() < 80 && dev_stub.contains("createDevicePlugins"));
         let rtc_stub = agent.get(&format!("http://127.0.0.1:{port1}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(rtc_stub.len() < 80 && rtc_stub.contains("createVideoCallComponents"));
+        let wb_stub = agent.get(&format!("http://127.0.0.1:{port1}/whiteboard-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(wb_stub.len() < 80 && wb_stub.contains("createWhiteboardComponents"));
         let gfx_stub = agent.get(&format!("http://127.0.0.1:{port1}/gfx-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(gfx_stub.len() < 80 && gfx_stub.contains("createGfxPlugin"));
 
-        // 2. VideoCall + 3D Scene app with camera+microphone permissions: full plugin files served.
-        let src_call = "function App() { return <Column><Native name=\"VideoCall\" active={false} /><Scene><Mesh geometry=\"box\" /></Scene></Column> }\n".to_string();
+        // 2. VideoCall + Whiteboard + 3D Scene app with camera+microphone permissions: full plugin files served.
+        let src_call = "function App() { return <Column><Native name=\"VideoCall\" active={false} /><Native name=\"Whiteboard\" readOnly={false} /><Scene><Mesh geometry=\"box\" /></Scene></Column> }\n".to_string();
         let mut perms = std::collections::BTreeMap::new();
         perms.insert("camera".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
         perms.insert("microphone".into(), crate::device_perms::DevicePermission { reason: None, sources: vec!["permissions.json".into()] });
@@ -2233,14 +2245,105 @@ mod tests {
         let who2: Json = serde_json::from_str(&agent.get(&format!("http://127.0.0.1:{port2}/api/whoami")).call().unwrap().into_string().unwrap()).unwrap();
         assert_eq!(who2["ok"]["devicePlugins"], json!(["camera"]));
         assert_eq!(who2["ok"]["videoCall"], json!(true));
+        assert_eq!(who2["ok"]["whiteboard"], json!(true));
         assert_eq!(who2["ok"]["gfx"], json!(true));
         let dev_full = agent.get(&format!("http://127.0.0.1:{port2}/device-plugins.js")).call().unwrap().into_string().unwrap();
         assert!(dev_full.len() > 2000 && dev_full.contains("handleCamera"));
         let rtc_full = agent.get(&format!("http://127.0.0.1:{port2}/webrtc-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(rtc_full.len() > 2000 && rtc_full.contains("RTCPeerConnection"));
+        let wb_full = agent.get(&format!("http://127.0.0.1:{port2}/whiteboard-plugin.js")).call().unwrap().into_string().unwrap();
+        assert!(wb_full.len() > 2000 && wb_full.contains("createWhiteboardComponent"));
         let gfx_full = agent.get(&format!("http://127.0.0.1:{port2}/gfx-plugin.js")).call().unwrap().into_string().unwrap();
         assert!(gfx_full.len() > 2000 && gfx_full.contains("createGfxPlugin"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sse_topic_prefix_streams_matching_objects_only_and_enforces_rules() {
+        use std::io::{BufRead, BufReader};
+
+        let dir = std::env::temp_dir().join(format!("tj-http-topic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = r#"
+@server @read("anyone") object Note {
+  text: string = ""
+  @read("staff") internal: string = ""
+  @allow("anyone") set(text: string, internal: string) {
+    this.text = text
+    this.internal = internal
+  }
+}
+@server @read("owner") object Secret {
+  @pii("other", "ops") body: string = ""
+}
+"#.to_string();
+        let audit = Audit::start(&dir).unwrap().0;
+        let eng = Engine::start(src, dir.clone(), false, true, Arc::default(), audit.clone()).unwrap();
+        let srv = Server::http("127.0.0.1:0").unwrap();
+        let port = srv.server_addr().to_ip().unwrap().port();
+        let front = Arc::new(Front::new(eng, None, None, Automation::Open, Identity::anonymous(), audit, Leases::open(&dir), false));
+        thread::spawn(move || {
+            for req in srv.incoming_requests() {
+                let f = front.clone();
+                thread::spawn(move || handle(req, &f));
+            }
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(5)).build();
+
+        // Seed studio:1 and other:1 before subscribing.
+        agent.post(&format!("{base}/api/Note/studio:1/set")).set("Content-Type", "application/json").send_string(r#"["s1","sec1"]"#).unwrap();
+        agent.post(&format!("{base}/api/Note/other:1/set")).set("Content-Type", "application/json").send_string(r#"["o1","sec2"]"#).unwrap();
+
+        // GET on wildcard returns 400; unauthorized wildcard returns 403.
+        let get_wild = agent.get(&format!("{base}/api/Note/studio:*")).call();
+        assert!(matches!(get_wild, Err(ureq::Error::Status(400, _))));
+        let get_secret = agent.get(&format!("{base}/api/Secret/user:ana*")).call();
+        assert!(matches!(get_secret, Err(ureq::Error::Status(403, _))));
+        let sse_secret = agent.get(&format!("{base}/api/events?object=Secret/user:ana*")).call().unwrap();
+        let mut sreader = BufReader::new(sse_secret.into_reader());
+        let mut refused_ev = String::new();
+        for _ in 0..2 {
+            sreader.read_line(&mut refused_ev).unwrap();
+        }
+        assert!(refused_ev.contains("event: refused") && refused_ev.contains("Secret/user:ana*"), "{refused_ev}");
+        drop(sreader);
+
+        // Subscribe to `Note/studio:*`: receives initial studio:1 (masked) and live studio:2, never other:1/other:2.
+        let resp = agent.get(&format!("{base}/api/events?object=Note/studio:*&since=0")).call().unwrap();
+        let mut reader = BufReader::new(resp.into_reader());
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        // Read initial catch-up event for Note/studio:1.
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim().to_string();
+            lines.push(trimmed.clone());
+            if trimmed.is_empty() && lines.iter().any(|l| l.contains("Note/studio:1")) {
+                break;
+            }
+        }
+        // Trigger other:2 and studio:2 while stream is open; wait until studio:2 arrives.
+        agent.post(&format!("{base}/api/Note/other:2/set")).set("Content-Type", "application/json").send_string(r#"["o2","sec3"]"#).unwrap();
+        agent.post(&format!("{base}/api/Note/studio:2/set")).set("Content-Type", "application/json").send_string(r#"["s2","sec4"]"#).unwrap();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            let trimmed = line.trim().to_string();
+            lines.push(trimmed.clone());
+            if trimmed.is_empty() && lines.iter().any(|l| l.contains("Note/studio:2")) {
+                break;
+            }
+        }
+        let joined = lines.join("\n");
+        assert!(joined.contains("Note/studio:1") && joined.contains("Note/studio:2"), "{joined}");
+        assert!(!joined.contains("Note/other:1") && !joined.contains("Note/other:2"), "{joined}");
+        assert!(!joined.contains("sec1") && !joined.contains("sec4"), "staff-only fields must stay masked: {joined}");
+
+        drop(reader);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

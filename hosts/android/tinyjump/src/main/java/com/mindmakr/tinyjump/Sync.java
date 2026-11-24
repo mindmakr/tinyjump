@@ -62,16 +62,21 @@ final class Sync {
         this.server = server == null ? null : server.replaceAll("/+$", "");
     }
 
+    private static boolean covers(String pattern, String key) {
+        return pattern.endsWith("*") && key.startsWith(pattern.substring(0, pattern.length() - 1));
+    }
+
     /** Starts keeping {@code key} current; {@code seq} is the change number of its cached state. */
     void subscribe(String key, long seq) {
         if (server == null || replicas.containsKey(key)) return;
-        // Already in a class stream (`Slot/*`): nothing new to ask for.
-        if (!key.endsWith("/*") && replicas.containsKey(key.split("/", 2)[0] + "/*")) return;
-        if (key.endsWith("/*")) {
-            // The class stream covers the objects of the class asked for one by one.
-            String prefix = key.substring(0, key.length() - 1);
+        // Already covered by a broader class or topic stream (`Slot/*`, `Room/studio:*`).
+        for (String pat : replicas.keySet()) {
+            if (covers(pat, key)) return;
+        }
+        if (key.endsWith("*")) {
+            // A broader topic or class stream covers narrower streams and individual objects.
             for (java.util.Iterator<String> i = replicas.keySet().iterator(); i.hasNext(); ) {
-                if (i.next().startsWith(prefix)) i.remove();
+                if (covers(key, i.next())) i.remove();
             }
         }
         replicas.put(key, seq);
@@ -185,13 +190,17 @@ final class Sync {
         tj.main.post(new Runnable() {
             @Override
             public void run() {
-                // An object of a class streamed whole (`Slot/*`): the class's entry keeps the
-                // change number, so a reconnect resumes and the stream address stays short.
-                String whole = key.split("/", 2)[0] + "/*";
-                String entry = replicas.containsKey(whole) ? whole : key;
-                Long have = replicas.get(entry);
-                if (have == null) return;
-                replicas.put(entry, Math.max(have, seq));
+                // Class/topic streams (`Slot/*`, `Room/studio:*`) keep the highest change number
+                // so reconnects resume cleanly and the stream address stays short.
+                boolean matched = false;
+                for (Map.Entry<String, Long> e : replicas.entrySet()) {
+                    String pat = e.getKey();
+                    if (pat.equals(key) || covers(pat, key)) {
+                        e.setValue(Math.max(e.getValue(), seq));
+                        matched = true;
+                    }
+                }
+                if (!matched) return;
                 try {
                     tj.send(TinyJump.input("sync").put("object", key).put("state", state).put("seq", seq));
                 } catch (JSONException e) {

@@ -9,8 +9,11 @@ TinyJump supports peer-to-peer voice and video calls with **0 bytes added to `tj
 3. **Permissions** use the canonical `camera` and `microphone` device permissions (`docs/device-plugins.md`),
    automatically injected into `AndroidManifest.xml` and `Info.plist` by `tj build`.
 
-See [examples/video-call/app.tj](../examples/video-call/app.tj) for a complete, runnable 1:1
-voice/video app (`cargo tj dev examples/video-call/app.tj`).
+See [examples/video-call/app.tj](../examples/video-call/app.tj) for a minimal 1:1
+voice/video call app (`cargo tj dev examples/video-call/app.tj`) and
+[examples/collab-studio/app.tj](../examples/collab-studio/app.tj) for a complete
+collaboration studio combining WebRTC calls, screen sharing, topic-partitioned chat, and a
+shared whiteboard.
 
 ## `<Native name="VideoCall" ... />` contract
 
@@ -28,6 +31,7 @@ All hosts (Web, Android, iOS) share the exact same prop and event contract:
 | `video` | `boolean` | `true` | Request camera track (`false` for voice-only calls). |
 | `muted` | `boolean` | `false` | Toggle local microphone track `enabled` without renegotiating. |
 | `cameraOff` | `boolean` | `false` | Toggle local video track `enabled` without renegotiating. |
+| `screenShare` | `boolean` | `false` | Replace the outbound video track with a display-capture stream (`getDisplayMedia`) when `true` (renegotiating on voice-only calls), and restore camera when `false` or ended. |
 | `signals` | `Signal[]` | `[]` | Array of `{ seq, from, to, kind, payload }` (`kind`: `"offer" \| "answer" \| "ice" \| "bye"`) from the `@server` room; processed monotonically by `seq`. |
 | `iceServers` | `IceServer[]` | public Google STUN | Optional STUN/TURN servers (`stun:`, `stuns:`, `turn:`, `turns:` URLs only). |
 
@@ -37,6 +41,7 @@ All hosts (Web, Android, iOS) share the exact same prop and event contract:
 |---|---|---|
 | `onSignal` | `{ to, kind, payload }` | Outbound SDP `"offer"`, `"answer"`, or `"ice"` candidate to forward to the `@server` room (hangup `"bye"` is sent by the app when leaving). |
 | `onState` | `string` | `"idle" \| "acquiring" \| "connecting" \| "connected" \| "disconnected" \| "failed" \| "closed"`. |
+| `onScreenShare` | `boolean` | Emitted with `true` when display capture begins and `false` when the browser stops sharing or the user cancels the picker. |
 | `onError` | `string` | Human-readable media or negotiation error. |
 
 ## Host setup

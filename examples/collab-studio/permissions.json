@@ -1,0 +1,6 @@
+{
+  "device": {
+    "camera": "Share video during live studio calls.",
+    "microphone": "Share audio during live studio calls."
+  }
+}
