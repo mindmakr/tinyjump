@@ -349,17 +349,19 @@ impl Runtime {
         }
     }
 
-    /// Drops pending durable cross-object messages belonging to or targeting `subject`
-    /// (except targets currently retained under `@legalHold`).
+    /// Drops pending durable cross-object messages belonging to `subject` or referencing
+    /// a personal object whose id matches `subject` (except targets retained under `@legalHold`).
     fn drop_messages_of(&mut self, subject: &str, held: &[(String, f64)]) -> Result<(), String> {
+        let is_person_key = |key: &str| {
+            let Some((cls, id)) = key.split_once('/') else { return false };
+            id == subject && self.program.object(cls).is_some_and(|c| self.program.objects[c as usize].belongs_to_a_person())
+        };
         let should_drop = |m: &super::objects::DurableMessage| {
             if held.iter().any(|(k, _)| k == &m.to) {
                 return false;
             }
             let by_subject = matches!(&m.caller, Some(crate::runtime::protocol::Caller::Remote { id, .. }) if id == subject);
-            let touches_subject = m.to.split_once('/').is_some_and(|(_, id)| id == subject)
-                || m.from.split_once('/').is_some_and(|(_, id)| id == subject);
-            by_subject || touches_subject
+            by_subject || is_person_key(&m.to) || is_person_key(&m.from)
         };
         self.staged_messages.retain(|m| !should_drop(m));
         let before = self.messages.len();

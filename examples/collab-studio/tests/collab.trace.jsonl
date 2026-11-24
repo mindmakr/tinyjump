@@ -29,7 +29,7 @@
 {"do": "get", "object": "BoardStroke/studio:000002", "expectContains": {"points": []}}
 {"do": "get", "object": "BoardStroke/other:000001", "expectContains": {"author": "Eve"}}
 
-# Switch tabs via UI and verify layout across Call, Board, Chat, and Feed on 390x844
+# Switch tabs via UI, join voice call, and confirm VideoCall stays mounted while switching tabs
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
 {"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
 {"do": "assertLayout", "width": 390, "height": 844, "review": true}
@@ -39,8 +39,22 @@
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "activity"}
 {"do": "assertScreen", "contains": ["Durable Room Activity", "Alice"]}
 {"do": "assertLayout", "width": 390, "height": 844, "review": true}
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "call"}
+{"do": "ui", "target": "#reset-room", "event": "onPress"}
+{"do": "ui", "target": "#name-input", "event": "onChange", "value": "Carol"}
+{"do": "ui", "target": "#join-audio", "event": "onPress"}
+{"do": "assertScreen", "contains": ["End Call", "Share Screen", "Peers: Carol"]}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": true, "videoEnabled": false}}
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
+{"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": true}}
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "call"}
+{"do": "assertScreen", "contains": ["End Call", "Peers: Carol"]}
+{"do": "ui", "target": "#leave-call", "event": "onPress"}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": false}}
 
 # Restart persistence over the same store keeps topic entries and activity
 {"do": "boot", "restart": true, "now": 1800000005000, "seed": 1, "server": true, "render": true}
 {"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"text": "Hello studio"}}
-{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 9}}
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 11}}

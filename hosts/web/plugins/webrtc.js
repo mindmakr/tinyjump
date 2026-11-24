@@ -185,6 +185,7 @@ export function createVideoCallComponent() {
         screenActive: false,
         screenWanted: false,
         screenSenderAdded: null,
+        needsRenegotiate: false,
         remoteStream: null,
         pc: null,
         lastSeq: 0,
@@ -202,9 +203,17 @@ export function createVideoCallComponent() {
         });
       }
 
+      function applyHeight(props) {
+        const h = props && typeof props.height === 'number' && props.height > 0 ? Math.max(48, Math.round(props.height)) : 260;
+        root.style.minHeight = h + 'px';
+        root.style.height = h < 200 ? h + 'px' : '';
+      }
+
       function renderBadge() {
         badge.textContent = st.screenActive ? st.baseBadge + ' · Sharing' : st.baseBadge;
       }
+
+      applyHeight(st.props);
 
       function setCallState(next, label) {
         if (st.destroyed) return;
@@ -268,12 +277,14 @@ export function createVideoCallComponent() {
         st.pendingIce = [];
         st.offerSentFor = '';
         st.screenSenderAdded = null;
+        st.needsRenegotiate = false;
         st.signalChain = Promise.resolve();
         if (st.pc) {
           try { st.pc.onicecandidate = null; } catch (e) { /* ignore */ }
           try { st.pc.ontrack = null; } catch (e) { /* ignore */ }
           try { st.pc.onconnectionstatechange = null; } catch (e) { /* ignore */ }
           try { st.pc.oniceconnectionstatechange = null; } catch (e) { /* ignore */ }
+          try { st.pc.onsignalingstatechange = null; } catch (e) { /* ignore */ }
           try { st.pc.close(); } catch (e) { /* ignore */ }
           st.pc = null;
         }
@@ -296,12 +307,18 @@ export function createVideoCallComponent() {
           : [];
         const restoreTrack = camTracks.length > 0 ? camTracks[0] : null;
         if (st.pc) {
-          const sender = findVideoSender(st.pc);
-          if (sender && typeof sender.replaceTrack === 'function') {
-            try {
-              const p = sender.replaceTrack(restoreTrack);
-              if (p && typeof p.catch === 'function') p.catch(function () {});
-            } catch (e) { /* ignore */ }
+          if (!restoreTrack && st.screenSenderAdded && st.props.active && typeof st.pc.removeTrack === 'function') {
+            try { st.pc.removeTrack(st.screenSenderAdded); } catch (e) { /* ignore */ }
+            st.screenSenderAdded = null;
+            renegotiate(st.peerGen);
+          } else {
+            const sender = findVideoSender(st.pc);
+            if (sender && typeof sender.replaceTrack === 'function') {
+              try {
+                const p = sender.replaceTrack(restoreTrack);
+                if (p && typeof p.catch === 'function') p.catch(function () {});
+              } catch (e) { /* ignore */ }
+            }
           }
         }
         renderBadge();
@@ -346,12 +363,33 @@ export function createVideoCallComponent() {
         };
 
         pc.ontrack = function (ev) {
-          if (st.destroyed || st.peerGen !== pGen) return;
-          if (ev.streams && ev.streams[0]) {
-            remoteVideo.srcObject = ev.streams[0];
-          } else if (st.remoteStream && ev.track) {
-            st.remoteStream.addTrack(ev.track);
+          if (st.destroyed || st.peerGen !== pGen || !ev.track) return;
+          if (st.remoteStream && typeof st.remoteStream.addTrack === 'function') {
+            const existing = typeof st.remoteStream.getTracks === 'function' ? st.remoteStream.getTracks() : [];
+            let hasThis = false;
+            for (let i = 0; i < existing.length; i++) {
+              const tr = existing[i];
+              if (tr === ev.track) {
+                hasThis = true;
+              } else if (tr.kind === ev.track.kind || tr.readyState === 'ended') {
+                try { st.remoteStream.removeTrack(tr); } catch (e) { /* ignore */ }
+              }
+            }
+            if (!hasThis) {
+              try { st.remoteStream.addTrack(ev.track); } catch (e) { /* ignore */ }
+            }
             remoteVideo.srcObject = st.remoteStream;
+            ev.track.onended = function () {
+              if (st.destroyed || st.peerGen !== pGen || !st.remoteStream) return;
+              try { st.remoteStream.removeTrack(ev.track); } catch (e) { /* ignore */ }
+              const hasAny = typeof st.remoteStream.getTracks === 'function' && st.remoteStream.getTracks().length > 0;
+              if (!hasAny) {
+                remoteVideo.style.display = 'none';
+                placeholder.style.display = 'block';
+              }
+            };
+          } else if (ev.streams && ev.streams[0]) {
+            remoteVideo.srcObject = ev.streams[0];
           }
           remoteVideo.style.display = 'block';
           placeholder.style.display = 'none';
@@ -378,6 +416,12 @@ export function createVideoCallComponent() {
         }
         pc.onconnectionstatechange = onStateChange;
         pc.oniceconnectionstatechange = onStateChange;
+        pc.onsignalingstatechange = function () {
+          if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
+          if (st.pc.signalingState === 'stable' && st.needsRenegotiate) {
+            renegotiate(pGen);
+          }
+        };
 
         const screenTracks = st.screenStream && typeof st.screenStream.getVideoTracks === 'function'
           ? st.screenStream.getVideoTracks()
@@ -387,13 +431,13 @@ export function createVideoCallComponent() {
           const tracks = st.localStream.getTracks();
           for (let i = 0; i < tracks.length; i++) {
             if (tracks[i].kind === 'video' && screenVideo) {
-              pc.addTrack(screenVideo, st.screenStream);
+              pc.addTrack(screenVideo, st.localStream);
             } else {
               pc.addTrack(tracks[i], st.localStream);
             }
           }
           if (screenVideo && typeof st.localStream.getVideoTracks === 'function' && st.localStream.getVideoTracks().length === 0) {
-            st.screenSenderAdded = pc.addTrack(screenVideo, st.screenStream);
+            st.screenSenderAdded = pc.addTrack(screenVideo, st.localStream);
           }
         }
         return pc;
@@ -413,7 +457,11 @@ export function createVideoCallComponent() {
 
       async function sendOffer(pGen, remote, label) {
         if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
-        if (st.pc.signalingState !== 'stable') return;
+        if (st.pc.signalingState !== 'stable') {
+          st.needsRenegotiate = true;
+          return;
+        }
+        st.needsRenegotiate = false;
         if (label) setCallState('connecting', label);
         try {
           const offer = await st.pc.createOffer();
@@ -447,6 +495,11 @@ export function createVideoCallComponent() {
         if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
         const remote = normId(st.props.remotePeerId);
         if (!remote) return;
+        if (st.pc.signalingState !== 'stable') {
+          st.needsRenegotiate = true;
+          return;
+        }
+        st.needsRenegotiate = false;
         sendOffer(pGen, remote, null);
       }
 
@@ -500,7 +553,7 @@ export function createVideoCallComponent() {
               if (p && typeof p.catch === 'function') p.catch(function () {});
             } catch (e) { /* ignore */ }
           } else {
-            st.screenSenderAdded = st.pc.addTrack(screenTrack, stream);
+            st.screenSenderAdded = st.pc.addTrack(screenTrack, st.localStream || stream);
             renegotiate(st.peerGen);
           }
         }
@@ -582,6 +635,9 @@ export function createVideoCallComponent() {
                     return;
                   }
                   emit('onSignal', { to: remote, kind: 'answer', payload: raw });
+                  if (st.needsRenegotiate && st.pc.signalingState === 'stable') {
+                    renegotiate(pGen);
+                  }
                 } catch (err) {
                   if (!st.destroyed && st.peerGen === pGen) {
                     failCall((err && err.message) || 'failed to accept call offer');
@@ -597,6 +653,9 @@ export function createVideoCallComponent() {
                     await st.pc.setRemoteDescription(desc);
                     if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
                     await flushPendingIce(st.pc, pGen);
+                    if (st.needsRenegotiate && st.pc.signalingState === 'stable') {
+                      renegotiate(pGen);
+                    }
                   }
                 } catch (err) {
                   if (!st.destroyed && st.peerGen === pGen) {
@@ -703,6 +762,7 @@ export function createVideoCallComponent() {
       function sync(nextProps) {
         if (st.destroyed) return;
         st.props = Object.assign({}, nextProps || {});
+        applyHeight(st.props);
         const active = Boolean(st.props.active);
         st.iceServers = sanitizeIceServers(st.props.iceServers);
 

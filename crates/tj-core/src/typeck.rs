@@ -1369,7 +1369,8 @@ impl<'a> Checker<'a> {
         }
         let target_ty = self.expr(&args[0], None);
         self.expr(&args[1], None);
-        match self.deref(&target_ty) {
+        let deref = self.deref(&target_ty);
+        match strip_null(deref) {
             Ty::Obj(target_class) => {
                 let (t_server, methods, method_info) = {
                     let info = &self.objects[&target_class];

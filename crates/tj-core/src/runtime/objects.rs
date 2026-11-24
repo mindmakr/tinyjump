@@ -659,7 +659,7 @@ impl Runtime {
     /// of the sender's locks or success after commit.
     #[cfg(feature = "server")]
     pub(crate) fn deliver_message(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<(), Exc> {
-        if !self.server {
+        if !self.server || !self.program.objects[o.class as usize].server {
             return Err(Exc::msg("deliver() is only available inside @server objects"));
         }
         if self.in_invariant {

@@ -3,6 +3,10 @@
 // (`Class.all(prefix)` -> `Class/prefix*` streams), and durable cross-object server messaging
 // (`this.deliver(...)`) in one compact app.
 //
+// Note: uses `@allow("anyone")` and `@read("anyone")` for zero-config multi-browser testing
+// in `tj dev`. For production deployments, enable auth and narrow rules to `@allow("signedIn")`
+// / `@read("signedIn")`.
+//
 //   cargo tj dev examples/collab-studio/app.tj
 
 type Signal = {
@@ -26,9 +30,9 @@ function pad6(n: number): string {
 }
 
 function isHexColor(c: string): boolean {
-  if (c.length !== 7 || !c.startsWith("#")) { return false }
+  if ((c.length !== 4 && c.length !== 7) || !c.startsWith("#")) { return false }
   const hex = "0123456789abcdefABCDEF"
-  for (let i = 1; i < 7; i += 1) {
+  for (let i = 1; i < c.length; i += 1) {
     if (!hex.includes(c.charAt(i))) { return false }
   }
   return true
@@ -343,7 +347,7 @@ function clock(ms: number): string {
 
 function App() {
   const local = StudioLocal.get("me")
-  const rawRoom = local.roomName.trim().replaceAll("/", "").replaceAll("*", "")
+  const rawRoom = local.roomName.trim().replaceAll("/", "").replaceAll("*", "").slice(0, 120)
   const roomKey = rawRoom === "" ? "studio" : rawRoom
   const room = StudioRoom.get(roomKey)
   const activity = RoomActivity.get(roomKey)
@@ -405,32 +409,32 @@ function App() {
       <Text id="call-status" size={13} color="#3f3f46">
         {`Peers: ${room.peers.join(", ") || "none"} · State: ${local.callState}`}
       </Text>
-
-      <Native
-        name="VideoCall"
-        id="video-call"
-        label="Studio video call"
-        height={260}
-        active={local.inCall}
-        peerId={me}
-        remotePeerId={remote}
-        initiator={initiator}
-        audio={true}
-        video={local.videoEnabled}
-        muted={local.muted}
-        cameraOff={local.cameraOff}
-        screenShare={local.screenShare}
-        signals={room.signals}
-        onSignal={(sig) => {
-          if (local.inCall && sig && sig.to) {
-            room.sendSignal(me, sig.to, sig.kind, sig.payload || "")
-          }
-        }}
-        onState={(s) => local.setState(s)}
-        onScreenShare={(on) => local.onScreenChanged(roomKey, on)}
-        onError={(e) => local.setError(e)}
-      />
     </Column>}
+
+    {(local.tab === "call" || local.inCall) && <Native
+      name="VideoCall"
+      id="video-call"
+      label="Studio video call"
+      height={local.tab === "call" ? 260 : 72}
+      active={local.inCall}
+      peerId={me}
+      remotePeerId={remote}
+      initiator={initiator}
+      audio={true}
+      video={local.videoEnabled}
+      muted={local.muted}
+      cameraOff={local.cameraOff}
+      screenShare={local.screenShare}
+      signals={room.signals}
+      onSignal={(sig) => {
+        if (local.inCall && sig && sig.to) {
+          room.sendSignal(me, sig.to, sig.kind, sig.payload || "")
+        }
+      }}
+      onState={(s) => local.setState(s)}
+      onScreenShare={(on) => local.onScreenChanged(roomKey, on)}
+      onError={(e) => local.setError(e)}
+    />}
 
     {local.tab === "board" && <Column gap={10}>
       <Row gap={8}>

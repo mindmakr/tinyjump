@@ -4798,10 +4798,17 @@ fn durable_cross_object_deliver_commits_atomically_and_survives_restarts() {
     this.deliver(Sink.get("main"), "log", who)
     this.deliver(Held.get(who), "ping")
   }
+  markPublic(id: string) {
+    this.deliver(PublicRoom.get(id), "touch")
+  }
 }
 @server @read("anyone") object Sink {
   items: string[] = []
   log(who: string) { this.items.push(who) }
+}
+@server @read("anyone") object PublicRoom {
+  hits: number = 0
+  touch() { this.hits += 1 }
 }
 "#;
     let pstore = Shared::default();
@@ -4826,10 +4833,22 @@ fn durable_cross_object_deliver_commits_atomically_and_survives_restarts() {
     prt.erase_subject("user:ana", None).unwrap();
     prt.handle(3009.0, Input::Tick);
     assert_eq!(state(&mut prt, 3010.0, "Sink/main")["items"], json!(["user:bo"]), "bo's pending message survived ana erasure");
+    // Non-personal class with id == "user:ana" queued by another user survives erase_subject("user:ana", None).
+    call(&mut prt, 3011.0, "Bridge/main", "markPublic", json!(["user:ana"])).unwrap();
+    prt.erase_subject("user:ana", None).unwrap();
+    prt.handle(3012.0, Input::Tick);
+    assert_eq!(state(&mut prt, 3013.0, "PublicRoom/user:ana")["hits"], json!(1), "non-personal class message kept on subject erasure");
 
-    // 7. Compile-time typeck and privacy flow checks for this.deliver(...).
+    // 7. Compile-time typeck, runtime sender @server guard, and privacy flow checks for this.deliver(...).
     let local_err = errors("object Local { f() { this.deliver(Local.get(\"x\"), \"f\") } }");
     assert!(local_err.contains("deliver() is only available inside non-@invariant @server"), "{local_err}");
+    let mut rt_non_srv_prog = compile("@server @read(\"anyone\") object S { f() { this.deliver(T.get(\"x\"), \"p\") } }\n@server @read(\"anyone\") object T { n: number = 0; p() { this.n += 1 } }").unwrap();
+    rt_non_srv_prog.objects[0].server = false;
+    let (mut non_srv_rt, _) = Runtime::boot(rt_non_srv_prog, Box::new(Shared::default()), Options { server: true, render: false, ..Options::new(4000.0, 7) }).unwrap();
+    let rt_non_srv_err = call(&mut non_srv_rt, 4001.0, "S/s", "f", json!([])).unwrap_err();
+    assert!(rt_non_srv_err.contains("only available inside @server objects"), "{rt_non_srv_err}");
+    let nullable_ok = errors("@server object B { p() {} }\n@server object A { f() { const t: B | null = B.get(\"x\"); if (t !== null) { this.deliver(t, \"p\") } } }");
+    assert_eq!(nullable_ok, "");
     let inv_err = errors("@server object A { @invariant ok(): boolean { this.deliver(A.get(\"x\"), \"p\"); return true } p() {} }");
     assert!(inv_err.contains("deliver() is only available inside non-@invariant @server"), "{inv_err}");
     let non_this = errors("@server object A { f() { A.get(\"x\").deliver(A.get(\"y\"), \"p\") } p() {} }");
