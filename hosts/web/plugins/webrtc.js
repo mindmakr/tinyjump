@@ -886,9 +886,11 @@ export function createVideoCallComponent() {
                 try { desc = JSON.parse(payload); } catch (e) { continue; }
                 if (!desc || desc.type !== 'offer' || typeof desc.sdp !== 'string') continue;
                 try {
+                  let resumeRenegotiate = st.needsRenegotiate;
                   if (st.pc.signalingState !== 'stable') {
                     if (st.props.initiator) continue; // impolite peer ignores colliding offer
-                    st.needsRenegotiate = true;
+                    resumeRenegotiate = true;
+                    st.needsRenegotiate = false;
                     await st.pc.setLocalDescription({ type: 'rollback' });
                     if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
                   }
@@ -898,6 +900,10 @@ export function createVideoCallComponent() {
                   await flushPendingIce(st.pc, pGen);
                   const answer = await st.pc.createAnswer();
                   if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
+                  if (st.needsRenegotiate) {
+                    resumeRenegotiate = true;
+                    st.needsRenegotiate = false;
+                  }
                   await st.pc.setLocalDescription(answer);
                   if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
                   const raw = serializeDesc(st.pc.localDescription);
@@ -906,6 +912,7 @@ export function createVideoCallComponent() {
                     return;
                   }
                   emit('onSignal', { to: remote, kind: 'answer', payload: raw });
+                  if (resumeRenegotiate) st.needsRenegotiate = true;
                   if (st.needsRenegotiate && st.pc.signalingState === 'stable') {
                     renegotiate(pGen);
                   }
