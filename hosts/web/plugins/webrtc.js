@@ -100,6 +100,36 @@ function maxSignalSeq(signals) {
   return hi;
 }
 
+function describeFallback(prefix, err) {
+  const name = err && typeof err.name === 'string' ? err.name : '';
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return prefix + ' (in use by another browser/app)';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return prefix + ' (device not found)';
+  }
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+    return prefix + ' (permission denied)';
+  }
+  return prefix;
+}
+
+function makeOverlayButton(text, bg) {
+  const b = document.createElement('button');
+  b.type = 'button';
+  b.textContent = text;
+  b.style.border = '1px solid rgba(255,255,255,0.22)';
+  b.style.borderRadius = '999px';
+  b.style.padding = '5px 11px';
+  b.style.fontSize = '12px';
+  b.style.fontWeight = '600';
+  b.style.lineHeight = '1.2';
+  b.style.cursor = 'pointer';
+  b.style.color = '#f9fafb';
+  b.style.background = bg || 'rgba(17,24,39,0.78)';
+  return b;
+}
+
 /**
  * Creates the `<Native name="VideoCall" ... />` host component spec for `TinyJump`.
  */
@@ -126,7 +156,7 @@ export function createVideoCallComponent() {
       remoteVideo.setAttribute('playsinline', '');
       remoteVideo.style.width = '100%';
       remoteVideo.style.height = '100%';
-      remoteVideo.style.objectFit = 'cover';
+      remoteVideo.style.objectFit = 'contain';
       remoteVideo.style.display = 'none';
 
       const localVideo = document.createElement('video');
@@ -144,30 +174,69 @@ export function createVideoCallComponent() {
       localVideo.style.border = '1px solid rgba(255,255,255,0.28)';
       localVideo.style.background = '#000';
       localVideo.style.transform = 'scaleX(-1)';
+      localVideo.style.zIndex = '2';
       localVideo.style.display = 'none';
 
       const badge = document.createElement('div');
       badge.style.position = 'absolute';
       badge.style.left = '12px';
-      badge.style.top = '12px';
+      badge.style.top = '10px';
       badge.style.padding = '4px 10px';
       badge.style.borderRadius = '999px';
       badge.style.fontSize = '12px';
-      badge.style.background = 'rgba(0,0,0,0.58)';
+      badge.style.background = 'rgba(0,0,0,0.62)';
       badge.style.color = '#f3f4f6';
+      badge.style.zIndex = '3';
       badge.textContent = 'Idle';
+
+      const noticePill = document.createElement('div');
+      noticePill.style.position = 'absolute';
+      noticePill.style.left = '12px';
+      noticePill.style.top = '40px';
+      noticePill.style.maxWidth = 'calc(100% - 24px)';
+      noticePill.style.padding = '5px 10px';
+      noticePill.style.borderRadius = '8px';
+      noticePill.style.fontSize = '12px';
+      noticePill.style.background = 'rgba(120,53,15,0.88)';
+      noticePill.style.border = '1px solid rgba(251,191,36,0.45)';
+      noticePill.style.color = '#fef3c7';
+      noticePill.style.zIndex = '3';
+      noticePill.style.display = 'none';
 
       const placeholder = document.createElement('div');
       placeholder.style.fontSize = '14px';
       placeholder.style.color = '#9ca3af';
       placeholder.style.textAlign = 'center';
       placeholder.style.padding = '16px';
+      placeholder.style.zIndex = '1';
       placeholder.textContent = 'Ready to start call';
+
+      const controlsBar = document.createElement('div');
+      controlsBar.style.position = 'absolute';
+      controlsBar.style.left = '12px';
+      controlsBar.style.bottom = '10px';
+      controlsBar.style.display = 'none';
+      controlsBar.style.gap = '6px';
+      controlsBar.style.flexWrap = 'wrap';
+      controlsBar.style.alignItems = 'center';
+      controlsBar.style.zIndex = '3';
+
+      const shareBtn = makeOverlayButton('Share Screen', 'rgba(37,99,235,0.88)');
+      const retryBtn = makeOverlayButton('Retry Cam/Mic', 'rgba(180,83,9,0.9)');
+      retryBtn.style.display = 'none';
+      const unmuteBtn = makeOverlayButton('Unmute Audio', 'rgba(15,118,110,0.92)');
+      unmuteBtn.style.display = 'none';
+
+      controlsBar.appendChild(shareBtn);
+      controlsBar.appendChild(retryBtn);
+      controlsBar.appendChild(unmuteBtn);
 
       root.appendChild(remoteVideo);
       root.appendChild(placeholder);
       root.appendChild(localVideo);
       root.appendChild(badge);
+      root.appendChild(noticePill);
+      root.appendChild(controlsBar);
 
       const st = {
         props: Object.assign({}, initialProps || {}),
@@ -175,9 +244,17 @@ export function createVideoCallComponent() {
         mediaGen: 0,
         peerGen: 0,
         screenGen: 0,
+        retryGen: 0,
+        retrying: false,
         callState: 'idle',
         baseBadge: 'Idle',
         mediaKey: '',
+        mediaReady: false,
+        mediaMode: 'idle',
+        mediaNotice: '',
+        compact: false,
+        autoplayMuted: false,
+        lastPropScreenShare: false,
         peerKey: '',
         endedPeerKey: '',
         localStream: null,
@@ -185,6 +262,8 @@ export function createVideoCallComponent() {
         screenActive: false,
         screenWanted: false,
         screenSenderAdded: null,
+        screenUpgradedTransceiver: null,
+        screenPrevDirection: '',
         needsRenegotiate: false,
         remoteStream: null,
         pc: null,
@@ -203,14 +282,81 @@ export function createVideoCallComponent() {
         });
       }
 
+      function getLiveTracks(stream, kind) {
+        if (!stream) return [];
+        const fn = kind === 'audio' ? 'getAudioTracks' : 'getVideoTracks';
+        if (typeof stream[fn] !== 'function') return [];
+        const list = stream[fn]();
+        const live = [];
+        for (let i = 0; i < list.length; i++) {
+          if (list[i] && list[i].readyState !== 'ended') live.push(list[i]);
+        }
+        return live;
+      }
+
+      function canDegrade() {
+        const wantA = st.props.audio !== false;
+        const wantV = st.props.video !== false;
+        const hasA = getLiveTracks(st.localStream, 'audio').length > 0;
+        const hasV = getLiveTracks(st.localStream, 'video').length > 0;
+        return (wantA && !hasA) || (wantV && !hasV);
+      }
+
+      function renderOverlayControls() {
+        const showBar = Boolean(st.props.active) && st.props.controls !== false && !st.compact;
+        controlsBar.style.display = showBar ? 'flex' : 'none';
+        shareBtn.textContent = st.screenActive || st.screenWanted ? 'Stop Share' : 'Share Screen';
+        shareBtn.style.background = st.screenActive ? 'rgba(185,28,28,0.9)' : 'rgba(37,99,235,0.88)';
+        retryBtn.style.display = showBar && st.mediaReady && canDegrade() ? 'inline-block' : 'none';
+        unmuteBtn.style.display = st.autoplayMuted && showBar ? 'inline-block' : 'none';
+        if (!st.mediaNotice || st.compact) {
+          noticePill.style.display = 'none';
+          noticePill.textContent = '';
+        } else {
+          noticePill.textContent = st.mediaNotice;
+          noticePill.style.display = 'block';
+        }
+      }
+
+      function setMediaState(mode, notice) {
+        if (st.destroyed) return;
+        st.mediaMode = mode || 'idle';
+        st.mediaNotice = notice || '';
+        renderOverlayControls();
+        renderBadge();
+        emit('onMediaMode', st.mediaMode);
+        emit('onNotice', st.mediaNotice);
+      }
+
+      function setNotice(msg) {
+        if (st.destroyed) return;
+        st.mediaNotice = msg || '';
+        renderOverlayControls();
+        emit('onNotice', st.mediaNotice);
+      }
+
       function applyHeight(props) {
+        const wasCompact = st.compact;
         const h = props && typeof props.height === 'number' && props.height > 0 ? Math.max(48, Math.round(props.height)) : 260;
+        st.compact = h < 140;
         root.style.minHeight = h + 'px';
         root.style.height = h < 200 ? h + 'px' : '';
+        if (st.compact) {
+          try { localVideo.srcObject = null; } catch (e) { /* ignore */ }
+          localVideo.style.display = 'none';
+        } else if (wasCompact && st.mediaReady) {
+          applyLocalPreview();
+        }
+        renderOverlayControls();
       }
 
       function renderBadge() {
-        badge.textContent = st.screenActive ? st.baseBadge + ' · Sharing' : st.baseBadge;
+        let label = st.baseBadge;
+        if (st.mediaMode === 'recv-only' && st.props.active) label += ' · View-only';
+        else if (st.mediaMode === 'audio-only' && st.props.active && st.props.video !== false) label += ' · Audio-only';
+        else if (st.mediaMode === 'video-only' && st.props.active && st.props.audio !== false) label += ' · Video-only';
+        if (st.screenActive) label += ' · Sharing';
+        badge.textContent = label;
       }
 
       applyHeight(st.props);
@@ -235,26 +381,86 @@ export function createVideoCallComponent() {
         setCallState('failed', 'Error');
       }
 
-      function findVideoSender(pc) {
-        if (!pc || typeof pc.getSenders !== 'function') return null;
-        const senders = pc.getSenders();
-        for (let i = 0; i < senders.length; i++) {
-          const s = senders[i];
-          if (s && s.track && s.track.kind === 'video') return s;
+      function findTransceiverByKind(pc, kind) {
+        if (!pc || typeof pc.getTransceivers !== 'function') return null;
+        const trs = pc.getTransceivers();
+        for (let i = 0; i < trs.length; i++) {
+          const tr = trs[i];
+          if (!tr) continue;
+          const sKind = tr.sender && tr.sender.track && tr.sender.track.kind;
+          const rKind = tr.receiver && tr.receiver.track && tr.receiver.track.kind;
+          if (sKind === kind || rKind === kind || tr._tjKind === kind) return tr;
         }
-        if (typeof pc.getTransceivers === 'function') {
-          const trs = pc.getTransceivers();
-          for (let i = 0; i < trs.length; i++) {
-            const tr = trs[i];
-            if (tr && tr.sender && tr.receiver && tr.receiver.track && tr.receiver.track.kind === 'video') {
-              return tr.sender;
-            }
+        return null;
+      }
+
+      function findVideoTransceiver(pc) {
+        return findTransceiverByKind(pc, 'video');
+      }
+
+      function findVideoSender(pc) {
+        if (!pc) return null;
+        if (typeof pc.getSenders === 'function') {
+          const senders = pc.getSenders();
+          for (let i = 0; i < senders.length; i++) {
+            const s = senders[i];
+            if (s && s.track && s.track.kind === 'video') return s;
           }
         }
+        const tr = findVideoTransceiver(pc);
+        if (tr && tr.sender) return tr.sender;
         return st.screenSenderAdded;
       }
 
+      function ensureReceiveTransceivers(pc) {
+        if (!pc || typeof pc.addTransceiver !== 'function') return;
+        const trs = typeof pc.getTransceivers === 'function' ? pc.getTransceivers() : [];
+        let hasAudio = false;
+        let hasVideo = false;
+        for (let i = 0; i < trs.length; i++) {
+          const tr = trs[i];
+          if (!tr) continue;
+          const sk = tr.sender && tr.sender.track && tr.sender.track.kind;
+          const rk = tr.receiver && tr.receiver.track && tr.receiver.track.kind;
+          const tk = tr._tjKind;
+          if (sk === 'audio' || rk === 'audio' || tk === 'audio') hasAudio = true;
+          if (sk === 'video' || rk === 'video' || tk === 'video') hasVideo = true;
+        }
+        if (!hasAudio) {
+          try {
+            const aTr = pc.addTransceiver('audio', { direction: 'recvonly' });
+            if (aTr) aTr._tjKind = 'audio';
+          } catch (e) { /* ignore */ }
+        }
+        if (!hasVideo) {
+          try {
+            const vTr = pc.addTransceiver('video', { direction: 'recvonly' });
+            if (vTr) vTr._tjKind = 'video';
+          } catch (e) { /* ignore */ }
+        }
+      }
+
+      function playRemote() {
+        if (!remoteVideo || typeof remoteVideo.play !== 'function') return;
+        const p = remoteVideo.play();
+        if (p && typeof p.catch === 'function') {
+          p.catch(function () {
+            if (st.destroyed) return;
+            remoteVideo.muted = true;
+            st.autoplayMuted = true;
+            renderOverlayControls();
+            const p2 = remoteVideo.play();
+            if (p2 && typeof p2.catch === 'function') p2.catch(function () {});
+          });
+        }
+      }
+
       function applyLocalPreview() {
+        if (st.compact) {
+          try { localVideo.srcObject = null; } catch (e) { /* ignore */ }
+          localVideo.style.display = 'none';
+          return;
+        }
         if (st.screenStream) {
           localVideo.srcObject = st.screenStream;
           localVideo.style.transform = 'none';
@@ -262,7 +468,7 @@ export function createVideoCallComponent() {
           return;
         }
         const wantVideo = st.props.video !== false;
-        if (st.localStream && wantVideo && typeof st.localStream.getVideoTracks === 'function' && st.localStream.getVideoTracks().length > 0) {
+        if (st.localStream && wantVideo && getLiveTracks(st.localStream, 'video').length > 0) {
           localVideo.srcObject = st.localStream;
           localVideo.style.transform = 'scaleX(-1)';
           localVideo.style.display = 'block';
@@ -277,6 +483,8 @@ export function createVideoCallComponent() {
         st.pendingIce = [];
         st.offerSentFor = '';
         st.screenSenderAdded = null;
+        st.screenUpgradedTransceiver = null;
+        st.screenPrevDirection = '';
         st.needsRenegotiate = false;
         st.signalChain = Promise.resolve();
         if (st.pc) {
@@ -291,6 +499,9 @@ export function createVideoCallComponent() {
         st.remoteStream = null;
         try { remoteVideo.srcObject = null; } catch (e) { /* ignore */ }
         remoteVideo.style.display = 'none';
+        st.autoplayMuted = false;
+        remoteVideo.muted = false;
+        unmuteBtn.style.display = 'none';
       }
 
       function stopScreenShare(emitOff) {
@@ -302,12 +513,23 @@ export function createVideoCallComponent() {
           st.screenStream = null;
         }
         applyLocalPreview();
-        const camTracks = st.localStream && typeof st.localStream.getVideoTracks === 'function'
-          ? st.localStream.getVideoTracks()
-          : [];
+        const camTracks = getLiveTracks(st.localStream, 'video');
         const restoreTrack = camTracks.length > 0 ? camTracks[0] : null;
         if (st.pc) {
-          if (!restoreTrack && st.screenSenderAdded && st.props.active && typeof st.pc.removeTrack === 'function') {
+          if (!restoreTrack && st.screenUpgradedTransceiver) {
+            const upTr = st.screenUpgradedTransceiver;
+            const prevDir = st.screenPrevDirection || 'recvonly';
+            st.screenUpgradedTransceiver = null;
+            st.screenPrevDirection = '';
+            if (upTr.sender && typeof upTr.sender.replaceTrack === 'function') {
+              try {
+                const p = upTr.sender.replaceTrack(null);
+                if (p && typeof p.catch === 'function') p.catch(function () {});
+              } catch (e) { /* ignore */ }
+            }
+            try { upTr.direction = prevDir; } catch (e) { /* ignore */ }
+            if (st.props.active) renegotiate(st.peerGen);
+          } else if (!restoreTrack && st.screenSenderAdded && st.props.active && typeof st.pc.removeTrack === 'function') {
             try { st.pc.removeTrack(st.screenSenderAdded); } catch (e) { /* ignore */ }
             st.screenSenderAdded = null;
             renegotiate(st.peerGen);
@@ -322,17 +544,26 @@ export function createVideoCallComponent() {
           }
         }
         renderBadge();
+        renderOverlayControls();
         if (emitOff && wasActive && !st.destroyed) emit('onScreenShare', false);
       }
 
       function teardownAll(emitIdle) {
         st.mediaGen += 1;
+        st.retryGen += 1;
+        st.retrying = false;
+        retryBtn.disabled = false;
+        retryBtn.textContent = 'Retry Cam/Mic';
         st.mediaKey = '';
+        st.mediaReady = false;
+        st.mediaMode = 'idle';
+        st.mediaNotice = '';
         st.peerKey = '';
         st.endedPeerKey = '';
         st.screenWanted = false;
-        stopScreenShare(false);
+        st.lastPropScreenShare = false;
         closePeerConnection();
+        stopScreenShare(false);
         if (st.localStream) {
           stopStream(st.localStream);
           st.localStream = null;
@@ -341,7 +572,11 @@ export function createVideoCallComponent() {
         localVideo.style.display = 'none';
         placeholder.style.display = 'block';
         placeholder.textContent = 'Ready to start call';
-        if (emitIdle && !st.destroyed) setCallState('idle', 'Idle');
+        renderOverlayControls();
+        if (emitIdle && !st.destroyed) {
+          setMediaState('idle', '');
+          setCallState('idle', 'Idle');
+        }
       }
 
       function createPeerConnection(pGen) {
@@ -379,6 +614,12 @@ export function createVideoCallComponent() {
               try { st.remoteStream.addTrack(ev.track); } catch (e) { /* ignore */ }
             }
             remoteVideo.srcObject = st.remoteStream;
+            ev.track.onunmute = function () {
+              if (st.destroyed || st.peerGen !== pGen) return;
+              remoteVideo.style.display = 'block';
+              placeholder.style.display = 'none';
+              playRemote();
+            };
             ev.track.onended = function () {
               if (st.destroyed || st.peerGen !== pGen || !st.remoteStream) return;
               try { st.remoteStream.removeTrack(ev.track); } catch (e) { /* ignore */ }
@@ -393,10 +634,7 @@ export function createVideoCallComponent() {
           }
           remoteVideo.style.display = 'block';
           placeholder.style.display = 'none';
-          if (typeof remoteVideo.play === 'function') {
-            const p = remoteVideo.play();
-            if (p && typeof p.catch === 'function') p.catch(function () {});
-          }
+          playRemote();
         };
 
         function onStateChange() {
@@ -427,18 +665,20 @@ export function createVideoCallComponent() {
           ? st.screenStream.getVideoTracks()
           : [];
         const screenVideo = screenTracks.length > 0 ? screenTracks[0] : null;
+        let addedScreen = false;
         if (st.localStream) {
           const tracks = st.localStream.getTracks();
           for (let i = 0; i < tracks.length; i++) {
             if (tracks[i].kind === 'video' && screenVideo) {
               pc.addTrack(screenVideo, st.localStream);
+              addedScreen = true;
             } else {
               pc.addTrack(tracks[i], st.localStream);
             }
           }
-          if (screenVideo && typeof st.localStream.getVideoTracks === 'function' && st.localStream.getVideoTracks().length === 0) {
-            st.screenSenderAdded = pc.addTrack(screenVideo, st.localStream);
-          }
+        }
+        if (screenVideo && !addedScreen) {
+          st.screenSenderAdded = pc.addTrack(screenVideo, st.localStream || st.screenStream);
         }
         return pc;
       }
@@ -464,7 +704,8 @@ export function createVideoCallComponent() {
         st.needsRenegotiate = false;
         if (label) setCallState('connecting', label);
         try {
-          const offer = await st.pc.createOffer();
+          ensureReceiveTransceivers(st.pc);
+          const offer = await st.pc.createOffer({ offerToReceiveAudio: true, offerToReceiveVideo: true });
           if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
           await st.pc.setLocalDescription(offer);
           if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
@@ -506,7 +747,8 @@ export function createVideoCallComponent() {
       async function startScreenShare() {
         if (typeof navigator === 'undefined' || !navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
           st.screenWanted = false;
-          emit('onError', 'screen sharing is not supported in this browser');
+          renderOverlayControls();
+          setNotice('Screen sharing is not supported in this browser (requires HTTPS or localhost)');
           emit('onScreenShare', false);
           return;
         }
@@ -518,8 +760,11 @@ export function createVideoCallComponent() {
           if (st.destroyed || st.screenGen !== sGen) return;
           st.screenWanted = false;
           st.screenActive = false;
-          if (err && err.name !== 'AbortError' && err.name !== 'NotAllowedError') {
-            emit('onError', err.message || 'could not start screen share');
+          renderOverlayControls();
+          if (err && err.name === 'NotAllowedError') {
+            setNotice('Screen share cancelled or blocked — click Share Screen to try again');
+          } else if (err && err.name !== 'AbortError') {
+            setNotice((err && err.message) || 'Could not start screen share');
           }
           emit('onScreenShare', false);
           return;
@@ -532,12 +777,15 @@ export function createVideoCallComponent() {
         if (tracks.length === 0) {
           stopStream(stream);
           st.screenWanted = false;
+          renderOverlayControls();
           emit('onScreenShare', false);
           return;
         }
         const screenTrack = tracks[0];
         st.screenStream = stream;
         st.screenActive = true;
+        st.screenUpgradedTransceiver = null;
+        st.screenPrevDirection = '';
         screenTrack.onended = function () {
           if (!st.destroyed && st.screenGen === sGen) {
             st.screenWanted = false;
@@ -546,24 +794,46 @@ export function createVideoCallComponent() {
         };
         applyLocalPreview();
         if (st.pc) {
-          const sender = findVideoSender(st.pc);
-          if (sender && typeof sender.replaceTrack === 'function') {
-            try {
-              const p = sender.replaceTrack(screenTrack);
-              if (p && typeof p.catch === 'function') p.catch(function () {});
-            } catch (e) { /* ignore */ }
+          const tr = findVideoTransceiver(st.pc);
+          if (tr && tr.sender && typeof tr.sender.replaceTrack === 'function') {
+            const prevDir = tr.direction || 'recvonly';
+            if (prevDir !== 'sendrecv' && prevDir !== 'sendonly') {
+              st.screenUpgradedTransceiver = tr;
+              st.screenPrevDirection = prevDir;
+              try { tr.direction = prevDir === 'recvonly' ? 'sendrecv' : 'sendonly'; } catch (e) { /* ignore */ }
+              try {
+                const p = tr.sender.replaceTrack(screenTrack);
+                if (p && typeof p.catch === 'function') p.catch(function () {});
+              } catch (e) { /* ignore */ }
+              renegotiate(st.peerGen);
+            } else {
+              try {
+                const p = tr.sender.replaceTrack(screenTrack);
+                if (p && typeof p.catch === 'function') p.catch(function () {});
+              } catch (e) { /* ignore */ }
+            }
           } else {
-            st.screenSenderAdded = st.pc.addTrack(screenTrack, st.localStream || stream);
-            renegotiate(st.peerGen);
+            const sender = findVideoSender(st.pc);
+            if (sender && typeof sender.replaceTrack === 'function') {
+              try {
+                const p = sender.replaceTrack(screenTrack);
+                if (p && typeof p.catch === 'function') p.catch(function () {});
+              } catch (e) { /* ignore */ }
+            } else {
+              st.screenSenderAdded = st.pc.addTrack(screenTrack, st.localStream || stream);
+              renegotiate(st.peerGen);
+            }
           }
         }
         renderBadge();
+        renderOverlayControls();
         emit('onScreenShare', true);
       }
 
       function syncScreenShare(wantScreen) {
         if (wantScreen && !st.screenWanted) {
           st.screenWanted = true;
+          renderOverlayControls();
           startScreenShare();
         } else if (!wantScreen && st.screenWanted) {
           st.screenWanted = false;
@@ -616,8 +886,11 @@ export function createVideoCallComponent() {
                 try { desc = JSON.parse(payload); } catch (e) { continue; }
                 if (!desc || desc.type !== 'offer' || typeof desc.sdp !== 'string') continue;
                 try {
+                  let resumeRenegotiate = st.needsRenegotiate;
                   if (st.pc.signalingState !== 'stable') {
                     if (st.props.initiator) continue; // impolite peer ignores colliding offer
+                    resumeRenegotiate = true;
+                    st.needsRenegotiate = false;
                     await st.pc.setLocalDescription({ type: 'rollback' });
                     if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
                   }
@@ -627,6 +900,10 @@ export function createVideoCallComponent() {
                   await flushPendingIce(st.pc, pGen);
                   const answer = await st.pc.createAnswer();
                   if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
+                  if (st.needsRenegotiate) {
+                    resumeRenegotiate = true;
+                    st.needsRenegotiate = false;
+                  }
                   await st.pc.setLocalDescription(answer);
                   if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
                   const raw = serializeDesc(st.pc.localDescription);
@@ -635,6 +912,7 @@ export function createVideoCallComponent() {
                     return;
                   }
                   emit('onSignal', { to: remote, kind: 'answer', payload: raw });
+                  if (resumeRenegotiate) st.needsRenegotiate = true;
                   if (st.needsRenegotiate && st.pc.signalingState === 'stable') {
                     renegotiate(pGen);
                   }
@@ -681,7 +959,7 @@ export function createVideoCallComponent() {
       }
 
       function ensurePeerConnection() {
-        if (st.destroyed || !st.localStream) return;
+        if (st.destroyed || !st.mediaReady) return;
         const me = normId(st.props.peerId);
         const remote = normId(st.props.remotePeerId);
         const iceKey = serializeIceKey(st.iceServers);
@@ -724,40 +1002,225 @@ export function createVideoCallComponent() {
         maybeStartOffer(st.peerGen);
       }
 
+      async function tryCaptureWithFallback(wantAudio, wantVideo) {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
+          return {
+            stream: null,
+            mode: 'recv-only',
+            notice: 'Camera & mic unavailable (requires HTTPS or localhost) — view-only mode (can still watch & share screen)',
+          };
+        }
+        let firstErr = null;
+        try {
+          const s1 = await navigator.mediaDevices.getUserMedia({ audio: wantAudio, video: wantVideo });
+          const mode1 = wantAudio && wantVideo ? 'audio-video' : wantAudio ? 'audio-only' : 'video-only';
+          return { stream: s1, mode: mode1, notice: '' };
+        } catch (err) {
+          firstErr = err;
+        }
+        if (wantAudio && wantVideo) {
+          try {
+            const sAudio = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+            return {
+              stream: sAudio,
+              mode: 'audio-only',
+              notice: describeFallback('Camera unavailable', firstErr) + ' — joined audio-only (can still view video & share screen)',
+            };
+          } catch (e2) { /* fall through to video-only */ }
+          try {
+            const sVideo = await navigator.mediaDevices.getUserMedia({ audio: false, video: true });
+            return {
+              stream: sVideo,
+              mode: 'video-only',
+              notice: describeFallback('Microphone unavailable', firstErr) + ' — joined video-only (can still listen & share screen)',
+            };
+          } catch (e3) { /* fall through to recv-only */ }
+          return {
+            stream: null,
+            mode: 'recv-only',
+            notice: describeFallback('Camera & mic unavailable', firstErr) + ' — view-only mode (can still watch & share screen)',
+          };
+        }
+        const label = wantAudio ? 'Microphone unavailable' : 'Camera unavailable';
+        const suffix = wantAudio ? ' — view-only mode (can still listen & share screen)' : ' — view-only mode (can still watch & share screen)';
+        return {
+          stream: null,
+          mode: 'recv-only',
+          notice: describeFallback(label, firstErr) + suffix,
+        };
+      }
+
       async function acquireMedia(mGen, wantAudio, wantVideo) {
         if (!wantAudio && !wantVideo) {
-          failCall('enable at least audio or video for a call');
+          if (typeof window === 'undefined' || typeof window.RTCPeerConnection !== 'function') {
+            failCall('WebRTC is not supported in this browser');
+            return;
+          }
+          st.localStream = null;
+          st.mediaReady = true;
+          setMediaState('recv-only', '');
+          applyLocalPreview();
+          ensurePeerConnection();
+          st.lastPropScreenShare = Boolean(st.props.screenShare);
+          if (st.lastPropScreenShare) syncScreenShare(true);
           return;
         }
         if (typeof window === 'undefined' || typeof window.RTCPeerConnection !== 'function') {
           failCall('WebRTC is not supported in this browser');
           return;
         }
-        if (typeof navigator === 'undefined' || !navigator.mediaDevices || typeof navigator.mediaDevices.getUserMedia !== 'function') {
-          failCall('camera/microphone capture requires HTTPS or localhost');
-          return;
-        }
         setCallState('acquiring', 'Requesting media...');
         placeholder.style.display = 'block';
         placeholder.textContent = 'Requesting microphone/camera...';
-        let stream;
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({ audio: wantAudio, video: wantVideo });
-        } catch (err) {
-          if (st.destroyed || st.mediaGen !== mGen) return;
-          failCall((err && err.message) || 'microphone/camera permission denied');
-          return;
-        }
+        const res = await tryCaptureWithFallback(wantAudio, wantVideo);
         if (st.destroyed || st.mediaGen !== mGen) {
-          stopStream(stream);
+          if (res.stream) stopStream(res.stream);
           return;
         }
-        st.localStream = stream;
-        applyTrackToggles(stream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
+        st.localStream = res.stream;
+        st.mediaReady = true;
+        if (res.stream) {
+          applyTrackToggles(res.stream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
+        }
+        setMediaState(res.mode, res.notice);
         applyLocalPreview();
         ensurePeerConnection();
-        syncScreenShare(Boolean(st.props.screenShare));
+        st.lastPropScreenShare = Boolean(st.props.screenShare);
+        if (st.lastPropScreenShare) syncScreenShare(true);
       }
+
+      async function retryCapture() {
+        if (st.destroyed || !st.props.active || st.retrying) return;
+        const wantAudio = st.props.audio !== false;
+        const wantVideo = st.props.video !== false;
+        const hasAudio = getLiveTracks(st.localStream, 'audio').length > 0;
+        const hasVideo = getLiveTracks(st.localStream, 'video').length > 0;
+        const needAudio = wantAudio && !hasAudio;
+        const needVideo = wantVideo && !hasVideo;
+        if (!needAudio && !needVideo) return;
+
+        st.retrying = true;
+        st.retryGen += 1;
+        const mGen = st.mediaGen;
+        const rGen = st.retryGen;
+        retryBtn.disabled = true;
+        retryBtn.textContent = 'Retrying...';
+        try {
+          const res = await tryCaptureWithFallback(needAudio, needVideo);
+          if (st.destroyed || st.mediaGen !== mGen || st.retryGen !== rGen || !st.props.active) {
+            if (res.stream) stopStream(res.stream);
+            return;
+          }
+          const addedTracks = [];
+          if (res.stream && typeof res.stream.getTracks === 'function') {
+            const newTracks = res.stream.getTracks();
+            if (!st.localStream) {
+              st.localStream = res.stream;
+              for (let i = 0; i < newTracks.length; i++) addedTracks.push(newTracks[i]);
+            } else {
+              for (let i = 0; i < newTracks.length; i++) {
+                const nt = newTracks[i];
+                const alreadyLive = getLiveTracks(st.localStream, nt.kind).length > 0;
+                if (alreadyLive) {
+                  try { nt.stop(); } catch (e) { /* ignore */ }
+                } else {
+                  if (typeof st.localStream.getTracks === 'function' && typeof st.localStream.removeTrack === 'function') {
+                    const existing = st.localStream.getTracks();
+                    for (let j = 0; j < existing.length; j++) {
+                      if (existing[j] && existing[j].kind === nt.kind && existing[j].readyState === 'ended') {
+                        try { st.localStream.removeTrack(existing[j]); } catch (e) { /* ignore */ }
+                      }
+                    }
+                  }
+                  if (typeof st.localStream.addTrack === 'function') {
+                    try { st.localStream.addTrack(nt); } catch (e) { /* ignore */ }
+                  }
+                  addedTracks.push(nt);
+                }
+              }
+            }
+          }
+          st.mediaReady = true;
+          const finalHasAudio = getLiveTracks(st.localStream, 'audio').length > 0;
+          const finalHasVideo = getLiveTracks(st.localStream, 'video').length > 0;
+          const finalMode = finalHasAudio && finalHasVideo
+            ? 'audio-video'
+            : finalHasAudio
+              ? 'audio-only'
+              : finalHasVideo
+                ? 'video-only'
+                : 'recv-only';
+          const stillMissing = (wantAudio && !finalHasAudio) || (wantVideo && !finalHasVideo);
+          let finalNotice = '';
+          if (stillMissing) {
+            if (addedTracks.length === 0 && finalMode !== 'recv-only') {
+              finalNotice = st.mediaNotice || (finalMode === 'audio-only'
+                ? 'Camera unavailable — joined audio-only (can still view video & share screen)'
+                : 'Microphone unavailable — joined video-only (can still listen & share screen)');
+            } else {
+              finalNotice = res.notice || st.mediaNotice;
+            }
+          }
+          if (st.localStream) {
+            applyTrackToggles(st.localStream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
+          }
+          if (st.pc && addedTracks.length > 0) {
+            let needNegotiate = false;
+            for (let i = 0; i < addedTracks.length; i++) {
+              const t = addedTracks[i];
+              if (t.kind === 'video' && st.screenActive) continue;
+              const tr = findTransceiverByKind(st.pc, t.kind);
+              if (tr && tr.sender && typeof tr.sender.replaceTrack === 'function') {
+                if (tr.direction !== 'sendrecv' && tr.direction !== 'sendonly') {
+                  try { tr.direction = 'sendrecv'; } catch (e) { /* ignore */ }
+                  needNegotiate = true;
+                }
+                try {
+                  const p = tr.sender.replaceTrack(t);
+                  if (p && typeof p.catch === 'function') p.catch(function () {});
+                } catch (e) { /* ignore */ }
+              } else {
+                st.pc.addTrack(t, st.localStream || res.stream);
+                needNegotiate = true;
+              }
+            }
+            if (needNegotiate) renegotiate(st.peerGen);
+          }
+          setMediaState(finalMode, finalNotice);
+          applyLocalPreview();
+        } finally {
+          if (!st.destroyed && st.retryGen === rGen) {
+            st.retrying = false;
+            retryBtn.disabled = false;
+            retryBtn.textContent = 'Retry Cam/Mic';
+            renderOverlayControls();
+          }
+        }
+      }
+
+      shareBtn.addEventListener('click', function () {
+        if (st.destroyed || !st.props.active) return;
+        if (st.screenWanted || st.screenActive) {
+          st.screenWanted = false;
+          stopScreenShare(true);
+        } else {
+          st.screenWanted = true;
+          renderOverlayControls();
+          startScreenShare();
+        }
+      });
+
+      retryBtn.addEventListener('click', function () {
+        retryCapture();
+      });
+
+      unmuteBtn.addEventListener('click', function () {
+        if (st.destroyed) return;
+        st.autoplayMuted = false;
+        remoteVideo.muted = false;
+        renderOverlayControls();
+        playRemote();
+      });
 
       function sync(nextProps) {
         if (st.destroyed) return;
@@ -767,7 +1230,7 @@ export function createVideoCallComponent() {
         st.iceServers = sanitizeIceServers(st.props.iceServers);
 
         if (!active) {
-          if (st.pc || st.localStream || st.mediaKey || st.screenStream || st.screenWanted) {
+          if (st.pc || st.localStream || st.mediaKey || st.mediaReady || st.screenStream || st.screenWanted) {
             teardownAll(true);
           }
           return;
@@ -784,10 +1247,17 @@ export function createVideoCallComponent() {
           return;
         }
 
-        if (st.localStream) {
-          applyTrackToggles(st.localStream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
+        if (st.mediaReady) {
+          if (st.localStream) {
+            applyTrackToggles(st.localStream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
+          }
+          renderOverlayControls();
           ensurePeerConnection();
-          syncScreenShare(Boolean(st.props.screenShare));
+          const wantScreen = Boolean(st.props.screenShare);
+          if (wantScreen !== st.lastPropScreenShare) {
+            st.lastPropScreenShare = wantScreen;
+            syncScreenShare(wantScreen);
+          }
         }
       }
 
