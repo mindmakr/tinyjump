@@ -197,6 +197,26 @@ function isHexColor(c: string): boolean {
     return seq
   }
 
+  @allow("anyone") undoStroke(peerId: string): boolean {
+    const actor = peerId.trim() === "" ? "Guest" : peerId.trim()
+    const strokes = BoardStroke.all(`${this.id}:`)
+    for (let i = strokes.length - 1; i >= 0; i -= 1) {
+      if (strokes[i].points.length > 0 && strokes[i].author === actor) {
+        this.deliver(strokes[i], "remove")
+        this.deliver(RoomActivity.get(this.id), "record", actor, "undo", "removed last stroke")
+        return true
+      }
+    }
+    for (let i = strokes.length - 1; i >= 0; i -= 1) {
+      if (strokes[i].points.length > 0) {
+        this.deliver(strokes[i], "remove")
+        this.deliver(RoomActivity.get(this.id), "record", actor, "undo", "removed last stroke")
+        return true
+      }
+    }
+    return false
+  }
+
   @allow("anyone") clearBoard(peerId: string): number {
     const author = peerId.trim()
     check(author.length > 0 && author.length <= 40, "peerId", "enter a name (1-40 characters)")
@@ -220,8 +240,10 @@ object StudioLocal {
   cameraOff: boolean = false
   screenShare: boolean = false
   callState: string = "idle"
+  mediaMode: string = "idle"
+  callNotice: string = ""
   penColor: string = "#111114"
-  penWidth: number = 3
+  penWidth: number = 4
   chatDraft: string = ""
   lastError: string = ""
 
@@ -234,6 +256,8 @@ object StudioLocal {
   toggleMute() { this.muted = !this.muted }
   toggleCamera() { this.cameraOff = !this.cameraOff }
   setState(s: string) { this.callState = s }
+  setMediaMode(m: string) { this.mediaMode = m }
+  setNotice(n: string) { this.callNotice = n }
   setError(e: string) { this.lastError = e }
 
   async joinRoom(roomKey: string, video: boolean) {
@@ -244,6 +268,8 @@ object StudioLocal {
     }
     this.joining = true
     this.lastError = ""
+    this.callNotice = ""
+    this.mediaMode = "idle"
     try {
       await StudioRoom.get(roomKey).join(me)
       this.videoEnabled = video
@@ -263,6 +289,8 @@ object StudioLocal {
     this.inCall = false
     this.screenShare = false
     this.callState = "idle"
+    this.mediaMode = "idle"
+    this.callNotice = ""
     this.lastError = ""
     const room = StudioRoom.get(roomKey)
     if (remote !== "") {
@@ -271,24 +299,22 @@ object StudioLocal {
     try { await room.leave(me) } catch (e) { }
   }
 
-  async toggleScreen(roomKey: string) {
-    const me = this.peerName.trim()
-    const next = !this.screenShare
+  toggleScreen() {
     this.lastError = ""
-    try {
-      await StudioRoom.get(roomKey).setScreenShare(me, next)
-      this.screenShare = next
-    } catch (e) {
-      this.lastError = e.message || "could not toggle screen share"
-    }
+    this.callNotice = ""
+    this.screenShare = !this.screenShare
   }
 
   async onScreenChanged(roomKey: string, active: boolean) {
-    if (this.screenShare === active) { return }
     this.screenShare = active
     const me = this.peerName.trim()
     if (me !== "" && this.inCall) {
-      try { await StudioRoom.get(roomKey).setScreenShare(me, active) } catch (e) { }
+      try {
+        await StudioRoom.get(roomKey).setScreenShare(me, active)
+      } catch (e) {
+        this.lastError = e.message || "could not update screen share"
+        if (active) { this.screenShare = false }
+      }
     }
   }
 
@@ -311,11 +337,7 @@ object StudioLocal {
   }
 
   async commitStroke(roomKey: string, stroke: { color: string, width: number, points: number[] }) {
-    const me = this.peerName.trim()
-    if (me === "") {
-      this.lastError = "Enter your name before drawing."
-      return
-    }
+    const me = this.peerName.trim() === "" ? "Guest" : this.peerName.trim()
     this.lastError = ""
     try {
       await StudioRoom.get(roomKey).addStroke(me, stroke.color, stroke.width, stroke.points)
@@ -324,12 +346,18 @@ object StudioLocal {
     }
   }
 
-  async clearBoard(roomKey: string) {
-    const me = this.peerName.trim()
-    if (me === "") {
-      this.lastError = "Enter your name before clearing."
-      return
+  async undoBoard(roomKey: string) {
+    const me = this.peerName.trim() === "" ? "Guest" : this.peerName.trim()
+    this.lastError = ""
+    try {
+      await StudioRoom.get(roomKey).undoStroke(me)
+    } catch (e) {
+      this.lastError = e.message || "could not undo stroke"
     }
+  }
+
+  async clearBoard(roomKey: string) {
+    const me = this.peerName.trim() === "" ? "Guest" : this.peerName.trim()
     this.lastError = ""
     try {
       await StudioRoom.get(roomKey).clearBoard(me)
@@ -381,6 +409,7 @@ function App() {
     />
 
     {local.lastError !== "" && <Text id="error" size={14} color="#b91c1c">{local.lastError}</Text>}
+    {local.callNotice !== "" && <Text id="call-notice" size={13} color="#92400e">{local.callNotice}</Text>}
 
     {local.tab === "call" && <Column gap={10}>
       {!local.inCall && <Row gap={8}>
@@ -399,7 +428,7 @@ function App() {
           {local.videoEnabled && <Button id="toggle-camera" grow={1} onPress={() => local.toggleCamera()}>{local.cameraOff ? "Cam On" : "Cam Off"}</Button>}
         </Row>
         <Row gap={8}>
-          <Button id="toggle-screen" grow={1} onPress={() => local.toggleScreen(roomKey)}>
+          <Button id="toggle-screen" grow={1} onPress={() => local.toggleScreen()}>
             {local.screenShare ? "Stop Share" : "Share Screen"}
           </Button>
           <Button id="leave-call" grow={1} onPress={() => local.leaveRoom(roomKey, remote)}>End Call</Button>
@@ -407,7 +436,9 @@ function App() {
       </Column>}
 
       <Text id="call-status" size={13} color="#3f3f46">
-        {`Peers: ${room.peers.join(", ") || "none"} · State: ${local.callState}`}
+        {local.inCall
+          ? `Peers: ${room.peers.join(", ") || "none"} · State: ${local.callState} (${local.mediaMode})`
+          : `Peers: ${room.peers.join(", ") || "none"} · State: ${local.callState}`}
       </Text>
     </Column>}
 
@@ -432,35 +463,30 @@ function App() {
         }
       }}
       onState={(s) => local.setState(s)}
+      onMediaMode={(m) => local.setMediaMode(m)}
+      onNotice={(n) => local.setNotice(n)}
       onScreenShare={(on) => local.onScreenChanged(roomKey, on)}
       onError={(e) => local.setError(e)}
     />}
 
     {local.tab === "board" && <Column gap={10}>
-      <Row gap={8}>
-        <Button id="color-ink" grow={1} background="#111114" color="#ffffff" onPress={() => local.setPenColor("#111114")}>Ink</Button>
-        <Button id="color-rust" grow={1} background="#9a3412" color="#ffffff" onPress={() => local.setPenColor("#9a3412")}>Rust</Button>
-        <Button id="color-teal" grow={1} background="#0f766e" color="#ffffff" onPress={() => local.setPenColor("#0f766e")}>Teal</Button>
-        <Button id="color-blue" grow={1} background="#1d4ed8" color="#ffffff" onPress={() => local.setPenColor("#1d4ed8")}>Blue</Button>
-      </Row>
-      <Row gap={8} align="center">
-        <Button id="width-thin" grow={1} onPress={() => local.setPenWidth(2)}>Thin</Button>
-        <Button id="width-bold" grow={1} onPress={() => local.setPenWidth(6)}>Bold</Button>
-        <Button id="clear-board" grow={1} onPress={() => local.clearBoard(roomKey)}>Clear</Button>
-      </Row>
       <Text id="board-status" size={13} color="#3f3f46">
-        {`Strokes (${roomKey}): ${strokes.length} · Pen: ${local.penColor} (${local.penWidth}px)`}
+        {`Strokes (${roomKey}): ${strokes.length} · Drawing as ${me || "Guest"} · Pen: ${local.penColor} (${local.penWidth}px)`}
       </Text>
       <Native
         name="Whiteboard"
         id="whiteboard"
         label="Collaborative drawing board"
-        height={260}
-        color={local.penColor}
-        width={local.penWidth}
-        readOnly={me === ""}
+        height={360}
+        strokeColor={local.penColor}
+        strokeWidth={local.penWidth}
+        readOnly={false}
         strokes={strokes.map((s) => ({ id: s.id, author: s.author, color: s.color, width: s.width, points: s.points }))}
         onStroke={(st) => local.commitStroke(roomKey, st)}
+        onColorChange={(c) => local.setPenColor(c)}
+        onWidthChange={(w) => local.setPenWidth(w)}
+        onUndo={() => local.undoBoard(roomKey)}
+        onClear={() => local.clearBoard(roomKey)}
       />
     </Column>}
 

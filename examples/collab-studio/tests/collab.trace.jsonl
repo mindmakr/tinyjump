@@ -16,21 +16,26 @@
 {"do": "call", "object": "StudioRoom/studio", "method": "addStroke", "args": ["Alice", "#111114", 3, [10, 20, 120, 240]], "expect": 1}
 {"do": "call", "object": "StudioRoom/studio", "method": "addStroke", "args": ["Bob", "#9a3412", 6, [300, 320, 500, 520]], "expect": 2}
 {"do": "call", "object": "StudioRoom/other", "method": "addStroke", "args": ["Eve", "#1d4ed8", 4, [50, 50, 90, 90]], "expect": 1}
+{"do": "call", "object": "StudioRoom/studio", "method": "undoStroke", "args": ["Alice"], "expect": true}
+{"do": "get", "object": "BoardStroke/studio:000001", "expectContains": {"points": []}}
+{"do": "get", "object": "BoardStroke/studio:000002", "expectContains": {"author": "Bob"}}
 
 # Verify durable RoomActivity received all cross-object delivered events in studio only
-{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 8}}
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 9}}
 {"do": "get", "object": "RoomActivity/other", "expectContains": {"nextSeq": 3}}
-{"do": "get", "object": "BoardStroke/studio:000001", "expectContains": {"author": "Alice", "color": "#111114"}}
 {"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"author": "Alice", "text": "Hello studio"}}
 
-# Clear studio board fans out durable deletes across BoardStroke/studio:* while leaving other room untouched
-{"do": "call", "object": "StudioRoom/studio", "method": "clearBoard", "args": ["Alice"], "expect": 2}
-{"do": "get", "object": "BoardStroke/studio:000001", "expectContains": {"points": []}}
+# Clear studio board fans out durable deletes across remaining BoardStroke/studio:* while leaving other room untouched
+{"do": "call", "object": "StudioRoom/studio", "method": "clearBoard", "args": ["Alice"], "expect": 1}
 {"do": "get", "object": "BoardStroke/studio:000002", "expectContains": {"points": []}}
 {"do": "get", "object": "BoardStroke/other:000001", "expectContains": {"author": "Eve"}}
 
-# Switch tabs via UI, join voice call, and confirm VideoCall stays mounted while switching tabs
+# Switch to Board as a guest (before entering a name) and draw via onStroke, then undo via onUndo
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
+{"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
+{"do": "ui", "target": "#whiteboard", "event": "onStroke", "value": {"color": "#0f766e", "width": 4, "points": [40, 40, 220, 180]}}
+{"do": "assertScreen", "contains": ["Strokes (studio): 1"]}
+{"do": "ui", "target": "#whiteboard", "event": "onUndo"}
 {"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
 {"do": "assertLayout", "width": 390, "height": 844, "review": true}
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "chat"}
@@ -45,6 +50,8 @@
 {"do": "ui", "target": "#join-audio", "event": "onPress"}
 {"do": "assertScreen", "contains": ["End Call", "Share Screen", "Peers: Carol"]}
 {"do": "get", "object": "StudioLocal/me", "expectContains": {"inCall": true, "videoEnabled": false}}
+{"do": "ui", "target": "#toggle-screen", "event": "onPress"}
+{"do": "get", "object": "StudioLocal/me", "expectContains": {"screenShare": true}}
 {"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
 {"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
 {"do": "assertLayout", "width": 390, "height": 844, "review": true}
@@ -57,4 +64,4 @@
 # Restart persistence over the same store keeps topic entries and activity
 {"do": "boot", "restart": true, "now": 1800000005000, "seed": 1, "server": true, "render": true}
 {"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"text": "Hello studio"}}
-{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 11}}
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 14}}

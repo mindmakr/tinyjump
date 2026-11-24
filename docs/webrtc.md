@@ -31,7 +31,8 @@ All hosts (Web, Android, iOS) share the exact same prop and event contract:
 | `video` | `boolean` | `true` | Request camera track (`false` for voice-only calls). |
 | `muted` | `boolean` | `false` | Toggle local microphone track `enabled` without renegotiating. |
 | `cameraOff` | `boolean` | `false` | Toggle local video track `enabled` without renegotiating. |
-| `screenShare` | `boolean` | `false` | Replace the outbound video track with a display-capture stream (`getDisplayMedia`) when `true` (renegotiating on voice-only calls), and restore camera when `false` or ended. |
+| `screenShare` | `boolean` | `false` | Replace the outbound video track with a display-capture stream (`getDisplayMedia`) when `true` (upgrading `recvonly` transceivers/renegotiating on audio-only or view-only calls), and restore camera when `false` or ended. |
+| `controls` | `boolean` | `true` | Render the built-in overlay controls (`Share Screen`, `Retry Cam/Mic` when degraded, and `Unmute Audio` if browser autoplay blocks audio). Automatically hidden on compact active-call strips (`height < 140`). |
 | `signals` | `Signal[]` | `[]` | Array of `{ seq, from, to, kind, payload }` (`kind`: `"offer" \| "answer" \| "ice" \| "bye"`) from the `@server` room; processed monotonically by `seq`. |
 | `iceServers` | `IceServer[]` | public Google STUN | Optional STUN/TURN servers (`stun:`, `stuns:`, `turn:`, `turns:` URLs only). |
 
@@ -41,8 +42,15 @@ All hosts (Web, Android, iOS) share the exact same prop and event contract:
 |---|---|---|
 | `onSignal` | `{ to, kind, payload }` | Outbound SDP `"offer"`, `"answer"`, or `"ice"` candidate to forward to the `@server` room (hangup `"bye"` is sent by the app when leaving). |
 | `onState` | `string` | `"idle" \| "acquiring" \| "connecting" \| "connected" \| "disconnected" \| "failed" \| "closed"`. |
+| `onMediaMode` | `string` | `"idle" \| "audio-video" \| "audio-only" \| "video-only" \| "recv-only"` reporting the active capture fallback tier. |
+| `onNotice` | `string` | Non-fatal status or fallback explanation (for example when a camera is busy in another browser and the peer falls back to audio-only/view-only). |
 | `onScreenShare` | `boolean` | Emitted with `true` when display capture begins and `false` when the browser stops sharing or the user cancels the picker. |
-| `onError` | `string` | Human-readable media or negotiation error. |
+| `onError` | `string` | Fatal negotiation or environment error. |
+
+## Media fallback & screen sharing
+
+- **Automatic capture fallback (`acquireMedia`):** When `audio`/`video` capture fails (such as `NotReadableError` when another browser on the same machine already holds the webcam, missing hardware, or denied permissions), `hosts/web/plugins/webrtc.js` automatically falls back along `{audio,video} -> audio-only -> video-only -> recv-only` without tearing down signaling or peer connection setup, adding `recvonly` transceivers so view-only peers still receive remote camera/screen video and audio and can click **Share Screen** or **Retry Cam/Mic** at any time.
+- **Autoplay resilience:** Remote video uses `object-fit: contain` so shared screens are never cropped; if unmuted `play()` is blocked by browser autoplay policy, playback continues muted with a clickable **Unmute Audio** button.
 
 ## Host setup
 
