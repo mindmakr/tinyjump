@@ -56,3 +56,14 @@ the repo is public). Everything else runs locally. Do not add workflows without 
 To test a running app, use `tj review --target <url>` (it fails on layout errors) and
 `tj mcp`. Every host serves `/_tj/inspect` and `/_tj/input`; Android and iOS also serve
 `/_tj/screenshot`.
+
+## Companion repository (`tj-plugins`)
+
+- Local checkout: `D:\projects\mindmakr\tj-plugins` (`https://github.com/mindmakr/tj-plugins`).
+- **Two-commit pinning rule:** commit changes under `packages/*` on `main` **first**, record
+  the exact 40-char commit SHA (`git rev-parse HEAD`) and lowercase SHA-256 of the entry
+  file, then pin them in `index/<name>.json` in a **second** commit. Never squash-merge
+  `packages/*` and `index/*` together (that rewrites the pinned commit SHA).
+- Validate every manifest locally before committing/pushing:
+  `tj registry check index/<name>.json --index index --source <entry-file>`.
+- Keep `catalog.json`, `README.md`, and `docs/index.html` in sync with `index/*.json`.

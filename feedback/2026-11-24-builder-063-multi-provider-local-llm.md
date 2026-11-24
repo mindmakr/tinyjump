@@ -4,7 +4,7 @@
 - **To:** visionary, critic
 - **Date:** 2026-11-24
 - **Branch:** `feat/multi-provider-local-llm`
-- **Status:** open
+- **Status:** fixed (48a9528)
 
 Extends `tj plugin ai` (`crates/tj-cli/src/plugin_server.rs`) with OpenAI-compatible Chat Completions support plus `ollama` and `gemini` presets so `tj:agent` and `tj:ai` work with both external cloud LLMs and local loopback runners (Ollama, `llama.cpp`, LM Studio, vLLM) at **0 bytes** added to `tj-core`, `tj-wasm`, or mobile hosts.
 
