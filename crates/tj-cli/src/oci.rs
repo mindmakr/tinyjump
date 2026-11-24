@@ -71,6 +71,78 @@ pub fn detect_elf_arch(bytes: &[u8]) -> Option<OciArch> {
     }
 }
 
+fn elf_u16(b: &[u8], off: usize, le: bool) -> Option<u16> {
+    let s = b.get(off..off + 2)?;
+    Some(if le { u16::from_le_bytes([s[0], s[1]]) } else { u16::from_be_bytes([s[0], s[1]]) })
+}
+
+fn elf_u32(b: &[u8], off: usize, le: bool) -> Option<u32> {
+    let s = b.get(off..off + 4)?;
+    let arr: [u8; 4] = s.try_into().ok()?;
+    Some(if le { u32::from_le_bytes(arr) } else { u32::from_be_bytes(arr) })
+}
+
+fn elf_u64(b: &[u8], off: usize, le: bool) -> Option<u64> {
+    let s = b.get(off..off + 8)?;
+    let arr: [u8; 8] = s.try_into().ok()?;
+    Some(if le { u64::from_le_bytes(arr) } else { u64::from_be_bytes(arr) })
+}
+
+/// Returns the ELF dynamic interpreter (`PT_INTERP`) path if the Linux binary is dynamically linked.
+pub fn detect_elf_dynamic_interp(bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 52 || &bytes[0..4] != b"\x7fELF" {
+        return None;
+    }
+    let class = bytes[4]; // 1 = ELF32, 2 = ELF64
+    let le = match bytes[5] {
+        1 => true,
+        2 => false,
+        _ => return None,
+    };
+    let (phoff, phentsize, phnum) = match class {
+        1 => (
+            usize::try_from(elf_u32(bytes, 28, le)?).ok()?,
+            usize::from(elf_u16(bytes, 42, le)?),
+            usize::from(elf_u16(bytes, 44, le)?),
+        ),
+        2 => (
+            usize::try_from(elf_u64(bytes, 32, le)?).ok()?,
+            usize::from(elf_u16(bytes, 54, le)?),
+            usize::from(elf_u16(bytes, 56, le)?),
+        ),
+        _ => return None,
+    };
+    if phentsize == 0 || phnum == 0 {
+        return None;
+    }
+    for idx in 0..phnum.min(128) {
+        let off = phoff.checked_add(idx.checked_mul(phentsize)?)?;
+        let p_type = elf_u32(bytes, off, le)?;
+        if p_type == 3 {
+            // PT_INTERP
+            let (p_offset, p_filesz) = match class {
+                1 => (
+                    usize::try_from(elf_u32(bytes, off + 4, le)?).ok()?,
+                    usize::try_from(elf_u32(bytes, off + 16, le)?).ok()?,
+                ),
+                2 => (
+                    usize::try_from(elf_u64(bytes, off + 8, le)?).ok()?,
+                    usize::try_from(elf_u64(bytes, off + 32, le)?).ok()?,
+                ),
+                _ => return None,
+            };
+            if p_filesz == 0 || p_filesz > 4096 {
+                return None;
+            }
+            let slice = bytes.get(p_offset..p_offset.checked_add(p_filesz)?)?;
+            let end = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            let interp = String::from_utf8_lossy(&slice[..end]).trim().to_string();
+            return (!interp.is_empty()).then_some(interp);
+        }
+    }
+    None
+}
+
 pub fn host_default_arch() -> OciArch {
     match std::env::consts::ARCH {
         "aarch64" => OciArch::Arm64,
@@ -179,15 +251,7 @@ pub fn build_oci_image(opts: &OciOptions<'_>) -> Result<OciOutput, String> {
     let layer_digest = format!("sha256:{}", hex_lower(&sha256(&layer_gz_vec)));
 
     let has_web = !web_files.is_empty();
-    let port_str = opts.port.to_string();
-    let mut cmd = vec![
-        "--host".to_string(),
-        "0.0.0.0".to_string(),
-        "--port".to_string(),
-        port_str.clone(),
-        "--data".to_string(),
-        "/data".to_string(),
-    ];
+    let mut cmd = vec!["--host".to_string(), "0.0.0.0".to_string()];
     if has_web {
         cmd.push("--web-dir".into());
         cmd.push("/web".into());
@@ -204,7 +268,7 @@ pub fn build_oci_image(opts: &OciOptions<'_>) -> Result<OciOutput, String> {
             "ExposedPorts": { port_key: {} },
             "Env": [
                 "TJ_DATA=/data",
-                format!("TJ_PORT={}", opts.port),
+                format!("TJ_DEFAULT_PORT={}", opts.port),
             ],
             "Entrypoint": [format!("/app/{bin_name}")],
             "Cmd": cmd,
@@ -256,6 +320,16 @@ pub fn build_oci_image(opts: &OciOptions<'_>) -> Result<OciOutput, String> {
     let manifest_bytes = serde_json::to_vec_pretty(&manifest_json).expect("manifest serializes");
     let image_digest = format!("sha256:{}", hex_lower(&sha256(&manifest_bytes)));
 
+    let mut platform = json!({
+        "architecture": opts.arch.as_str(),
+        "os": "linux",
+    });
+    if opts.arch == OciArch::Arm {
+        platform
+            .as_object_mut()
+            .expect("json object")
+            .insert("variant".into(), json!("v7"));
+    }
     let index_json = json!({
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -263,10 +337,7 @@ pub fn build_oci_image(opts: &OciOptions<'_>) -> Result<OciOutput, String> {
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "digest": image_digest,
             "size": manifest_bytes.len(),
-            "platform": {
-                "architecture": opts.arch.as_str(),
-                "os": "linux",
-            },
+            "platform": platform,
             "annotations": {
                 "org.opencontainers.image.ref.name": format!("{bin_name}:{}", opts.version),
             },
@@ -334,14 +405,14 @@ pub fn build_oci_image(opts: &OciOptions<'_>) -> Result<OciOutput, String> {
 /// Renders a matching rootless `FROM scratch` `Containerfile` / `Dockerfile` reference
 /// next to an OCI layout directory.
 pub fn render_containerfile(bin_name: &str, title: &str, version: &str, app_sha256: &str, port: u16, has_web: bool) -> String {
-    let web_copy = if has_web { "COPY web /web\n" } else { "" };
+    let web_copy = if has_web { "COPY --chown=65532:65532 web /web\n" } else { "" };
     let cmd_json = if has_web {
-        format!("[\"--host\", \"0.0.0.0\", \"--port\", \"{port}\", \"--data\", \"/data\", \"--web-dir\", \"/web\"]")
+        "[\"--host\", \"0.0.0.0\", \"--web-dir\", \"/web\"]"
     } else {
-        format!("[\"--host\", \"0.0.0.0\", \"--port\", \"{port}\", \"--data\", \"/data\"]")
+        "[\"--host\", \"0.0.0.0\"]"
     };
     format!(
-        "# Sealed rootless FROM scratch container definition for {title} ({bin_name}:{version})\n\
+        "# Sealed rootless FROM scratch container definition for {escaped_title} ({bin_name}:{version})\n\
          # Preferred: deploy the daemonless OCI layout directly (`skopeo copy oci:./layout ...` or `--assemble` .tar).\n\
          # If building from unpacked `app/`{web_note} directories with `docker build`, run inside a staging folder holding `app/{bin_name}`{web_note2}:\n\
          FROM scratch\n\
@@ -350,7 +421,7 @@ pub fn render_containerfile(bin_name: &str, title: &str, version: &str, app_sha2
                io.tinyjump.bytecode.sha256=\"{app_sha256}\"\n\
          COPY --chown=65532:65532 app/{bin_name} /app/{bin_name}\n\
          {web_copy}\
-         ENV TJ_DATA=/data TJ_PORT={port}\n\
+         ENV TJ_DATA=/data TJ_DEFAULT_PORT={port}\n\
          WORKDIR /app\n\
          USER 65532:65532\n\
          VOLUME [\"/data\"]\n\
@@ -764,5 +835,21 @@ mod tests {
         let (p, n) = split_ustar_path(&long_path).unwrap();
         assert_eq!(p.len(), 110);
         assert_eq!(n, "file.bin");
+
+        // Dynamic linker PT_INTERP detection on ELF64 LE binary.
+        let mut dyn_elf = vec![0u8; 256];
+        dyn_elf[0..4].copy_from_slice(b"\x7fELF");
+        dyn_elf[4] = 2; // ELF64
+        dyn_elf[5] = 1; // little endian
+        dyn_elf[18..20].copy_from_slice(&0x003Eu16.to_le_bytes());
+        dyn_elf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        dyn_elf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        dyn_elf[56..58].copy_from_slice(&1u16.to_le_bytes());  // e_phnum
+        dyn_elf[64..68].copy_from_slice(&3u32.to_le_bytes());  // PT_INTERP
+        dyn_elf[72..80].copy_from_slice(&160u64.to_le_bytes()); // p_offset
+        let interp = b"/lib64/ld-linux-x86-64.so.2\0";
+        dyn_elf[96..104].copy_from_slice(&(interp.len() as u64).to_le_bytes()); // p_filesz
+        dyn_elf[160..160 + interp.len()].copy_from_slice(interp);
+        assert_eq!(detect_elf_dynamic_interp(&dyn_elf).as_deref(), Some("/lib64/ld-linux-x86-64.so.2"));
     }
 }

@@ -31,7 +31,7 @@
 ## Trade-offs & Sizes
 - Adds one optional target (`--oci`) with zero effect on `examples/todo/app.tj` or existing targets (`--web`, `--linux`, `--android`, `--ios`).
 - Device/core impact: **0 KB** added to `tj_wasm.wasm` (`860 KB`), `libtj_android.so` (`arm64` `1108 KB`, `armv7` `788 KB`, `i686` `1322 KB`, `x86_64` `1310 KB`), or all 4 benchmark apps.
-- CLI (`target/release/tj.exe`) measured `10,468,864` bytes (`10,224 KB` vs `9,830 KB` on `main`, `+394 KB` combined across `#84` `--oci` + `flate2::GzBuilder` and `#85` `tj migrate` + `compare`); `scripts/budget.json` updated `9850` -> `10250 KB` for `target/release/tj` only.
+- CLI (`target/release/tj.exe`) measured `10,465,280` bytes (`10,220 KB` vs `9,830 KB` on `main`, `+390 KB` combined across `#84` `--oci` + `flate2::GzBuilder` and `#85` `tj migrate` + `compare`); `scripts/budget.json` updated `9850` -> `10250 KB` for `target/release/tj` only.
 - Measured `--oci --assemble` outputs on `tj.exe` (hosting Windows runner + full `860 KB` `tj_wasm.wasm`; cross-building a stripped `musl` Linux runner + `--aot` WASM shrinks images further):
-  - `examples/todo/app.tj`: `9,447 B` bytecode, `10,478,359 B` standalone exe, `11,418,112 B` layer tar, `4,331,062 B` gzip layer (`4.13 MiB`), `4,339,712 B` assembled `todo-oci.tar` (`4.14 MiB`).
-  - `examples/booking/app.tj`: `27,792 B` bytecode, `10,496,704 B` standalone exe, `11,436,544 B` layer tar, `4,338,052 B` gzip layer (`4.14 MiB`), `4,346,368 B` assembled `booking-oci.tar` (`4.15 MiB`).
+  - `examples/todo/app.tj`: `9,447 B` bytecode, `10,474,775 B` standalone exe, `11,414,528 B` layer tar, `4,326,468 B` gzip layer (`4.13 MiB`), `4,335,104 B` assembled `todo-oci.tar` (`4.13 MiB`).
+  - `examples/booking/app.tj`: `27,792 B` bytecode, `10,493,120 B` standalone exe, `11,432,960 B` layer tar, `4,333,277 B` gzip layer (`4.13 MiB`), `4,341,760 B` assembled `booking-oci.tar` (`4.14 MiB`).

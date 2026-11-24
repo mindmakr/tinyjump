@@ -3,7 +3,7 @@
 //!
 //! Strictly CLI-only: 0 bytes added to `tj-core` or device builds.
 
-use crate::engine::{is_public, PRIVATE_FETCH_ENV};
+use crate::engine::{public_or_loopback, PRIVATE_FETCH_ENV};
 use crate::golden::{compare as compare_png, decode_png, encode_png, DEFAULT_THRESHOLD_PCT};
 use crate::{app, review, test_runner};
 use serde_json::{json, Value as Json};
@@ -11,8 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read;
-use std::net::ToSocketAddrs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tj_core::ui::layout::Measure;
 use tj_core::{Input, MemStore, Options, Output, Runtime};
@@ -136,14 +135,13 @@ fn migrate_path(input: &Path, out: Option<&Path>) -> Result<MigrateOutcome, Stri
         let dest_dir = out
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("{}-tj", input.display())));
-        if let Ok(dest_canon) = fs::canonicalize(&dest_dir) {
-            if dest_canon == in_canon || dest_canon.starts_with(&in_canon) {
-                return Err(format!(
-                    "refusing to write migrated directory {} inside/over input {}",
-                    dest_dir.display(),
-                    input.display()
-                ));
-            }
+        let dest_canon = resolve_logical_path(&dest_dir)?;
+        if dest_canon == in_canon || dest_canon.starts_with(&in_canon) {
+            return Err(format!(
+                "refusing to write migrated directory {} inside/over input {}",
+                dest_dir.display(),
+                input.display()
+            ));
         }
         let files = collect_source_files(&in_canon)?;
         if files.is_empty() {
@@ -171,22 +169,59 @@ fn migrate_path(input: &Path, out: Option<&Path>) -> Result<MigrateOutcome, Stri
                 compile_errors: Vec::new(),
             });
         }
-        // Check entry file compilation via app::read (resolving multi-file imports).
+        // Check entry file compilation via app::read (resolving multi-file imports),
+        // plus any unimported sibling output `.tj` files so `--strict` never misses broken siblings.
+        let mut checked_outputs: HashSet<PathBuf> = HashSet::new();
         let entry_idx = pick_entry_index(&results);
         if let Some(idx) = entry_idx {
             let entry_path = PathBuf::from(&results[idx].output);
-            match app::read(&entry_path).and_then(|loaded| {
+            if let Ok(canon) = fs::canonicalize(&entry_path) {
+                checked_outputs.insert(canon);
+            }
+            match app::read(&entry_path) {
+                Ok(loaded) => {
+                    for dep in &loaded.files {
+                        if let Ok(canon) = fs::canonicalize(dep) {
+                            checked_outputs.insert(canon);
+                        }
+                    }
+                    match tj_core::compile(&loaded.source) {
+                        Ok(_) => results[idx].compiles = Some(true),
+                        Err(errs) => {
+                            let out_disp = results[idx].output.clone();
+                            results[idx].compiles = Some(false);
+                            results[idx].compile_errors.extend(
+                                errs.iter().map(|d| d.render(&out_disp, &loaded.source)),
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    results[idx].compiles = Some(false);
+                    results[idx].compile_errors.push(e);
+                }
+            }
+        }
+        for r in &mut results {
+            if r.compiles.is_some() {
+                continue;
+            }
+            let out_p = PathBuf::from(&r.output);
+            if fs::canonicalize(&out_p).is_ok_and(|c| checked_outputs.contains(&c)) {
+                continue;
+            }
+            match app::read(&out_p).and_then(|loaded| {
                 tj_core::compile(&loaded.source).map_err(|errs| {
                     errs.iter()
-                        .map(|d| d.render(&results[idx].output, &loaded.source))
+                        .map(|d| d.render(&r.output, &loaded.source))
                         .collect::<Vec<_>>()
                         .join("\n\n")
                 })
             }) {
-                Ok(_) => results[idx].compiles = Some(true),
+                Ok(_) => r.compiles = Some(true),
                 Err(e) => {
-                    results[idx].compiles = Some(false);
-                    results[idx].compile_errors.push(e);
+                    r.compiles = Some(false);
+                    r.compile_errors.push(e);
                 }
             }
         }
@@ -401,6 +436,49 @@ fn paths_match(a: &Path, b: &Path) -> bool {
         (Ok(ca), Ok(cb)) => ca == cb,
         _ => false,
     }
+}
+
+/// Resolves a potentially non-existent path by canonicalizing its deepest existing
+/// ancestor and appending normalized remaining path components.
+fn resolve_logical_path(path: &Path) -> Result<PathBuf, String> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("cannot read working directory: {e}"))?
+            .join(path)
+    };
+    let mut norm = PathBuf::new();
+    for comp in joined.components() {
+        match comp {
+            Component::Prefix(p) => norm.push(p.as_os_str()),
+            Component::RootDir => norm.push(comp.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::Normal(s) => norm.push(s),
+        }
+    }
+    let mut tail = Vec::new();
+    let mut cur = norm.as_path();
+    let base = loop {
+        if cur.exists() {
+            break fs::canonicalize(cur).map_err(|e| format!("cannot resolve {}: {e}", cur.display()))?;
+        }
+        let Some(parent) = cur.parent() else {
+            return Ok(norm);
+        };
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        cur = parent;
+    };
+    let mut resolved = base;
+    for seg in tail.into_iter().rev() {
+        resolved.push(seg);
+    }
+    Ok(resolved)
 }
 
 fn read_bounded_utf8(path: &Path, limit: usize) -> Result<String, String> {
@@ -764,10 +842,9 @@ fn detect_unsupported_patterns(src: &str, file: &str, diags: &mut Vec<MigrationD
             ("class", "syntax-class", "`class` declarations are not supported in TinyJump", "Use durable `object Name { ... }` blocks with methods instead."),
             ("finally", "syntax-finally", "`try { ... } finally { ... }` is not supported", "Run cleanup after the `try / catch` block or inside a helper."),
         ] {
-            if has_kw(pat) {
-                // Only flag `switch (` or `window.`/`document.` when followed by `.` / `(` as expected
+            if let Some(pos) = find_code_keyword(src, &mask, line_start, line_end, pat) {
                 let valid = match pat {
-                    "switch" => line.contains("switch (") || line.contains("switch("),
+                    "switch" => next_code_non_ws(src, &mask, pos + pat.len(), line_end) == Some('('),
                     _ => true,
                 };
                 if valid {
@@ -782,25 +859,53 @@ fn detect_unsupported_patterns(src: &str, file: &str, diags: &mut Vec<MigrationD
                 }
             }
         }
-        if has_kw("new") {
-            for (ctor, hint) in [
-                ("Date", "Store timestamps as UTC millisecond numbers (`Date.now()`) and format UI via `<Time>` / `Time.*`."),
-                ("Map", "Replace `new Map()` with `Record<string, T>` or `{}` object maps."),
-                ("Set", "Replace `new Set()` with deduplicated arrays (`arr.includes(x)`) or `Record<string, boolean>`."),
-            ] {
-                if line.contains(&format!("new {ctor}")) {
-                    diags.push(MigrationDiagnostic {
-                        file: file.into(),
-                        line: line_no,
-                        severity: "manual",
-                        kind: "builtin-new",
-                        message: format!("`new {ctor}` is not supported (`new` only constructs `Error`)"),
-                        hint: hint.into(),
-                    });
+        let mut scan = line_start;
+        while let Some(new_pos) = find_code_keyword(src, &mask, scan, line_end, "new") {
+            let mut k = new_pos + 3;
+            while k < line_end && (!mask[k] || src.as_bytes()[k].is_ascii_whitespace()) {
+                k += 1;
+            }
+            if k < line_end && src.is_char_boundary(k) {
+                if let Some(ctor) = ident_at(&src[k..line_end]) {
+                    let hint = match ctor {
+                        "Date" => Some("Store timestamps as UTC millisecond numbers (`Date.now()`) and format UI via `<Time>` / `Time.*`."),
+                        "Map" => Some("Replace `new Map()` with `Record<string, T>` or `{}` object maps."),
+                        "Set" => Some("Replace `new Set()` with deduplicated arrays (`arr.includes(x)`) or `Record<string, boolean>`."),
+                        _ => None,
+                    };
+                    if let Some(hint) = hint {
+                        diags.push(MigrationDiagnostic {
+                            file: file.into(),
+                            line: line_no,
+                            severity: "manual",
+                            kind: "builtin-new",
+                            message: format!("`new {ctor}` is not supported (`new` only constructs `Error`)"),
+                            hint: hint.into(),
+                        });
+                    }
+                    scan = k + ctor.len();
+                    continue;
                 }
             }
+            scan = new_pos + 3;
         }
     }
+}
+
+fn next_code_non_ws(src: &str, mask: &[bool], start: usize, end: usize) -> Option<char> {
+    let mut i = start;
+    while i < end {
+        if mask[i] && src.is_char_boundary(i) {
+            let ch = src[i..].chars().next()?;
+            if !ch.is_whitespace() {
+                return Some(ch);
+            }
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 fn find_code_keyword(src: &str, mask: &[bool], start: usize, end: usize, kw: &str) -> Option<usize> {
@@ -846,19 +951,7 @@ fn ident_at(s: &str) -> Option<&str> {
 }
 
 fn rewrite_ts_dialect(src: &str) -> String {
-    let strip_annots = [
-        ": JSX.Element",
-        ": React.ReactNode",
-        ": React.ReactElement",
-        ": React.FC",
-    ];
-    let mut pre = src.to_string();
-    for pat in strip_annots {
-        pre = pre.replace(pat, "");
-    }
-    // Simplify common React event param type annotations like `(e: React.ChangeEvent<HTMLInputElement>)`.
-    pre = strip_react_event_types(&pre);
-
+    let pre = strip_react_type_annotations(src);
     let mask = code_mask(&pre);
     let b = pre.as_bytes();
     let mut out = String::with_capacity(pre.len() + 16);
@@ -894,7 +987,7 @@ fn rewrite_ts_dialect(src: &str) -> String {
                 continue;
             }
         }
-        if prev_ok && pre[i..].starts_with("var") {
+        if prev_ok && (i == 0 || b[i - 1] != b'.') && pre[i..].starts_with("var") {
             let end = i + 3;
             if end < b.len() && matches!(b[end], b' ' | b'\t') {
                 out.push_str("let");
@@ -909,30 +1002,74 @@ fn rewrite_ts_dialect(src: &str) -> String {
     out
 }
 
-fn strip_react_event_types(src: &str) -> String {
-    let mut out = src.to_string();
-    for marker in [": React.ChangeEvent<", ": React.FormEvent<", ": React.MouseEvent<", ": ChangeEvent<", ": FormEvent<", ": MouseEvent<"] {
-        while let Some(pos) = out.find(marker) {
-            let after_lt = pos + marker.len();
-            let mut depth = 1usize;
-            let bytes = out.as_bytes();
-            let mut j = after_lt;
-            while j < bytes.len() && depth > 0 {
-                match bytes[j] {
-                    b'<' => depth += 1,
-                    b'>' => depth -= 1,
-                    _ => {}
-                }
+fn strip_react_type_annotations(src: &str) -> String {
+    let mask = code_mask(src);
+    let b = src.as_bytes();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if mask[i] && b[i] == b':' {
+            let mut j = i + 1;
+            while j < b.len() && matches!(b[j], b' ' | b'\t') {
                 j += 1;
             }
-            if depth == 0 {
-                out.replace_range(pos..j, "");
-            } else {
-                break;
+            let rest = &src[j..];
+            if let Some(gt_end) = match_generic_react_annot(src, &mask, j, rest) {
+                i = gt_end;
+                continue;
+            }
+            if let Some(plain_end) = match_plain_react_annot(rest) {
+                i = j + plain_end;
+                continue;
+            }
+        }
+        let ch = src[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn match_generic_react_annot(src: &str, mask: &[bool], j: usize, rest: &str) -> Option<usize> {
+    for prefix in [
+        "React.FC<",
+        "React.FunctionComponent<",
+        "React.ChangeEvent<",
+        "React.FormEvent<",
+        "React.MouseEvent<",
+        "ChangeEvent<",
+        "FormEvent<",
+        "MouseEvent<",
+    ] {
+        if rest.starts_with(prefix) {
+            let lt_idx = j + prefix.len() - 1;
+            if let Some(gt_idx) = find_matching_delim(src, mask, lt_idx, b'<', b'>') {
+                return Some(gt_idx + 1);
             }
         }
     }
-    out
+    None
+}
+
+fn match_plain_react_annot(rest: &str) -> Option<usize> {
+    for pat in [
+        "JSX.Element",
+        "React.ReactNode",
+        "React.ReactElement",
+        "React.FunctionComponent",
+        "React.FC",
+    ] {
+        if let Some(after) = rest.strip_prefix(pat) {
+            let next_ok = after
+                .as_bytes()
+                .first()
+                .map_or(true, |&c| !is_ident_char(c) && c != b'.' && c != b'<');
+            if next_ok {
+                return Some(pat.len());
+            }
+        }
+    }
+    None
 }
 
 struct HookVar {
@@ -1268,33 +1405,16 @@ fn rewrite_state_reads(src: &str, vars: &HashSet<String>) -> String {
                     // Arrow param shadowing like `count => ...` or `(count) => ...`
                     let is_arrow_param = src[end..].trim_start().starts_with("=>")
                         || (next == Some(')') && src[end..].find(')').is_some_and(|p| src[end + p + 1..].trim_start().starts_with("=>")));
-                    // Object key literal `{ count: 1 }` vs JS shorthand `{ count }` (exclude JSX `{count}` / `attr={count}`).
+                    // Object key literal `{ count: 1 }`, destructuring `{ a, count } = ...`,
+                    // vs ES6 shorthand `{ count }` / `{ a, count }`.
                     let is_obj_key = matches!(prev, Some('{') | Some(',')) && next == Some(':');
-                    let is_shorthand = if prev == Some(',') && matches!(next, Some(',') | Some('}')) {
-                        true
-                    } else if prev == Some('{') && next == Some('}') {
-                        let brace_pos = src[..i].rfind('{').unwrap_or(0);
-                        let close_pos = end + src[end..].find('}').unwrap_or(0);
-                        let before = prev_non_ws(src, brace_pos);
-                        let after_close = next_non_ws(src, close_pos + 1);
-                        after_close != Some('<')
-                            && ((ends_with_kw(&src[..brace_pos], &["return"])
-                                && after_close.map_or(true, |c| matches!(c, ';' | '}' | ')' | ',')))
-                                || (matches!(before, Some('[' | ','))
-                                    && matches!(after_close, Some(']' | ',' | ')' | ';' | '}')))
-                                || (before == Some('(')
-                                    && matches!(after_close, Some(')' | ','))
-                                    && !matches!(
-                                        prev_non_ws(src, src[..brace_pos].rfind('(').unwrap_or(0)),
-                                        Some('>')
-                                    ))
-                                || (before == Some(':')
-                                    && matches!(after_close, Some(',' | '}' | ')' | ';'))
-                                    && is_after_obj_colon(&src[..brace_pos])))
-                    } else {
-                        false
-                    };
-                    if after_dot || is_jsx_attr || is_arrow_param || is_obj_key {
+                    let is_destructuring_binding = prev.is_some_and(|c| matches!(c, '{' | ',' | ':'))
+                        && next.is_some_and(|c| matches!(c, ',' | '}' | ':' | '='))
+                        && find_enclosing_curly(src, &mask, i, end)
+                            .is_some_and(|(o, c)| is_enclosing_destructuring(src, o, c));
+                    let is_shorthand = !is_destructuring_binding
+                        && is_shorthand_object_prop(src, &mask, i, end, prev, next);
+                    if after_dot || is_jsx_attr || is_arrow_param || is_obj_key || is_destructuring_binding {
                         out.push_str(tok);
                     } else if is_shorthand {
                         let _ = write!(out, "{tok}: state.{tok}");
@@ -1334,6 +1454,104 @@ fn ends_with_kw(s: &str, kws: &[&str]) -> bool {
         }
     }
     false
+}
+
+fn is_enclosing_destructuring(src: &str, open_brace: usize, close_brace: usize) -> bool {
+    if ends_with_kw(&src[..open_brace], &["const", "let", "var"]) {
+        return true;
+    }
+    let after_close = next_non_ws(src, close_brace + 1);
+    if after_close == Some('=')
+        && !src[close_brace + 1..].trim_start().starts_with("==")
+        && !src[close_brace + 1..].trim_start().starts_with("=>")
+    {
+        return true;
+    }
+    if prev_non_ws(src, open_brace) == Some('(') && after_close == Some(')') {
+        if let Some(rel_rparen) = src[close_brace + 1..].find(')') {
+            if src[close_brace + 1 + rel_rparen + 1..].trim_start().starts_with("=>") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_shorthand_object_prop(
+    src: &str,
+    mask: &[bool],
+    i: usize,
+    end: usize,
+    prev: Option<char>,
+    next: Option<char>,
+) -> bool {
+    if !matches!(prev, Some('{') | Some(',')) || !matches!(next, Some(',') | Some('}')) {
+        return false;
+    }
+    let Some((open_brace, close_brace)) = find_enclosing_curly(src, mask, i, end) else {
+        return false;
+    };
+    let before = prev_non_ws(src, open_brace);
+    let after_close = next_non_ws(src, close_brace + 1);
+    if after_close == Some('<') || is_enclosing_destructuring(src, open_brace, close_brace) {
+        return false;
+    }
+    (ends_with_kw(&src[..open_brace], &["return"])
+        && after_close.map_or(true, |c| matches!(c, ';' | '}' | ')' | ',')))
+        || (matches!(before, Some('[' | ',' | '=' | '{'))
+            && matches!(after_close, Some(']' | ',' | ')' | ';' | '}')))
+        || (before == Some('(')
+            && matches!(after_close, Some(')' | ','))
+            && !matches!(
+                prev_non_ws(src, src[..open_brace].rfind('(').unwrap_or(0)),
+                Some('>')
+            ))
+        || (before == Some(':')
+            && matches!(after_close, Some(',' | '}' | ')' | ';'))
+            && is_after_obj_colon(&src[..open_brace]))
+}
+
+fn find_enclosing_curly(src: &str, mask: &[bool], i: usize, end: usize) -> Option<(usize, usize)> {
+    let b = src.as_bytes();
+    let mut curly = 0usize;
+    let mut paren = 0usize;
+    let mut bracket = 0usize;
+    let mut p = i;
+    let mut open_brace = None;
+    while p > 0 {
+        p -= 1;
+        if !mask[p] {
+            continue;
+        }
+        match b[p] {
+            b')' => paren += 1,
+            b'(' => {
+                if paren == 0 {
+                    return None;
+                }
+                paren -= 1;
+            }
+            b']' => bracket += 1,
+            b'[' => {
+                if bracket == 0 {
+                    return None;
+                }
+                bracket -= 1;
+            }
+            b'}' => curly += 1,
+            b'{' => {
+                if curly == 0 {
+                    open_brace = Some(p);
+                    break;
+                }
+                curly -= 1;
+            }
+            _ => {}
+        }
+    }
+    let open = open_brace?;
+    let close = find_matching_brace(src, mask, open)?;
+    (close >= end).then_some((open, close))
 }
 
 fn is_after_obj_colon(before_brace: &str) -> bool {
@@ -1412,11 +1630,21 @@ fn translate_jsx(src: &str, file: &str, diags: &mut Vec<MigrationDiagnostic>) ->
                         let after_tag = i + 1 + tag.len();
                         let next_ch = b.get(after_tag).copied();
                         if next_ch.is_some_and(|c| c.is_ascii_whitespace() || c == b'>' || c == b'/') {
-                            if let Some((attrs, self_closing, tag_end)) = parse_jsx_open_tag(src, &mask, after_tag) {
+                            if let Some(parsed) = parse_jsx_open_tag(src, &mask, after_tag) {
                                 let line_no = src[..i].bytes().filter(|&c| c == b'\n').count() + 1;
+                                for sp in &parsed.spreads {
+                                    diags.push(MigrationDiagnostic {
+                                        file: file.into(),
+                                        line: line_no,
+                                        severity: "manual",
+                                        kind: "jsx-spread",
+                                        message: format!("JSX spread `{sp}` is not supported in TinyJump"),
+                                        hint: "Pass explicit component props instead of spreading objects in JSX.".into(),
+                                    });
+                                }
                                 let (tj_tag, rendered_attrs, void_tag) =
-                                    convert_html_element(tag, &attrs, line_no, file, diags);
-                                let close_self = self_closing || void_tag;
+                                    convert_html_element(tag, &parsed.attrs, line_no, file, diags);
+                                let close_self = parsed.self_closing || void_tag;
                                 out.push('<');
                                 out.push_str(&tj_tag);
                                 if !rendered_attrs.is_empty() {
@@ -1429,7 +1657,7 @@ fn translate_jsx(src: &str, file: &str, diags: &mut Vec<MigrationDiagnostic>) ->
                                     out.push('>');
                                     stack.push((tag.to_string(), tj_tag));
                                 }
-                                i = tag_end;
+                                i = parsed.end;
                                 continue;
                             }
                         }
@@ -1461,11 +1689,17 @@ enum AttrVal {
     Braced(String),
 }
 
-type OpenTag = (Vec<(String, AttrVal)>, bool, usize);
+struct OpenTag {
+    attrs: Vec<(String, AttrVal)>,
+    spreads: Vec<String>,
+    self_closing: bool,
+    end: usize,
+}
 
 fn parse_jsx_open_tag(src: &str, mask: &[bool], start: usize) -> Option<OpenTag> {
     let b = src.as_bytes();
     let mut attrs = Vec::new();
+    let mut spreads = Vec::new();
     let mut i = start;
     while i < b.len() {
         while i < b.len() && b[i].is_ascii_whitespace() {
@@ -1475,14 +1709,15 @@ fn parse_jsx_open_tag(src: &str, mask: &[bool], start: usize) -> Option<OpenTag>
             return None;
         }
         if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'>' {
-            return Some((attrs, true, i + 2));
+            return Some(OpenTag { attrs, spreads, self_closing: true, end: i + 2 });
         }
         if b[i] == b'>' {
-            return Some((attrs, false, i + 1));
+            return Some(OpenTag { attrs, spreads, self_closing: false, end: i + 1 });
         }
-        // Spread props `{...props}` or attr names with `-` (`aria-label`)
+        // Spread props `{...props}` or braced tag attribute
         if b[i] == b'{' {
             let end_b = find_matching_brace(src, mask, i)?;
+            spreads.push(src[i..=end_b].to_string());
             i = end_b + 1;
             continue;
         }
@@ -1765,12 +2000,32 @@ fn unwrap_event_handler(val: &AttrVal, is_checkbox: bool) -> String {
         }
     }
     if let Some((param, body)) = parse_single_arrow_fn(&expr) {
-        if !body.contains(&param) {
+        if !contains_code_ident(body, &param) {
             return format!("() => {}", body.trim());
         }
     }
     expr = expr.trim().to_string();
     expr
+}
+
+fn contains_code_ident(src: &str, ident: &str) -> bool {
+    let mask = code_mask(src);
+    let b = src.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if mask[i] && (i == 0 || !is_ident_char(b[i - 1])) && src.is_char_boundary(i) {
+            if let Some(tok) = ident_at(&src[i..]) {
+                let after_dot = i > 0 && b[i - 1] == b'.';
+                if !after_dot && tok == ident {
+                    return true;
+                }
+                i += tok.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 fn trim_excess_blank_lines(src: &str) -> String {
@@ -2163,43 +2418,26 @@ fn compare_sets(expected_json: &Json, actual: &BTreeSet<String>, substring_ok: b
 }
 
 fn fetch_old_url_texts(url: &str) -> Result<Vec<String>, String> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!("--old-url {url:?} must start with http:// or https://"));
-    }
-    let after_scheme = url.split_once("://").map(|x| x.1).unwrap_or("");
-    let host_port = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
-    if host_port.is_empty() {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| format!("--old-url {url:?} must start with http:// or https://"))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
         return Err(format!("invalid --old-url {url:?}"));
     }
-    let host_only = if host_port.starts_with('[') {
-        host_port.split(']').next().unwrap_or("").trim_start_matches('[')
-    } else {
-        host_port.split(':').next().unwrap_or("")
-    };
-    let port: u16 = if host_port.contains(':') && !host_port.ends_with(']') {
-        host_port.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(if url.starts_with("https://") { 443 } else { 80 })
-    } else if url.starts_with("https://") {
-        443
-    } else {
-        80
-    };
-    let is_loopback_name = matches!(host_only, "localhost" | "127.0.0.1" | "::1");
-    let allow_private = is_loopback_name || std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
-    if !allow_private {
-        let addrs: Vec<_> = (host_only, port)
-            .to_socket_addrs()
-            .map_err(|e| format!("cannot resolve {host_only}: {e}"))?
-            .collect();
-        if addrs.is_empty() || addrs.iter().any(|a| !is_public(a.ip()) && !a.ip().is_loopback()) {
-            return Err(format!("refusing private/link-local address for {url:?} (set {PRIVATE_FETCH_ENV}=1 to allow)"));
-        }
-    }
-
-    let agent = ureq::AgentBuilder::new()
+    let allow_private = std::env::var(PRIVATE_FETCH_ENV).is_ok_and(|v| v == "1");
+    let mut builder = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(10))
-        .redirects(0)
-        .build();
+        .redirects(0);
+    if !allow_private {
+        builder = builder.resolver(public_or_loopback);
+    }
+    let agent = builder.build();
     let resp = agent.get(url).call().map_err(|e| format!("cannot fetch {url}: {e}"))?;
+    if (300..400).contains(&resp.status()) {
+        return Err(format!("refusing HTTP {} redirect from --old-url {url:?}", resp.status()));
+    }
     let is_json = resp.content_type().contains("json");
     let mut bytes = Vec::new();
     resp.into_reader()
@@ -2451,10 +2689,82 @@ export default function App() {
         assert!(!out_dir.join("node_modules/pkg/bad.tj").exists());
         assert!(!out_dir.join("src/App.test.tj").exists());
 
-        // Overwrite protection refuses same input/output path.
+        // Overwrite protection refuses same input/output path AND non-existent nested dirs inside input.
         assert!(migrate_path(&src_dir.join("App.tsx"), Some(&src_dir.join("App.tsx"))).is_err());
+        assert!(migrate_path(&app_dir, Some(&app_dir.join("nested-new-out"))).is_err());
+
+        // Unimported broken sibling file fails directory all_compile check.
+        fs::write(src_dir.join("broken.ts"), "export function Broken( { ??? }\n").unwrap();
+        let out_broken = dir.join("migrated-broken");
+        let broken_out = migrate_path(&app_dir, Some(&out_broken)).unwrap();
+        assert!(!broken_out.all_compile, "broken unimported sibling must set all_compile=false");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handles_critic_073_regressions_and_ssrf_redirects() {
+        // C-073.1 + C-073.6: calls/arrays/destructuring, React.FC<Props>, obj.var, (e) => setFlag(false), new Error("new Date"), {...props}.
+        let tsx = r#"
+import { useState } from "react";
+export function Complex() {
+  const [count, setCount] = useState(0);
+  const [flag, setFlag] = useState(true);
+  const obj = { var: 1, a: 2, count: 9 };
+  const Card: React.FC<Props> = () => <div {...props}><span /></div>;
+  const sum = combine(1, count, 2);
+  const arr = [1, count, 2];
+  const { a, count: renamed } = obj;
+  const payload = { a, count };
+  if (obj.var === 1 && !flag) { throw new Error("new Date failed"); }
+  return (
+    <div>
+      <span>{sum + arr.length + renamed + payload.count + a}</span>
+      <button onClick={(e) => setFlag(false)}>Off</button>
+    </div>
+  );
+}
+"#;
+        let (code, diags) = translate_source(tsx, "Complex.tsx");
+        assert!(code.contains("combine(1, state.count, 2)"), "call arg mangled:\n{code}");
+        assert!(code.contains("[1, state.count, 2]"), "array element mangled:\n{code}");
+        assert!(!code.contains("{ a, count: state.count: renamed }") && code.contains("const { a, count: renamed } = obj"), "destructuring mangled:\n{code}");
+        assert!(code.contains("const payload = { a, count: state.count }"), "object shorthand expected:\n{code}");
+        assert!(code.contains("obj.var === 1"), "obj.var mangled:\n{code}");
+        assert!(code.contains("const Card = () =>"), "React.FC<Props> mangled:\n{code}");
+        assert!(code.contains("() => state.setFlag(false)"), "unused event param (e) kept:\n{code}");
+        assert!(!diags.iter().any(|d| d.kind == "builtin-new"), "string \"new Date\" false-positive: {diags:?}");
+        assert!(diags.iter().any(|d| d.kind == "jsx-spread"), "spread props should emit diagnostic: {diags:?}");
+
+        // Destructuring `const { a, count } = obj` must also not turn into `count: state.count`.
+        let tsx2 = r#"
+import { useState } from "react";
+export function Destr() {
+  const [count, setCount] = useState(0);
+  const { a, count } = { a: 1, count: 2 };
+  return <div>{a + count}</div>;
+}
+"#;
+        let (code2, _) = translate_source(tsx2, "Destr.tsx");
+        assert!(code2.contains("const { a, count } ="), "destructuring count rewritten:\n{code2}");
+
+        // C-073.2: SSRF userinfo@ bypass blocked cleanly by resolver.
+        let ssrf = fetch_old_url_texts("http://localhost:80@169.254.169.254/latest/meta-data/");
+        assert!(ssrf.is_err(), "userinfo@ SSRF must fail cleanly: {ssrf:?}");
+
+        // C-073.7: HTTP 302 redirect from --old-url is rejected instead of comparing redirect HTML.
+        let srv = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = srv.server_addr().to_ip().unwrap().port();
+        thread::spawn(move || {
+            if let Ok(Some(req)) = srv.recv_timeout(Duration::from_secs(5)) {
+                let resp = tiny_http::Response::from_string("Found")
+                    .with_status_code(302)
+                    .with_header(tiny_http::Header::from_bytes("Location", "http://169.254.169.254/").unwrap());
+                let _ = req.respond(resp);
+            }
+        });
+        let redir_err = fetch_old_url_texts(&format!("http://127.0.0.1:{port}/redirect"));
+        assert!(redir_err.is_err() && redir_err.as_ref().unwrap_err().contains("redirect"), "{redir_err:?}");
     }
 
     #[test]

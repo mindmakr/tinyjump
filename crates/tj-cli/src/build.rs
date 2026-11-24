@@ -587,7 +587,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
     let sha_hex = hex_bytes(&digest);
     let name = app_name(entry);
     let title = opts.title.unwrap_or(&name);
-    if opts.title.is_some() || matches!(target, Target::Web | Target::Android | Target::Ios) {
+    if opts.title.is_some() || matches!(target, Target::Web | Target::Android | Target::Ios | Target::Oci) {
         validate_title(title)?;
     }
     let version = opts.version.unwrap_or("0.1.0");
@@ -730,8 +730,15 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             let runner_path = resolve_runner(opts.runner)?;
             let exe_bytes = assemble_standalone_bytes(&runner_path, &bytes)?;
             let detected_arch = oci::detect_elf_arch(&exe_bytes);
-            if detected_arch.is_none() && opts.runner.is_none() {
+            if detected_arch.is_none() {
                 notes.push("packaged using non-ELF host runner; pass --runner <path-to-static-linux-tj> for a runnable Linux OCI image".into());
+            } else if let (Some(explicit), Some(elf_arch)) = (opts.arch, detected_arch) {
+                if explicit != elf_arch {
+                    notes.push(format!("--arch {} overrides runner ELF arch {}; ensure the binary matches your target runtime", explicit.as_str(), elf_arch.as_str()));
+                }
+            }
+            if let Some(interp) = oci::detect_elf_dynamic_interp(&exe_bytes) {
+                notes.push(format!("runner ELF is dynamically linked ({interp}); FROM scratch images require a static Linux binary (e.g. musl)"));
             }
             let arch = opts.arch.or(detected_arch).unwrap_or_else(oci::host_default_arch);
             let port = opts.port.unwrap_or(4700);
@@ -1988,25 +1995,50 @@ function App() {
         let tar_path = PathBuf::from(rep["artifact"].as_str().unwrap());
         assert!(tar_path.is_file());
         let cf = fs::read_to_string(oci_dir.join("Containerfile")).unwrap();
-        assert!(cf.contains("USER 65532:65532") && cf.contains("EXPOSE 8080") && cf.contains("\"--web-dir\", \"/web\""));
+        assert!(
+            cf.contains("USER 65532:65532")
+                && cf.contains("EXPOSE 8080")
+                && cf.contains("TJ_DEFAULT_PORT=8080")
+                && !cf.contains("\"--port\"")
+                && cf.contains("\"--web-dir\", \"/web\"")
+        );
 
-        // Direct .tar output + --no-web omits /web/ cleanly.
+        // Reject invalid auto-derived title with control chars, and warn on dynamically linked ELF / arch mismatch.
+        let mut dyn_elf = vec![0u8; 256];
+        dyn_elf[0..4].copy_from_slice(b"\x7fELF");
+        dyn_elf[4] = 2;
+        dyn_elf[5] = 1;
+        dyn_elf[18..20].copy_from_slice(&0x003Eu16.to_le_bytes());
+        dyn_elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        dyn_elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        dyn_elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        dyn_elf[64..68].copy_from_slice(&3u32.to_le_bytes());
+        dyn_elf[72..80].copy_from_slice(&160u64.to_le_bytes());
+        dyn_elf[96..104].copy_from_slice(&28u64.to_le_bytes());
+        dyn_elf[160..188].copy_from_slice(b"/lib64/ld-linux-x86-64.so.2\0");
+        let dyn_runner = dir.join("dyn-runner");
+        fs::write(&dyn_runner, &dyn_elf).unwrap();
+
+        // Direct .tar output + --no-web omits /web/ cleanly; mismatched --arch and dynamic ELF emit clear notes.
         let tar_only = dir.join("headless.tar");
         let rep2 = build_app(
             &app_file,
             Target::Oci,
             &BuildOpts {
                 out: Some(&tar_only),
-                runner: Some(&runner),
-                arch: Some(oci::OciArch::Amd64),
+                runner: Some(&dyn_runner),
+                arch: Some(oci::OciArch::Arm),
                 no_web: true,
                 ..Default::default()
             },
         )
         .unwrap();
         assert!(tar_only.is_file());
-        assert_eq!(rep2["oci"]["arch"], json!("amd64"));
+        assert_eq!(rep2["oci"]["arch"], json!("arm"));
         assert_eq!(rep2["oci"]["webFiles"], json!([]));
+        let rep2_notes = rep2["notes"].as_array().unwrap();
+        assert!(rep2_notes.iter().any(|n| n.as_str().is_some_and(|s| s.contains("overrides runner ELF arch"))));
+        assert!(rep2_notes.iter().any(|n| n.as_str().is_some_and(|s| s.contains("dynamically linked"))));
         let outer = oci::parse_tar_entries(&fs::read(&tar_only).unwrap()).unwrap();
         assert!(outer.iter().any(|(n, _)| n == "oci-layout"));
 

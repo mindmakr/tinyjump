@@ -1,6 +1,6 @@
 # Sealed Container / OCI Deployment Units (`tj build --oci`)
 
-`tj build <app.tj> --oci` packages a TinyJump app into a deterministic, rootless `FROM scratch` **OCI Image Layout 1.0.0** bundle (`layout/`, `manifest.json`, `Containerfile`, and optionally an `.tar` archive) with **zero Docker daemon** at build time and **0 KB** added to `tj-core` or device hosts.
+`tj build <app.tj> --oci` packages a TinyJump app into a deterministic, rootless `FROM scratch` **OCI Image Layout 1.0.0** bundle (`layout/`, `manifest.json`, `Containerfile`, and optionally a `.tar` archive) with **zero Docker daemon** at build time and **0 KB** added to `tj-core` or device hosts.
 
 See [feedback/2026-11-24-builder-072-oci-retro.md](../feedback/2026-11-24-builder-072-oci-retro.md) for the design retro explaining why TinyJump implements sealed OCI packaging rather than embedding a Linux container runtime.
 
@@ -25,8 +25,8 @@ tj build examples/todo/app.tj --oci --runner ./tj-linux-amd64 --aot --assemble
 | Flag | Default | Description |
 |---|---|---|
 | `--out <path>` | `<app-dir>/dist/oci` | Output folder (`layout/`, `Containerfile`, `manifest.json`), or direct `.tar` archive when ending in `.tar` |
-| `--assemble` | `false` | Also write `<bin_name>-oci.tar` alongside `layout/` (implies `.tar` archive ready for `docker load` / `podman load`) |
-| `--port <n>` | `4700` | Exposed TCP port (`1..=65535`), sets `ExposedPorts`, `TJ_PORT`, and default `CMD` `--port` |
+| `--assemble` | `false` | Also write `<bin_name>-oci.tar` alongside `layout/` (OCI layout archive for `podman load`, `skopeo copy oci-archive:...`, or Docker with containerd image store) |
+| `--port <n>` | `4700` | Exposed TCP port (`1..=65535`), sets `ExposedPorts` and `TJ_DEFAULT_PORT` (`PORT` / `TJ_PORT` override at runtime) |
 | `--arch <arch>` | auto-detected from `--runner` ELF header | `amd64`, `arm64`, or `arm` |
 | `--no-web` | `false` | Backend/headless API-only image; omits `/web/` static UI and WASM bundle |
 | `--runner <file>` | current `tj` executable | Standalone host runner binary (pass a Linux static `tj` ELF when cross-packaging) |
@@ -54,7 +54,7 @@ Every `--oci` image contains a single deterministic gzipped POSIX `ustar` layer 
 
 At startup, embedded binaries produced by `--linux` or `--oci`:
 - Verify the `TJAPP001` trailer's SHA-256 against the embedded bytecode before booting.
-- Bind `--host 0.0.0.0 --port $TJ_PORT` (falling back to `$PORT`, then `4700`) and store persistent state in `--data /data` (or `$TJ_DATA`).
+- Bind `--host 0.0.0.0` (from container `CMD`) and listen on `--port`, or `$TJ_PORT` -> `$PORT` -> build-time `$TJ_DEFAULT_PORT` -> `4700` (so PaaS `PORT=8080` overrides work out of the box), storing state in `--data` or `$TJ_DATA` (`/data`).
 - Serve the companion browser UI from `--web-dir /web` while keeping `permissions.json` local to engine initialization.
 - Support `--info` and `--info --json` directly with `FROM scratch` (no `/bin/sh` required) to inspect embedded bytecode hash, object classes, and port.
 
@@ -67,26 +67,28 @@ At startup, embedded binaries produced by `--linux` or `--oci`:
 ## Deploying with Docker, Podman, or Skopeo
 
 ```sh
-# Load an --assemble .tar into local Docker or Podman
-docker load -i examples/todo/dist/oci/todo-oci.tar
+# Load an --assemble OCI archive into Podman or Docker (containerd image store),
+# or copy the unpacked layout into classic Docker / any OCI registry via Skopeo
 podman load -i examples/todo/dist/oci/todo-oci.tar
-
-# Or push the OCI layout directly without a Docker daemon
+skopeo copy oci:examples/todo/dist/oci/layout docker-daemon:todo:0.1.0
 skopeo copy oci:examples/todo/dist/oci/layout docker://ghcr.io/you/todo:0.1.0
 
-# Run rootless with persistent storage and keys
+# Create keys file (if enforcing API keys) and run rootless with persistent storage;
+# set TJ_TLS_TERMINATED=1 when running behind a TLS-terminating reverse proxy
 docker run --rm -p 4700:4700 \
   -v todo-data:/data \
+  -v ./keys.json:/data/keys.json:ro \
   -e TJ_KEY_FILE=/data/app.key \
-  -e TJ_KEYS=my-secret-api-key \
+  -e TJ_KEYS=/data/keys.json \
+  -e TJ_TLS_TERMINATED=1 \
   todo:0.1.0
 ```
 
 ## Measured sizes
 
-Measured on Windows `tj.exe` (`10,468,864` bytes release CLI) with full `860 KB` `tj_wasm.wasm` (cross-packaging a stripped `musl` Linux runner + `--aot` WASM shrinks images further):
+Measured on Windows `tj.exe` (`10,465,280` bytes release CLI) with full `860 KB` `tj_wasm.wasm` (cross-packaging a stripped `musl` Linux runner + `--aot` WASM shrinks images further):
 
 | App | Bytecode | Standalone exe | Uncompressed layer | Gzip layer | Assembled `.tar` |
 |---|---|---|---|---|---|
-| `examples/todo/app.tj` | 9,447 B | 10,478,359 B | 11,418,112 B | 4,331,062 B (4.13 MiB) | 4,339,712 B (4.14 MiB) |
-| `examples/booking/app.tj` | 27,792 B | 10,496,704 B | 11,436,544 B | 4,338,052 B (4.14 MiB) | 4,346,368 B (4.15 MiB) |
+| `examples/todo/app.tj` | 9,447 B | 10,474,775 B | 11,414,528 B | 4,326,468 B (4.13 MiB) | 4,335,104 B (4.13 MiB) |
+| `examples/booking/app.tj` | 27,792 B | 10,493,120 B | 11,432,960 B | 4,333,277 B (4.13 MiB) | 4,341,760 B (4.14 MiB) |

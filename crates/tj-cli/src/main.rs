@@ -69,7 +69,7 @@ USAGE:
                                  generate a typed `.tj` client module (and optional registry manifest) from
                                  an OpenAPI 3.x JSON specification
   tj migrate <input.tsx|ts|dir> [--out <path>] [--report <file.md>] [--strict] [--json]
-  tj migrate compare <migrated.tj> [--trace <file.trace.jsonl>]... [--old-snapshot <file.json>] [--old-url <http://...>] [--old-screenshot <a.png> --new-screenshot <b.png>]
+  tj migrate compare <migrated.tj> [--trace <file.trace.jsonl>]... [--old-snapshot <file.json>] [--old-url <http://...>] [--old-screenshot <a.png> --new-screenshot <b.png>] [--threshold <pct>] [--diff <out.png>] [--width <n>] [--height <n>] [--json]
                                  port TypeScript/React modules to `.tj` with fix hints, and verify parity
   tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]
                                  validate a registry manifest (schema, license, typosquats, commit/hash pin,
@@ -303,7 +303,8 @@ fn main() -> ExitCode {
     }
     if raw.len() < 2
         || raw.get(1).is_some_and(|a| a == "help")
-        || raw.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h"))
+        || (raw.get(1).map(String::as_str) != Some("migrate")
+            && raw.iter().skip(1).any(|a| matches!(a.as_str(), "--help" | "-h")))
     {
         print!("{USAGE}");
         return ExitCode::SUCCESS;
@@ -977,7 +978,7 @@ fn parse_embedded_args(raw_args: &[String]) -> Result<Option<EmbeddedOpts>, Stri
                 println!(
                     "Standalone tinyjump app (embedded AOT bytecode)\n\n\
                      OPTIONS:\n\
-                       --port <n>       port to listen on (default TJ_PORT, PORT, or 4700)\n\
+                       --port <n>       port to listen on (default TJ_PORT, PORT, TJ_DEFAULT_PORT, or 4700)\n\
                        --host <addr>    address to bind (default 127.0.0.1)\n\
                        --data <dir>     where objects are stored (default TJ_DATA or .tj-data)\n\
                        --web-dir <dir>  serve the web UI and WASM runtime from this folder\n\
@@ -988,29 +989,46 @@ fn parse_embedded_args(raw_args: &[String]) -> Result<Option<EmbeddedOpts>, Stri
             other => return Err(format!("unknown option {other}")),
         }
     }
-    let port = match port {
-        Some(p) => p,
-        None => {
-            if let Ok(raw) = std::env::var("TJ_PORT").or_else(|_| std::env::var("PORT")) {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    4700
-                } else {
-                    let p: u16 = trimmed.parse().map_err(|_| format!("invalid TJ_PORT/PORT {trimmed:?}"))?;
-                    if p == 0 {
-                        return Err("TJ_PORT/PORT must be in 1..=65535".into());
-                    }
-                    p
-                }
-            } else {
-                4700
-            }
-        }
-    };
+    let tj_port = std::env::var("TJ_PORT").ok();
+    let env_port = std::env::var("PORT").ok();
+    let default_port = std::env::var("TJ_DEFAULT_PORT").ok();
+    let port = resolve_embedded_port(port, tj_port.as_deref(), env_port.as_deref(), default_port.as_deref())?;
     let data = data
         .or_else(|| std::env::var_os("TJ_DATA").filter(|v| !v.is_empty()).map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(".tj-data"));
     Ok(Some(EmbeddedOpts { port, host, data, web_dir, info, json }))
+}
+
+fn resolve_embedded_port(
+    cli_port: Option<u16>,
+    tj_port: Option<&str>,
+    port: Option<&str>,
+    default_port: Option<&str>,
+) -> Result<u16, String> {
+    if let Some(p) = cli_port {
+        return Ok(p);
+    }
+    for (name, val) in [("TJ_PORT", tj_port), ("PORT", port), ("TJ_DEFAULT_PORT", default_port)] {
+        if let Some(p) = parse_env_port_value(name, val)? {
+            return Ok(p);
+        }
+    }
+    Ok(4700)
+}
+
+fn parse_env_port_value(name: &str, raw: Option<&str>) -> Result<Option<u16>, String> {
+    let Some(val) = raw else {
+        return Ok(None);
+    };
+    let trimmed = val.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let p: u16 = trimmed.parse().map_err(|_| format!("invalid {name} {trimmed:?}"))?;
+    if p == 0 {
+        return Err(format!("{name} must be in 1..=65535"));
+    }
+    Ok(Some(p))
 }
 
 fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
@@ -1252,5 +1270,13 @@ mod tests {
 
         assert!(parse_embedded_args(&["--port".into(), "0".into()]).is_err());
         assert!(parse_embedded_args(&["--bogus".into()]).is_err());
+
+        // Port precedence: CLI --port > TJ_PORT > PORT > TJ_DEFAULT_PORT > 4700; empty values fall through.
+        assert_eq!(resolve_embedded_port(None, None, None, None).unwrap(), 4700);
+        assert_eq!(resolve_embedded_port(None, None, None, Some("4701")).unwrap(), 4701);
+        assert_eq!(resolve_embedded_port(None, Some(""), Some("8080"), Some("4700")).unwrap(), 8080);
+        assert_eq!(resolve_embedded_port(None, Some("9000"), Some("8080"), Some("4700")).unwrap(), 9000);
+        assert_eq!(resolve_embedded_port(Some(3000), Some("9000"), Some("8080"), Some("4700")).unwrap(), 3000);
+        assert!(resolve_embedded_port(None, Some("0"), None, None).is_err());
     }
 }

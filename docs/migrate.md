@@ -35,7 +35,7 @@ tj migrate ./my-app --out ./my-app-tj --strict
 ### What translates automatically
 
 - **React & CSS imports:** Removes `import React ... from "react"` and stylesheet imports (`*.css`/`*.scss`); normalizes relative module imports by dropping `.ts`/`.tsx`/`.js`/`.jsx` extensions.
-- **Entry & exports:** Maps `export default function` to `function App` (when entry or named `App`) or `export function ...`.
+- **Entry & exports:** Maps anonymous `export default function(` or `export default function App` to `function App`, and named `export default function Foo` to `export function Foo`.
 - **TS/JS dialect:** Maps `undefined` -> `null`, `==`/`!=` -> `===`/`!==`, `var` -> `let`, strips `: JSX.Element`, `: React.FC`, and React synthetic event parameter types (`React.ChangeEvent<...>`, etc.).
 - **Local state (`useState`):** Lifts `[x, setX] = useState(...)` inside PascalCase components into an `object <Component>State` declaration with `const state = <Component>State.get("main")`, rewrites `setX(c => c + 1)` updaters to `state.setX(state.x + 1)`, and rewrites free state reads (`state.x`) while preserving JSX text interpolations and prop names.
 - **JSX primitives & styling:**
