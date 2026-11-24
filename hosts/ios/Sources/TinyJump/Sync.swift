@@ -31,15 +31,18 @@ final class Sync: NSObject, URLSessionDataDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
     }
 
+    private static func covers(_ pattern: String, _ key: String) -> Bool {
+        pattern.hasSuffix("*") && key.hasPrefix(String(pattern.dropLast()))
+    }
+
     /// Starts keeping `key` current; `seq` is the change number of its cached state.
     func subscribe(_ key: String, seq: UInt64) {
         guard server != nil, replicas[key] == nil else { return }
-        // Already in a class stream (`Slot/*`): nothing new to ask for.
-        if !key.hasSuffix("/*"), replicas[String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"] != nil { return }
-        if key.hasSuffix("/*") {
-            // The class stream covers the objects of the class asked for one by one.
-            let prefix = String(key.dropLast())
-            replicas = replicas.filter { !$0.key.hasPrefix(prefix) }
+        // Already covered by a broader class or topic stream (`Slot/*`, `Room/studio:*`).
+        if replicas.keys.contains(where: { Sync.covers($0, key) }) { return }
+        if key.hasSuffix("*") {
+            // A broader topic or class stream covers narrower streams and individual objects.
+            replicas = replicas.filter { !Sync.covers(key, $0.key) }
         }
         replicas[key] = seq
         cursor = replicas.values.min() ?? 0
@@ -96,13 +99,13 @@ final class Sync: NSObject, URLSessionDataDelegate {
     }
 
     private func deliver(_ key: String, _ state: Any, _ seq: UInt64) {
+        var matched = false
+        for (entry, have) in replicas where entry == key || Sync.covers(entry, key) {
+            replicas[entry] = max(have, seq)
+            matched = true
+        }
+        guard matched else { return }
         cursor = max(cursor, seq) // the stream is in change order
-        // An object of a class streamed whole (`Slot/*`): the class's entry keeps the change
-        // number, so a reconnect resumes and the stream address stays short.
-        let whole = String(key.split(separator: "/", maxSplits: 1).first ?? "") + "/*"
-        let entry = replicas[whole] != nil ? whole : key
-        guard let have = replicas[entry] else { return }
-        replicas[entry] = max(have, seq)
         tj?.send(["type": "sync", "object": key, "state": state, "seq": seq])
     }
 

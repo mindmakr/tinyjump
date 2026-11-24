@@ -156,7 +156,7 @@ pub enum Output {
     Changed { object: String, state: Json, seq: u64 },
     /// Keep this device's replica of an `@server` object current: stream the server's changes
     /// after `seq` (the cached replica's change number, 0 if none) and send each as
-    /// [`Input::Sync`].
+    /// [`Input::Sync`]. `object` may be `"Class/id"`, `"Class/*"`, or `"Class/prefix*"`.
     Subscribe { object: String, seq: u64 },
     Reply {
         reply: u64,
@@ -180,8 +180,8 @@ pub enum Output {
     #[cfg(feature = "server")]
     Erased { object: String, reason: String, forget: bool },
     /// Servers only, for the audit log: a call nobody requested ended. `by` is `timer`,
-    /// `alarm` or `invoke`; `caller` is who it ran as (none: the system). Never arguments,
-    /// results or error text.
+    /// `alarm`, `message` or `invoke`; `caller` is who it ran as (none: the system). Never
+    /// arguments, results or error text.
     Ran {
         object: String,
         method: String,

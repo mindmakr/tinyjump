@@ -174,11 +174,17 @@ export function createVideoCallComponent() {
         destroyed: false,
         mediaGen: 0,
         peerGen: 0,
+        screenGen: 0,
         callState: 'idle',
+        baseBadge: 'Idle',
         mediaKey: '',
         peerKey: '',
         endedPeerKey: '',
         localStream: null,
+        screenStream: null,
+        screenActive: false,
+        screenWanted: false,
+        screenSenderAdded: null,
         remoteStream: null,
         pc: null,
         lastSeq: 0,
@@ -196,9 +202,14 @@ export function createVideoCallComponent() {
         });
       }
 
+      function renderBadge() {
+        badge.textContent = st.screenActive ? st.baseBadge + ' · Sharing' : st.baseBadge;
+      }
+
       function setCallState(next, label) {
         if (st.destroyed) return;
-        badge.textContent = label || next;
+        st.baseBadge = label || next;
+        renderBadge();
         if (st.callState !== next) {
           st.callState = next;
           emit('onState', next);
@@ -207,17 +218,56 @@ export function createVideoCallComponent() {
 
       function failCall(msg) {
         if (st.destroyed) return;
-        badge.textContent = 'Error';
+        st.baseBadge = 'Error';
+        renderBadge();
         placeholder.textContent = msg;
         placeholder.style.display = 'block';
         emit('onError', msg);
         setCallState('failed', 'Error');
       }
 
+      function findVideoSender(pc) {
+        if (!pc || typeof pc.getSenders !== 'function') return null;
+        const senders = pc.getSenders();
+        for (let i = 0; i < senders.length; i++) {
+          const s = senders[i];
+          if (s && s.track && s.track.kind === 'video') return s;
+        }
+        if (typeof pc.getTransceivers === 'function') {
+          const trs = pc.getTransceivers();
+          for (let i = 0; i < trs.length; i++) {
+            const tr = trs[i];
+            if (tr && tr.sender && tr.receiver && tr.receiver.track && tr.receiver.track.kind === 'video') {
+              return tr.sender;
+            }
+          }
+        }
+        return st.screenSenderAdded;
+      }
+
+      function applyLocalPreview() {
+        if (st.screenStream) {
+          localVideo.srcObject = st.screenStream;
+          localVideo.style.transform = 'none';
+          localVideo.style.display = 'block';
+          return;
+        }
+        const wantVideo = st.props.video !== false;
+        if (st.localStream && wantVideo && typeof st.localStream.getVideoTracks === 'function' && st.localStream.getVideoTracks().length > 0) {
+          localVideo.srcObject = st.localStream;
+          localVideo.style.transform = 'scaleX(-1)';
+          localVideo.style.display = 'block';
+        } else {
+          try { localVideo.srcObject = null; } catch (e) { /* ignore */ }
+          localVideo.style.display = 'none';
+        }
+      }
+
       function closePeerConnection() {
         st.peerGen += 1;
         st.pendingIce = [];
         st.offerSentFor = '';
+        st.screenSenderAdded = null;
         st.signalChain = Promise.resolve();
         if (st.pc) {
           try { st.pc.onicecandidate = null; } catch (e) { /* ignore */ }
@@ -232,11 +282,39 @@ export function createVideoCallComponent() {
         remoteVideo.style.display = 'none';
       }
 
+      function stopScreenShare(emitOff) {
+        st.screenGen += 1;
+        const wasActive = st.screenActive || Boolean(st.screenStream);
+        st.screenActive = false;
+        if (st.screenStream) {
+          stopStream(st.screenStream);
+          st.screenStream = null;
+        }
+        applyLocalPreview();
+        const camTracks = st.localStream && typeof st.localStream.getVideoTracks === 'function'
+          ? st.localStream.getVideoTracks()
+          : [];
+        const restoreTrack = camTracks.length > 0 ? camTracks[0] : null;
+        if (st.pc) {
+          const sender = findVideoSender(st.pc);
+          if (sender && typeof sender.replaceTrack === 'function') {
+            try {
+              const p = sender.replaceTrack(restoreTrack);
+              if (p && typeof p.catch === 'function') p.catch(function () {});
+            } catch (e) { /* ignore */ }
+          }
+        }
+        renderBadge();
+        if (emitOff && wasActive && !st.destroyed) emit('onScreenShare', false);
+      }
+
       function teardownAll(emitIdle) {
         st.mediaGen += 1;
         st.mediaKey = '';
         st.peerKey = '';
         st.endedPeerKey = '';
+        st.screenWanted = false;
+        stopScreenShare(false);
         closePeerConnection();
         if (st.localStream) {
           stopStream(st.localStream);
@@ -301,10 +379,21 @@ export function createVideoCallComponent() {
         pc.onconnectionstatechange = onStateChange;
         pc.oniceconnectionstatechange = onStateChange;
 
+        const screenTracks = st.screenStream && typeof st.screenStream.getVideoTracks === 'function'
+          ? st.screenStream.getVideoTracks()
+          : [];
+        const screenVideo = screenTracks.length > 0 ? screenTracks[0] : null;
         if (st.localStream) {
           const tracks = st.localStream.getTracks();
           for (let i = 0; i < tracks.length; i++) {
-            pc.addTrack(tracks[i], st.localStream);
+            if (tracks[i].kind === 'video' && screenVideo) {
+              pc.addTrack(screenVideo, st.screenStream);
+            } else {
+              pc.addTrack(tracks[i], st.localStream);
+            }
+          }
+          if (screenVideo && typeof st.localStream.getVideoTracks === 'function' && st.localStream.getVideoTracks().length === 0) {
+            st.screenSenderAdded = pc.addTrack(screenVideo, st.screenStream);
           }
         }
         return pc;
@@ -322,14 +411,10 @@ export function createVideoCallComponent() {
         }
       }
 
-      async function maybeStartOffer(pGen) {
+      async function sendOffer(pGen, remote, label) {
         if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
-        const remote = normId(st.props.remotePeerId);
-        if (!remote || !st.props.initiator) return;
-        if (st.offerSentFor === remote) return;
         if (st.pc.signalingState !== 'stable') return;
-        st.offerSentFor = remote;
-        setCallState('connecting', 'Calling ' + remote + '...');
+        if (label) setCallState('connecting', label);
         try {
           const offer = await st.pc.createOffer();
           if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
@@ -345,6 +430,91 @@ export function createVideoCallComponent() {
           if (st.destroyed || st.peerGen !== pGen) return;
           st.offerSentFor = '';
           failCall((err && err.message) || 'failed to create call offer');
+        }
+      }
+
+      function maybeStartOffer(pGen) {
+        if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
+        const remote = normId(st.props.remotePeerId);
+        if (!remote || !st.props.initiator) return;
+        if (st.offerSentFor === remote) return;
+        if (st.pc.signalingState !== 'stable') return;
+        st.offerSentFor = remote;
+        sendOffer(pGen, remote, 'Calling ' + remote + '...');
+      }
+
+      function renegotiate(pGen) {
+        if (st.destroyed || st.peerGen !== pGen || !st.pc) return;
+        const remote = normId(st.props.remotePeerId);
+        if (!remote) return;
+        sendOffer(pGen, remote, null);
+      }
+
+      async function startScreenShare() {
+        if (typeof navigator === 'undefined' || !navigator.mediaDevices || typeof navigator.mediaDevices.getDisplayMedia !== 'function') {
+          st.screenWanted = false;
+          emit('onError', 'screen sharing is not supported in this browser');
+          emit('onScreenShare', false);
+          return;
+        }
+        const sGen = ++st.screenGen;
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+        } catch (err) {
+          if (st.destroyed || st.screenGen !== sGen) return;
+          st.screenWanted = false;
+          st.screenActive = false;
+          if (err && err.name !== 'AbortError' && err.name !== 'NotAllowedError') {
+            emit('onError', err.message || 'could not start screen share');
+          }
+          emit('onScreenShare', false);
+          return;
+        }
+        if (st.destroyed || st.screenGen !== sGen || !st.props.active || !st.screenWanted) {
+          stopStream(stream);
+          return;
+        }
+        const tracks = typeof stream.getVideoTracks === 'function' ? stream.getVideoTracks() : [];
+        if (tracks.length === 0) {
+          stopStream(stream);
+          st.screenWanted = false;
+          emit('onScreenShare', false);
+          return;
+        }
+        const screenTrack = tracks[0];
+        st.screenStream = stream;
+        st.screenActive = true;
+        screenTrack.onended = function () {
+          if (!st.destroyed && st.screenGen === sGen) {
+            st.screenWanted = false;
+            stopScreenShare(true);
+          }
+        };
+        applyLocalPreview();
+        if (st.pc) {
+          const sender = findVideoSender(st.pc);
+          if (sender && typeof sender.replaceTrack === 'function') {
+            try {
+              const p = sender.replaceTrack(screenTrack);
+              if (p && typeof p.catch === 'function') p.catch(function () {});
+            } catch (e) { /* ignore */ }
+          } else {
+            st.screenSenderAdded = st.pc.addTrack(screenTrack, stream);
+            renegotiate(st.peerGen);
+          }
+        }
+        renderBadge();
+        emit('onScreenShare', true);
+      }
+
+      function syncScreenShare(wantScreen) {
+        if (wantScreen && !st.screenWanted) {
+          st.screenWanted = true;
+          startScreenShare();
+        } else if (!wantScreen && st.screenWanted) {
+          st.screenWanted = false;
+          stopScreenShare(false);
         }
       }
 
@@ -525,14 +695,9 @@ export function createVideoCallComponent() {
         }
         st.localStream = stream;
         applyTrackToggles(stream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
-        if (wantVideo) {
-          localVideo.srcObject = stream;
-          localVideo.style.display = 'block';
-        } else {
-          try { localVideo.srcObject = null; } catch (e) { /* ignore */ }
-          localVideo.style.display = 'none';
-        }
+        applyLocalPreview();
         ensurePeerConnection();
+        syncScreenShare(Boolean(st.props.screenShare));
       }
 
       function sync(nextProps) {
@@ -542,7 +707,7 @@ export function createVideoCallComponent() {
         st.iceServers = sanitizeIceServers(st.props.iceServers);
 
         if (!active) {
-          if (st.pc || st.localStream || st.mediaKey) {
+          if (st.pc || st.localStream || st.mediaKey || st.screenStream || st.screenWanted) {
             teardownAll(true);
           }
           return;
@@ -562,6 +727,7 @@ export function createVideoCallComponent() {
         if (st.localStream) {
           applyTrackToggles(st.localStream, Boolean(st.props.muted), Boolean(st.props.cameraOff));
           ensurePeerConnection();
+          syncScreenShare(Boolean(st.props.screenShare));
         }
       }
 

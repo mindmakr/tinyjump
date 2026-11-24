@@ -254,8 +254,9 @@ Apps should not have to build their own delivery plumbing. Planned, in this orde
    reconnecting replica resumes from its last one instead of refetching.
 2. **At-least-once server calls (done).** Devices queue calls in a durable outbox while offline. Each
    call carries an id, and the server drops duplicates, so a retry never runs twice.
-3. **Fan-out and multicast.** Many subscribers per object (done), topic groups across
-   objects, and durable object-to-object messages on the server.
+3. **Fan-out and multicast (done).** Many subscribers per object, prefix topic groups
+   across objects (`Class.all(prefix)` / `Class/prefix*` streams), and durable atomic
+   object-to-object messages on the server (`this.deliver(target, "method", ...args)`).
 4. **Backpressure and access control (done, with sign-in tokens).** Slow subscribers
    are coalesced to the latest state, and each object declares who may read and call it
    (`docs/access-control.md`).
@@ -349,7 +350,9 @@ Raised by the owner. To be discussed and critiqued before any work starts:
     Webhooks (`webhooks.json`) connect systems that are not tinyjump (incoming: HMAC-signed
     `POST /webhooks/{name}` becomes a method call under `@allow` rules; outgoing: `@read` /
     `@pii`-masked change subscriptions delivered durably by HTTP with retries).
-  - **Topics across objects** (`Room/*`): add when an app needs them.
+  - **Topics across objects and cross-object delivery (done):** `Class.all(prefix?)`
+    subscribes to `Class/prefix*` streams, and `this.deliver(target, "method", ...args)`
+    commits durable server messages alongside the caller's turn (`examples/collab-studio`).
 - **Plugins and the agent loop (agreed; plugins and `tj:ai` done):** plugins are typed
   `.tj` modules backed by MCP servers (`docs/plugins.md`). The durable cart has a shop
   assistant. Next is the `tj:agent` library, whose tools are the app's own methods under
@@ -378,9 +381,9 @@ built on demand when packaging precompiled `.tjb` apps:
 
 | Build | Default (compiler + VM) | AOT-only (`--no-default-features`) | Savings |
 |---|---|---|---|
-| Web WASM (`tj_wasm.wasm`) | 858 KB (322 KB gz) | 553 KB / 219 KB gz (`cargo web-aot`) | -305 KB (-36%) |
-| Android `arm64-v8a` (`libtj_android.so`) | 1106 KB | 852 KB | -254 KB (-23%) |
-| Android `armeabi-v7a` (`libtj_android.so`) | 787 KB | 610 KB | -177 KB (-22%) |
+| Web WASM (`tj_wasm.wasm`) | 860 KB (323 KB gz) | 555 KB / 220 KB gz (`cargo web-aot`) | -305 KB (-35%) |
+| Android `arm64-v8a` (`libtj_android.so`) | 1108 KB | 852 KB | -256 KB (-23%) |
+| Android `armeabi-v7a` (`libtj_android.so`) | 788 KB | 610 KB | -178 KB (-23%) |
 
 Splitting `server` privacy/retention out of device builds is already done (`check` and
 `server` features in `crates/tj-core/Cargo.toml`); the remaining server access/call-record

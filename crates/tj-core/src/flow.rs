@@ -1067,6 +1067,10 @@ impl Checker {
                     _ => {}
                 }
                 if name == "all" && self.classes.contains_key(ns.as_str()) {
+                    for a in args {
+                        let v = self.expr(a, fr);
+                        self.sink(&v, a.span, "a topic prefix, which is sent in subscription URLs");
+                    }
                     return Val::Handles { class: Rc::from(ns.as_str()) };
                 }
                 if name == "get" && self.classes.contains_key(ns.as_str()) {
@@ -1111,6 +1115,40 @@ impl Checker {
                                 self.call(&decl, vals, fr.this.clone(), Endpoint::Internal, false, fr.on_server, None);
                             }
                             None => self.report(Diagnostic::new("the privacy check cannot follow this alarm to its method", span).hint("name the method as a string, e.g. this.schedule(60000, \"remind\", ...)")),
+                        }
+                    }
+                    return clean();
+                }
+                "deliver" => {
+                    let target = args.first().map(|a| self.expr(a, fr)).unwrap_or_else(clean);
+                    if let Some(m) = args.get(1) {
+                        let v = self.expr(m, fr);
+                        self.sink(&v, m.span, "a durable message's method name, which is stored on disk");
+                    }
+                    let mut vals = Vec::new();
+                    for a in args.iter().skip(2) {
+                        let v = self.expr(a, fr);
+                        self.sink(&v, a.span, "a durable message's arguments, which are stored on disk");
+                        vals.push(v);
+                    }
+                    // Follow the durable message into its target method when revealed PII is sent,
+                    // so transfers and sinks inside the recipient method are audited.
+                    if vals.iter().any(|v| !self.flatten(v).revealed.is_empty()) {
+                        let target_decl = match (&target, args.get(1).map(|a| &a.kind)) {
+                            (Val::Handle { class, other }, Some(ExprKind::Str(m))) => {
+                                self.classes.get(class).and_then(|c| c.methods.get(m.as_str())).map(|(d, _)| (class.clone(), *other, d.clone()))
+                            }
+                            _ => None,
+                        };
+                        match target_decl {
+                            Some((class, other, decl)) => {
+                                let on_server = fr.on_server || self.classes.get(&class).is_some_and(|c| c.server);
+                                self.call(&decl, vals, Some((class, other)), Endpoint::Internal, false, on_server, None);
+                            }
+                            None => self.report(
+                                Diagnostic::new("the privacy check cannot follow this durable message to its target method", span)
+                                    .hint("pass an object handle and a literal method name, e.g. this.deliver(Customer.get(id), \"notify\", ...)"),
+                            ),
                         }
                     }
                     return clean();

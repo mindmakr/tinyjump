@@ -95,6 +95,7 @@ pub struct Engine {
     fetch_allowlist: bool,
     device_plugins: Arc<Mutex<Vec<&'static str>>>,
     video_call: Arc<AtomicBool>,
+    whiteboard: Arc<AtomicBool>,
     gfx: Arc<AtomicBool>,
     has_frame: Arc<AtomicBool>,
 }
@@ -154,6 +155,7 @@ struct Booted {
     max_objects: usize,
     max_object_bytes: usize,
     video_call: bool,
+    whiteboard: bool,
     gfx: bool,
     has_frame: bool,
 }
@@ -171,6 +173,7 @@ fn boot(
 ) -> Result<Booted, String> {
     let program = tj_core::load(source).map_err(|errs| errs.iter().map(|d| d.render("app.tj", source)).collect::<Vec<_>>().join("\n\n"))?;
     let video_call = crate::device_perms::uses_video_call(&program, device_perms);
+    let whiteboard = crate::device_perms::uses_whiteboard(&program);
     let has_frame = program.has_frame();
     let gfx = program.uses_scene() || has_frame;
     let mut manifest = Manifest::build(source, &program, configured_plugins);
@@ -201,7 +204,7 @@ fn boot(
     let (mut rt, mut out) = Runtime::boot(program, store, opts).map_err(|e| format!("boot failed: {e}"))?;
     // Secure random bytes for `crypto.randomId()` and ids, as every host sends them.
     out.extend(rt.handle(now_ms(), Input::Entropy { bytes: crate::bytes::hex(&crate::bytes::random::<32>()?) }));
-    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call, gfx, has_frame })
+    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call, whiteboard, gfx, has_frame })
 }
 
 struct EngineSyncSink(Sender<Msg>);
@@ -252,6 +255,8 @@ impl Engine {
         let device_plugins_ref = device_plugins.clone();
         let video_call = Arc::new(AtomicBool::new(false));
         let video_call_ref = video_call.clone();
+        let whiteboard = Arc::new(AtomicBool::new(false));
+        let whiteboard_ref = whiteboard.clone();
         let gfx = Arc::new(AtomicBool::new(false));
         let gfx_ref = gfx.clone();
         let has_frame = Arc::new(AtomicBool::new(false));
@@ -265,8 +270,9 @@ impl Engine {
             .spawn(move || {
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call: has_vc, gfx: has_gfx, has_frame: hf }) => {
+                    Ok(Booted { rt, out, manifest, snap, max_objects, max_object_bytes, video_call: has_vc, whiteboard: has_wb, gfx: has_gfx, has_frame: hf }) => {
                         video_call_ref.store(has_vc, Ordering::Relaxed);
+                        whiteboard_ref.store(has_wb, Ordering::Relaxed);
                         gfx_ref.store(has_gfx, Ordering::Relaxed);
                         has_frame_ref.store(hf, Ordering::Relaxed);
                         let shared = Arc::new(Mutex::new(manifest));
@@ -275,7 +281,7 @@ impl Engine {
                         }
                         let _ = ready_tx.send(Ok((max_objects, max_object_bytes)));
                         audit.record(Entry::new("start").text("app", &sha256_hex(&source)));
-                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms, device_plugins_ref, video_call_ref, gfx_ref, has_frame_ref);
+                        run(rt, out, rx, back, data, render, explain, plugins, measured, audit, shared, live_source_ref, source, snap, compliance, fetch_allow_arc, remotes, webhooks, webhook_sender, device_perms, device_plugins_ref, video_call_ref, whiteboard_ref, gfx_ref, has_frame_ref);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -289,7 +295,7 @@ impl Engine {
             .ok()
             .and_then(|g| g.clone())
             .unwrap_or_else(|| Arc::new(Mutex::new(Manifest { json: Json::Null })));
-        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist, device_plugins, video_call, gfx, has_frame })
+        Ok(Engine { tx, stats, manifest, source: live_source, max_objects, max_object_bytes, fetch_allowlist, device_plugins, video_call, whiteboard, gfx, has_frame })
     }
 
     /// Opt-in host device plugins (`files`, `notifications`, `location`, `camera`) enabled by the app's permissions.
@@ -300,6 +306,11 @@ impl Engine {
     /// Whether the app opts into the WebRTC `<Native name="VideoCall" />` component.
     pub fn has_video_call(&self) -> bool {
         self.video_call.load(Ordering::Relaxed)
+    }
+
+    /// Whether the app opts into the collaborative `<Native name="Whiteboard" />` component.
+    pub fn has_whiteboard(&self) -> bool {
+        self.whiteboard.load(Ordering::Relaxed)
     }
 
     /// Whether the app opts into the 3D `<Scene>` renderer or `@frame` animation loop.
@@ -631,6 +642,7 @@ fn run(
     mut device_perms: std::collections::BTreeMap<String, crate::device_perms::DevicePermission>,
     device_plugins: Arc<Mutex<Vec<&'static str>>>,
     video_call: Arc<AtomicBool>,
+    whiteboard: Arc<AtomicBool>,
     gfx: Arc<AtomicBool>,
     has_frame: Arc<AtomicBool>,
 ) {
@@ -756,7 +768,7 @@ fn run(
                 let next_perms = updated_perms.as_ref().unwrap_or(&device_perms);
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&source, &data, render, explain, &refs, &remote_classes, next_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, whiteboard: has_wb, gfx: has_gfx, has_frame: hf, .. }) => {
                         if let Some(p) = updated_perms {
                             if let Ok(mut dp) = device_plugins.lock() {
                                 *dp = crate::device_perms::bundled_host_plugins(&p);
@@ -764,6 +776,7 @@ fn run(
                             device_perms = p;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        whiteboard.store(has_wb, Ordering::Relaxed);
                         gfx.store(has_gfx, Ordering::Relaxed);
                         has_frame.store(hf, Ordering::Relaxed);
                         let new_sha = sha256_hex(&source);
@@ -813,7 +826,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&req.source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, video_call: has_vc, whiteboard: has_wb, gfx: has_gfx, has_frame: hf, .. }) => {
                         let prev_source = std::mem::replace(&mut current_source, req.source.clone());
                         let prev_sha = std::mem::replace(&mut current_sha, new_sha.clone());
                         previous = Some((prev_source.clone(), prev_sha.clone()));
@@ -822,6 +835,7 @@ fn run(
                             *s = req.source;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        whiteboard.store(has_wb, Ordering::Relaxed);
                         gfx.store(has_gfx, Ordering::Relaxed);
                         has_frame.store(hf, Ordering::Relaxed);
                         rt = new_rt;
@@ -875,7 +889,7 @@ fn run(
                 d.turn_errors = 0;
                 let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                 match boot(&prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
+                    Ok(Booted { rt: new_rt, out, manifest: new_manifest, snap: new_snap, video_call: has_vc, whiteboard: has_wb, gfx: has_gfx, has_frame: hf, .. }) => {
                         let rolled_from_sha = std::mem::replace(&mut current_sha, prev_sha.clone());
                         current_source = prev_source.clone();
                         previous = None;
@@ -884,6 +898,7 @@ fn run(
                             *s = prev_source;
                         }
                         video_call.store(has_vc, Ordering::Relaxed);
+                        whiteboard.store(has_wb, Ordering::Relaxed);
                         gfx.store(has_gfx, Ordering::Relaxed);
                         has_frame.store(hf, Ordering::Relaxed);
                         rt = new_rt;
@@ -922,7 +937,7 @@ fn run(
                     d.stats.set_watch_until(0);
                     let refs: Vec<&str> = plugin_names.iter().map(String::as_str).collect();
                     match boot(&w.prev_source, &data, render, explain, &refs, &remote_classes, &device_perms) {
-                        Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, video_call: has_vc, gfx: has_gfx, has_frame: hf, .. }) => {
+                        Ok(Booted { rt: prev_rt, out: boot_out, manifest: prev_manifest, snap: prev_snap, video_call: has_vc, whiteboard: has_wb, gfx: has_gfx, has_frame: hf, .. }) => {
                             current_source = w.prev_source.clone();
                             current_sha = w.prev_sha.clone();
                             previous = None;
@@ -931,6 +946,7 @@ fn run(
                                 *s = w.prev_source;
                             }
                             video_call.store(has_vc, Ordering::Relaxed);
+                            whiteboard.store(has_wb, Ordering::Relaxed);
                             gfx.store(has_gfx, Ordering::Relaxed);
                             has_frame.store(hf, Ordering::Relaxed);
                             rt = prev_rt;
@@ -1114,6 +1130,7 @@ impl Dispatch {
                     let kind = match by.as_str() {
                         "timer" => "timer",
                         "alarm" => "alarm",
+                        "message" => "message",
                         _ => "invoke",
                     };
                     self.audit.record(Entry::new(kind).who(Actor::id(caller.as_deref())).object(&object).text("method", &method).ok(ok).num("ms", ms));

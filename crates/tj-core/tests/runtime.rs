@@ -1752,6 +1752,9 @@ impl Store for Flaky {
     fn keys(&mut self, prefix: &str) -> Result<Vec<String>, String> {
         self.0.keys(prefix)
     }
+    fn remove(&mut self, key: &str) -> Result<(), String> {
+        self.0.remove(key)
+    }
 }
 
 #[test]
@@ -4515,3 +4518,353 @@ object Mover {
     assert!(errors("object A { @frame @every(\"1s\") f() {} }").contains("cannot also have"));
     assert!(errors("object A { @frame @invariant f(): boolean { return true } }").contains("cannot also have"));
 }
+
+#[test]
+fn prefix_topic_streams_subscribe_filter_and_enforce_access() {
+    let src = r#"
+@server @read("anyone") object Note {
+  text: string = ""
+  @read("staff") internalNote: string = ""
+  @allow("anyone") set(text: string, note: string) {
+    this.text = text
+    this.internalNote = note
+  }
+}
+@server @read("owner") object Secret {
+  @pii("other", "ops") body: string = ""
+}
+object View {
+  last: string[] = []
+  listTopic(prefix: string): string[] {
+    this.last = Note.all(prefix).map(n => n.id)
+    return this.last
+  }
+  listAll(): string[] {
+    return Note.all().map(n => n.id)
+  }
+}
+"#;
+    // 1. Device-side prefix subscription emits Class/prefix* once, skips covered prefixes,
+    //    subscribes to disjoint prefixes, and filters synced replicas cleanly.
+    let (mut dev, _) = boot_with(src, Shared::default(), 100.0);
+    let out1 = dev.handle(
+        101.0,
+        Input::Call { object: "View/v".into(), method: "listTopic".into(), args: vec![json!("studio:")], reply: Some(1), call: None, caller: None },
+    );
+    assert!(
+        out1.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Note/studio:*")),
+        "expected Note/studio:* subscribe in {out1:?}"
+    );
+    assert_eq!(reply(&out1).unwrap(), json!([]));
+
+    // Calling again with same or narrower prefix does NOT emit another Subscribe.
+    let out_dup = dev.handle(
+        102.0,
+        Input::Call { object: "View/v".into(), method: "listTopic".into(), args: vec![json!("studio:")], reply: Some(2), call: None, caller: None },
+    );
+    assert!(!out_dup.iter().any(|o| matches!(o, Output::Subscribe { .. })));
+    let out_sub = dev.handle(
+        103.0,
+        Input::Call { object: "View/v".into(), method: "listTopic".into(), args: vec![json!("studio:sub:")], reply: Some(3), call: None, caller: None },
+    );
+    assert!(!out_sub.iter().any(|o| matches!(o, Output::Subscribe { .. })), "broader studio:* covers studio:sub:*");
+
+    // Disjoint prefix subscribes separately.
+    let out_other = dev.handle(
+        104.0,
+        Input::Call { object: "View/v".into(), method: "listTopic".into(), args: vec![json!("other:")], reply: Some(4), call: None, caller: None },
+    );
+    assert!(out_other.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Note/other:*")));
+
+    // Sync objects from both rooms; each prefix query returns only its topic.
+    for (k, txt, seq) in [("Note/studio:2", "two", 2), ("Note/other:1", "eve", 3), ("Note/studio:1", "one", 1)] {
+        dev.handle(105.0, Input::Sync { object: k.into(), state: json!({ "text": txt }), seq: Some(seq) });
+    }
+    assert_eq!(call(&mut dev, 106.0, "View/v", "listTopic", json!(["studio:"])).unwrap(), json!(["studio:1", "studio:2"]));
+    assert_eq!(call(&mut dev, 107.0, "View/v", "listTopic", json!(["other:"])).unwrap(), json!(["other:1"]));
+
+    // Calling broad Note.all() subscribes to Note/* and returns all 3.
+    let out_all = dev.handle(
+        108.0,
+        Input::Call { object: "View/v".into(), method: "listAll".into(), args: vec![], reply: Some(5), call: None, caller: None },
+    );
+    assert!(out_all.iter().any(|o| matches!(o, Output::Subscribe { object, seq: 0 } if object == "Note/*")));
+    assert_eq!(reply(&out_all).unwrap(), json!(["other:1", "studio:1", "studio:2"]));
+
+    // Invalid prefix or wildcard ID is rejected.
+    assert!(call(&mut dev, 109.0, "View/v", "listTopic", json!(["bad*prefix"])).is_err());
+    assert!(call(&mut dev, 110.0, "View/v", "listTopic", json!(["bad/prefix"])).is_err());
+
+    // 2. Server-side changed_since, field hiding, and fail-closed wildcard access control.
+    let (mut srv, _) = boot_as(src, Shared::default(), 200.0, true);
+    assert!(call(&mut srv, 201.0, "Note/bad*id", "set", json!(["x", "y"])).is_err(), "concrete id cannot contain *");
+    call(&mut srv, 202.0, "Note/studio:1", "set", json!(["hi", "secret-1"])).unwrap();
+    call(&mut srv, 203.0, "Note/other:1", "set", json!(["yo", "secret-2"])).unwrap();
+    call(&mut srv, 204.0, "Note/studio:2", "set", json!(["hi2", "secret-3"])).unwrap();
+
+    let catch_up = srv.changed_since(&["Note/studio:*".into()], 0);
+    let keys_and_seqs: Vec<(String, u64)> = catch_up
+        .iter()
+        .filter_map(|o| match o {
+            Output::Changed { object, seq, .. } => Some((object.clone(), *seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(keys_and_seqs.len(), 2);
+    assert_eq!(keys_and_seqs[0].0, "Note/studio:1");
+    assert_eq!(keys_and_seqs[1].0, "Note/studio:2");
+    assert!(keys_and_seqs[0].1 < keys_and_seqs[1].1);
+
+    // Per-field @read("staff") stays hidden for non-staff callers even on topic objects.
+    let anon = Caller::Remote { id: "".into(), roles: vec![] };
+    for o in &catch_up {
+        if let Output::Changed { object, state, .. } = o {
+            let hidden = srv.hidden_from(object, state, Some(&anon));
+            assert!(!hidden.is_empty(), "staff-only field must be masked on {object}");
+        }
+    }
+
+    // Fail-closed access control on wildcards:
+    let ana = Caller::Remote { id: "user:ana".into(), roles: vec![] };
+    assert!(srv.may_read("Note/studio:*", &anon).is_ok());
+    assert!(srv.may_read("Secret/user:ana*", &ana).is_err(), "@read(owner) must never allow wildcards");
+    assert!(srv.may_read("Note/studio:**", &anon).is_err());
+    assert!(srv.may_read("Note/*studio", &anon).is_err());
+    assert!(srv.may_read("Note/a/b*", &anon).is_err());
+
+    // Input::Call refuses wildcards (403); Input::Get returns 400 on readable wildcard and 403 on forbidden wildcard.
+    let call_wild = srv.handle(
+        205.0,
+        Input::Call { object: "Note/studio:*".into(), method: "set".into(), args: vec![json!("a"), json!("b")], reply: Some(10), call: None, caller: Some(anon.clone()) },
+    );
+    assert!(matches!(call_wild.first(), Some(Output::Reply { status: Some(403), .. })));
+    let get_wild_ok = srv.handle(206.0, Input::Get { object: "Note/studio:*".into(), reply: Some(11), caller: Some(anon) });
+    assert!(matches!(get_wild_ok.first(), Some(Output::Reply { status: Some(400), .. })));
+    let get_wild_forbid = srv.handle(207.0, Input::Get { object: "Secret/user:ana*".into(), reply: Some(12), caller: Some(ana) });
+    assert!(matches!(get_wild_forbid.first(), Some(Output::Reply { status: Some(403), .. })));
+
+    // Flow check: unrevealed PII cannot be used as a topic prefix.
+    let pii_prefix = r#"
+@server @read("anyone") object Tag { id2: string = "" }
+@server @read("owner") object User {
+  @pii("contact", "ops") email: string = ""
+  @allow("owner") find(): any { return Tag.all(this.email) }
+}
+"#;
+    assert!(errors(pii_prefix).contains("topic prefix"));
+}
+
+#[test]
+fn durable_cross_object_deliver_commits_atomically_and_survives_restarts() {
+    let src = r#"
+@server @read("anyone") object AuditLog {
+  events: any[] = []
+  fails: number = 0
+
+  record(from: string, who: string, note: string) {
+    this.events.push({ from, who, note })
+  }
+
+  bad() {
+    this.fails += 1
+    throw new Error("boom in target")
+  }
+}
+
+@server @read("anyone") object Order {
+  status: string = "new"
+  amount: number = 0
+
+  @invariant nonNeg(): boolean { return this.amount >= 0 }
+
+  @allow("signedIn") @exclusive place(amount: number, failAfter: boolean, badAmount: boolean) {
+    this.status = "placed"
+    this.amount = badAmount ? -10 : amount
+    this.emit("queued", { amount })
+    this.deliver(AuditLog.get("main"), "record", this.id, caller.id, `placed:${amount}`)
+    this.deliver(AuditLog.get("main"), "bad")
+    if (failAfter) { throw new Error("abort sender") }
+  }
+
+  @allow("signedIn") placeAndDelete(amount: number) {
+    this.status = "ephemeral"
+    this.deliver(AuditLog.get("main"), "record", this.id, caller.id, `ephemeral:${amount}`)
+    this.delete()
+  }
+}
+
+@server @read("anyone") object Relay {
+  log: string[] = []
+  @allow("signedIn") hop1() {
+    this.log.push("1")
+    this.deliver(Relay.get("b"), "hop2", caller.id)
+  }
+  hop2(who: string) {
+    this.log.push(`2:${who}`)
+    this.deliver(Relay.get("c"), "hop3", who)
+  }
+  hop3(who: string) {
+    this.log.push(`3:${who}`)
+  }
+}
+"#;
+    let store = Flaky::default();
+    let (mut rt, _) = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(1000.0, 7) }).unwrap();
+    let ana = who("user:ana", &[]);
+
+    // 1. Rollback on sender throw & @invariant failure: nothing committed, zero deliveries.
+    assert!(call_as(&mut rt, 1001.0, "Order/o1", "place", json!([25, true, false]), ana.clone()).is_err());
+    assert!(call_as(&mut rt, 1002.0, "Order/o1", "place", json!([25, false, true]), ana.clone()).is_err());
+    assert_eq!(state(&mut rt, 1003.0, "Order/o1")["status"], json!("new"));
+    assert_eq!(state(&mut rt, 1003.0, "AuditLog/main")["events"], json!([]));
+
+    // 2. Rollback when tj:messages fails to save on disk: 503, sender state & emit rolled back!
+    call_as(&mut rt, 1004.0, "Order/o1", "place", json!([10, false, false]), ana.clone()).unwrap();
+    assert_eq!(state(&mut rt, 1005.0, "Order/o1")["amount"], json!(10));
+    assert_eq!(state(&mut rt, 1005.0, "AuditLog/main")["events"].as_array().unwrap().len(), 1);
+    *store.3.borrow_mut() = "tj:messages".into();
+    let disk_err = call_as(&mut rt, 1006.0, "Order/o1", "place", json!([99, false, false]), ana.clone()).unwrap_err();
+    assert_eq!(disk_err.0, Some(503));
+    store.3.borrow_mut().clear();
+    assert_eq!(state(&mut rt, 1007.0, "Order/o1")["amount"], json!(10), "disk failure on tj:messages rolled back sender");
+    assert_eq!(state(&mut rt, 1007.0, "AuditLog/main")["events"].as_array().unwrap().len(), 1);
+
+    // 3. Target error inside AuditLog.bad() does NOT roll back Order/o1 and does NOT retry forever.
+    let ok_out = rt.handle(
+        1008.0,
+        Input::Call { object: "Order/o2".into(), method: "place".into(), args: json!([42, false, false]).as_array().unwrap().clone(), reply: Some(50), call: None, caller: ana.clone() },
+    );
+    assert!(reply(&ok_out).is_ok());
+    assert!(ok_out.iter().any(|o| matches!(o, Output::Ran { object, method, by, caller: Some(c), ok: true, .. } if object == "AuditLog/main" && method == "record" && by == "message" && c == "user:ana")));
+    assert!(ok_out.iter().any(|o| matches!(o, Output::Ran { object, method, by, ok: false, .. } if object == "AuditLog/main" && method == "bad" && by == "message")));
+    assert_eq!(state(&mut rt, 1009.0, "Order/o2")["amount"], json!(42));
+    // Subsequent tick must NOT re-deliver AuditLog.bad().
+    let tick_after = rt.handle(1010.0, Input::Tick);
+    assert!(!tick_after.iter().any(|o| matches!(o, Output::Error { message, .. } if message.contains("boom in target"))));
+
+    // 4. Sender calling this.delete() after this.deliver(...) still delivers the message.
+    call_as(&mut rt, 1011.0, "Order/ephem", "placeAndDelete", json!([77]), ana.clone()).unwrap();
+    assert_eq!(state(&mut rt, 1012.0, "Order/ephem")["status"], json!("new"));
+    let evs = state(&mut rt, 1012.0, "AuditLog/main")["events"].as_array().unwrap().clone();
+    assert_eq!(evs.last().unwrap()["note"], json!("ephemeral:77"));
+
+    // 5. Crash / restart survival: chained Relay/a.hop1 -> Relay/b.hop2 -> Relay/c.hop3.
+    // hop1 runs and fire_timers delivers hop2, which persists hop3 in tj:messages for next tick.
+    let hop_out = rt.handle(
+        2000.0,
+        Input::Call { object: "Relay/a".into(), method: "hop1".into(), args: vec![], reply: Some(60), call: None, caller: ana.clone() },
+    );
+    assert!(reply(&hop_out).is_ok());
+    assert!(
+        hop_out.iter().any(|o| matches!(o, Output::Ran { object, method, by, ok: true, .. } if object == "Relay/b" && method == "hop2" && by == "message")),
+        "hop2 should execute in the first turn's timer flush: {hop_out:?}"
+    );
+    assert!(
+        !hop_out.iter().any(|o| matches!(o, Output::Ran { object, .. } if object == "Relay/c")),
+        "hop3 must remain queued for the next tick: {hop_out:?}"
+    );
+    let b_raw = store.0.0.borrow().data.get("Relay/b").cloned().expect("Relay/b stored");
+    let b_state: serde_json::Value = serde_json::from_str(&b_raw).unwrap();
+    assert_eq!(b_state["state"]["log"], json!(["2:user:ana"]));
+    assert!(!store.0.0.borrow().data.contains_key("Relay/c"), "Relay/c untouched before reboot");
+    assert!(store.0.0.borrow().data.get("tj:messages").is_some_and(|s| s.contains("hop3")), "hop3 persisted in tj:messages");
+
+    // Reboot fresh Runtime over the same store and tick -> hop3 executes cleanly!
+    let (mut restarted, boot_out) = Runtime::boot(compile(src).unwrap(), Box::new(store.clone()), Options { server: true, render: false, ..Options::new(2005.0, 7) }).unwrap();
+    assert!(matches!(boot_out.last(), Some(Output::Wake { at: Some(_) })));
+    let after_boot_tick = restarted.handle(2005.0, Input::Tick);
+    assert!(after_boot_tick.iter().any(|o| matches!(o, Output::Ran { object, method, by, caller: Some(c), ok: true, .. } if object == "Relay/c" && method == "hop3" && by == "message" && c == "user:ana")));
+    assert_eq!(state(&mut restarted, 2006.0, "Relay/c")["log"], json!(["3:user:ana"]));
+    assert_eq!(store.0.0.borrow().data.get("tj:messages").map(String::as_str), Some("[]"));
+
+    // 6. GDPR erase_subject drops pending durable messages for erased subject while keeping others/held.
+    let pii_src = r#"
+@server @read("owner") object Account {
+  @pii("contact", "account") email: string = ""
+  @allow("owner") setEmail(e: string) { this.email = e }
+  @allow("owner") triggerChain() {
+    this.deliver(Bridge.get("main"), "step", caller.id)
+  }
+}
+@server @read("owner") @legalHold("7d") object Held {
+  @pii("financial", "tax") taxId: string = ""
+  pings: number = 0
+  @allow("owner") setTax(t: string) { this.taxId = t }
+  ping() { this.pings += 1 }
+}
+@server @read("anyone") object Bridge {
+  seen: string[] = []
+  step(who: string) {
+    this.deliver(Sink.get("main"), "log", who)
+    this.deliver(Held.get(who), "ping")
+  }
+}
+@server @read("anyone") object Sink {
+  items: string[] = []
+  log(who: string) { this.items.push(who) }
+}
+"#;
+    let pstore = Shared::default();
+    let (mut prt, _) = boot_as(pii_src, pstore.clone(), 3000.0, true);
+    call_as(&mut prt, 3001.0, "Account/user:ana", "setEmail", json!(["ana@example.com"]), who("user:ana", &[])).unwrap();
+    call_as(&mut prt, 3002.0, "Held/user:ana", "setTax", json!(["TX1"]), who("user:ana", &[])).unwrap();
+    call_as(&mut prt, 3003.0, "Account/user:bo", "setEmail", json!(["bo@example.com"]), who("user:bo", &[])).unwrap();
+    call_as(&mut prt, 3004.0, "Account/user:ana", "triggerChain", json!([]), who("user:ana", &[])).unwrap();
+    // Both Sink/main.log("user:ana") and Held/user:ana.ping are queued in tj:messages right now.
+    let pre_erase_msgs = pstore.0.borrow().data.get("tj:messages").cloned().unwrap_or_default();
+    assert!(pre_erase_msgs.contains("Sink/main") && pre_erase_msgs.contains("Held/user:ana"), "{pre_erase_msgs}");
+    prt.erase_subject("user:ana", None).unwrap();
+    let post_erase_msgs = pstore.0.borrow().data.get("tj:messages").cloned().unwrap_or_default();
+    assert!(!post_erase_msgs.contains("Sink/main"), "non-held pending message for erased subject dropped: {post_erase_msgs}");
+    assert!(post_erase_msgs.contains("Held/user:ana"), "@legalHold target pending message kept: {post_erase_msgs}");
+    prt.handle(3005.0, Input::Tick);
+    assert_eq!(state(&mut prt, 3006.0, "Sink/main")["items"], json!([]), "ana's Sink message was pruned");
+    let held: serde_json::Value = serde_json::from_str(pstore.0.borrow().data.get("Held/user:ana").expect("Held/user:ana stored")).unwrap();
+    assert_eq!(held["state"]["pings"], json!(1), "held target still received ping");
+    // Unrelated subject's pending message survives erase_subject("user:ana", None).
+    call_as(&mut prt, 3008.0, "Account/user:bo", "triggerChain", json!([]), who("user:bo", &[])).unwrap();
+    prt.erase_subject("user:ana", None).unwrap();
+    prt.handle(3009.0, Input::Tick);
+    assert_eq!(state(&mut prt, 3010.0, "Sink/main")["items"], json!(["user:bo"]), "bo's pending message survived ana erasure");
+
+    // 7. Compile-time typeck and privacy flow checks for this.deliver(...).
+    let local_err = errors("object Local { f() { this.deliver(Local.get(\"x\"), \"f\") } }");
+    assert!(local_err.contains("deliver() is only available inside non-@invariant @server"), "{local_err}");
+    let inv_err = errors("@server object A { @invariant ok(): boolean { this.deliver(A.get(\"x\"), \"p\"); return true } p() {} }");
+    assert!(inv_err.contains("deliver() is only available inside non-@invariant @server"), "{inv_err}");
+    let non_this = errors("@server object A { f() { A.get(\"x\").deliver(A.get(\"y\"), \"p\") } p() {} }");
+    assert!(non_this.contains("this.deliver"), "{non_this}");
+    let target_local = errors("object L { p() {} }\n@server object A { f() { this.deliver(L.get(\"x\"), \"p\") } }");
+    assert!(target_local.contains("must be declared with @server"), "{target_local}");
+    let non_lit = errors("@server object A { f(m: string) { this.deliver(A.get(\"x\"), m) } p() {} }");
+    assert!(non_lit.contains("string literal method name"), "{non_lit}");
+    let priv_err = errors("@server object B { private p() {} }\n@server object A { f() { this.deliver(B.get(\"x\"), \"p\") } }");
+    assert!(priv_err.contains("private to B"), "{priv_err}");
+    let arg_err = errors("@server object B { p(n: number) {} }\n@server object A { f() { this.deliver(B.get(\"x\"), \"p\", \"wrong\") } }");
+    assert!(arg_err.contains("expected number") || arg_err.contains("got string"), "{arg_err}");
+
+    let flow_unrevealed = r#"
+@server @read("anyone") object Sink { put(e: string) {} }
+@server @read("owner") object User {
+  @pii("contact", "ops") email: string = ""
+  @allow("owner") f() { this.deliver(Sink.get("s"), "put", this.email) }
+}
+"#;
+    assert!(errors(flow_unrevealed).contains("durable message's arguments"));
+
+    let flow_revealed = r#"
+const lawfulBasis = { ops: "legitimate-interest" }
+@server @read("anyone") object Sink {
+  async fwd(e: string) { await fetch("https://audit.example/log", { method: "POST", body: e }) }
+}
+@server @read("owner") object User {
+  @pii("contact", "ops") email: string = ""
+  @allow("owner") f() { this.deliver(Sink.get("s"), "fwd", reveal(this.email, "ops")) }
+}
+"#;
+    assert_eq!(errors(flow_revealed), "");
+    let facts = tj_core::facts(flow_revealed);
+    assert_eq!(facts.reveals.len(), 1);
+    assert_eq!(facts.transfers.len(), 1);
+}
+

@@ -1,0 +1,46 @@
+# Deterministic trace test for examples/collab-studio/app.tj
+{"do": "boot", "now": 1800000000000, "seed": 1, "server": true, "render": true}
+{"do": "assertScreen", "contains": ["TinyJump Studio", "Room studio", "Join Video", "Voice Only"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+
+# Join room + toggle screen share; durable activity recorded via this.deliver
+{"do": "call", "object": "StudioRoom/studio", "method": "join", "args": ["Alice"], "expect": ["Alice"]}
+{"do": "call", "object": "StudioRoom/studio", "method": "join", "args": ["Bob"], "expect": ["Alice", "Bob"]}
+{"do": "call", "object": "StudioRoom/studio", "method": "setScreenShare", "args": ["Alice", true], "expect": "Alice"}
+{"do": "call", "object": "StudioRoom/studio", "method": "setScreenShare", "args": ["Bob", true], "expectError": "already sharing"}
+{"do": "call", "object": "StudioRoom/studio", "method": "setScreenShare", "args": ["Alice", false], "expect": ""}
+
+# Room-isolated chat & whiteboard strokes (`ChatEntry.all("studio:")` vs `"other:"`)
+{"do": "call", "object": "StudioRoom/studio", "method": "postChat", "args": ["Alice", "Hello studio"], "expect": 1}
+{"do": "call", "object": "StudioRoom/other", "method": "postChat", "args": ["Eve", "Secret other room"], "expect": 1}
+{"do": "call", "object": "StudioRoom/studio", "method": "addStroke", "args": ["Alice", "#111114", 3, [10, 20, 120, 240]], "expect": 1}
+{"do": "call", "object": "StudioRoom/studio", "method": "addStroke", "args": ["Bob", "#9a3412", 6, [300, 320, 500, 520]], "expect": 2}
+{"do": "call", "object": "StudioRoom/other", "method": "addStroke", "args": ["Eve", "#1d4ed8", 4, [50, 50, 90, 90]], "expect": 1}
+
+# Verify durable RoomActivity received all cross-object delivered events in studio only
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 8}}
+{"do": "get", "object": "RoomActivity/other", "expectContains": {"nextSeq": 3}}
+{"do": "get", "object": "BoardStroke/studio:000001", "expectContains": {"author": "Alice", "color": "#111114"}}
+{"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"author": "Alice", "text": "Hello studio"}}
+
+# Clear studio board fans out durable deletes across BoardStroke/studio:* while leaving other room untouched
+{"do": "call", "object": "StudioRoom/studio", "method": "clearBoard", "args": ["Alice"], "expect": 2}
+{"do": "get", "object": "BoardStroke/studio:000001", "expectContains": {"points": []}}
+{"do": "get", "object": "BoardStroke/studio:000002", "expectContains": {"points": []}}
+{"do": "get", "object": "BoardStroke/other:000001", "expectContains": {"author": "Eve"}}
+
+# Switch tabs via UI and verify layout across Call, Board, Chat, and Feed on 390x844
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "board"}
+{"do": "assertScreen", "contains": ["Strokes (studio): 0"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "chat"}
+{"do": "assertScreen", "contains": ["Hello studio"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+{"do": "ui", "target": "#tabs", "event": "onChange", "value": "activity"}
+{"do": "assertScreen", "contains": ["Durable Room Activity", "Alice"]}
+{"do": "assertLayout", "width": 390, "height": 844, "review": true}
+
+# Restart persistence over the same store keeps topic entries and activity
+{"do": "boot", "restart": true, "now": 1800000005000, "seed": 1, "server": true, "render": true}
+{"do": "get", "object": "ChatEntry/studio:000001", "expectContains": {"text": "Hello studio"}}
+{"do": "get", "object": "RoomActivity/studio", "expectContains": {"nextSeq": 9}}

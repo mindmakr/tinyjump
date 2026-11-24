@@ -232,8 +232,12 @@ fn strip_null(t: Ty) -> Ty {
 }
 
 struct ObjInfo {
+    #[cfg(feature = "check")]
+    server: bool,
     fields: IndexMap<Rc<str>, Ty>,
     methods: HashMap<Rc<str>, Rc<FnTy>>,
+    #[cfg(feature = "check")]
+    private_methods: Vec<Rc<str>>,
 }
 
 struct Var {
@@ -292,7 +296,19 @@ pub fn check_with_locales(items: &[&Item], locales: &crate::i18n::Locales) -> Ve
                 c.aliases.insert(name, (generics, ty));
             }
             Item::Object(o) => {
-                c.objects.insert(Rc::from(o.name.as_str()), ObjInfo { fields: IndexMap::new(), methods: HashMap::new() });
+                #[cfg(feature = "check")]
+                let server = o.decorators.iter().any(|d| d.name == "server");
+                c.objects.insert(
+                    Rc::from(o.name.as_str()),
+                    ObjInfo {
+                        #[cfg(feature = "check")]
+                        server,
+                        fields: IndexMap::new(),
+                        methods: HashMap::new(),
+                        #[cfg(feature = "check")]
+                        private_methods: Vec::new(),
+                    },
+                );
                 c.globals.insert(o.name.clone(), Var { ty: Ty::Class(Rc::from(o.name.as_str())), mutable: false });
             }
             _ => {}
@@ -542,8 +558,22 @@ impl<'a> Checker<'a> {
             };
             fields.insert(Rc::from(f.name.as_str()), ty);
         }
+        #[cfg(feature = "check")]
+        let server = o.decorators.iter().any(|d| d.name == "server");
         let methods = o.methods.iter().map(|m| (Rc::from(m.func.name.as_str()), self.signature(&m.func))).collect();
-        self.objects.insert(Rc::from(o.name.as_str()), ObjInfo { fields, methods });
+        #[cfg(feature = "check")]
+        let private_methods = o.methods.iter().filter(|m| m.private).map(|m| Rc::from(m.func.name.as_str())).collect();
+        self.objects.insert(
+            Rc::from(o.name.as_str()),
+            ObjInfo {
+                #[cfg(feature = "check")]
+                server,
+                fields,
+                methods,
+                #[cfg(feature = "check")]
+                private_methods,
+            },
+        );
     }
 
     fn var(&self, name: &str) -> Option<&Var> {
@@ -826,7 +856,7 @@ impl<'a> Checker<'a> {
                     #[cfg(feature = "check")]
                     self.check_idempotency_key(obj, name, sp);
                     let t = self.expr(obj, None);
-                    self.method_call(&t, name, args, sp)
+                    self.method_call_on(matches!(obj.kind, ExprKind::This), &t, name, args, sp)
                 }
                 _ => {
                     if let ExprKind::Ident(name) = &callee.kind {
@@ -1233,7 +1263,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn method_call(&mut self, recv: &Ty, name: &str, args: &[Expr], span: Span) -> Ty {
+    fn method_call_on(&mut self, #[cfg_attr(not(feature = "check"), allow(unused_variables))] is_this: bool, recv: &Ty, name: &str, args: &[Expr], span: Span) -> Ty {
         let recv = strip_null(self.deref(recv));
         match recv {
             Ty::Arr(el) => self.array_method(&el, name, args, span),
@@ -1258,7 +1288,11 @@ impl<'a> Checker<'a> {
                 }
             }
             Ty::Obj(class) => {
-                if matches!(name, "emit" | "schedule" | "unschedule" | "delete") {
+                #[cfg(feature = "check")]
+                if name == "deliver" {
+                    return self.check_deliver(is_this, args, span);
+                }
+                if matches!(name, "emit" | "schedule" | "unschedule" | "delete" | "deliver") {
                     for a in args {
                         self.expr(a, None);
                     }
@@ -1289,7 +1323,7 @@ impl<'a> Checker<'a> {
                     self.args(&get, args, span);
                     Ty::Obj(class)
                 } else if name == "all" {
-                    let all = FnTy { params: Vec::new(), rest: None, ret: Ty::Arr(Box::new(Ty::Obj(class.clone()))) };
+                    let all = FnTy { params: vec![(Rc::from("prefix"), Ty::Str, true)], rest: None, ret: Ty::Arr(Box::new(Ty::Obj(class.clone()))) };
                     self.args(&all, args, span);
                     Ty::Arr(Box::new(Ty::Obj(class)))
                 } else {
@@ -1308,6 +1342,106 @@ impl<'a> Checker<'a> {
                 Ty::Any
             }
         }
+    }
+
+    #[cfg(feature = "check")]
+    fn check_deliver(&mut self, is_this: bool, args: &[Expr], span: Span) -> Ty {
+        if !is_this {
+            self.errors.push(
+                Diagnostic::new("deliver() can only be called as this.deliver(...)", span)
+                    .hint("call this.deliver(target, \"method\", ...args)"),
+            );
+        } else if !self.this_server {
+            self.errors.push(
+                Diagnostic::new("deliver() is only available inside non-@invariant @server object methods", span)
+                    .hint("call this.deliver(target, \"method\", ...args) inside an @server object method"),
+            );
+        }
+        if args.len() < 2 {
+            for a in args {
+                self.expr(a, None);
+            }
+            self.errors.push(
+                Diagnostic::new("this.deliver(target, \"method\", ...args) needs a target object and a method name", span)
+                    .hint("pass target object and method name string: this.deliver(Target.get(id), \"method\", ...args)"),
+            );
+            return Ty::Void;
+        }
+        let target_ty = self.expr(&args[0], None);
+        self.expr(&args[1], None);
+        match self.deref(&target_ty) {
+            Ty::Obj(target_class) => {
+                let (t_server, methods, method_info) = {
+                    let info = &self.objects[&target_class];
+                    let mname = match &args[1].kind {
+                        ExprKind::Str(s) => Some(s.as_str()),
+                        _ => None,
+                    };
+                    let mut list: Vec<String> = info.methods.keys().map(|k| k.to_string()).collect();
+                    list.sort();
+                    let found = mname.and_then(|n| {
+                        info.methods
+                            .get(n)
+                            .cloned()
+                            .map(|fn_ty| (fn_ty, info.private_methods.iter().any(|p| p.as_ref() == n)))
+                    });
+                    (info.server, list, found)
+                };
+                if !t_server {
+                    for a in &args[2..] {
+                        self.expr(a, None);
+                    }
+                    self.errors.push(
+                        Diagnostic::new(format!("deliver() target '{target_class}' must be declared with @server"), args[0].span)
+                            .hint(format!("mark `object {target_class}` with `@server`")),
+                    );
+                    return Ty::Void;
+                }
+                let ExprKind::Str(mname) = &args[1].kind else {
+                    for a in &args[2..] {
+                        self.expr(a, None);
+                    }
+                    self.errors.push(
+                        Diagnostic::new("this.deliver(target, \"method\", ...args) needs a string literal method name", args[1].span)
+                            .hint("write this.deliver(target, \"methodName\", ...args)"),
+                    );
+                    return Ty::Void;
+                };
+                match method_info {
+                    Some((fn_ty, is_private)) => {
+                        if is_private && !matches!(args[0].kind, ExprKind::This) {
+                            self.errors.push(
+                                Diagnostic::new(format!("'{mname}' is private to {target_class}"), args[1].span)
+                                    .hint(format!("remove `private` on {target_class}.{mname} so other objects can deliver messages to it")),
+                            );
+                        }
+                        self.args(&fn_ty, &args[2..], span);
+                    }
+                    None => {
+                        for a in &args[2..] {
+                            self.expr(a, None);
+                        }
+                        let hint = suggest(mname, &format!("methods of {target_class}"), &methods);
+                        self.errors.push(Diagnostic::new(format!("{target_class} has no method '{mname}'"), args[1].span).hint(hint));
+                    }
+                }
+            }
+            Ty::Any | Ty::Null => {
+                for a in &args[2..] {
+                    self.expr(a, None);
+                }
+            }
+            other => {
+                for a in &args[2..] {
+                    self.expr(a, None);
+                }
+                self.errors.push(
+                    Diagnostic::new(format!("deliver() target must be an @server object, got {other}"), args[0].span)
+                        .hint("pass Target.get(id) as the first argument to this.deliver(...)"),
+                );
+            }
+        }
+        Ty::Void
     }
 
     fn array_method(&mut self, el: &Ty, name: &str, args: &[Expr], span: Span) -> Ty {

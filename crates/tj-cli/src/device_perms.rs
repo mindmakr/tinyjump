@@ -184,6 +184,17 @@ pub fn uses_video_call(program: &tj_core::vm::program::Program, perms: &BTreeMap
             .any(|v| matches!(v, tj_core::vm::value::Value::Str(s) if &**s == "VideoCall"))
 }
 
+/// Whether a compiled app opts into the built-in collaborative `<Native name="Whiteboard" ... />`
+/// host component: requires a compiled `<Native>` element and a `"Whiteboard"` string constant.
+/// Works identically for `.tj` sources and AOT `.tjb` bundles while adding 0 bytes to `tj-core`.
+pub fn uses_whiteboard(program: &tj_core::vm::program::Program) -> bool {
+    program.elems.iter().any(|e| &*e.kind == "Native")
+        && program
+            .consts
+            .iter()
+            .any(|v| matches!(v, tj_core::vm::value::Value::Str(s) if &**s == "Whiteboard"))
+}
+
 /// Generates deduplicated `<uses-permission>` and `<uses-feature>` XML lines for `AndroidManifest.xml`
 /// covering `minSdk = 21` through `targetSdk = 35`.
 pub fn android_manifest_xml(perms: &BTreeMap<String, DevicePermission>) -> String {
@@ -387,6 +398,14 @@ mod tests {
         assert!(uses_video_call(&aot_prog, &merged), "AOT .tjb bundle still detects VideoCall");
         let comment_only = tj_core::compile("// VideoCall in a comment\nfunction App() { return <Column><Text>hi</Text></Column> }").unwrap();
         assert!(!uses_video_call(&comment_only, &merged), "comment mentioning VideoCall does not opt in");
+
+        // `uses_whiteboard` checks compiled bytecode (works for .tj AND AOT .tjb, ignores comments).
+        let wb_prog = tj_core::compile("function App() { return <Column><Native name=\"Whiteboard\" readOnly={false} /></Column> }").unwrap();
+        assert!(uses_whiteboard(&wb_prog), "Whiteboard opts in");
+        let wb_aot = tj_core::vm::program::Program::from_bytes(&wb_prog.to_bytes().unwrap()).unwrap();
+        assert!(uses_whiteboard(&wb_aot), "AOT .tjb bundle still detects Whiteboard");
+        let wb_comment = tj_core::compile("// Whiteboard in a comment\nfunction App() { return <Column><Text>hi</Text></Column> }").unwrap();
+        assert!(!uses_whiteboard(&wb_comment), "comment mentioning Whiteboard does not opt in");
 
         let ios_xml = ios_plist_xml(&merged, "MyApp", esc);
         assert!(ios_xml.contains("<key>NSCameraUsageDescription</key>"));

@@ -311,12 +311,16 @@ export async function start(opts) {
     });
     stream.addEventListener('changed', (e) => {
       const d = JSON.parse(e.data);
-      // An object of a class streamed whole (`Slot/*`): the class's entry keeps the change
-      // number, so a reconnect resumes and the stream address stays short.
-      const whole = d.object.split('/')[0] + '/*';
-      const key = replicas.has(whole) ? whole : d.object;
-      if (!replicas.has(key)) return;
-      replicas.set(key, Math.max(replicas.get(key), d.seq));
+      // A class or topic stream (`Slot/*`, `Room/studio:*`) keeps the highest change number for
+      // reconnects so the stream address stays short.
+      let matched = false;
+      replicas.forEach((seq, pat) => {
+        if (pat === d.object || coversPattern(pat, d.object)) {
+          replicas.set(pat, Math.max(seq, d.seq));
+          matched = true;
+        }
+      });
+      if (!matched) return;
       send({ type: 'sync', object: d.object, state: d.state, seq: d.seq });
     });
     // Objects this user may not read (a replica kept from before they signed in as someone
@@ -346,14 +350,19 @@ export async function start(opts) {
     }
   }
 
+  function coversPattern(pattern, key) {
+    return pattern.slice(-1) === '*' && key.indexOf(pattern.slice(0, -1)) === 0;
+  }
+
   function subscribe(key, seq) {
     if (server === undefined || replicas.has(key)) return;
-    // Already in a class stream: nothing new to ask for.
-    if (key.slice(-2) !== '/*' && replicas.has(key.split('/')[0] + '/*')) return;
-    if (key.slice(-2) === '/*') {
-      // The class stream covers the objects of the class asked for one by one.
-      const prefix = key.slice(0, -1);
-      Array.from(replicas.keys()).forEach((k) => { if (k.indexOf(prefix) === 0) replicas.delete(k); });
+    // Already covered by a broader class or topic stream: nothing new to ask for.
+    let covered = false;
+    replicas.forEach((_, pat) => { if (coversPattern(pat, key)) covered = true; });
+    if (covered) return;
+    if (key.slice(-1) === '*') {
+      // A broader topic or class stream covers narrower streams and individual objects.
+      Array.from(replicas.keys()).forEach((k) => { if (coversPattern(key, k)) replicas.delete(k); });
     }
     replicas.set(key, seq || 0);
     clearTimeout(reconnect);

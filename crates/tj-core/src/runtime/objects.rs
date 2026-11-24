@@ -2,6 +2,8 @@
 
 use super::access::Who;
 use super::protocol::{Caller, Output};
+#[cfg(feature = "server")]
+use super::{By, Entry};
 use super::{BootError, Runtime, TimerKind};
 use crate::vm::interp::Fiber;
 use crate::vm::value::{Closure, Exc, ObjRef, Record, Value};
@@ -13,6 +15,12 @@ use std::rc::Rc;
 const ALARM_INDEX_KEY: &str = "tj:alarms";
 /// The last change number handed out, so numbers keep growing across restarts.
 const CHANGE_SEQ_KEY: &str = "tj:seq";
+#[cfg(feature = "server")]
+pub(crate) const MESSAGES_KEY: &str = "tj:messages";
+#[cfg(feature = "server")]
+const MAX_PENDING_MESSAGES: usize = 10_000;
+#[cfg(feature = "server")]
+const MESSAGE_BATCH_LIMIT: usize = 64;
 const MAX_ID_LEN: usize = 128;
 /// How many objects a class stream starts with, newest changes first.
 pub(crate) const CLASS_STREAM_CAP: usize = 1000;
@@ -130,6 +138,18 @@ pub(crate) struct Alarm {
     pub caller: Option<Caller>,
 }
 
+#[cfg(feature = "server")]
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct DurableMessage {
+    pub id: u64,
+    pub from: String,
+    pub to: String,
+    pub method: String,
+    pub args: Vec<Json>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<Caller>,
+}
+
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Stored {
     pub(crate) state: Map<String, Json>,
@@ -150,9 +170,9 @@ pub(crate) struct Stored {
 impl Runtime {
     /// Returns the handle of `Class/id`, loading or creating the instance.
     pub(crate) fn instance(&mut self, class: u16, id: &str) -> Result<Rc<ObjRef>, Exc> {
-        // `*` names a whole class in a stream (`Slot/*`), so it is no object's id.
-        if id.is_empty() || id == "*" || id.len() > MAX_ID_LEN || id.contains('/') || id.chars().any(char::is_control) {
-            return Err(Exc::msg(format!("invalid object id {id:?}: use 1-{MAX_ID_LEN} characters without '/', and not `*`")));
+        // `*` is reserved for wildcard topic streams (`Slot/*`, `Room/studio:*`).
+        if id.is_empty() || id.len() > MAX_ID_LEN || id.contains('/') || id.contains('*') || id.chars().any(char::is_control) {
+            return Err(Exc::msg(format!("invalid object id {id:?}: use 1-{MAX_ID_LEN} characters without '/' or '*'")));
         }
         let key = (class, Rc::<str>::from(id));
         if let Some(inst) = self.instances.get(&key) {
@@ -274,8 +294,8 @@ impl Runtime {
     /// Resets every replica to its defaults and resubscribes from scratch, after the device's
     /// user changed: what one user could read must not stay for the next.
     pub(crate) fn clear_replicas(&mut self) {
-        // Class streams start over too: the screen asks again for what this user may list.
-        self.class_streams.clear();
+        // Class and topic streams start over too: the screen asks again for what this user may list.
+        self.topic_streams.clear();
         let replicas: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.remote).map(|i| i.handle.clone()).collect();
         for o in replicas {
             let Ok(fresh) = self.defaults(o.class) else { continue };
@@ -628,16 +648,159 @@ impl Runtime {
         Some(a)
     }
 
+    #[cfg(feature = "server")]
+    fn new_message_id(&mut self) -> u64 {
+        self.next_message_id = (self.next_message_id + 1).max((self.now.max(0.0) * 1000.0) as u64);
+        self.next_message_id
+    }
+
+    /// `this.deliver(target, "method", ...args)`: stages a durable cross-object server message
+    /// that commits atomically with the current turn into `tj:messages` and runs independently
+    /// of the sender's locks or success after commit.
+    #[cfg(feature = "server")]
+    pub(crate) fn deliver_message(&mut self, o: &Rc<ObjRef>, args: &[Value], who: &Who) -> Result<(), Exc> {
+        if !self.server {
+            return Err(Exc::msg("deliver() is only available inside @server objects"));
+        }
+        if self.in_invariant {
+            return Err(Exc::msg("@invariant methods cannot deliver messages"));
+        }
+        let (Some(Value::Obj(target)), Some(Value::Str(method))) = (args.first(), args.get(1)) else {
+            return Err(Exc::msg("deliver(target, \"method\", ...args) needs a target object and a method name"));
+        };
+        if self.is_remote(target) {
+            return Err(Exc::msg(format!("cannot deliver() to remote replica {}; use await target.{method}(...) instead", target.key())));
+        }
+        if !self.program.objects[target.class as usize].server {
+            return Err(Exc::msg(format!("deliver() target {} must be an @server object", target.key())));
+        }
+        let (_, private) = self.method(target.class, method)?;
+        if private && target.as_ref() != o.as_ref() {
+            return Err(Exc::msg(format!("'{method}' is private to {}", target.class_name)));
+        }
+        if self.messages.len() + self.staged_messages.len() >= MAX_PENDING_MESSAGES {
+            return Err(Exc::msg("too many pending durable messages; try again shortly"));
+        }
+        let json_args = args[2..]
+            .iter()
+            .map(Value::to_json)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Exc::msg(format!("deliver arguments: {e}")))?;
+        let msg = DurableMessage {
+            id: self.new_message_id(),
+            from: o.key(),
+            to: target.key(),
+            method: method.to_string(),
+            args: json_args,
+            caller: who.to_caller(),
+        };
+        if self.max_object_bytes > 0 {
+            let len = serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0);
+            if len > self.max_object_bytes {
+                return Err(Exc::msg(format!(
+                    "durable message to {} exceeds the object size limit ({len} > {} bytes)",
+                    target.key(),
+                    self.max_object_bytes
+                )));
+            }
+        }
+        self.staged_messages.push(msg);
+        Ok(())
+    }
+
+    /// Delivers up to `MESSAGE_BATCH_LIMIT` persisted durable messages, removing each from
+    /// `tj:messages` before invoking its target so a target error never rolls back the sender
+    /// or causes an infinite retry loop.
+    #[cfg(feature = "server")]
+    pub(crate) fn deliver_pending_messages(&mut self) {
+        let count = self.messages.len().min(MESSAGE_BATCH_LIMIT);
+        for _ in 0..count {
+            let Some(msg) = self.messages.pop_front() else { break };
+            let text = serde_json::to_string(&self.messages).expect("messages serialize");
+            if let Err(e) = self.store.save(MESSAGES_KEY, &text) {
+                self.messages.push_front(msg);
+                self.outputs.push(Output::Error { message: format!("could not save durable messages: {e}"), trace: Vec::new() });
+                self.push_timer(self.now + 1000.0, TimerKind::Message);
+                return;
+            }
+            let target = match self.resolve_object(&msg.to) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.outputs.push(Output::Error { message: format!("could not deliver message to {}: {e}", msg.to), trace: Vec::new() });
+                    continue;
+                }
+            };
+            if self.is_remote(&target) || !self.program.objects[target.class as usize].server {
+                self.outputs.push(Output::Error {
+                    message: format!("could not deliver message to {}: target is not a local @server object", msg.to),
+                    trace: Vec::new(),
+                });
+                continue;
+            }
+            match self.method(target.class, &msg.method) {
+                Ok((_, private)) if private && msg.from != msg.to => {
+                    self.outputs.push(Output::Error {
+                        message: format!("could not deliver message to {}.{}: method is private", msg.to, msg.method),
+                        trace: Vec::new(),
+                    });
+                    continue;
+                }
+                Err(e) => {
+                    self.outputs.push(Output::Error {
+                        message: format!("could not deliver message to {}.{}: {}", msg.to, msg.method, e.message()),
+                        trace: Vec::new(),
+                    });
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            let args = msg.args.iter().map(Value::from_json).collect();
+            let who = msg.caller.as_ref().map_or(Who::System, |c| Who::from_caller(c, self.server));
+            self.invoke(
+                target,
+                &msg.method,
+                args,
+                false,
+                None,
+                Entry {
+                    who,
+                    chain: 0,
+                    by: By::Message,
+                    call_id: None,
+                },
+            );
+        }
+        if !self.messages.is_empty() {
+            self.push_timer(self.now, TimerKind::Message);
+        }
+    }
+
     pub(crate) fn object_state(&self, o: &ObjRef) -> Result<Json, String> {
         Value::Rec(self.inst(o).state.clone().into()).to_json()
+    }
+
+    /// Parses `"Class/*"` or `"Class/prefix*"` into `(class, prefix)`. Rejects extra `*`, `/`,
+    /// control characters, or prefixes reaching `MAX_ID_LEN`.
+    pub(crate) fn stream_prefix(key: &str) -> Option<(&str, &str)> {
+        let (class, pat) = key.split_once('/')?;
+        let prefix = pat.strip_suffix('*')?;
+        if class.is_empty()
+            || prefix.len() >= MAX_ID_LEN
+            || prefix.contains('/')
+            || prefix.contains('*')
+            || prefix.chars().any(char::is_control)
+        {
+            return None;
+        }
+        Some((class, prefix))
     }
 
     /// For a server resuming a client's stream: the current state of each of `objects` that
     /// changed after change number `since`, oldest change first. Unknown objects are skipped.
     pub fn changed_since(&mut self, objects: &[String], since: u64) -> Vec<Output> {
         let mut out = Vec::new();
-        // A class stream (`Slot/*`) starts with the class's objects that changed: the most
-        // recent CLASS_STREAM_CAP of them, so a client resuming never misses a new change.
+        // A class/topic stream (`Slot/*` or `Room/studio:*`) starts with matching objects that
+        // changed: the most recent CLASS_STREAM_CAP of them, so a client resuming never misses a change.
         let mut keys: Vec<String> = Vec::new();
         let mut streamed: Vec<String> = Vec::new();
         for key in objects {
@@ -645,10 +808,15 @@ impl Runtime {
             if self.is_remote_key(key) {
                 continue;
             }
-            match key.strip_suffix("/*").and_then(|c| self.program.object(c).map(|class| (c, class))) {
-                Some((name, class)) => {
-                    streamed.push(format!("{name}/"));
-                    keys.extend(self.class_ids(class).into_iter().map(|id| format!("{name}/{id}")));
+            match Self::stream_prefix(key).and_then(|(c, pref)| self.program.object(c).map(|class| (c, pref, class))) {
+                Some((name, prefix, class)) => {
+                    streamed.push(format!("{name}/{prefix}"));
+                    keys.extend(
+                        self.class_ids(class)
+                            .into_iter()
+                            .filter(|id| id.starts_with(prefix))
+                            .map(|id| format!("{name}/{id}")),
+                    );
                 }
                 None => keys.push(key.clone()),
             }
@@ -688,27 +856,45 @@ impl Runtime {
         ids
     }
 
-    /// `Class.all()`: every object of the class. On a device, a server class's replicas, and
-    /// the first call subscribes to the whole class, so the list fills as the server sends it.
-    pub(crate) fn all_objects(&mut self, class: u16) -> Result<Vec<Rc<ObjRef>>, Exc> {
+    /// `Class.all(prefix?)`: every object of the class (or those whose id starts with `prefix`).
+    /// On a device, a server class's replicas, and the first call for an uncovered prefix subscribes
+    /// to that class or topic stream (`Class/*` or `Class/prefix*`), so the list fills live.
+    pub(crate) fn all_objects(&mut self, class: u16, prefix: &str) -> Result<Vec<Rc<ObjRef>>, Exc> {
+        if !prefix.is_empty()
+            && (prefix.len() >= MAX_ID_LEN || prefix.contains('/') || prefix.contains('*') || prefix.chars().any(char::is_control))
+        {
+            return Err(Exc::msg(format!("invalid prefix {prefix:?}: use fewer than {MAX_ID_LEN} characters without '/' or '*'")));
+        }
         let def = &self.program.objects[class as usize];
         if self.is_remote_class(class) {
-            if self.class_streams.insert(class) {
-                let stream = format!("{}/*", def.name);
+            let key = format!("{}/{prefix}", def.name);
+            let covered = self.topic_streams.iter().any(|p| key.starts_with(p.as_str()));
+            if !covered {
+                let stream = format!("{key}*");
+                self.topic_streams.retain(|p| !p.starts_with(&key));
+                self.topic_streams.push(key);
                 // The replicas kept on the device come first, so the list shows offline too.
-                for id in self.class_ids(class) {
+                for id in self.class_ids(class).into_iter().filter(|id| id.starts_with(prefix)) {
                     self.instance(class, &id)?;
                 }
                 self.outputs.push(Output::Subscribe { object: stream, seq: 0 });
             }
             // A replica the server never sent (seq 0) is not a member: one left blank by a
             // change of user, or asked for by id and not there.
-            let mut list: Vec<Rc<ObjRef>> = self.instances.values().filter(|i| i.handle.class == class && i.remote && i.seq > 0 && !i.gone).map(|i| i.handle.clone()).collect();
+            let mut list: Vec<Rc<ObjRef>> = self
+                .instances
+                .values()
+                .filter(|i| i.handle.class == class && i.remote && i.seq > 0 && !i.gone && i.handle.id.starts_with(prefix))
+                .map(|i| i.handle.clone())
+                .collect();
             list.sort_by(|a, b| a.id.cmp(&b.id));
             return Ok(list);
         }
         let mut list = Vec::new();
         for id in self.class_ids(class) {
+            if !id.starts_with(prefix) {
+                continue;
+            }
             let o = self.instance(class, &id)?;
             if !self.is_gone(&o) {
                 list.push(o);
@@ -880,6 +1066,8 @@ impl Runtime {
     /// uncommitted `emit` and `effect` outputs from indices `>= mark`, and persists any
     /// consumed-alarm removal so a failing alarm never re-fires or resurrects.
     pub(crate) fn rollback_turn(&mut self, mark: usize) {
+        #[cfg(feature = "server")]
+        self.staged_messages.clear();
         let touched = std::mem::take(&mut self.touched);
         let consumed = std::mem::take(&mut self.consumed_alarms);
         for key in &touched {
@@ -980,7 +1168,7 @@ impl Runtime {
         let mut seq_changed = false;
         let mut failed = false;
         #[cfg(feature = "server")]
-        let multi = touched.len() > 1;
+        let multi = touched.len() > 1 || !self.staged_messages.is_empty();
         #[cfg(feature = "server")]
         let mut saved_before = Vec::new();
         // An object that now has alarms goes into the alarm index before it is saved, so a
@@ -1070,6 +1258,24 @@ impl Runtime {
                 self.outputs.push(Output::Changed { object, state, seq: record.seq });
             }
         }
+        #[cfg(feature = "server")]
+        if !self.staged_messages.is_empty() {
+            if failed {
+                self.staged_messages.clear();
+            } else {
+                let staged = std::mem::take(&mut self.staged_messages);
+                let prev_len = self.messages.len();
+                self.messages.extend(staged);
+                let text = serde_json::to_string(&self.messages).expect("messages serialize");
+                if let Err(e) = self.store.save(MESSAGES_KEY, &text) {
+                    self.messages.truncate(prev_len);
+                    self.outputs.push(Output::Error { message: format!("could not save durable messages: {e}"), trace: Vec::new() });
+                    failed = true;
+                } else {
+                    self.push_timer(self.now, TimerKind::Message);
+                }
+            }
+        }
         if failed {
             #[cfg(feature = "server")]
             if !saved_before.is_empty() {
@@ -1088,13 +1294,13 @@ impl Runtime {
                         index_changed |= self.alarm_index.insert(prev_obj);
                     }
                 }
-                let mut i = 0;
-                self.outputs.retain(|o| {
-                    let keep = i < mark || !matches!(o, Output::Changed { .. });
-                    i += 1;
-                    keep
-                });
             }
+            let mut i = 0;
+            self.outputs.retain(|o| {
+                let keep = i < mark || !matches!(o, Output::Changed { .. } | Output::Emit { .. } | Output::Effect { .. });
+                i += 1;
+                keep
+            });
             for o in self.outputs.iter_mut().skip(mark) {
                 if let Output::Reply { ok, error, field, status, .. } = o {
                     if error.is_none() {
@@ -1188,6 +1394,19 @@ impl Runtime {
             let Some((class, id)) = key.split_once('/') else { continue };
             if let Some(c) = program.object(class) {
                 self.instance(c, id).map_err(boot_err)?;
+            }
+        }
+        #[cfg(feature = "server")]
+        if self.server {
+            if let Some(text) = self.store.load(MESSAGES_KEY).map_err(read)? {
+                self.messages = serde_json::from_str(&text)
+                    .map_err(|e| read(format!("{MESSAGES_KEY} is damaged ({e}); restore it from a backup")))?;
+                if let Some(max_id) = self.messages.iter().map(|m| m.id).max() {
+                    self.next_message_id = self.next_message_id.max(max_id);
+                }
+                if !self.messages.is_empty() {
+                    self.push_timer(self.now, TimerKind::Message);
+                }
             }
         }
         Ok(())

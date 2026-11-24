@@ -111,7 +111,7 @@ struct Timer {
     kind: TimerKind,
 }
 
-enum TimerKind {
+pub(crate) enum TimerKind {
     Every { obj: Rc<ObjRef>, method: Rc<str>, interval: f64 },
     Alarm { obj: Rc<ObjRef>, alarm: u64 },
     /// Retry server calls waiting in the outbox.
@@ -121,6 +121,9 @@ enum TimerKind {
     /// The next step of the retention sweep (`privacy.rs`).
     #[cfg(feature = "server")]
     Retain,
+    /// Deliver queued cross-object server messages (`objects.rs`).
+    #[cfg(feature = "server")]
+    Message,
     /// The start of the next minute, for a screen that shows the time.
     Clock,
 }
@@ -164,6 +167,8 @@ pub(crate) enum By {
     /// An `@every` beat; a beat that finds one waiting merges into it.
     Timer,
     Alarm,
+    #[cfg(feature = "server")]
+    Message,
     Invoke,
 }
 
@@ -225,8 +230,8 @@ pub struct Runtime {
     invocations: std::collections::VecDeque<calls::Invocation>,
     /// Who the fiber running now belongs to, and its chain (see `vm::interp::Runtime::run`).
     pub(crate) running_caller: Who,
-    /// On a device: server classes whose whole stream `Class.all()` asked for.
-    pub(crate) class_streams: std::collections::HashSet<u16>,
+    /// On a device: server classes or topic prefixes whose stream `Class.all(prefix?)` asked for.
+    pub(crate) topic_streams: Vec<String>,
     /// On a device, the signed-in user's roles (`Input::Identity`), for `caller.roles` in UI
     /// code.
     pub(crate) device_roles: Rc<[Rc<str>]>,
@@ -278,6 +283,14 @@ pub struct Runtime {
     /// Erasures waiting for a legal hold to end: object -> when (epoch ms). Saved.
     #[cfg(feature = "server")]
     erasures: std::collections::BTreeMap<String, f64>,
+    /// Durable cross-object server messages persisted under `tj:messages`.
+    #[cfg(feature = "server")]
+    pub(crate) messages: std::collections::VecDeque<objects::DurableMessage>,
+    /// Messages staged during the current turn and committed atomically on `flush_from`.
+    #[cfg(feature = "server")]
+    pub(crate) staged_messages: Vec<objects::DurableMessage>,
+    #[cfg(feature = "server")]
+    next_message_id: u64,
     /// The secret behind `caller_tag`, once read or made.
     secret: Option<Rc<str>>,
     /// Alarms already fired and consumed during the current turn: kept removed even if the
@@ -339,7 +352,7 @@ impl Runtime {
             outbox_held: false,
             invocations: std::collections::VecDeque::new(),
             running_caller: Who::System,
-            class_streams: std::collections::HashSet::new(),
+            topic_streams: Vec::new(),
             device_roles: Rc::from([]),
             running_chain: 0,
             #[cfg(feature = "server")]
@@ -377,6 +390,12 @@ impl Runtime {
             retain_queue: Vec::new(),
             #[cfg(feature = "server")]
             erasures: std::collections::BTreeMap::new(),
+            #[cfg(feature = "server")]
+            messages: std::collections::VecDeque::new(),
+            #[cfg(feature = "server")]
+            staged_messages: Vec::new(),
+            #[cfg(feature = "server")]
+            next_message_id: 0,
             secret: None,
             consumed_alarms: Vec::new(),
             in_invariant: false,
@@ -459,6 +478,9 @@ impl Runtime {
                 } else {
                     match self.admit(&object, None, caller) {
                         Err((status, why)) => self.reply_status(reply, status, why),
+                        Ok(who) if object.contains('*') => {
+                            self.reply_status(reply, 400, format!("cannot get wildcard {object:?}; use /api/events?object=... to stream it"))
+                        }
                         Ok(who) => {
                             // Each field reaches the readers its rule names; tools see personal data masked.
                             let state = self.resolve_object(&object).and_then(|o| {
@@ -925,6 +947,8 @@ impl Runtime {
             By::Request => return,
             By::Timer => "timer",
             By::Alarm => "alarm",
+            #[cfg(feature = "server")]
+            By::Message => "message",
             By::Invoke => "invoke",
         };
         if let Some(obj) = f.frames[0].this.clone() {
@@ -1045,13 +1069,17 @@ impl Runtime {
 
     // ---------- timers ----------
 
-    fn push_timer(&mut self, at: f64, kind: TimerKind) {
+    pub(crate) fn push_timer(&mut self, at: f64, kind: TimerKind) {
         self.seq += 1;
         self.timers.push(Reverse(Timer { at, seq: self.seq, kind }));
     }
 
     fn fire_timers(&mut self) {
-        if !self.touched.is_empty() {
+        #[cfg(feature = "server")]
+        let pending_flush = !self.touched.is_empty() || !self.staged_messages.is_empty();
+        #[cfg(not(feature = "server"))]
+        let pending_flush = !self.touched.is_empty();
+        if pending_flush {
             self.flush();
         }
         // Only fire timers that already existed on entry: a timer re-queued by a failed disk
@@ -1118,6 +1146,8 @@ impl Runtime {
                 TimerKind::Expire => self.expire_waiters(),
                 #[cfg(feature = "server")]
                 TimerKind::Retain => self.retain_step(),
+                #[cfg(feature = "server")]
+                TimerKind::Message => self.deliver_pending_messages(),
             }
         }
         for t in deferred {

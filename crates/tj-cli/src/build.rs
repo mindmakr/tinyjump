@@ -448,6 +448,11 @@ fn find_web_webrtc_js() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
+fn find_web_whiteboard_js() -> Option<PathBuf> {
+    let candidates = [workspace_dir().join("hosts/web/plugins/whiteboard.js"), PathBuf::from("hosts/web/plugins/whiteboard.js")];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 fn find_web_gfx_js() -> Option<PathBuf> {
     let candidates = [workspace_dir().join("hosts/web/plugins/gfx.js"), PathBuf::from("hosts/web/plugins/gfx.js")];
     candidates.into_iter().find(|p| p.exists())
@@ -633,6 +638,17 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             } else if stale_webrtc_js.exists() {
                 let _ = fs::remove_file(&stale_webrtc_js);
             }
+            let has_whiteboard = device_perms::uses_whiteboard(&program);
+            let stale_whiteboard_js = dest.join("whiteboard-plugin.js");
+            if has_whiteboard {
+                if let Some(wbjs) = find_web_whiteboard_js() {
+                    fs::copy(&wbjs, &stale_whiteboard_js).map_err(|e| format!("cannot copy {}: {e}", wbjs.display()))?;
+                } else {
+                    notes.push("hosts/web/plugins/whiteboard.js not found in workspace; copy it as whiteboard-plugin.js into this folder".into());
+                }
+            } else if stale_whiteboard_js.exists() {
+                let _ = fs::remove_file(&stale_whiteboard_js);
+            }
             let has_frame = program.has_frame();
             let has_gfx = program.uses_scene() || has_frame;
             let stale_gfx_js = dest.join("gfx-plugin.js");
@@ -648,7 +664,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             if has_server_objects && opts.server_url.is_none() {
                 notes.push("this app has @server objects; pass --server <url> (or '' for same-origin) so the web host knows where `tj serve` runs".into());
             }
-            let html = web_index_html(title, opts.server_url, &host_plugins, has_video_call, has_gfx, has_frame);
+            let html = web_index_html(title, opts.server_url, &host_plugins, has_video_call, has_whiteboard, has_gfx, has_frame);
             fs::write(dest.join("index.html"), html).map_err(|e| format!("cannot write index.html: {e}"))?;
             let manifest = json!({
                 "target": "web",
@@ -1239,7 +1255,7 @@ fn strip_win_unc(p: &Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).replace('\\', "/")
 }
 
-fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], video_call: bool, gfx: bool, has_frame: bool) -> String {
+fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], video_call: bool, whiteboard: bool, gfx: bool, has_frame: bool) -> String {
     let escaped = escape_xml(title);
     let server_opt = match server {
         Some(url) => {
@@ -1261,13 +1277,18 @@ fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], vide
             format!(", plugins: createDevicePlugins({caps})"),
         )
     };
-    let (webrtc_import, webrtc_opt) = if video_call {
-        (
-            "import { createVideoCallComponents } from './webrtc-plugin.js';\n".to_string(),
-            ", components: createVideoCallComponents()".to_string(),
-        )
-    } else {
-        (String::new(), String::new())
+    let mut comp_imports = String::new();
+    if video_call {
+        comp_imports.push_str("import { createVideoCallComponents } from './webrtc-plugin.js';\n");
+    }
+    if whiteboard {
+        comp_imports.push_str("import { createWhiteboardComponents } from './whiteboard-plugin.js';\n");
+    }
+    let comp_opt = match (video_call, whiteboard) {
+        (true, true) => ", components: Object.assign({}, createVideoCallComponents(), createWhiteboardComponents())".to_string(),
+        (true, false) => ", components: createVideoCallComponents()".to_string(),
+        (false, true) => ", components: createWhiteboardComponents()".to_string(),
+        (false, false) => String::new(),
     };
     let (gfx_import, gfx_opt) = if gfx {
         (
@@ -1278,7 +1299,7 @@ fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], vide
         (String::new(), String::new())
     };
     format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}{webrtc_import}{gfx_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt}{webrtc_opt}{gfx_opt} }}));\n</script>\n</body>\n</html>\n"
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{escaped}</title>\n<style>html,body{{margin:0;padding:0;min-height:100vh;font-family:system-ui,-apple-system,sans-serif}}body{{display:flex;flex-direction:column}}#app{{flex:1;display:flex;flex-direction:column}}</style>\n</head>\n<body>\n<div id=\"app\"></div>\n<script type=\"module\">\nimport {{ start }} from './tinyjump.js';\n{plugin_import}{comp_imports}{gfx_import}fetch('./app.tjb').then((r) => {{ if (!r.ok) throw new Error('failed to load app.tjb: HTTP ' + r.status); return r.text(); }}).then((source) => start({{ wasm: './tj_wasm.wasm', source, root: document.getElementById('app'){server_opt}{plugin_opt}{comp_opt}{gfx_opt} }}));\n</script>\n</body>\n</html>\n"
     )
 }
 
@@ -1669,21 +1690,33 @@ function App() {
         assert!(!fs::read_to_string(ios_dev.join("AppDelegate.swift")).unwrap().contains("DevicePlugins"));
         assert!(!fs::read_to_string(ios_dev.join("build.sh")).unwrap().contains("DevicePlugins.swift"));
 
-        // 4. WebRTC VideoCall component is bundled ONLY when camera/microphone + VideoCall are used.
+        // 4. WebRTC VideoCall + Whiteboard components are bundled ONLY when used.
         assert!(!web_dev.join("webrtc-plugin.js").exists());
-        fs::write(&app_file, "function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }\n").unwrap();
+        assert!(!web_dev.join("whiteboard-plugin.js").exists());
+        fs::write(&app_file, "function App() { return <Column><Native name=\"VideoCall\" active={false} /><Native name=\"Whiteboard\" readOnly={false} /></Column> }\n").unwrap();
         fs::write(dir.join("permissions.json"), r#"{ "device": { "camera": "Video", "microphone": "Audio" } }"#).unwrap();
         build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
         assert!(web_dev.join("webrtc-plugin.js").exists());
-        let webrtc_html = fs::read_to_string(web_dev.join("index.html")).unwrap();
-        assert!(webrtc_html.contains("import { createVideoCallComponents } from './webrtc-plugin.js';"));
-        assert!(webrtc_html.contains("components: createVideoCallComponents()"));
+        assert!(web_dev.join("whiteboard-plugin.js").exists());
+        let combined_html = fs::read_to_string(web_dev.join("index.html")).unwrap();
+        assert!(combined_html.contains("import { createVideoCallComponents } from './webrtc-plugin.js';"));
+        assert!(combined_html.contains("import { createWhiteboardComponents } from './whiteboard-plugin.js';"));
+        assert!(combined_html.contains("components: Object.assign({}, createVideoCallComponents(), createWhiteboardComponents())"));
 
-        // Rebuilding without VideoCall cleans up stale webrtc-plugin.js.
+        // Rebuilding with VideoCall only removes stale whiteboard-plugin.js and uses direct helper.
+        fs::write(&app_file, "function App() { return <Column><Native name=\"VideoCall\" active={false} /></Column> }\n").unwrap();
+        build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
+        assert!(web_dev.join("webrtc-plugin.js").exists());
+        assert!(!web_dev.join("whiteboard-plugin.js").exists());
+        assert!(fs::read_to_string(web_dev.join("index.html")).unwrap().contains("components: createVideoCallComponents()"));
+
+        // Rebuilding without VideoCall or Whiteboard cleans up both plugin files.
         fs::write(&app_file, "function App() { return <Column><Text>hi</Text></Column> }\n").unwrap();
         build_app(&app_file, Target::Web, &BuildOpts { out: Some(&web_dev), ..Default::default() }).unwrap();
         assert!(!web_dev.join("webrtc-plugin.js").exists());
-        assert!(!fs::read_to_string(web_dev.join("index.html")).unwrap().contains("webrtc-plugin.js"));
+        assert!(!web_dev.join("whiteboard-plugin.js").exists());
+        let clean_html = fs::read_to_string(web_dev.join("index.html")).unwrap();
+        assert!(!clean_html.contains("webrtc-plugin.js") && !clean_html.contains("whiteboard-plugin.js"));
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -76,8 +76,12 @@ impl Mailbox {
         if q.closed {
             return false;
         }
-        let class_stream = || e.object.split_once('/').map(|(c, _)| format!("{c}/*"));
-        if !e.object.is_empty() && self.only.as_ref().is_some_and(|only| !only.contains(&e.object) && !class_stream().is_some_and(|c| only.contains(&c))) {
+        if !e.object.is_empty()
+            && self
+                .only
+                .as_ref()
+                .is_some_and(|only| !only.iter().any(|pat| matches_pattern(pat, &e.object)))
+        {
             return true;
         }
         if e.merge.is_some() {
@@ -130,6 +134,13 @@ impl Mailbox {
     }
 }
 
+fn matches_pattern(pattern: &str, object: &str) -> bool {
+    pattern == object
+        || pattern
+            .strip_suffix('*')
+            .is_some_and(|pref| pref.contains('/') && object.starts_with(pref))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +186,16 @@ mod tests {
         m.push(state("A/a", 2));
         let texts: Vec<String> = m.take(Duration::ZERO).into_iter().map(|e| e.text).collect();
         assert_eq!(texts, ["A/a@2"]);
+    }
+
+    #[test]
+    fn prefix_topic_pattern_matches_only_matching_room_and_class() {
+        let m = Mailbox::new(Some(vec!["Room/studio:*".into()]), None);
+        m.push(state("Room/studio:1", 1));
+        m.push(state("Room/other:1", 2));
+        m.push(state("Other/studio:1", 3));
+        m.push(state("Room/studio:2", 4));
+        let texts: Vec<String> = m.take(Duration::ZERO).into_iter().map(|e| e.text).collect();
+        assert_eq!(texts, ["Room/studio:1@1", "Room/studio:2@4"]);
     }
 }
