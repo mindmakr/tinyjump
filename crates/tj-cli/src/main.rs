@@ -18,6 +18,8 @@ mod identity;
 mod leases;
 mod mailbox;
 mod manifest;
+mod migrate;
+mod oci;
 mod plugin_server;
 mod plugins;
 mod privacy;
@@ -66,14 +68,17 @@ USAGE:
   tj bridge openapi <spec.json> [--out <file.tj>] [--base-url <https://...>] [--manifest <file.json>]
                                  generate a typed `.tj` client module (and optional registry manifest) from
                                  an OpenAPI 3.x JSON specification
+  tj migrate <input.tsx|ts|dir> [--out <path>] [--report <file.md>] [--strict] [--json]
+  tj migrate compare <migrated.tj> [--trace <file.trace.jsonl>]... [--old-snapshot <file.json>] [--old-url <http://...>] [--old-screenshot <a.png> --new-screenshot <b.png>]
+                                 port TypeScript/React modules to `.tj` with fix hints, and verify parity
   tj registry check <manifest.json> [--index <dir>] [--source <file>] [--local]
                                  validate a registry manifest (schema, license, typosquats, commit/hash pin,
                                  static permission audit)
   tj bench <app.tj> [--json]     time compiling, booting and a minute of running; count VM steps and patches
   tj bench --budget <file>       fail if apps or builds are slower or bigger than the budget (scripts/budget.sh)
-  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios] [--app-id <id>] [--title <name>] [--version <x.y.z>] [--version-code <n>] [--server <url>] [--aot] [--release] [--assemble] [--abis <csv>] [--wasm <file>] [--runner <file>] [--min-trust <level>] [--json]
+  tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios | --oci] [--app-id <id>] [--title <name>] [--version <x.y.z>] [--version-code <n>] [--server <url>] [--aot] [--release] [--assemble] [--abis <csv>] [--port <n>] [--arch <amd64|arm64|arm>] [--no-web] [--wasm <file>] [--runner <file>] [--min-trust <level>] [--json]
                                  compile AOT bytecode (.tjb) or package a static web bundle, standalone
-                                 executable, or turnkey Android (.apk) / iOS (.app) project
+                                 executable, turnkey Android (.apk) / iOS (.app) project, or sealed OCI unit
   tj test  <app.tj> [trace...]   run deterministic .trace.jsonl tests in memory (controllable clock,
                                  fake plugins/HTTP, access & @pii checks, Taffy layout review, restarts)
   tj serve <app.tj> [options]    run the backend: objects, timers, HTTP API, realtime events
@@ -395,6 +400,15 @@ fn main() -> ExitCode {
     }
     if raw.get(1).map(String::as_str) == Some("bridge") {
         return match bridge::run(&raw[2..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    if raw.get(1).map(String::as_str) == Some("migrate") {
+        return match migrate::run(&raw[2..]) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{e}");
@@ -926,52 +940,145 @@ fn serve(args: &Args, dev_mode: bool) -> Result<(), String> {
     http::serve(&addr, http::Front::new(engine, web, dev, automation, identity, audit, leases, tls).with_app_file(file.to_path_buf()).with_webhooks(webhooks))
 }
 
-fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
-    let mut port: u16 = 4700;
+#[derive(Debug, Default)]
+struct EmbeddedOpts {
+    port: u16,
+    host: String,
+    data: PathBuf,
+    web_dir: Option<PathBuf>,
+    info: bool,
+    json: bool,
+}
+
+fn parse_embedded_args(raw_args: &[String]) -> Result<Option<EmbeddedOpts>, String> {
+    let mut port: Option<u16> = None;
     let mut host = "127.0.0.1".to_string();
     let mut data: Option<PathBuf> = None;
+    let mut web_dir: Option<PathBuf> = None;
     let mut info = false;
+    let mut json = false;
     let mut it = raw_args.iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--info" => info = true,
-            "--port" => port = value()?.parse().map_err(|_| "--port must be a number")?,
+            "--json" => json = true,
+            "--port" => {
+                let p: u16 = value()?.parse().map_err(|_| "--port must be a number in 1..=65535")?;
+                if p == 0 {
+                    return Err("--port must be in 1..=65535".into());
+                }
+                port = Some(p);
+            }
             "--host" => host = value()?.clone(),
             "--data" => data = Some(PathBuf::from(value()?)),
+            "--web-dir" => web_dir = Some(PathBuf::from(value()?)),
             "--help" | "-h" => {
-                println!("Standalone tinyjump app (embedded AOT bytecode)\n\nOPTIONS:\n  --port <n>      port to listen on (default 4700)\n  --host <addr>   address to bind (default 127.0.0.1)\n  --data <dir>    where objects are stored (default: .tj-data)\n  --info          print embedded app metadata and exit");
-                return Ok(());
+                println!(
+                    "Standalone tinyjump app (embedded AOT bytecode)\n\n\
+                     OPTIONS:\n\
+                       --port <n>       port to listen on (default TJ_PORT, PORT, or 4700)\n\
+                       --host <addr>    address to bind (default 127.0.0.1)\n\
+                       --data <dir>     where objects are stored (default TJ_DATA or .tj-data)\n\
+                       --web-dir <dir>  serve the web UI and WASM runtime from this folder\n\
+                       --info [--json]  print embedded app metadata and exit"
+                );
+                return Ok(None);
             }
             other => return Err(format!("unknown option {other}")),
         }
     }
+    let port = match port {
+        Some(p) => p,
+        None => {
+            if let Ok(raw) = std::env::var("TJ_PORT").or_else(|_| std::env::var("PORT")) {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    4700
+                } else {
+                    let p: u16 = trimmed.parse().map_err(|_| format!("invalid TJ_PORT/PORT {trimmed:?}"))?;
+                    if p == 0 {
+                        return Err("TJ_PORT/PORT must be in 1..=65535".into());
+                    }
+                    p
+                }
+            } else {
+                4700
+            }
+        }
+    };
+    let data = data
+        .or_else(|| std::env::var_os("TJ_DATA").filter(|v| !v.is_empty()).map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(".tj-data"));
+    Ok(Some(EmbeddedOpts { port, host, data, web_dir, info, json }))
+}
+
+fn serve_embedded(bytecode: &[u8], raw_args: &[String]) -> Result<(), String> {
+    let Some(opts) = parse_embedded_args(raw_args)? else {
+        return Ok(());
+    };
     let program = tj_core::vm::program::Program::from_bytes(bytecode)?;
-    if info {
-        let objects: Vec<&str> = program.objects.iter().map(|o| &*o.name).collect();
-        println!("embedded AOT app: {} bytes bytecode, objects: [{}], ui: {}", bytecode.len(), objects.join(", "), program.app.is_some());
+    let objects: Vec<&str> = program.objects.iter().map(|o| &*o.name).collect();
+    let app_hash = bytes::hex(&tj_core::crypto::sha256(bytecode));
+    if opts.info {
+        if opts.json {
+            let info = serde_json::json!({
+                "appSha256": app_hash,
+                "bytecodeBytes": bytecode.len(),
+                "objects": objects,
+                "hasUi": program.app.is_some(),
+                "port": opts.port,
+                "webDir": opts.web_dir.as_ref().map(|p| p.display().to_string()),
+            });
+            println!("{}", serde_json::to_string_pretty(&info).expect("json"));
+        } else {
+            println!(
+                "embedded AOT app: {} bytes bytecode (sha256 {}), objects: [{}], ui: {}",
+                bytecode.len(),
+                &app_hash[..12],
+                objects.join(", "),
+                program.app.is_some()
+            );
+        }
         return Ok(());
     }
+    let web = if let Some(ref dir) = opts.web_dir {
+        let wasm = dir.join("tinyjump.wasm");
+        for req in ["index.html", "tinyjump.js", "tinyjump.wasm"] {
+            if !dir.join(req).is_file() {
+                return Err(format!("--web-dir {}: missing {req}", dir.display()));
+            }
+        }
+        Some(Arc::new(Web { source: PathBuf::new(), web_dir: dir.clone(), wasm }))
+    } else {
+        None
+    };
     let source = tj_core::vm::bytecode::bundle_from_bytes(bytecode);
-    let data = data.unwrap_or_else(|| PathBuf::from(".tj-data"));
     let identity = identity::Identity::new(None)?;
-    let (_, storage) = sealed::open_store(&data, &[])?;
-    let (audit, audit_key) = audit::Audit::start(&data)?;
+    let (_, storage) = sealed::open_store(&opts.data, &[])?;
+    let (audit, audit_key) = audit::Audit::start(&opts.data)?;
     let plugins = Arc::new(plugins::Plugins::default());
     let remotes = Arc::new(remotes::Remotes::default());
     let webhooks = Arc::new(webhooks::Webhooks::default());
-    let engine = Engine::start_with_integrations(source, data.clone(), false, false, plugins, audit.clone(), None, remotes, webhooks.clone(), std::collections::BTreeMap::new())?;
-    let addr = format!("{host}:{port}");
+    let embed_perms = match &opts.web_dir {
+        Some(dir) if dir.join("permissions.json").is_file() => {
+            device_perms::load_app_device_permissions(dir)?
+        }
+        _ => std::collections::BTreeMap::new(),
+    };
+    let engine = Engine::start_with_integrations(source, opts.data.clone(), false, false, plugins, audit.clone(), None, remotes, webhooks.clone(), embed_perms)?;
+    let addr = format!("{}:{}", opts.host, opts.port);
     let automation = auth::Automation::for_serve()?;
-    let leases = leases::Leases::open(&data);
-    let tls = http::credentials_need_tls(false, &host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
-    eprintln!("tinyjump standalone server on http://{addr} (data: {}; storage: {storage}; audit: {audit_key})", data.display());
+    let leases = leases::Leases::open(&opts.data);
+    let tls = http::credentials_need_tls(false, &opts.host, std::env::var(http::TLS_TERMINATED_ENV).ok().as_deref());
+    let web_note = if let Some(ref d) = opts.web_dir { format!("; web: {}", d.display()) } else { String::new() };
+    eprintln!("tinyjump standalone server on http://{addr} (data: {}; storage: {storage}; audit: {audit_key}{web_note})", opts.data.display());
     if tls {
-        eprintln!("credentials: refused over plain HTTP on {host}; behind a TLS proxy, set {}=1", http::TLS_TERMINATED_ENV);
+        eprintln!("credentials: refused over plain HTTP on {}; behind a TLS proxy, set {}=1", opts.host, http::TLS_TERMINATED_ENV);
     } else if std::env::var(http::TLS_TERMINATED_ENV).is_ok_and(|v| v == "1") && std::env::var("TJ_TRUST_PROXY").ok().as_deref() != Some("1") {
         eprintln!("note: {}=1 is set without TJ_TRUST_PROXY=1; per-IP rate and stream limits will see the proxy address", http::TLS_TERMINATED_ENV);
     }
-    http::serve(&addr, http::Front::new(engine, None, None, automation, identity, audit, leases, tls).with_webhooks(webhooks))
+    http::serve(&addr, http::Front::new(engine, web, None, automation, identity, audit, leases, tls).with_webhooks(webhooks))
 }
 
 fn reload_cmd(args: &[String]) -> Result<(), String> {
@@ -1114,5 +1221,36 @@ fn watch(file: PathBuf, engine: Engine, dev: Arc<Dev>) {
     });
     if let Err(e) = spawned {
         eprintln!("[tj] live reload is off: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_embedded_container_flags() {
+        let args = vec![
+            "--host".into(),
+            "0.0.0.0".into(),
+            "--port".into(),
+            "8080".into(),
+            "--data".into(),
+            "/data".into(),
+            "--web-dir".into(),
+            "/web".into(),
+            "--info".into(),
+            "--json".into(),
+        ];
+        let opts = parse_embedded_args(&args).unwrap().expect("some opts");
+        assert_eq!(opts.host, "0.0.0.0");
+        assert_eq!(opts.port, 8080);
+        assert_eq!(opts.data, PathBuf::from("/data"));
+        assert_eq!(opts.web_dir, Some(PathBuf::from("/web")));
+        assert!(opts.info);
+        assert!(opts.json);
+
+        assert!(parse_embedded_args(&["--port".into(), "0".into()]).is_err());
+        assert!(parse_embedded_args(&["--bogus".into()]).is_err());
     }
 }

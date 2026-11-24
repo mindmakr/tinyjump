@@ -1,10 +1,10 @@
 //! `tj build`: ahead-of-time bytecode compilation (`.tjb`) and turnkey target packaging
-//! (`--web`, `--linux`, `--android`, `--ios`).
+//! (`--web`, `--linux`, `--android`, `--ios`, `--oci`).
 //!
 //! Devices and standalone servers boot `.tjb` bytecode directly via `Program::from_bytes` /
 //! `Program::from_bundle`, skipping the lexer, parser, type-checker and compiler at startup.
 
-use crate::{app, device_perms, registry, remotes, webhooks};
+use crate::{app, device_perms, oci, registry, remotes, webhooks};
 use serde_json::{json, Value as Json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -37,6 +37,7 @@ enum Target {
     Linux,
     Android,
     Ios,
+    Oci,
 }
 
 impl Target {
@@ -47,6 +48,7 @@ impl Target {
             Target::Linux => "linux",
             Target::Android => "android",
             Target::Ios => "ios",
+            Target::Oci => "oci",
         }
     }
 }
@@ -63,13 +65,16 @@ struct BuildOpts<'a> {
     version: Option<&'a str>,
     version_code: Option<u32>,
     abis: Option<Vec<String>>,
+    port: Option<u16>,
+    arch: Option<oci::OciArch>,
+    no_web: bool,
     aot: bool,
     release: bool,
     assemble: bool,
 }
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    let usage = "usage: tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios]\n  [--app-id <id>] [--title <name>] [--version <x.y.z>] [--version-code <n>]\n  [--server <url>] [--aot] [--release] [--assemble] [--abis <csv>]\n  [--wasm <file>] [--runner <file>] [--min-trust <level>] [--json]";
+    let usage = "usage: tj build <app.tj> [--out <path>] [--web | --linux | --android | --ios | --oci]\n  [--app-id <id>] [--title <name>] [--version <x.y.z>] [--version-code <n>]\n  [--server <url>] [--aot] [--release] [--assemble] [--abis <csv>]\n  [--port <n>] [--arch <amd64|arm64|arm>] [--no-web]\n  [--wasm <file>] [--runner <file>] [--min-trust <level>] [--json]";
     let mut file: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut target = Target::Bytecode;
@@ -83,6 +88,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut version: Option<String> = None;
     let mut version_code: Option<u32> = None;
     let mut abis: Option<Vec<String>> = None;
+    let mut port: Option<u16> = None;
+    let mut arch: Option<oci::OciArch> = None;
+    let mut no_web = false;
     let mut aot = false;
     let mut release = false;
     let mut assemble = false;
@@ -94,7 +102,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
     }
     let mut set_target = |t: Target| -> Result<(), String> {
         if target_set && target != t {
-            return Err(format!("choose only one build target (--web, --linux, --android or --ios)\n\n{usage}"));
+            return Err(format!("choose only one build target (--web, --linux, --android, --ios or --oci)\n\n{usage}"));
         }
         target = t;
         target_set = true;
@@ -108,6 +116,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--linux" => set_target(Target::Linux)?,
             "--android" => set_target(Target::Android)?,
             "--ios" => set_target(Target::Ios)?,
+            "--oci" => set_target(Target::Oci)?,
             "--wasm" => wasm = Some(PathBuf::from(value()?)),
             "--server" => server_url = Some(value()?.clone()),
             "--runner" => runner = Some(PathBuf::from(value()?)),
@@ -124,6 +133,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 version_code = Some(n);
             }
             "--abis" => abis = Some(parse_abis(value()?)?),
+            "--port" => {
+                let raw = value()?;
+                let n: u16 = raw.parse().map_err(|_| format!("--port {raw:?} must be in 1..=65535"))?;
+                if n == 0 {
+                    return Err("--port must be in 1..=65535".into());
+                }
+                port = Some(n);
+            }
+            "--arch" => arch = Some(oci::OciArch::parse(value()?)?),
+            "--no-web" => no_web = true,
             "--aot" => aot = true,
             "--release" => release = true,
             "--assemble" => assemble = true,
@@ -143,6 +162,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
         version: version.as_deref(),
         version_code,
         abis,
+        port,
+        arch,
+        no_web,
         aot,
         release,
         assemble,
@@ -433,29 +455,34 @@ fn workspace_dir() -> PathBuf {
     fs::canonicalize(&fallback).unwrap_or(fallback)
 }
 
-fn find_web_js() -> Option<PathBuf> {
-    let candidates = [workspace_dir().join("hosts/web/tinyjump.js"), PathBuf::from("hosts/web/tinyjump.js")];
+fn find_web_file(rel: &str) -> Option<PathBuf> {
+    let joined = format!("hosts/web/{rel}");
+    let candidates = [workspace_dir().join(&joined), PathBuf::from(&joined)];
     candidates.into_iter().find(|p| p.exists())
+}
+
+fn find_web_js() -> Option<PathBuf> {
+    find_web_file("tinyjump.js")
+}
+
+fn find_web_host_index() -> Option<PathBuf> {
+    find_web_file("index.html")
 }
 
 fn find_web_device_plugins_js() -> Option<PathBuf> {
-    let candidates = [workspace_dir().join("hosts/web/plugins/device.js"), PathBuf::from("hosts/web/plugins/device.js")];
-    candidates.into_iter().find(|p| p.exists())
+    find_web_file("plugins/device.js")
 }
 
 fn find_web_webrtc_js() -> Option<PathBuf> {
-    let candidates = [workspace_dir().join("hosts/web/plugins/webrtc.js"), PathBuf::from("hosts/web/plugins/webrtc.js")];
-    candidates.into_iter().find(|p| p.exists())
+    find_web_file("plugins/webrtc.js")
 }
 
 fn find_web_whiteboard_js() -> Option<PathBuf> {
-    let candidates = [workspace_dir().join("hosts/web/plugins/whiteboard.js"), PathBuf::from("hosts/web/plugins/whiteboard.js")];
-    candidates.into_iter().find(|p| p.exists())
+    find_web_file("plugins/whiteboard.js")
 }
 
 fn find_web_gfx_js() -> Option<PathBuf> {
-    let candidates = [workspace_dir().join("hosts/web/plugins/gfx.js"), PathBuf::from("hosts/web/plugins/gfx.js")];
-    candidates.into_iter().find(|p| p.exists())
+    find_web_file("plugins/gfx.js")
 }
 
 /// Resolves the WASM runtime for `--web`. Returns `(path, used_aot, stale_aot_note)`.
@@ -523,8 +550,11 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
     if opts.abis.is_some() && target != Target::Android {
         return Err("--abis only applies to --android".into());
     }
-    if opts.assemble && !matches!(target, Target::Android | Target::Ios) {
-        return Err("--assemble only applies to --android and --ios targets".into());
+    if (opts.port.is_some() || opts.arch.is_some() || opts.no_web) && target != Target::Oci {
+        return Err("--port, --arch, and --no-web only apply to --oci".into());
+    }
+    if opts.assemble && !matches!(target, Target::Android | Target::Ios | Target::Oci) {
+        return Err("--assemble only applies to --android, --ios, and --oci targets".into());
     }
 
     let app_dir = entry.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
@@ -581,6 +611,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
     let dev_perm_names: Vec<&str> = dev_perms.keys().map(String::as_str).collect();
     let mut notes: Vec<String> = Vec::new();
     let mut artifact_path: Option<PathBuf> = None;
+    let mut oci_meta: Option<Json> = None;
 
     let output_path = match target {
         Target::Bytecode => {
@@ -684,10 +715,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             dest
         }
         Target::Linux => {
-            let runner_path = match opts.runner {
-                Some(p) => p.to_path_buf(),
-                None => std::env::current_exe().map_err(|e| format!("cannot locate current executable: {e}"))?,
-            };
+            let runner_path = resolve_runner(opts.runner)?;
             let runner_ext = runner_path.extension().and_then(|e| e.to_str()).unwrap_or("");
             let default_name = if runner_ext.eq_ignore_ascii_case("exe") { format!("{name}.exe") } else { name.clone() };
             let dest = opts.out.map(PathBuf::from).unwrap_or_else(|| app_dir.join("dist").join(default_name));
@@ -695,12 +723,91 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
             if cfg!(windows) && opts.runner.is_none() {
                 notes.push("packaged using the current Windows tj binary; pass --runner <path-to-linux-tj> to cross-package a Linux ELF".into());
             }
-            for sidecar in ["plugins.json", "remotes.json", "webhooks.json"] {
-                if app_dir.join(sidecar).exists() {
-                    notes.push(format!("{sidecar} is not loaded by standalone binaries yet; deploy with `tj serve <app.tj>` when using {sidecar}"));
-                }
-            }
+            note_standalone_sidecars(app_dir, &mut notes);
             dest
+        }
+        Target::Oci => {
+            let runner_path = resolve_runner(opts.runner)?;
+            let exe_bytes = assemble_standalone_bytes(&runner_path, &bytes)?;
+            let detected_arch = oci::detect_elf_arch(&exe_bytes);
+            if detected_arch.is_none() && opts.runner.is_none() {
+                notes.push("packaged using non-ELF host runner; pass --runner <path-to-static-linux-tj> for a runnable Linux OCI image".into());
+            }
+            let arch = opts.arch.or(detected_arch).unwrap_or_else(oci::host_default_arch);
+            let port = opts.port.unwrap_or(4700);
+            let bin_name = oci::sanitize_bin_name(&name);
+            let web_owned = collect_oci_web_assets(&program, &dev_perms, opts, has_ui, &mut notes)?;
+            let web_refs: Vec<(&str, &[u8])> = web_owned.iter().map(|(k, v)| (k.as_str(), v.as_slice())).collect();
+            let out_is_tar = opts.out.is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("tar")));
+
+            let (output_dir_or_tar, layout_dir, archive_target, containerfile_path) = if out_is_tar {
+                let tar_path = opts.out.expect("checked").to_path_buf();
+                (tar_path.clone(), None, Some(tar_path), None)
+            } else {
+                let dist = opts.out.map(PathBuf::from).unwrap_or_else(|| app_dir.join("dist").join("oci"));
+                fs::create_dir_all(&dist).map_err(|e| format!("cannot create {}: {e}", dist.display()))?;
+                let layout = dist.join("layout");
+                let tar_out = opts.assemble.then(|| dist.join(format!("{bin_name}-oci.tar")));
+                let cf = dist.join("Containerfile");
+                (dist, Some(layout), tar_out, Some(cf))
+            };
+
+            let oci_res = oci::build_oci_image(&oci::OciOptions {
+                layout_dir: layout_dir.as_deref(),
+                archive_path: archive_target.as_deref(),
+                app_name: &name,
+                title,
+                version,
+                app_sha256: &sha_hex,
+                bytecode_bytes: bytes.len(),
+                has_ui,
+                port,
+                arch,
+                executable_bytes: &exe_bytes,
+                web_assets: &web_refs,
+            })?;
+
+            if let Some(ref cf_path) = containerfile_path {
+                let cf = oci::render_containerfile(&oci_res.bin_name, title, version, &sha_hex, port, !oci_res.web_files.is_empty());
+                fs::write(cf_path, cf).map_err(|e| format!("cannot write {}: {e}", cf_path.display()))?;
+            }
+            artifact_path = oci_res.archive_path.clone();
+            note_standalone_sidecars(app_dir, &mut notes);
+
+            let meta = json!({
+                "binary": oci_res.bin_name,
+                "arch": arch.as_str(),
+                "platform": arch.platform_str(),
+                "port": port,
+                "imageDigest": oci_res.image_digest,
+                "configDigest": oci_res.config_digest,
+                "layerDigest": oci_res.layer_digest,
+                "diffId": oci_res.diff_id,
+                "executableBytes": exe_bytes.len(),
+                "layerTarBytes": oci_res.layer_tar_bytes,
+                "layerGzBytes": oci_res.layer_gz_bytes,
+                "webFiles": oci_res.web_files,
+                "containerfile": containerfile_path.as_ref().map(|p| p.display().to_string()),
+            });
+            if !out_is_tar {
+                let mf = json!({
+                    "target": "oci",
+                    "app": name,
+                    "title": title,
+                    "version": version,
+                    "sha256": sha_hex,
+                    "bytecodeBytes": bytes.len(),
+                    "bundleBytes": bundle.len(),
+                    "objects": objects,
+                    "hasUi": has_ui,
+                    "artifact": artifact_path.as_ref().map(|p| p.display().to_string()),
+                    "oci": meta,
+                });
+                fs::write(output_dir_or_tar.join("manifest.json"), serde_json::to_string_pretty(&mf).expect("json"))
+                    .map_err(|e| format!("cannot write manifest.json: {e}"))?;
+            }
+            oci_meta = Some(meta);
+            output_dir_or_tar
         }
         Target::Android => {
             let dest = opts.out.map(PathBuf::from).unwrap_or_else(|| app_dir.join("dist").join("android"));
@@ -807,7 +914,7 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
         }
     };
 
-    Ok(json!({
+    let mut out = json!({
         "target": target.as_str(),
         "app": name,
         "appId": app_id,
@@ -821,7 +928,11 @@ fn build_app(entry: &Path, target: Target, opts: &BuildOpts<'_>) -> Result<Json,
         "objects": objects,
         "hasUi": has_ui,
         "notes": notes,
-    }))
+    });
+    if let Some(meta) = oci_meta {
+        out.as_object_mut().expect("json object").insert("oci".into(), meta);
+    }
+    Ok(out)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1303,9 +1414,87 @@ fn web_index_html(title: &str, server: Option<&str>, host_plugins: &[&str], vide
     )
 }
 
-/// Appends a compiled `.tjb` payload + 48-byte SHA-256 trailer to a copy of `runner`.
-/// Any existing verified embedded trailer on `runner` is stripped first.
-pub fn package_standalone(runner: &Path, bytecode: &[u8], out: &Path) -> Result<(), String> {
+fn resolve_runner(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    match explicit {
+        Some(p) => Ok(p.to_path_buf()),
+        None => std::env::current_exe().map_err(|e| format!("cannot locate current executable: {e}")),
+    }
+}
+
+fn note_standalone_sidecars(app_dir: &Path, notes: &mut Vec<String>) {
+    for sidecar in ["plugins.json", "remotes.json", "webhooks.json"] {
+        if app_dir.join(sidecar).exists() {
+            notes.push(format!("{sidecar} is not loaded by standalone binaries yet; deploy with `tj serve <app.tj>` when using {sidecar}"));
+        }
+    }
+}
+
+fn collect_oci_web_assets(
+    program: &tj_core::vm::program::Program,
+    dev_perms: &BTreeMap<String, device_perms::DevicePermission>,
+    opts: &BuildOpts<'_>,
+    has_ui: bool,
+    notes: &mut Vec<String>,
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if !has_ui || opts.no_web {
+        return Ok(Vec::new());
+    }
+    let (found_wasm, used_aot_wasm, stale_note) = find_wasm(opts.wasm, opts.aot);
+    if let Some(note) = stale_note {
+        notes.push(note);
+    }
+    if let Some(explicit) = opts.wasm {
+        if found_wasm.is_none() {
+            return Err(format!("wasm file not found at {}", explicit.display()));
+        }
+    }
+    if opts.aot && !used_aot_wasm && opts.wasm.is_none() {
+        return Err("compiler-free AOT WASM not found; run `cargo web-aot` first (or pass --wasm <file>)".into());
+    }
+    let (Some(html), Some(js), Some(wasm_path)) = (find_web_host_index(), find_web_js(), found_wasm) else {
+        notes.push("skipping /web/ inside OCI image (build WASM with `cargo web` / `cargo web-aot`, or pass --no-web)".into());
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (rel, path) in [("index.html", html), ("tinyjump.js", js), ("tinyjump.wasm", wasm_path)] {
+        let data = fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        out.push((rel.to_string(), data));
+    }
+    let host_plugins = device_perms::bundled_host_plugins(dev_perms);
+    let optional: [(&str, bool, Option<PathBuf>); 4] = [
+        ("plugins/device.js", !host_plugins.is_empty(), find_web_device_plugins_js()),
+        ("plugins/webrtc.js", device_perms::uses_video_call(program, dev_perms), find_web_webrtc_js()),
+        ("plugins/whiteboard.js", device_perms::uses_whiteboard(program), find_web_whiteboard_js()),
+        ("plugins/gfx.js", program.uses_scene() || program.has_frame(), find_web_gfx_js()),
+    ];
+    for (rel, needed, found) in optional {
+        if needed {
+            if let Some(p) = found {
+                let data = fs::read(&p).map_err(|e| format!("cannot read {}: {e}", p.display()))?;
+                out.push((rel.to_string(), data));
+            } else {
+                notes.push(format!("hosts/web/{rel} not found in workspace; skipped from /web/"));
+            }
+        }
+    }
+    if !dev_perms.is_empty() {
+        let mut dev_map = serde_json::Map::new();
+        for (k, perm) in dev_perms {
+            let val = match &perm.reason {
+                Some(r) => serde_json::Value::String(r.clone()),
+                None => serde_json::Value::Bool(true),
+            };
+            dev_map.insert(k.clone(), val);
+        }
+        let doc = json!({ "device": dev_map });
+        out.push(("permissions.json".to_string(), serde_json::to_vec_pretty(&doc).expect("json")));
+    }
+    Ok(out)
+}
+
+/// Builds a standalone executable image (`runner_base || bytecode || 48-byte SHA-256 trailer`)
+/// in memory, stripping any prior verified embedded payload from `runner`.
+pub fn assemble_standalone_bytes(runner: &Path, bytecode: &[u8]) -> Result<Vec<u8>, String> {
     if (bytecode.len() as u64) > MAX_EMBEDDED_BYTES {
         return Err(format!("bytecode payload ({} bytes) exceeds 64 MiB limit", bytecode.len()));
     }
@@ -1319,15 +1508,24 @@ pub fn package_standalone(runner: &Path, bytecode: &[u8], out: &Path) -> Result<
         base.truncate(payload_start);
     }
     let digest = sha256(bytecode);
+    let mut out = Vec::with_capacity(base.len() + bytecode.len() + TRAILER_LEN as usize);
+    out.extend_from_slice(&base);
+    out.extend_from_slice(bytecode);
+    out.extend_from_slice(&(bytecode.len() as u64).to_le_bytes());
+    out.extend_from_slice(&digest);
+    out.extend_from_slice(TRAILER_MAGIC);
+    Ok(out)
+}
+
+/// Appends a compiled `.tjb` payload + 48-byte SHA-256 trailer to a copy of `runner`.
+/// Any existing verified embedded trailer on `runner` is stripped first.
+pub fn package_standalone(runner: &Path, bytecode: &[u8], out: &Path) -> Result<(), String> {
+    let image = assemble_standalone_bytes(runner, bytecode)?;
     if let Some(p) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(p).map_err(|e| format!("cannot create {}: {e}", p.display()))?;
     }
     let mut f = fs::File::create(out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
-    f.write_all(&base).map_err(|e| format!("write runner failed: {e}"))?;
-    f.write_all(bytecode).map_err(|e| format!("write payload failed: {e}"))?;
-    f.write_all(&(bytecode.len() as u64).to_le_bytes()).map_err(|e| format!("write trailer failed: {e}"))?;
-    f.write_all(&digest).map_err(|e| format!("write trailer failed: {e}"))?;
-    f.write_all(TRAILER_MAGIC).map_err(|e| format!("write trailer failed: {e}"))?;
+    f.write_all(&image).map_err(|e| format!("write standalone binary failed: {e}"))?;
     f.sync_all().map_err(|e| format!("sync failed: {e}"))?;
     #[cfg(unix)]
     {
@@ -1717,6 +1915,100 @@ function App() {
         assert!(!web_dev.join("whiteboard-plugin.js").exists());
         let clean_html = fs::read_to_string(web_dev.join("index.html")).unwrap();
         assert!(!clean_html.contains("webrtc-plugin.js") && !clean_html.contains("whiteboard-plugin.js"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builds_oci_layout_tar_and_validates_flags() {
+        let dir = tmp("oci");
+        let app_file = dir.join("app.tj");
+        fs::write(
+            &app_file,
+            r#"
+@server @read("anyone") object Room {
+  @allow("anyone") ping(): string { return "ok" }
+}
+function App() {
+  return <Column><Native name="VideoCall" active={false} /><Text>hi</Text></Column>
+}
+"#,
+        )
+        .unwrap();
+
+        let mut elf_arm64 = vec![0u8; 64];
+        elf_arm64[0..4].copy_from_slice(b"\x7fELF");
+        elf_arm64[5] = 1;
+        elf_arm64[18..20].copy_from_slice(&0x00B7u16.to_le_bytes());
+        let runner = dir.join("runner-arm64");
+        fs::write(&runner, &elf_arm64).unwrap();
+        fs::write(
+            dir.join("permissions.json"),
+            r#"{ "device": { "camera": "Video", "microphone": "Audio" } }"#,
+        )
+        .unwrap();
+        let wasm = dir.join("tinyjump.wasm");
+        fs::write(&wasm, b"\x00asm\x01\x00\x00\x00").unwrap();
+
+        // Flag validation across targets.
+        assert!(build_app(&app_file, Target::Linux, &BuildOpts { port: Some(8080), ..Default::default() }).is_err());
+        assert!(build_app(&app_file, Target::Web, &BuildOpts { arch: Some(oci::OciArch::Arm64), ..Default::default() }).is_err());
+        assert!(build_app(&app_file, Target::Android, &BuildOpts { no_web: true, ..Default::default() }).is_err());
+
+        // Full OCI layout + assembled tar with /web/ and auto-detected arm64 arch.
+        let oci_dir = dir.join("out-oci");
+        let rep = build_app(
+            &app_file,
+            Target::Oci,
+            &BuildOpts {
+                out: Some(&oci_dir),
+                runner: Some(&runner),
+                wasm: Some(&wasm),
+                port: Some(8080),
+                version: Some("1.0.0"),
+                title: Some("Call Room"),
+                assemble: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rep["target"], json!("oci"));
+        assert_eq!(rep["oci"]["arch"], json!("arm64"));
+        assert_eq!(rep["oci"]["platform"], json!("linux/arm64"));
+        assert_eq!(rep["oci"]["port"], json!(8080));
+        let web_files = rep["oci"]["webFiles"].as_array().unwrap();
+        assert!(web_files.iter().any(|v| v == "index.html"));
+        assert!(web_files.iter().any(|v| v == "tinyjump.wasm"));
+        assert!(web_files.iter().any(|v| v == "plugins/webrtc.js"));
+        assert!(web_files.iter().any(|v| v == "permissions.json"));
+        assert!(!web_files.iter().any(|v| v == "plugins/whiteboard.js"));
+
+        let verified = oci::verify_oci_layout(&oci_dir.join("layout")).unwrap();
+        assert_eq!(verified["architecture"], json!("arm64"));
+        let tar_path = PathBuf::from(rep["artifact"].as_str().unwrap());
+        assert!(tar_path.is_file());
+        let cf = fs::read_to_string(oci_dir.join("Containerfile")).unwrap();
+        assert!(cf.contains("USER 65532:65532") && cf.contains("EXPOSE 8080") && cf.contains("\"--web-dir\", \"/web\""));
+
+        // Direct .tar output + --no-web omits /web/ cleanly.
+        let tar_only = dir.join("headless.tar");
+        let rep2 = build_app(
+            &app_file,
+            Target::Oci,
+            &BuildOpts {
+                out: Some(&tar_only),
+                runner: Some(&runner),
+                arch: Some(oci::OciArch::Amd64),
+                no_web: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(tar_only.is_file());
+        assert_eq!(rep2["oci"]["arch"], json!("amd64"));
+        assert_eq!(rep2["oci"]["webFiles"], json!([]));
+        let outer = oci::parse_tar_entries(&fs::read(&tar_only).unwrap()).unwrap();
+        assert!(outer.iter().any(|(n, _)| n == "oci-layout"));
 
         let _ = fs::remove_dir_all(&dir);
     }
