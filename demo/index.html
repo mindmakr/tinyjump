@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23111114'/%3E%3Cpath d='M9 22L16 9l7 13h-4.2L16 16.5 13.2 22z' fill='%23ff6b2c'/%3E%3C/svg%3E">
+  <title>tinyjump live WASM demo</title>
+  <style>
+    :root {
+      --bg: #fafaf8; --bg-elev: #ffffff; --bg-subtle: #f2f1ec;
+      --fg: #111114; --muted: #62626e; --line: #e4e2da; --line-strong: #cfccc2;
+      --accent: #d9480f; --code-bg: #131318; --code-fg: #e8e6df;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0b0e; --bg-elev: #131318; --bg-subtle: #191920;
+        --fg: #f3f2ed; --muted: #8e8d98; --line: #23232c; --line-strong: #353542;
+        --accent: #ff7338; --code-bg: #0f0f14; --code-fg: #ebe9e1;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.55 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    header {
+      display: flex; justify-content: space-between; align-items: center; gap: 16px; flex-wrap: wrap;
+      padding: 14px 24px; border-bottom: 1px solid var(--line); background: var(--bg-elev);
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    }
+    .brand { display: inline-flex; align-items: center; gap: 8px; font-weight: 700; font-size: 16px; }
+    .brand a { color: inherit; text-decoration: none; }
+    .brand span { color: var(--accent); }
+    .brand .sep { color: var(--muted); font-weight: 400; }
+    .links a { color: var(--muted); text-decoration: none; margin-left: 18px; font-size: 13px; }
+    .links a:hover { color: var(--fg); }
+    main { display: grid; grid-template-columns: minmax(320px, 460px) 1fr; gap: 20px; padding: 24px; max-width: 1280px; margin: 0 auto; }
+    .panel { background: var(--bg-elev); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; min-width: 0; }
+    .label {
+      font: 600 11px ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+      padding: 11px 16px; border-bottom: 1px solid var(--line); background: var(--bg-subtle);
+      display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    .label button {
+      font: inherit; text-transform: none; letter-spacing: 0;
+      background: var(--fg); border: 1px solid var(--fg); color: var(--bg);
+      padding: 4px 10px; border-radius: 6px; cursor: pointer;
+    }
+    .label button:hover { opacity: 0.9; }
+    #app { color: #111114; background: #ffffff; min-height: 340px; }
+    pre { margin: 0; background: var(--code-bg); color: var(--code-fg); padding: 16px; overflow: auto; font: 12.5px/1.6 ui-monospace, "SF Mono", Menlo, Consolas, monospace; max-height: 60vh; }
+    .side { display: grid; gap: 20px; min-width: 0; }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; padding: 16px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <a href="../">tiny<span>jump</span></a>
+      <span class="sep">/</span>
+      <span style="color:var(--muted);font-weight:500;">live demo</span>
+    </div>
+    <div class="links">
+      <a href="../">← back to site</a>
+      <a href="https://mindmakr.github.io/tj-plugins/">registry</a>
+      <a href="../guide/">agent skills</a>
+      <a href="https://github.com/mindmakr/tinyjump/blob/main/examples/todo/app.tj">source</a>
+      <a href="https://github.com/mindmakr/tinyjump">github</a>
+    </div>
+  </header>
+  <main>
+    <div class="panel">
+      <div class="label">running app · wasm runtime + native DOM</div>
+      <div id="app"></div>
+    </div>
+    <div class="side">
+      <div class="panel">
+        <div class="label">automation · window.tinyjump.inspect() <button id="inspect" type="button">Inspect state &amp; tree</button></div>
+        <pre id="tree">Press "Inspect state &amp; tree" to see what an AI agent sees: every node with its bounds and visibility, plus durable object state.</pre>
+      </div>
+      <div class="panel">
+        <div class="label">examples/todo/app.tj</div>
+        <pre id="source"></pre>
+      </div>
+    </div>
+  </main>
+  <script type="module">
+    import { start } from './tinyjump.js';
+
+    function outline(nodes, depth, out) {
+      for (const n of nodes) {
+        const text = n.props.text ? ' "' + n.props.text + '"' : '';
+        const id = n.props.id ? ' #' + n.props.id : '';
+        const ev = n.events.length ? '  on ' + n.events.join(',') : '';
+        const b = n.bounds;
+        out.push('  '.repeat(depth) + n.kind + text + id + '  [' + b.x + ',' + b.y + ' ' + b.w + 'x' + b.h + (n.visible ? '' : ' hidden') + ']' + ev);
+        outline(n.children, depth + 1, out);
+      }
+      return out;
+    }
+
+    async function main() {
+      const source = await (await fetch('app.tj')).text();
+      document.getElementById('source').textContent = source;
+      const tj = await start({ wasm: 'tinyjump.wasm', source, root: document.getElementById('app'), devOverlay: true });
+      document.getElementById('inspect').addEventListener('click', async () => {
+        const s = await tj.inspect();
+        const objects = s.objects.map((o) => o.object + ' ' + JSON.stringify(o.state)).join('\n');
+        document.getElementById('tree').textContent = outline(s.tree, 0, []).join('\n') + '\n\n' + objects;
+      });
+    }
+    main();
+  </script>
+</body>
+</html>

@@ -1,0 +1,1974 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23111114'/%3E%3Cpath d='M9 22L16 9l7 13h-4.2L16 16.5 13.2 22z' fill='%23ff6b2c'/%3E%3C/svg%3E">
+  <title>tinyjump — One runtime for humans and AI agents to build reliable software</title>
+  <meta name="description" content="Open-source runtime where humans and AI agents collaborate to build reliable, private, native software. One TypeScript-shaped codebase compiles to Web, Android, iOS, and a durable real-time backend.">
+  <style>
+    :root {
+      --bg: #fafaf8;
+      --bg-elev: #ffffff;
+      --bg-subtle: #f2f1ec;
+      --bg-tint: rgba(234, 88, 12, 0.06);
+      --fg: #111114;
+      --fg-2: #3b3b44;
+      --muted: #62626e;
+      --line: #e4e2da;
+      --line-strong: #cfccc2;
+      --accent: #d9480f;
+      --accent-soft: rgba(217, 72, 15, 0.10);
+      --accent-glow: rgba(217, 72, 15, 0.16);
+      --ok: #0f7b4b;
+      --ok-soft: rgba(15, 123, 75, 0.10);
+      --doing: #b45309;
+      --doing-soft: rgba(180, 83, 9, 0.12);
+      --code-bg: #131318;
+      --code-header: #1b1b22;
+      --code-border: #282832;
+      --code-fg: #e8e6df;
+      --shadow-sm: 0 1px 2px rgba(17, 17, 20, 0.04), 0 1px 1px rgba(17, 17, 20, 0.03);
+      --shadow-md: 0 10px 30px -12px rgba(17, 17, 20, 0.12), 0 2px 6px rgba(17, 17, 20, 0.05);
+      --shadow-lg: 0 24px 60px -20px rgba(17, 17, 20, 0.22);
+      --radius: 12px;
+      --radius-lg: 18px;
+      --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg: #0b0b0e;
+        --bg-elev: #131318;
+        --bg-subtle: #191920;
+        --bg-tint: rgba(255, 107, 44, 0.08);
+        --fg: #f3f2ed;
+        --fg-2: #c9c7be;
+        --muted: #8e8d98;
+        --line: #23232c;
+        --line-strong: #353542;
+        --accent: #ff7338;
+        --accent-soft: rgba(255, 115, 56, 0.14);
+        --accent-glow: rgba(255, 115, 56, 0.18);
+        --ok: #34d399;
+        --ok-soft: rgba(52, 211, 153, 0.12);
+        --doing: #fbbf24;
+        --doing-soft: rgba(251, 191, 36, 0.14);
+        --code-bg: #0f0f14;
+        --code-header: #16161d;
+        --code-border: #252530;
+        --code-fg: #ebe9e1;
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+        --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+        --shadow-lg: 0 28px 70px -20px rgba(0, 0, 0, 0.72);
+      }
+    }
+
+    :root[data-theme="dark"] {
+      --bg: #0b0b0e;
+      --bg-elev: #131318;
+      --bg-subtle: #191920;
+      --bg-tint: rgba(255, 107, 44, 0.08);
+      --fg: #f3f2ed;
+      --fg-2: #c9c7be;
+      --muted: #8e8d98;
+      --line: #23232c;
+      --line-strong: #353542;
+      --accent: #ff7338;
+      --accent-soft: rgba(255, 115, 56, 0.14);
+      --accent-glow: rgba(255, 115, 56, 0.18);
+      --ok: #34d399;
+      --ok-soft: rgba(52, 211, 153, 0.12);
+      --doing: #fbbf24;
+      --doing-soft: rgba(251, 191, 36, 0.14);
+      --code-bg: #0f0f14;
+      --code-header: #16161d;
+      --code-border: #252530;
+      --code-fg: #ebe9e1;
+      --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+      --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.55);
+      --shadow-lg: 0 28px 70px -20px rgba(0, 0, 0, 0.72);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; overflow-x: clip; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: var(--font-sans);
+      font-size: 16px;
+      line-height: 1.65;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+      overflow-x: clip;
+    }
+
+    a { color: inherit; }
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.87em;
+      background: var(--bg-subtle);
+      border: 1px solid var(--line);
+      padding: 1px 5px;
+      border-radius: 5px;
+    }
+    pre code { background: none; border: 0; padding: 0; font-size: inherit; }
+
+    .wrap { max-width: 1160px; margin: 0 auto; padding: 0 24px; }
+
+    /* Top bar */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 40;
+      background: color-mix(in srgb, var(--bg) 86%, transparent);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--line);
+    }
+    .topbar-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      height: 64px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      text-decoration: none;
+      font-family: var(--font-mono);
+      font-weight: 700;
+      font-size: 17px;
+      letter-spacing: -0.03em;
+    }
+    .brand-mark {
+      width: 26px;
+      height: 26px;
+      border-radius: 7px;
+      background: var(--fg);
+      color: var(--bg);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .brand-text span { color: var(--accent); }
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+    .nav a {
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--muted);
+      transition: color 0.15s ease;
+    }
+    .nav a:hover { color: var(--fg); }
+    .nav-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 18px;
+      border-radius: 9px;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      color: var(--fg);
+      cursor: pointer;
+      transition: transform 0.12s ease, border-color 0.15s ease, background 0.15s ease, box-shadow 0.15s ease;
+    }
+    .btn:hover { border-color: var(--fg); transform: translateY(-1px); }
+    .btn.primary {
+      background: var(--fg);
+      color: var(--bg);
+      border-color: var(--fg);
+      box-shadow: var(--shadow-sm);
+    }
+    .btn.primary:hover { opacity: 0.92; }
+    .btn.accent {
+      background: var(--accent);
+      color: #ffffff;
+      border-color: var(--accent);
+    }
+    .btn.accent:hover { filter: brightness(1.06); }
+    .btn.sm { padding: 7px 12px; font-size: 13px; border-radius: 8px; }
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: var(--bg-elev);
+      color: var(--muted);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .icon-btn:hover { color: var(--fg); border-color: var(--line-strong); }
+
+    /* Hero */
+    .hero-section {
+      position: relative;
+      padding: 68px 0 48px;
+      background:
+        radial-gradient(60% 55% at 72% 10%, var(--accent-glow), transparent 65%),
+        linear-gradient(to bottom, transparent, var(--bg));
+      border-bottom: 1px solid var(--line);
+    }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1.05fr 0.95fr;
+      gap: 44px;
+      align-items: center;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--fg-2);
+      margin-bottom: 22px;
+      box-shadow: var(--shadow-sm);
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    h1 {
+      margin: 0 0 18px;
+      font-size: clamp(30px, 4.4vw, 54px);
+      line-height: 1.05;
+      letter-spacing: -0.035em;
+      font-weight: 800;
+    }
+    h1 .hl { color: var(--accent); }
+    .hero-lede {
+      font-size: 18px;
+      line-height: 1.6;
+      color: var(--fg-2);
+      margin: 0 0 28px;
+      max-width: 36em;
+    }
+    .hero-cta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 26px;
+    }
+    .hero-trust {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      color: var(--muted);
+    }
+    .hero-trust span { display: inline-flex; align-items: center; gap: 6px; }
+    .hero-trust i { color: var(--ok); font-style: normal; font-weight: 700; }
+
+    /* Code window */
+    .code-win {
+      background: var(--code-bg);
+      border: 1px solid var(--code-border);
+      border-radius: var(--radius-lg);
+      overflow: hidden;
+      box-shadow: var(--shadow-lg);
+      min-width: 0;
+    }
+    .code-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      padding: 11px 16px;
+      background: var(--code-header);
+      border-bottom: 1px solid var(--code-border);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: #a1a0ad;
+    }
+    .dots { display: inline-flex; gap: 6px; }
+    .dots span { width: 10px; height: 10px; border-radius: 999px; background: #343442; }
+    .code-tag {
+      font-size: 11px;
+      padding: 2px 9px;
+      border-radius: 999px;
+      background: rgba(255, 115, 56, 0.16);
+      color: #ff9a6c;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .code-win pre {
+      margin: 0;
+      padding: 18px 20px;
+      overflow-x: auto;
+      max-width: 100%;
+      font-family: var(--font-mono);
+      font-size: 12.75px;
+      line-height: 1.6;
+      color: var(--code-fg);
+    }
+    .code-foot {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 11px 16px;
+      background: var(--code-header);
+      border-top: 1px solid var(--code-border);
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: #a9a7b5;
+    }
+    .code-foot span {
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+    }
+    .code-foot strong { color: #f6f4ec; font-weight: 600; }
+    .k { color: #ff9866; }
+    .s { color: #a7e088; }
+    .c { color: #848394; }
+    .t { color: #7cc9f5; }
+    .a { color: #f4c977; }
+
+    /* Proof Strip */
+    .proof-strip {
+      margin-top: 48px;
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 1px;
+      background: var(--line);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+    .proof-item {
+      background: var(--bg-elev);
+      padding: 18px 20px;
+    }
+    .proof-item b {
+      display: block;
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      line-height: 1.15;
+      margin-bottom: 4px;
+    }
+    .proof-item span {
+      font-size: 12.5px;
+      color: var(--muted);
+      line-height: 1.35;
+      display: block;
+    }
+
+    /* Section framing */
+    .sec {
+      padding: 84px 0;
+      border-bottom: 1px solid var(--line);
+    }
+    .sec.tinted { background: var(--bg-subtle); }
+    .sec-head {
+      max-width: 720px;
+      margin-bottom: 42px;
+    }
+    .kicker {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.09em;
+      color: var(--accent);
+      margin-bottom: 12px;
+    }
+    .kicker .num-pill {
+      padding: 2px 7px;
+      border-radius: 5px;
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: clamp(28px, 3.3vw, 40px);
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      font-weight: 800;
+    }
+    .sec-sub {
+      margin: 0;
+      font-size: 17.5px;
+      color: var(--fg-2);
+      line-height: 1.6;
+    }
+    h3 {
+      margin: 0 0 8px;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+    }
+
+    /* Grids & Cards */
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+    .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px; }
+    .grid-2 > *, .grid-3 > *, .grid-4 > *, .hero-grid > *, .arch-compare > *, .tab-panel > *, .vision-banner > * { min-width: 0; max-width: 100%; }
+
+    .card {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .card p { margin: 0; color: var(--fg-2); font-size: 15px; }
+    .card p + p { margin-top: 10px; }
+    .card-icon {
+      width: 38px;
+      height: 38px;
+      border-radius: 10px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 14px;
+    }
+    .card-meta {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    /* Before / After Architecture Compare */
+    .arch-compare {
+      display: grid;
+      grid-template-columns: 1fr 1.15fr;
+      gap: 20px;
+      margin-bottom: 24px;
+    }
+    .arch-box {
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      border: 1px solid var(--line);
+      background: var(--bg-elev);
+    }
+    .arch-box.featured {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 1px var(--accent-soft), var(--shadow-md);
+      background: linear-gradient(180deg, var(--bg-tint), var(--bg-elev) 45%);
+    }
+    .arch-label {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .arch-box.featured .arch-label { color: var(--accent); }
+    .chip-cloud {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 14px 0 16px;
+    }
+    .chip {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      padding: 5px 10px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--bg-subtle);
+      color: var(--fg-2);
+    }
+    .chip.broken { border-style: dashed; color: var(--muted); }
+    .chip.solid {
+      background: var(--bg-elev);
+      border-color: var(--line-strong);
+      color: var(--fg);
+      font-weight: 600;
+    }
+    .arch-flow {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr;
+      gap: 12px;
+      align-items: center;
+      margin: 16px 0;
+    }
+    .flow-node {
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--bg-elev);
+      border: 1px solid var(--line-strong);
+      font-size: 13.5px;
+    }
+    .flow-node b { display: block; font-size: 14px; margin-bottom: 2px; }
+    .flow-node span { color: var(--muted); font-size: 12px; font-family: var(--font-mono); }
+    .flow-arrow { color: var(--accent); font-family: var(--font-mono); font-weight: 700; font-size: 18px; text-align: center; }
+
+    /* Why it is: Story + Roles */
+    .story-quote {
+      border-left: 3px solid var(--accent);
+      padding: 4px 0 4px 20px;
+      margin: 0 0 22px;
+      font-size: 19px;
+      font-weight: 600;
+      line-height: 1.5;
+      color: var(--fg);
+    }
+    .roles-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+      box-shadow: var(--shadow-sm);
+    }
+    .role-list {
+      display: grid;
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .role-row {
+      display: grid;
+      grid-template-columns: 112px 1fr;
+      gap: 12px;
+      align-items: baseline;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+      font-size: 14.5px;
+    }
+    .role-row:last-child { border-bottom: 0; padding-bottom: 0; }
+    .role-badge {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--line);
+      text-align: center;
+      color: var(--fg);
+    }
+
+    /* Audience strip inside Why */
+    .audience-grid {
+      margin-top: 28px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+    }
+    .audience-grid ul {
+      margin: 12px 0 0;
+      padding-left: 18px;
+      color: var(--fg-2);
+      font-size: 14.5px;
+    }
+    .audience-grid li { margin-bottom: 8px; }
+
+    /* What it has: Bento + Measurements + Platforms */
+    .bento-tag {
+      display: inline-block;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--ok-soft);
+      color: var(--ok);
+      margin-bottom: 12px;
+    }
+    .feature-list {
+      list-style: none;
+      padding: 0;
+      margin: 14px 0 0;
+      display: grid;
+      gap: 7px;
+      font-size: 14px;
+      color: var(--fg-2);
+    }
+    .feature-list li {
+      position: relative;
+      padding-left: 18px;
+    }
+    .feature-list li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      color: var(--ok);
+      font-weight: 700;
+    }
+
+    .numbers-grid {
+      margin-top: 32px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    .num-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 20px 22px;
+    }
+    .num-card b {
+      display: block;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--fg);
+      margin-bottom: 4px;
+    }
+    .num-card span {
+      font-size: 13.5px;
+      color: var(--muted);
+      line-height: 1.45;
+      display: block;
+    }
+
+    .platforms-wrap {
+      margin-top: 32px;
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+    }
+    .status {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14.5px;
+      margin-top: 10px;
+    }
+    .status td {
+      padding: 12px 12px 12px 0;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    .status tr:last-child td { border-bottom: 0; }
+    .status td:first-child { font-weight: 600; color: var(--fg); width: 44%; }
+    .status td:last-child { font-family: var(--font-mono); font-size: 13px; color: var(--muted); }
+    .status td.ok { color: var(--ok); font-weight: 600; }
+    .status td.ok::before { content: "● "; }
+    .status td.next { color: var(--muted); }
+    .status td.next::before { content: "○ "; }
+
+    /* What it can: Interactive Agentic Showcase */
+    .tabs-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 20px;
+    }
+    .tab-btn {
+      padding: 9px 15px;
+      border-radius: 9px;
+      border: 1px solid var(--line-strong);
+      background: var(--bg-elev);
+      color: var(--fg-2);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover { border-color: var(--fg); color: var(--fg); }
+    .tab-btn[aria-selected="true"] {
+      background: var(--fg);
+      color: var(--bg);
+      border-color: var(--fg);
+    }
+    .tab-panel {
+      display: grid;
+      grid-template-columns: 0.85fr 1.15fr;
+      gap: 24px;
+      align-items: start;
+    }
+    .tab-panel[hidden] { display: none; }
+    .example-meta {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      padding: 26px;
+    }
+    .example-meta .tag-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin: 14px 0 18px;
+    }
+    .mini-tag {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--line);
+      color: var(--fg-2);
+    }
+    .cmd-box {
+      margin-top: 16px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      overflow-x: auto;
+      max-width: 100%;
+      border: 1px solid var(--code-border);
+    }
+
+    /* Agent loop strip */
+    .loop-strip {
+      margin-top: 32px;
+      display: grid;
+      grid-template-columns: repeat(6, 1fr);
+      gap: 12px;
+    }
+    .loop-step {
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+    .loop-step .step-n {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 6px;
+      display: block;
+    }
+    .loop-step b {
+      display: block;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      margin-bottom: 4px;
+    }
+    .loop-step span {
+      display: block;
+      font-size: 12.5px;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+
+    /* Timeline */
+    .timeline {
+      position: relative;
+      display: grid;
+      gap: 18px;
+      padding-left: 28px;
+    }
+    .timeline::before {
+      content: "";
+      position: absolute;
+      left: 9px;
+      top: 10px;
+      bottom: 10px;
+      width: 2px;
+      background: var(--line-strong);
+    }
+    .tl-item {
+      position: relative;
+      background: var(--bg-elev);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 22px 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .tl-item::before {
+      content: "";
+      position: absolute;
+      left: -25px;
+      top: 26px;
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: var(--ok);
+      border: 3px solid var(--bg);
+      box-shadow: 0 0 0 1px var(--ok);
+    }
+    .tl-item.active {
+      border-color: var(--accent);
+      background: linear-gradient(180deg, var(--bg-tint), var(--bg-elev) 60%);
+    }
+    .tl-item.active::before {
+      background: var(--accent);
+      box-shadow: 0 0 0 4px var(--accent-soft);
+    }
+    .tl-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .tl-head h3 { margin: 0; font-size: 17px; }
+    .tl-badges { display: inline-flex; align-items: center; gap: 8px; }
+    .badge {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 3px 9px;
+      border-radius: 999px;
+    }
+    .badge.done { background: var(--ok-soft); color: var(--ok); }
+    .badge.doing { background: var(--doing-soft); color: var(--doing); }
+    .badge.date { background: var(--bg-subtle); color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+    .tl-item p { margin: 0 0 10px; color: var(--fg-2); font-size: 14.5px; }
+    .tl-pills { display: flex; flex-wrap: wrap; gap: 6px; }
+
+    /* What it could be + Join CTA */
+    .vision-banner {
+      margin-top: 28px;
+      border-radius: var(--radius-lg);
+      padding: 36px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      border: 1px solid var(--code-border);
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 32px;
+      align-items: center;
+      box-shadow: var(--shadow-lg);
+    }
+    .vision-banner h3 {
+      font-size: clamp(22px, 2.5vw, 30px);
+      line-height: 1.15;
+      color: #ffffff;
+      margin: 0 0 12px;
+    }
+    .vision-banner p { color: #c7c5d0; margin: 0 0 14px; font-size: 15.5px; }
+    .vision-banner .cta-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+    .vision-banner .btn.light {
+      background: #ffffff;
+      color: #111114;
+      border-color: #ffffff;
+    }
+    .vision-banner .btn.ghost {
+      background: rgba(255, 255, 255, 0.06);
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.2);
+    }
+    .vision-banner .btn.ghost:hover { border-color: #ffffff; }
+
+    .quickstart-box {
+      position: relative;
+      background: #0a0a0e;
+      border: 1px solid #2b2b38;
+      border-radius: 12px;
+      overflow: hidden;
+      max-width: 100%;
+      min-width: 0;
+    }
+    .quickstart-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 9px 14px;
+      background: #14141c;
+      border-bottom: 1px solid #252532;
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: #9e9cac;
+    }
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.08);
+      color: #f3f2ed;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 6px;
+      padding: 3px 9px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .copy-btn:hover { background: rgba(255, 255, 255, 0.16); }
+    .quickstart-box pre {
+      margin: 0;
+      padding: 16px;
+      overflow-x: auto;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+      color: #e8e6df;
+    }
+
+    /* Decisions accordion / table */
+    .decisions {
+      border-top: 1px solid var(--line);
+      margin-top: 28px;
+    }
+    .decision {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      gap: 24px;
+      padding: 16px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 15px;
+    }
+    .decision b { font-weight: 700; color: var(--fg); }
+    .decision span { color: var(--fg-2); }
+
+    /* Footer */
+    footer {
+      padding: 40px 0 56px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .footer-inner {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+    .footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      font-family: var(--font-mono);
+      font-size: 13px;
+    }
+    .footer-links a { text-decoration: none; color: var(--muted); }
+    .footer-links a:hover { color: var(--fg); }
+
+    /* Responsive */
+    @media (max-width: 1020px) {
+      .hero-grid, .arch-compare, .tab-panel, .vision-banner { grid-template-columns: 1fr; }
+      .proof-strip { grid-template-columns: repeat(3, 1fr); }
+      .loop-strip { grid-template-columns: repeat(3, 1fr); }
+      .grid-4 { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 820px) {
+      .nav { display: none; }
+      .grid-2, .grid-3, .audience-grid, .numbers-grid, .decision { grid-template-columns: 1fr; }
+      .proof-strip { grid-template-columns: 1fr 1fr; }
+      .loop-strip { grid-template-columns: 1fr 1fr; }
+      .arch-flow { grid-template-columns: 1fr; }
+      .flow-arrow { transform: rotate(90deg); }
+      .sec { padding: 56px 0; }
+      .hero-section { padding: 44px 0 36px; }
+      .vision-banner { padding: 26px; }
+    }
+    @media (max-width: 480px) {
+      .wrap { padding: 0 16px; }
+      .topbar-inner { gap: 8px; }
+      .nav-actions { gap: 6px; }
+      .nav-actions .btn.sm { padding: 6px 10px; font-size: 12px; }
+      .eyebrow { font-size: 11px; padding: 5px 10px; border-radius: 10px; line-height: 1.4; }
+      .code-win pre { padding: 14px; font-size: 11.5px; }
+      .proof-strip, .loop-strip, .grid-4 { grid-template-columns: 1fr; }
+      .role-row { grid-template-columns: 1fr; gap: 6px; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .btn { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="#top">
+        <span class="brand-mark" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M5 19L12 5l7 14h-3.6L12 12.2 8.6 19H5z" fill="currentColor"/></svg>
+        </span>
+        <span class="brand-text">tiny<span>jump</span></span>
+      </a>
+      <nav class="nav" aria-label="Primary">
+        <a href="#what-it-is">What it is</a>
+        <a href="#why-it-is">Why it is</a>
+        <a href="#what-it-has">What it has</a>
+        <a href="#what-it-can">What it can</a>
+        <a href="#timeline">Timeline</a>
+        <a href="guide/">Agent Skills</a>
+        <a href="https://mindmakr.github.io/tj-plugins/">Registry</a>
+      </nav>
+      <div class="nav-actions">
+        <a class="btn sm" href="https://mindmakr.github.io/tj-plugins/">Registry</a>
+        <a class="btn sm" href="demo/">Live demo</a>
+        <a class="btn sm primary" href="https://github.com/mindmakr/tinyjump">GitHub</a>
+        <button class="icon-btn" id="theme-toggle" type="button" title="Switch light or dark theme" aria-label="Switch theme">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- HERO -->
+    <section class="hero-section">
+      <div class="wrap">
+        <div class="hero-grid">
+          <div>
+            <div class="eyebrow">
+              <span class="pulse-dot" aria-hidden="true"></span>
+              Open Source · Web · Android · iOS · macOS · Linux · MIT / Apache-2.0
+            </div>
+            <h1>One tiny runtime where <span class="hl">humans and AI agents</span> build reliable software together.</h1>
+            <p class="hero-lede">Write one TypeScript-shaped codebase. Get native screens on Web, Android, iOS, macOS AppKit, and Linux GTK 3, a durable real-time backend with privacy and access rules built in, opt-in device &amp; WebRTC plugins at 0 KB core cost, and native automation so coding agents can write, prove, drive, and evolve apps safely alongside people.</p>
+            <div class="hero-cta">
+              <a class="btn accent" href="guide/">
+                Install Agent Skill &amp; Guide
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 5l7 7-7 7"/></svg>
+              </a>
+              <a class="btn" href="demo/">Try live WASM demo</a>
+              <a class="btn" href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Language (1 page)</a>
+              <a class="btn" href="https://mindmakr.github.io/tj-plugins/">Registry (12 Official)</a>
+            </div>
+            <div class="hero-trust">
+              <span><i>✓</i> Closed by default</span>
+              <span><i>✓</i> Zero cloud lock-in</span>
+              <span><i>✓</i> Runs on 10-year-old phones</span>
+              <span><i>✓</i> Self-hostable on one binary</span>
+            </div>
+          </div>
+
+          <div class="code-win">
+            <div class="code-bar">
+              <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>examples/booking/app.tj</span>
+              <span class="code-tag">283 lines · 4 platforms</span>
+            </div>
+<pre><span class="a">@server</span> <span class="a">@read</span>(<span class="s">"anyone"</span>) <span class="k">object</span> <span class="t">Slot</span> {
+  title: <span class="t">string</span> = <span class="s">""</span>
+  start: <span class="t">number</span> = 0
+  <span class="c">// staff &amp; customer read it; others see "•••"</span>
+  <span class="a">@read</span>(<span class="s">"staff"</span>, <span class="s">"self"</span>) customer: <span class="t">string</span> = <span class="s">""</span>
+
+  <span class="c">// actor-safe booking + durable reminder alarm</span>
+  <span class="a">@allow</span>(<span class="s">"signedIn"</span>) <span class="a">@exclusive</span> <span class="k">async</span> book() {
+    <span class="k">this</span>.mustBeOpen()
+    <span class="k">this</span>.customer = caller.id
+    <span class="k">const</span> before = Settings.get(<span class="s">"main"</span>).reminderMinutes * 60000
+    <span class="k">const</span> wait = Math.max(0, <span class="k">this</span>.start - before - Date.now())
+    <span class="k">this</span>.schedule(<span class="s">"remind"</span>, wait, <span class="s">"remind"</span>)
+  }
+}
+
+<span class="a">@server</span> <span class="a">@read</span>(<span class="s">"owner"</span>, <span class="s">"staff"</span>) <span class="a">@retain</span>(<span class="s">"1y"</span>) <span class="k">object</span> <span class="t">Customer</span> {
+  <span class="a">@pii</span>(<span class="s">"contact"</span>, <span class="s">"booking"</span>) name: <span class="t">string</span> = <span class="s">""</span>
+  <span class="a">@pii</span>(<span class="s">"contact"</span>, <span class="s">"booking"</span>) phone: <span class="t">string</span> = <span class="s">""</span>
+  <span class="a">@allow</span>(<span class="s">"owner"</span>) <span class="k">async</span> deleteAccount() {
+    <span class="k">await</span> erase(caller.id)
+  }
+}</pre>
+            <div class="code-foot">
+              <span>Web: <strong>215 KB gz</strong></span>
+              <span>Android APK: <strong>531 KB</strong></span>
+              <span>iOS: <strong>UIKit .app</strong></span>
+              <span>Boot: <strong>&lt;0.2 ms</strong></span>
+              <span>QA: <strong>tj mcp + tj review</strong></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="proof-strip" aria-label="Measured runtime benchmarks">
+          <div class="proof-item">
+            <b>220 KB</b>
+            <span>AOT Web WASM gzipped (555 KB raw, compiler-free)</span>
+          </div>
+          <div class="proof-item">
+            <b>531 KB</b>
+            <span>Complete installable native Android APK (arm64 AOT)</span>
+          </div>
+          <div class="proof-item">
+            <b>3.1 MB</b>
+            <span>Native Linux GTK 3 host (zero dev headers) + macOS AppKit</span>
+          </div>
+          <div class="proof-item">
+            <b>0.05 ms</b>
+            <span>Sub-0.2 ms cold boot &amp; 0.001–0.018 ms per tick</span>
+          </div>
+          <div class="proof-item">
+            <b>0 B core</b>
+            <span>Device plugins, WebRTC, desktop hosts &amp; 12 registry pkgs</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 01: WHAT IT IS -->
+    <section id="what-it-is" class="sec">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">01</span> What it is</div>
+          <h2>One unified runtime. Zero fragile glue between UI, backend, and agents.</h2>
+          <p class="sec-sub">tinyjump is an open-source, deterministic runtime written in pure Rust. Its core building block is a durable, observable <strong>object</strong> that holds state, timers, alarms, access rules, and events — running identically on browsers, phones, and servers.</p>
+        </div>
+
+        <div class="arch-compare">
+          <div class="arch-box">
+            <div class="arch-label">
+              <span>Traditional App Stack</span>
+              <span>10+ tools · fragile joins</span>
+            </div>
+            <p style="margin:0;color:var(--fg-2);font-size:14.5px;">A web framework, two mobile stacks, a REST/GraphQL API, an ORM, a database, a realtime broker, a job queue, an auth layer, a privacy checklist, and brittle E2E scripts — each with its own language, schema, and failure modes.</p>
+            <div class="chip-cloud">
+              <span class="chip broken">Web SPA</span>
+              <span class="chip broken">iOS App</span>
+              <span class="chip broken">Android App</span>
+              <span class="chip broken">API Gateway</span>
+              <span class="chip broken">ORM + Migrations</span>
+              <span class="chip broken">Pub/Sub Broker</span>
+              <span class="chip broken">Cron / Queue</span>
+              <span class="chip broken">Auth Glue</span>
+              <span class="chip broken">PII Spreadsheets</span>
+              <span class="chip broken">Flaky Browser Tests</span>
+            </div>
+            <p style="margin:0;color:var(--muted);font-size:13.5px;">AI agents can write each part fast — and then spend days debugging the seams between them.</p>
+          </div>
+
+          <div class="arch-box featured">
+            <div class="arch-label">
+              <span>tinyjump Runtime</span>
+              <span>1 language · 0 I/O in core</span>
+            </div>
+            <p style="margin:0;color:var(--fg-2);font-size:14.5px;">One TypeScript-shaped source compiles to small AOT bytecode (<code>.tjb</code>). The I/O-free core computes state, rules, and layout once; thin hosts draw real native widgets and perform disk, network, and crypto I/O.</p>
+            <div class="arch-flow">
+              <div class="flow-node">
+                <b>1. Durable Objects</b>
+                <span>@server · @read · @allow · @pii · @exclusive · @invariant</span>
+              </div>
+              <div class="flow-arrow" aria-hidden="true">→</div>
+              <div class="flow-node">
+                <b>2. Every Target + Agent</b>
+                <span>Web DOM · Android Views · iOS UIKit · Linux API · tj mcp</span>
+              </div>
+            </div>
+            <div class="chip-cloud" style="margin-bottom:0;">
+              <span class="chip solid">Offline-first replicas</span>
+              <span class="chip solid">Live SSE sync</span>
+              <span class="chip solid">Tamper-evident audit</span>
+              <span class="chip solid">Deterministic replay</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M9 9h6v6H9z"/></svg>
+            </div>
+            <h3>Durable objects everywhere</h3>
+            <p>State, scheduled alarms, recurring timers, and events live together on objects. Every mutation persists atomically to disk and streams in order to every subscribed screen.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="14" height="12" rx="2"/><rect x="14" y="8" width="8" height="12" rx="2"/></svg>
+            </div>
+            <h3>Real native UI, one layout engine</h3>
+            <p>Not a web view. The core computes CSS flexbox layout once (Taffy) with RTL mirroring; hosts render real DOM, Android Views, and UIKit widgets that behave identically everywhere.</p>
+          </div>
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
+            </div>
+            <h3>Built-in automation &amp; proof</h3>
+            <p>Every host exposes the same semantic tree, object state, controllable clock, and input channel. Agents inspect, drive, screenshot-diff, and verify apps in one deterministic loop.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 02: WHY IT IS -->
+    <section id="why-it-is" class="sec tinted">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">02</span> Why it is</div>
+          <h2>Software powers our world and economy — it should be safe, small, and open to everyone.</h2>
+          <p class="sec-sub">In the agentic era, writing code is no longer the bottleneck. <strong>Trust, reliability, privacy, and maintainability</strong> are. We built tinyjump so humans and AI agents can ship dependable systems together without massive cloud complexity.</p>
+        </div>
+
+        <div class="grid-2">
+          <div>
+            <p class="story-quote">The joins between ten tools are where apps leak personal data, drop offline work, and break at 2 a.m. Removing the joins makes both humans and AI agents 10× more reliable.</p>
+            <p style="color:var(--fg-2);margin:0 0 14px;">Clinics, local shops, schools, cooperatives, startups, and public institutions everywhere need software that works offline, speaks local languages (including Arabic, Urdu, and CJK), respects personal data laws, and runs smoothly on affordable 10-year-old phones.</p>
+            <p style="color:var(--fg-2);margin:0 0 14px;">Today, delivering that reliability takes a whole platform team and a stack of proprietary cloud services. When the runtime itself guarantees closed-by-default access control, compile-time PII protection, durable state, and live-reload safety, a single founder or a small team collaborating with AI agents can build institutional-grade software — and own every byte on their own Linux server.</p>
+            <p style="color:var(--fg-2);margin:0;">Because tinyjump starts clean, there is no legacy bloat: every feature is measured against strict binary size and VM step budgets before it merges.</p>
+          </div>
+
+          <div class="roles-card">
+            <div class="kicker" style="margin-bottom:6px;">How humans &amp; AI collaborate here</div>
+            <h3>Five explicit roles. Honest two-way debate.</h3>
+            <p style="margin:0;color:var(--fg-2);font-size:14.5px;">tinyjump itself is built using the exact collaboration model it enables: people and AI agents work in distinct roles through an open, conflict-free <code>feedback/</code> log — never rubber-stamping, never ignoring, always weighing value against cost.</p>
+            <div class="role-list">
+              <div class="role-row">
+                <span class="role-badge">Visionary</span>
+                <span>Human owner sets goals, guardrails, ethics, and work order in <code>docs/vision.md</code>.</span>
+              </div>
+              <div class="role-row">
+                <span class="role-badge">Builder</span>
+                <span>Ships small branches with tests, keeps size/speed budgets green, answers findings with proof.</span>
+              </div>
+              <div class="role-row">
+                <span class="role-badge">Critic</span>
+                <span>Empty-mind reviewer audits security, privacy, and durability without the builder's assumptions.</span>
+              </div>
+              <div class="role-row">
+                <span class="role-badge">Tester</span>
+                <span>Drives real apps on Web, Android, iOS, and Linux — testing restarts, offline queues, and RTL.</span>
+              </div>
+              <div class="role-row">
+                <span class="role-badge">Maintainer</span>
+                <span>Protects binary size, stored-state compatibility across upgrades, key hygiene, and clean code.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="audience-grid">
+          <div class="card">
+            <h3>For Founders &amp; Builders</h3>
+            <ul>
+              <li>Ship Web, Android, iOS, and a live server from one compact codebase.</li>
+              <li>Offline sync, audit logs, GDPR/PDPL compliance checks, and sign-in are built in — not separate quarters of work.</li>
+              <li>MIT / Apache-2.0 open source. Run on your own Linux box; your data stays yours.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>For Engineers</h3>
+            <ul>
+              <li>Pure Rust I/O-free core: deterministic replay, zero hidden async magic, sub-millisecond ticks.</li>
+              <li><code>@exclusive</code> actor turns, crash-safe atomic saves, resumable SSE change streams, and idempotent outbox retries.</li>
+              <li>Escape hatches everywhere: <code>&lt;Native&gt;</code> views, MCP plugins, <code>fetch</code>, OpenAPI bridges, and webhooks.</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>For Agentic Coders</h3>
+            <ul>
+              <li><code>tj docs</code> hands an agent the entire language specification in one call.</li>
+              <li><code>tj check</code> gives fix-hint diagnostics, access/privacy matrices, and schema compatibility checks.</li>
+              <li><code>tj mcp</code>, <code>tj test</code>, <code>tj review</code>, and <code>tj retro</code> close the build–verify–refactor loop automatically.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 03: WHAT IT HAS -->
+    <section id="what-it-has" class="sec">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">03</span> What it has</div>
+          <h2>Everything shipped and verified today — measured, not claimed.</h2>
+          <p class="sec-sub">No vaporware. Every capability below is built, tested by 249+ automated tests and live multi-platform runs, and guarded on every commit by <code>scripts/budget.sh</code>.</p>
+        </div>
+
+        <div class="grid-3">
+          <div class="card">
+            <span class="bento-tag">Language &amp; Core</span>
+            <h3>TypeScript-Shaped, One Way</h3>
+            <p>A strict TypeScript subset agents already know, with clear rules and fix-hint errors.</p>
+            <ul class="feature-list">
+              <li>Multi-file modules (<code>import</code> / <code>export</code>) &amp; gradual types</li>
+              <li><code>tj docs</code> single-page reference &amp; <code>tj check --manifest</code></li>
+              <li><code>tj check --against</code> schema compatibility verification</li>
+              <li>AOT <code>.tjb</code> bytecode &amp; compiler-free device builds</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <span class="bento-tag">Durable State &amp; Sync</span>
+            <h3>Offline-First, Real-Time Objects</h3>
+            <p>Objects replace separate databases, ORMs, queues, and pub/sub plumbing.</p>
+            <ul class="feature-list">
+              <li>Crash-safe atomic disk saves; failed saves fail the call</li>
+              <li><code>@server</code> authority with live offline-cached device replicas</li>
+              <li>Ordered resumable change streams &amp; idempotent outbox</li>
+              <li><code>@exclusive</code> actor turns, <code>@every</code> timers &amp; keyed alarms</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <span class="bento-tag">Native UI &amp; Global i18n</span>
+            <h3>One Layout, Every Language</h3>
+            <p>Real platform widgets with first-class internationalization and zero ICU bloat.</p>
+            <ul class="feature-list">
+              <li>Shared Taffy CSS flexbox + automatic RTL mirroring</li>
+              <li><code>&lt;Tabs&gt;</code>, <code>&lt;List&gt;</code>, <code>&lt;Icon&gt;</code>, <code>&lt;Theme&gt;</code> &amp; custom <code>&lt;Native&gt;</code></li>
+              <li><code>t("key", { count })</code>, CLDR plurals &amp; native <code>&lt;Format&gt;</code>/<code>&lt;Time&gt;</code></li>
+              <li>Offline multi-locale &amp; <code>"pseudo"</code> overflow sweeps + golden diffs</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <span class="bento-tag">Security &amp; Privacy</span>
+            <h3>Closed by Default, Law-Ready</h3>
+            <p>Guarantees that fail closed in the compiler and runtime — never forgotten checklists.</p>
+            <ul class="feature-list">
+              <li><code>@read</code>, <code>@allow</code>, per-field <code>"self"</code> masking &amp; OIDC sign-in</li>
+              <li>AES-256-GCM encryption at rest &amp; tamper-evident audit logs</li>
+              <li><code>@pii</code> compile-time taint tracking + explicit <code>reveal()</code></li>
+              <li>Per-person crypto-shredding, <code>@retain</code>, <code>@needs</code> &amp; GDPR/PDPL packs</li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <span class="bento-tag">Living Agentic Apps</span>
+            <h3>Safe to Evolve in Production</h3>
+            <p>Built so agents and operators can maintain live apps with guardrails and instant rollback.</p>
+            <ul class="feature-list">
+              <li>Scoped operational keys (<code>--ops observe|test|maintain</code>) &amp; leases</li>
+              <li><code>@invariant</code> checks with atomic turn rollback</li>
+              <li>Shadow-booted <code>tj reload</code> with health-gated auto-rollback</li>
+              <li>Deterministic <code>tj test</code> traces, <code>tj retro</code> &amp; <code>crypto.idempotencyKey()</code></li>
+            </ul>
+          </div>
+
+          <div class="card">
+            <span class="bento-tag">Ecosystem &amp; Packaging</span>
+            <h3>Turnkey Ship &amp; Open Registry</h3>
+            <p>Package native artifacts in one command and connect cleanly to existing systems.</p>
+            <ul class="feature-list">
+              <li><code>tj build</code>: <code>--web</code>, standalone <code>--linux</code>, <code>--android --assemble</code>, <code>--ios --assemble</code></li>
+              <li>MCP plugins (<code>tj:ai</code> for Claude, OpenAI, Gemini &amp; local Ollama/<code>llama.cpp</code>; <code>tj:agent</code>) &amp; <code>tj bridge openapi</code></li>
+              <li>Server-to-server object replicas &amp; HMAC-signed webhooks</li>
+              <li>Live <a href="https://mindmakr.github.io/tj-plugins/"><code>tj-plugins</code></a> registry: <code>tj search</code>, <code>tj add</code>, SHA-256 lockfile</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="numbers-grid" aria-label="Detailed runtime measurements">
+          <div class="num-card">
+            <b>220 KB gz</b>
+            <span>Compiler-free AOT web runtime (<code>555 KB</code> raw via <code>cargo web-aot</code>; <code>860 KB</code> / <code>323 KB</code> gz with compiler).</span>
+          </div>
+          <div class="num-card">
+            <b>531 KB APK</b>
+            <span>Complete installable native Android APK (arm64 AOT: <code>484 KB</code> runtime, <code>42 KB</code> plain-Java DEX, zero AndroidX/Kotlin).</span>
+          </div>
+          <div class="num-card">
+            <b>3.1 MB GTK 3</b>
+            <span>Native Linux GTK 3 desktop binary (<code>dlopen</code>, zero <code>-dev</code> headers) alongside zero-Xcode macOS AppKit &amp; iOS UIKit <code>.app</code>s.</span>
+          </div>
+          <div class="num-card">
+            <b>0.05 ms boot</b>
+            <span><code>0.045–0.104 ms</code> cold boot across examples; <code>0.001–0.018 ms</code> per tick in <code>tj bench</code>.</span>
+          </div>
+          <div class="num-card">
+            <b>0 B wgpu cost</b>
+            <span>Opt-in <code>tj-gfx</code> (<code>wgpu</code>), <code>gfx.js</code>, device plugins (<code>files</code>, <code>notifications</code>, <code>location</code>, <code>camera</code>), WebRTC screen sharing, Whiteboard canvas, desktop hosts, audit log, and encryption add zero bytes to non-opting-in apps.</span>
+          </div>
+          <div class="num-card">
+            <b>6 native targets</b>
+            <span>Web (ES2017), Android 5+ (<code>minSdk 21</code>), iOS 13+, macOS 12+, Linux Desktop (GTK 3), and static Linux servers (<code>x86_64</code>, <code>aarch64</code>, <code>armv7</code>).</span>
+          </div>
+        </div>
+
+        <div class="platforms-wrap">
+          <div class="grid-2" style="align-items:start;">
+            <div>
+              <div class="kicker" style="margin-bottom:6px;">Platform Matrix</div>
+              <h3 style="font-size:22px;">Where it runs today</h3>
+              <p style="color:var(--fg-2);font-size:14.5px;margin:0 0 12px;">Generated directly from <code>docs/vision.md</code> on every site build so status never drifts from reality.</p>
+              <table class="status">
+                <tbody><tr><td>Web (WASM + DOM)</td><td class="ok">working</td></tr>
+<tr><td>Android (Views, minSdk 21; arm64, armv7, x86, x86_64)</td><td class="ok">working</td></tr>
+<tr><td>iOS (UIKit, iOS 13+)</td><td class="ok">working: built and driven on the iOS Simulator in CI</td></tr>
+<tr><td>macOS (AppKit, macOS 12+)</td><td class="ok">working: built and driven natively on macOS CI (`hosts/macos`)</td></tr>
+<tr><td>Linux (server/CLI, static: x86_64, aarch64, armv7)</td><td class="ok">working</td></tr>
+<tr><td>Linux desktop UI (GTK 3)</td><td class="ok">working: native GTK 3 host (`hosts/linux`, 3.1 MB, zero dev headers)</td></tr>
+<tr><td>Microcontrollers</td><td class="next">out of scope for now</td></tr></tbody>
+              </table>
+            </div>
+            <div>
+              <div class="kicker" style="margin-bottom:6px;">Engineering Decisions</div>
+              <h3 style="font-size:22px;">Principles we do not compromise</h3>
+              <div class="decisions" style="margin-top:14px;">
+                <div class="decision"><b>The core does no I/O</b><span>Inputs in, outputs out. Every run replays identically in tests across platforms.</span></div>
+                <div class="decision"><b>Strictly additive</b><span>A one-file app stays zero-config; keys, privacy, manifests, and compliance switch on only when used.</span></div>
+                <div class="decision"><b>Runtime vs. plugin</b><span>Fail-closed guarantees live in core; integrations, vendor APIs, and regional packs stay plugins.</span></div>
+                <div class="decision"><b>Size &amp; speed budgets</b><span>Every commit is checked by <code>scripts/budget.sh</code> — regressions fail the build.</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 04: WHAT IT CAN -->
+    <section id="what-it-can" class="sec tinted">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">04</span> What it can</div>
+          <h2>Real systems in the agentic world — humans and AI acting on the same truth.</h2>
+          <p class="sec-sub">Explore four runnable applications from the repository. In every one, humans, HTTP callers, and AI agents share the exact same durable objects, rules, and audit trail.</p>
+        </div>
+
+        <div class="tabs-bar" role="tablist" aria-label="Agentic runtime examples">
+          <button class="tab-btn" role="tab" aria-selected="true" aria-controls="ex-agent" id="tab-agent" type="button">1. AI Shop Assistant (tj:agent)</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ex-booking" id="tab-booking" type="button">2. 4-Platform Booking App</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ex-privacy" id="tab-privacy" type="button">3. Privacy &amp; Consent (GDPR/PDPL)</button>
+          <button class="tab-btn" role="tab" aria-selected="false" aria-controls="ex-meter" id="tab-meter" type="button">4. Event-Driven Smart Meter</button>
+        </div>
+
+        <!-- Example 1 -->
+        <div class="tab-panel" role="tabpanel" id="ex-agent" aria-labelledby="tab-agent">
+          <div class="example-meta">
+            <h3>Agents that obey the exact same rules as people</h3>
+            <p style="color:var(--fg-2);font-size:15px;">In <code>examples/durable-cart</code>, a customer can ask the AI assistant in plain language (<em>"two teas, please"</em>) while another shopper taps the UI and an integration calls the HTTP API. Every tool the model calls is an app method checked under the caller's identity: anyone can shop, only staff can restock — and API keys never leave the server.</p>
+            <div class="tag-row">
+              <span class="mini-tag">tj:agent</span>
+              <span class="mini-tag">tj:ai MCP plugin</span>
+              <span class="mini-tag">@exclusive turns</span>
+              <span class="mini-tag">Durable stock timers</span>
+              <span class="mini-tag">Realtime SSE</span>
+            </div>
+            <p style="color:var(--muted);font-size:13.5px;margin:0;">Run it offline with a fake model, a local LLM (Ollama / <code>llama.cpp</code>), or Claude / OpenAI / Gemini:</p>
+            <div class="cmd-box">TJ_AI_PROVIDER=ollama cargo tj dev examples/durable-cart/app.tj<br># or offline: cargo tj dev examples/durable-cart/app.tj --plugin ai=fake:examples/durable-cart/fake-ai.json</div>
+          </div>
+          <div class="code-win">
+            <div class="code-bar">
+              <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>examples/durable-cart/assistant.tj</span>
+              <span class="code-tag">Agentic tools = app methods</span>
+            </div>
+<pre><span class="k">import</span> { act, <span class="t">Skill</span> } <span class="k">from</span> <span class="s">"tj:agent"</span>
+
+<span class="c">// Every skill maps to an app method under caller's @allow rules.</span>
+<span class="c">// Shopper's name is fixed so the model cannot spoof identity.</span>
+<span class="k">function</span> skills(name: <span class="t">string</span>): <span class="t">Skill</span>[] {
+  <span class="k">const</span> by = { name: <span class="s">`${name} (via the assistant)`</span> }
+  <span class="k">return</span> [
+    { name: <span class="s">"add"</span>, object: <span class="s">"Cart/demo"</span>, method: <span class="s">"add"</span>,
+      params: [<span class="s">"sku"</span>, <span class="s">"name"</span>], input: SKU, fixed: by },
+    { name: <span class="s">"restock"</span>, object: <span class="s">"Shelf/main"</span>, method: <span class="s">"stock"</span>,
+      params: [<span class="s">"sku"</span>, <span class="s">"qty"</span>], input: RESTOCK, fixed: {} },
+  ]
+}
+
+<span class="k">export</span> <span class="a">@server</span> <span class="a">@read</span>(<span class="s">"anyone"</span>) <span class="k">object</span> <span class="t">Assistant</span> {
+  lines: <span class="t">ChatLine</span>[] = []
+
+  <span class="a">@allow</span>(<span class="s">"anyone"</span>) <span class="a">@exclusive</span> <span class="k">async</span> ask(q: <span class="t">string</span>, name: <span class="t">string</span>) {
+    <span class="k">const</span> mem = AssistantMemory.get(<span class="k">this</span>.id)
+    <span class="k">const</span> turn = <span class="k">await</span> act(<span class="k">this</span>.instructions(),
+      mem.messages.concat([{ role: <span class="s">"user"</span>, text: q }]),
+      skills(name), MAX_STEPS)
+    mem.keep(turn.messages)
+    <span class="k">this</span>.say(<span class="s">"assistant"</span>, turn.text || <span class="s">"Done."</span>)
+  }
+}</pre>
+          </div>
+        </div>
+
+        <!-- Example 2 -->
+        <div class="tab-panel" role="tabpanel" id="ex-booking" aria-labelledby="tab-booking" hidden>
+          <div class="example-meta">
+            <h3>283 lines. Four platforms. Proven by blind AI review.</h3>
+            <p style="color:var(--fg-2);font-size:15px;">Milestone 1 proved the entire stack end-to-end: AI developers built an appointment booking app from a behaviour spec alone, and independent empty-mind reviewers graded it across 3 rounds — driving real primitives into the engine until the full 4-platform app dropped from 612 lines to 283 lines with zero <code>reveal</code> leaks.</p>
+            <div class="tag-row">
+              <span class="mini-tag">Web + Android + iOS + Linux</span>
+              <span class="mini-tag">Offline queue</span>
+              <span class="mini-tag">Keyed reminder alarms</span>
+              <span class="mini-tag">Per-field @read("self")</span>
+              <span class="mini-tag">Zero double-booking</span>
+            </div>
+            <p style="color:var(--muted);font-size:13.5px;margin:0;">Verify access, privacy, and compliance in one command:</p>
+            <div class="cmd-box">cargo tj check examples/booking/app.tj --access --privacy</div>
+          </div>
+          <div class="code-win">
+            <div class="code-bar">
+              <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>examples/booking/app.tj</span>
+              <span class="code-tag">Milestone 1 · 97/100 blind review</span>
+            </div>
+<pre><span class="a">@server</span> <span class="a">@read</span>(<span class="s">"anyone"</span>) <span class="k">object</span> <span class="t">Slot</span> {
+  title: <span class="t">string</span> = <span class="s">""</span>
+  start: <span class="t">number</span> = 0
+  minutes: <span class="t">number</span> = 0
+  <span class="a">@read</span>(<span class="s">"staff"</span>, <span class="s">"self"</span>) customer: <span class="t">string</span> = <span class="s">""</span>
+
+  <span class="a">@allow</span>(<span class="s">"signedIn"</span>) <span class="a">@exclusive</span> <span class="k">async</span> book() {
+    <span class="k">if</span> (caller.roles.includes(<span class="s">"staff"</span>)) { <span class="k">throw new</span> Error(<span class="s">"Staff cannot book"</span>) }
+    <span class="k">this</span>.mustBeOpen()
+    <span class="k">const</span> me = Customer.get(caller.id)
+    <span class="k">if</span> (me.name === <span class="s">""</span> || me.phone === <span class="s">""</span>) {
+      <span class="k">throw new</span> Error(<span class="s">"Save your name and phone before booking"</span>)
+    }
+    <span class="k">this</span>.customer = caller.id
+    <span class="k">const</span> before = Settings.get(<span class="s">"main"</span>).reminderMinutes * 60000
+    <span class="k">this</span>.schedule(<span class="s">"remind"</span>, Math.max(0, <span class="k">this</span>.start - before - Date.now()), <span class="s">"remind"</span>)
+  }
+
+  <span class="a">@allow</span>(<span class="s">"signedIn"</span>) <span class="a">@exclusive</span> cancel() {
+    <span class="k">this</span>.unschedule(<span class="s">"remind"</span>)
+    <span class="k">this</span>.customer = <span class="s">""</span>
+  }
+}</pre>
+          </div>
+        </div>
+
+        <!-- Example 3 -->
+        <div class="tab-panel" role="tabpanel" id="ex-privacy" aria-labelledby="tab-privacy" hidden>
+          <div class="example-meta">
+            <h3>Compliance enforced by the compiler, not paperwork</h3>
+            <p style="color:var(--fg-2);font-size:15px;">In <code>examples/members</code>, personal data is marked once with <code>@pii</code> and retention with <code>@retain</code>. The compiler refuses to let personal data reach <code>fetch</code>, logs, errors, or plugins without an explicit <code>reveal(value, purpose)</code> — and data-only regional packs (GDPR, Saudi PDPL, or your own) verify lawful basis and allowed hosts automatically.</p>
+            <div class="tag-row">
+              <span class="mini-tag">@pii flow check</span>
+              <span class="mini-tag">@retain("2y")</span>
+              <span class="mini-tag">@needs("consent:news")</span>
+              <span class="mini-tag">Crypto-shred erase</span>
+              <span class="mini-tag">GDPR / PDPL packs</span>
+            </div>
+            <p style="color:var(--muted);font-size:13.5px;margin:0;">Run compliance check + generate GDPR Article 30 record:</p>
+            <div class="cmd-box">cargo tj check examples/members/app.tj \<br>&nbsp;&nbsp;--compliance examples/members/club.pack.json --privacy --record</div>
+          </div>
+          <div class="code-win">
+            <div class="code-bar">
+              <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>examples/members/app.tj</span>
+              <span class="code-tag">Compile-time taint &amp; consent</span>
+            </div>
+<pre><span class="k">import</span> { erase, exportData } <span class="k">from</span> <span class="s">"tj:privacy"</span>
+<span class="k">import</span> { Consent, consented } <span class="k">from</span> <span class="s">"tj:consent"</span>
+
+<span class="k">const</span> lawfulBasis = { account: <span class="s">"contract"</span>, news: <span class="s">"consent"</span> }
+
+<span class="a">@server</span> <span class="a">@read</span>(<span class="s">"owner"</span>) <span class="a">@retain</span>(<span class="s">"2y"</span>) <span class="k">object</span> <span class="t">Member</span> {
+  <span class="a">@pii</span>(<span class="s">"contact"</span>, <span class="s">"account"</span>) name: <span class="t">string</span> = <span class="s">""</span>
+  <span class="a">@pii</span>(<span class="s">"contact"</span>, <span class="s">"account"</span>, <span class="s">"news"</span>) email: <span class="t">string</span> = <span class="s">""</span>
+
+  <span class="c">// Runs only for members who actively consented to "news".</span>
+  <span class="a">@needs</span>(<span class="s">"consent:news"</span>) <span class="k">async</span> newsletter(issue: <span class="t">string</span>) {
+    <span class="k">await</span> fetch(<span class="s">"https://api.mailer.example/send"</span>, {
+      method: <span class="s">"POST"</span>,
+      body: JSON.stringify({ to: reveal(<span class="k">this</span>.email, <span class="s">"news"</span>), template: issue }),
+    })
+  }
+
+  <span class="a">@allow</span>(<span class="s">"owner"</span>) <span class="k">async</span> myData(): <span class="t">any</span> { <span class="k">return await</span> exportData(caller.id) }
+  <span class="a">@allow</span>(<span class="s">"owner"</span>) <span class="k">async</span> leave() { <span class="k">await</span> erase(caller.id) }
+}</pre>
+          </div>
+        </div>
+
+        <!-- Example 4 -->
+        <div class="tab-panel" role="tabpanel" id="ex-meter" aria-labelledby="tab-meter" hidden>
+          <div class="example-meta">
+            <h3>Durable infrastructure &amp; autonomous event workflows</h3>
+            <p style="color:var(--fg-2);font-size:15px;">In <code>examples/smart-meter</code>, hardware gateways post load readings over HTTP while <code>@every("5s")</code> samples and durable confirmation/escalation alarms drive state transitions across restarts. Every state change broadcasts live to operator screens and subscribed webhooks — and agents can inspect and test every edge case deterministically.</p>
+            <div class="tag-row">
+              <span class="mini-tag">@every("5s")</span>
+              <span class="mini-tag">Durable alarms</span>
+              <span class="mini-tag">this.emit() SSE</span>
+              <span class="mini-tag">HTTP API + UI</span>
+              <span class="mini-tag">Prometheus /_tj/metrics</span>
+            </div>
+            <p style="color:var(--muted);font-size:13.5px;margin:0;">Drive a real spike from any gateway or script:</p>
+            <div class="cmd-box">curl -X POST localhost:4700/api/Meter/home/record \<br>&nbsp;&nbsp;-H 'content-type: application/json' -d '[7.2, "gateway"]'</div>
+          </div>
+          <div class="code-win">
+            <div class="code-bar">
+              <span class="dots" aria-hidden="true"><span></span><span></span><span></span></span>
+              <span>examples/smart-meter/app.tj</span>
+              <span class="code-tag">Timers, alarms &amp; live telemetry</span>
+            </div>
+<pre><span class="a">@server</span> <span class="a">@read</span>(<span class="s">"anyone"</span>) <span class="k">object</span> <span class="t">Meter</span> {
+  state: <span class="s">"normal"</span> | <span class="s">"high"</span> | <span class="s">"alert"</span> = <span class="s">"normal"</span>
+  limitKw: <span class="t">number</span> = 5
+  acknowledged: <span class="t">boolean</span> = <span class="k">true</span>
+
+  <span class="a">@allow</span>(<span class="s">"anyone"</span>) record(kw: <span class="t">number</span>, source: <span class="t">string</span>) {
+    <span class="k">this</span>.readings.push({ at: Date.now(), kw, source })
+    <span class="k">if</span> (<span class="k">this</span>.state === <span class="s">"normal"</span> &amp;&amp; kw &gt; <span class="k">this</span>.limitKw) {
+      <span class="k">this</span>.state = <span class="s">"high"</span>
+      <span class="k">this</span>.schedule(CONFIRM_MS, <span class="s">"confirm"</span>)
+    }
+  }
+
+  <span class="c">// Durable alarm: still high after confirmation window? Escalate!</span>
+  <span class="k">private</span> confirm() {
+    <span class="k">if</span> (<span class="k">this</span>.state !== <span class="s">"high"</span> || <span class="k">this</span>.average(3) &lt;= <span class="k">this</span>.limitKw) { <span class="k">return</span> }
+    <span class="k">this</span>.state = <span class="s">"alert"</span>
+    <span class="k">this</span>.acknowledged = <span class="k">false</span>
+    <span class="k">this</span>.emit(<span class="s">"notice"</span>, { level: <span class="s">"alert"</span>, kw: <span class="k">this</span>.average(3) })
+    <span class="k">this</span>.schedule(ESCALATE_MS, <span class="s">"escalate"</span>)
+  }
+}</pre>
+          </div>
+        </div>
+
+        <!-- The Agentic Loop -->
+        <div style="margin-top:42px;">
+          <div class="kicker" style="margin-bottom:8px;">The Closed Agentic Loop</div>
+          <h3 style="font-size:22px;margin-bottom:16px;">From one prompt to a verified, live, cross-platform system</h3>
+          <div class="loop-strip">
+            <div class="loop-step">
+              <span class="step-n">01 · LEARN</span>
+              <b>tj docs</b>
+              <span>Agent loads the entire language spec in one call.</span>
+            </div>
+            <div class="loop-step">
+              <span class="step-n">02 · PROVE</span>
+              <b>tj check</b>
+              <span>Types, access rules, PII flow, compliance &amp; schema compat.</span>
+            </div>
+            <div class="loop-step">
+              <span class="step-n">03 · REPLAY</span>
+              <b>tj test</b>
+              <span>Deterministic input traces with controllable virtual clocks.</span>
+            </div>
+            <div class="loop-step">
+              <span class="step-n">04 · INSPECT</span>
+              <b>tj review &amp; mcp</b>
+              <span>Drive UI, sweep RTL/pseudo locales, diff golden screenshots.</span>
+            </div>
+            <div class="loop-step">
+              <span class="step-n">05 · EVOLVE</span>
+              <b>tj reload</b>
+              <span>Shadow-boot upgrade with automatic health-gated rollback.</span>
+            </div>
+            <div class="loop-step">
+              <span class="step-n">06 · SHIP</span>
+              <b>tj build</b>
+              <span>215 KB Web, 531 KB Android APK, UIKit iOS .app &amp; Linux binary.</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 05: TIMELINE -->
+    <section id="timeline" class="sec">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">05</span> Timeline</div>
+          <h2>What we have done, and what we are building right now.</h2>
+          <p class="sec-sub">Built in the open with relentless focus, independent reviews on every milestone, and strict binary size budgets from day one.</p>
+        </div>
+
+        <div class="timeline">
+          <article class="tl-item">
+            <div class="tl-head">
+              <h3>Phase 1 · Core Runtime, Native Hosts &amp; Shared Layout</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 19–20, 2026</span>
+                <span class="badge done">Done</span>
+              </div>
+            </div>
+            <p>Shipped the TypeScript-shaped compiler, bytecode VM, and I/O-free Rust core alongside Web (WASM + DOM), Android (plain Java Views, <code>minSdk 21</code>), iOS (UIKit running on macOS CI), and static Linux binaries. Added the shared Taffy CSS flexbox engine with RTL mirroring, <code>@server</code> objects with offline-cached replicas, resumable SSE change streams, durable outbox retries, multi-file modules, and <code>scripts/budget.sh</code>.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">tj-core</span>
+              <span class="mini-tag">Web · Android · iOS · Linux</span>
+              <span class="mini-tag">Shared Flexbox + RTL</span>
+              <span class="mini-tag">Offline Replicas</span>
+            </div>
+          </article>
+
+          <article class="tl-item">
+            <div class="tl-head">
+              <h3>Phase 2 · Trust, Security, Privacy &amp; Agent Tools</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 20–21, 2026</span>
+                <span class="badge done">Done</span>
+              </div>
+            </div>
+            <p>Hardened the runtime after an independent security critique: closed-by-default <code>@read</code>/<code>@allow</code> rules, OIDC sign-in, MCP plugins (<code>tj:ai</code>, <code>tj:agent</code>), crash-safe disk saves, <code>@exclusive</code> actor turns, tamper-evident hash-chained audit logs, AES-256-GCM encryption at rest, <code>@pii</code> compile-time taint tracking with <code>reveal()</code>, per-person crypto-shredding, <code>@retain</code>/<code>@legalHold</code>, <code>tj:consent</code>, and extensible compliance packs.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">Closed by default</span>
+              <span class="mini-tag">AES-256-GCM</span>
+              <span class="mini-tag">Tamper-evident Audit</span>
+              <span class="mini-tag">@pii + GDPR/PDPL</span>
+              <span class="mini-tag">tj:agent</span>
+            </div>
+          </article>
+
+          <article class="tl-item">
+            <div class="tl-head">
+              <h3>Phase 3 · Milestone 1 Proven End-to-End Across 4 Platforms</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 21–22, 2026</span>
+                <span class="badge done">Done</span>
+              </div>
+            </div>
+            <p>Validated the entire platform with three blind AI build-and-review rounds on a real appointment booking app (<code>examples/booking/app.tj</code>). Turned recurring boilerplate into clean engine primitives — <code>Time</code>, <code>check()</code>, <code>Class.all()</code>, keyed alarms, <code>this.delete()</code>, per-field <code>@read("self")</code>, and <code>tj:ui</code> <code>Form</code>/<code>Actions</code> — cutting the app from 612 lines down to 283 lines, verified live on Web, Android emulator, iOS Simulator, and Linux.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">612 → 283 lines</span>
+              <span class="mini-tag">Blind review 96 &amp; 97</span>
+              <span class="mini-tag">4-platform sign-off</span>
+            </div>
+          </article>
+
+          <article class="tl-item">
+            <div class="tl-head">
+              <h3>Phase 4 · Living Apps, AOT Packaging, i18n &amp; Live Registry</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 22–23, 2026</span>
+                <span class="badge done">Done</span>
+              </div>
+            </div>
+            <p>Completed all Living Apps milestones: scoped <code>--ops</code> keys, manifests, work leases, deterministic <code>tj test</code> traces, <code>@invariant</code> rollback, shadow-booted <code>tj reload</code>/<code>tj rollback</code>, <code>tj retro</code>, and crash-stable <code>crypto.idempotencyKey()</code>. Added server-to-server replicas, HMAC webhooks, <code>&lt;Native&gt;</code> &amp; expanded UI catalog, translations + CLDR plurals + pseudo-locale sweeps, golden-image screenshot diffs, turnkey compiler-free AOT packaging (215 KB Web / 531 KB Android APK / zero-Xcode iOS <code>.app</code>), <code>tj bridge openapi</code>, and the live <a href="https://mindmakr.github.io/tj-plugins/"><code>mindmakr/tj-plugins</code></a> registry.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">Shadow Live Reload</span>
+              <span class="mini-tag">215 KB Web / 531 KB APK</span>
+              <span class="mini-tag">i18n + Golden Diffs</span>
+              <span class="mini-tag">OpenAPI Bridge</span>
+              <span class="mini-tag">Live Registry</span>
+            </div>
+          </article>
+
+          <article class="tl-item">
+            <div class="tl-head">
+              <h3>Phase 5 · Opt-In Device Plugins, WebRTC Calls &amp; Native Desktop Hosts</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 23, 2026</span>
+                <span class="badge done">Done</span>
+              </div>
+            </div>
+            <p>Shipped the unified opt-in <code>registerPlugin</code> / <code>DevicePlugin</code> protocol and 11 canonical permissions with automatic <code>AndroidManifest.xml</code> &amp; <code>Info.plist</code> injection; core opt-in plugins for <code>files</code>, <code>notifications</code>, <code>location</code>, and <code>camera</code> across Web, Android, and iOS; opt-in WebRTC voice/video calls (<code>&lt;Native name="VideoCall" /&gt;</code> + <code>@server</code> signaling, 11 Official packages live on <code>mindmakr/tj-plugins</code>); plus full native desktop hosts for <strong>macOS AppKit</strong> (CI-verified) and <strong>Linux GTK 3</strong> (3.1 MB, zero dev headers) — all at <strong>0 bytes</strong> core overhead.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">0 B core overhead</span>
+              <span class="mini-tag">files · notifications · location · camera</span>
+              <span class="mini-tag">WebRTC VideoCall</span>
+              <span class="mini-tag">macOS AppKit</span>
+              <span class="mini-tag">Linux GTK 3 (3.1 MB)</span>
+              <span class="mini-tag">11 Official packages</span>
+            </div>
+          </article>
+
+          <article class="tl-item done">
+            <div class="tl-head">
+              <h3>Phase 6 · Opt-In GPU &amp; 3D (<code>tj-gfx</code> on <code>wgpu</code>) &amp; Multi-Provider AI</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 24, 2026</span>
+                <span class="badge done">Shipped</span>
+              </div>
+            </div>
+            <p>Shipped the standalone opt-in <code>crates/tj-gfx</code> renderer on <code>wgpu</code> 25 (Vulkan, Metal, D3D12, GLES 3, WebGPU) with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code>, synchronous <code>@frame(dt)</code> animation hooks, occlusion-aware ray picking, headless RGBA/PNG readback, and a plain-ES2017 WebGL2/Canvas2D plugin (<code>hosts/web/plugins/gfx.js</code>) — keeping <strong>0 KB of <code>wgpu</code></strong> in device builds and <strong>0 KB of 3D JS</strong> in 2D apps. Also shipped multi-provider &amp; local LLM support in <code>tj plugin ai</code> (Anthropic, OpenAI-compatible, Ollama, Gemini).</p>
+            <div class="tl-pills">
+              <span class="mini-tag">tj-gfx on wgpu 25</span>
+              <span class="mini-tag">&lt;Scene&gt; &lt;Mesh&gt; &lt;Camera&gt; &lt;Light&gt;</span>
+              <span class="mini-tag">@frame(dt)</span>
+              <span class="mini-tag">0 KB wgpu in core</span>
+              <span class="mini-tag">Ollama / OpenAI / Gemini</span>
+            </div>
+          </article>
+
+          <article class="tl-item done">
+            <div class="tl-head">
+              <h3>Phase 7 · Topic Groups, Durable Messaging &amp; Collab Studio Showcase</h3>
+              <div class="tl-badges">
+                <span class="badge date">Nov 24, 2026</span>
+                <span class="badge done">Shipped</span>
+              </div>
+            </div>
+            <p>Shipped on-demand prefix topic streams (<code>Class.all(prefix?)</code> &rarr; <code>Class/prefix*</code> across all 5 hosts, SSE, webhooks, and remote sync), durable atomic cross-object server messaging (<code>this.deliver(target, "method", ...args)</code> with privacy-flow checks and GDPR erasure pruning), WebRTC screen sharing, the opt-in ES2017 Whiteboard plugin + <code>tj:whiteboard</code> library (12 Official packages in <code>mindmakr/tj-plugins</code>), and the <code>examples/collab-studio</code> showcase.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">Class/prefix* topics</span>
+              <span class="mini-tag">this.deliver(...)</span>
+              <span class="mini-tag">WebRTC screen share</span>
+              <span class="mini-tag">Whiteboard &amp; collab-studio</span>
+            </div>
+          </article>
+
+          <article class="tl-item active">
+            <div class="tl-head">
+              <h3>Next · UI Craft &amp; Ecosystem Polish</h3>
+              <div class="tl-badges">
+                <span class="badge date">Up next</span>
+                <span class="badge doing">Next milestone</span>
+              </div>
+            </div>
+            <p>Sealed OCI app units (<code>tj build --oci</code>) and React/TS porting (<code>tj migrate</code> + <code>compare</code>) are shipped; next up is polishing <code>tj:ui</code> components and starter apps (<code>examples/booking</code>) from real mobile design patterns, plus Sigstore provenance.</p>
+            <div class="tl-pills">
+              <span class="mini-tag">tj:ui polish</span>
+              <span class="mini-tag">examples/booking</span>
+              <span class="mini-tag">OCI + tj migrate</span>
+            </div>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- 06: WHAT IT COULD BE -->
+    <section id="what-it-could-be" class="sec tinted">
+      <div class="wrap">
+        <div class="sec-head">
+          <div class="kicker"><span class="num-pill">06</span> What it could be</div>
+          <h2>Dependable digital infrastructure for a better world and economy.</h2>
+          <p class="sec-sub">We are only at the beginning. Imagine a world where anyone — a neighborhood clinic, an independent founder, a cooperative, a city, or a global team — can co-create secure, sovereign, fast native software with AI agents they can inspect and trust.</p>
+        </div>
+
+        <div class="grid-4">
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+            </div>
+            <h3>Optional GPU &amp; 3D (<code>tj-gfx</code>)</h3>
+            <p>One Rust renderer on <code>wgpu</code> (Vulkan, Metal, D3D12, GLES 3, WebGPU) plus an opt-in ES2017 WebGL2 plugin with declarative <code>&lt;Scene&gt;</code>, <code>&lt;Mesh&gt;</code>, <code>&lt;Camera&gt;</code>, <code>&lt;Light&gt;</code>, and <code>@frame(dt)</code> — 0 KB of <code>wgpu</code> in 2D builds.</p>
+            <div class="card-meta">Shipped · crates/tj-gfx</div>
+          </div>
+
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 10l5-3v10l-5-3z"/><rect x="3" y="6" width="12" height="12" rx="2"/></svg>
+            </div>
+            <h3>Realtime Media &amp; Canvas Demo</h3>
+            <p>A compact showcase uniting live chat, WebRTC audio/video calls, screen sharing, and an opt-in collaborative drawing board on one durable runtime.</p>
+            <div class="card-meta">Shipped · examples/collab-studio</div>
+          </div>
+
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="19" r="3"/><circle cx="19" cy="19" r="3"/><path d="M10.5 7.5L6.5 16.5M13.5 7.5l4 9"/></svg>
+            </div>
+            <h3>Topics &amp; Cross-Object Messaging</h3>
+            <p>Prefix topic groups across objects (<code>Class.all(prefix?)</code> / <code>Class/prefix*</code>) and durable atomic server object-to-object messaging via <code>this.deliver(...)</code>.</p>
+            <div class="card-meta">Shipped · Class/prefix* + deliver()</div>
+          </div>
+
+          <div class="card">
+            <div class="card-icon" aria-hidden="true">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+            </div>
+            <h3>Verified Agentic Ecosystem</h3>
+            <p>12 Official packages live today in <code>mindmakr/tj-plugins</code>, alongside sealed <code>--oci</code> deployment units and <code>tj migrate</code> — growing toward Sigstore/SLSA publisher provenance.</p>
+            <div class="card-meta">Growing · mindmakr/tj-plugins</div>
+          </div>
+        </div>
+
+        <div class="vision-banner">
+          <div>
+            <div class="kicker" style="color:#ff9a6c;margin-bottom:10px;">Build With Your Own Agent</div>
+            <h3>Install the tinyjump skill and ship your first 6-platform app today.</h3>
+            <p>Whether you use <strong>Claude Code</strong>, <strong>Antigravity / Gemini CLI</strong>, <strong>OpenAI Codex</strong>, or <strong>Cursor</strong>, install our open <code>SKILL.md</code> package in one command — your agent will load <code>tj docs</code>, verify access &amp; privacy rules, run deterministic tests, and package Web, Android, iOS, macOS, and Linux builds.</p>
+            <p style="margin-bottom:0;">Try an example, publish a pure-<code>.tj</code> library or compliance pack to the registry, run an empty-mind critique in <code>feedback/</code>, or build your next app on a runtime you can understand from top to bottom.</p>
+            <div class="cta-row">
+              <a class="btn light" href="guide/">Open Agent Skills &amp; Multi-Platform Guide</a>
+              <a class="btn ghost" href="https://github.com/mindmakr/tinyjump">Star on GitHub</a>
+              <a class="btn ghost" href="demo/">Open live browser demo</a>
+            </div>
+          </div>
+
+          <div class="quickstart-box">
+            <div class="quickstart-head">
+              <span>Run tinyjump in 60 seconds</span>
+              <button class="copy-btn" id="copy-cmd" type="button">Copy</button>
+            </div>
+<pre id="quickstart-code">git clone https://github.com/mindmakr/tinyjump
+cd tinyjump
+rustup target add wasm32-unknown-unknown
+cargo web
+cargo tj dev examples/durable-cart/app.tj \
+  --plugin ai=fake:examples/durable-cart/fake-ai.json
+<span class="c"># Open http://127.0.0.1:4700 in two tabs</span>
+
+curl -X POST localhost:4700/api/Cart/demo/add \
+  -H 'content-type: application/json' -d '["tea", "curl"]'</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="wrap footer-inner">
+      <div>
+        <strong style="color:var(--fg);">tinyjump</strong> · Created by Asif Raja (<a href="https://github.com/mindmakr">mindmakr</a>) · Dual-licensed MIT / Apache-2.0
+      </div>
+      <div class="footer-links">
+        <a href="guide/">Agent Skills</a>
+        <a href="demo/">Demo</a>
+        <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/language.md">Language</a>
+        <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/vision.md">Vision</a>
+        <a href="https://github.com/mindmakr/tinyjump/blob/main/docs/trust.md">Trust</a>
+        <a href="https://mindmakr.github.io/tj-plugins/">Registry</a>
+        <a href="https://github.com/mindmakr/tinyjump">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    (function () {
+      // Theme toggle (persists in localStorage, respects prefers-color-scheme by default)
+      var root = document.documentElement;
+      try {
+        var saved = localStorage.getItem('tj-site-theme');
+        if (saved === 'light' || saved === 'dark') { root.setAttribute('data-theme', saved); }
+      } catch (e) {}
+      var toggle = document.getElementById('theme-toggle');
+      if (toggle) {
+        toggle.addEventListener('click', function () {
+          var isDark = root.getAttribute('data-theme') === 'dark' ||
+            (!root.getAttribute('data-theme') && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var next = isDark ? 'light' : 'dark';
+          root.setAttribute('data-theme', next);
+          try { localStorage.setItem('tj-site-theme', next); } catch (e) {}
+        });
+      }
+
+      // Example tabs
+      var tabs = document.querySelectorAll('[role="tab"]');
+      for (var i = 0; i < tabs.length; i++) {
+        tabs[i].addEventListener('click', function (ev) {
+          var target = ev.currentTarget;
+          var panelId = target.getAttribute('aria-controls');
+          for (var j = 0; j < tabs.length; j++) {
+            var active = tabs[j] === target;
+            tabs[j].setAttribute('aria-selected', active ? 'true' : 'false');
+            var p = document.getElementById(tabs[j].getAttribute('aria-controls'));
+            if (p) { p.hidden = !active; }
+          }
+          var chosen = document.getElementById(panelId);
+          if (chosen) { chosen.hidden = false; }
+        });
+      }
+
+      // Copy quickstart
+      var copyBtn = document.getElementById('copy-cmd');
+      var codeEl = document.getElementById('quickstart-code');
+      if (copyBtn && codeEl) {
+        copyBtn.addEventListener('click', function () {
+          var text = codeEl.textContent || '';
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(function () {
+              copyBtn.textContent = 'Copied!';
+              setTimeout(function () { copyBtn.textContent = 'Copy'; }, 1800);
+            });
+          }
+        });
+      }
+    })();
+  </script>
+</body>
+</html>
