@@ -357,9 +357,13 @@ Raised by the owner. To be discussed and critiqued before any work starts:
   `.tj` modules backed by MCP servers (`docs/plugins.md`). The durable cart has a shop
   assistant. Next is the `tj:agent` library, whose tools are the app's own methods under
   the access rules.
-- **Docker-like features:** park until the retro. First decide whether this means packaging
-  and deploying apps as sealed units, or isolating running apps. The runtime is already
-  sandboxed: it has no I/O except through its host.
+- **Docker-like features (decided in retro; sealed OCI units shipped):** `tj build --oci`
+  (`docs/oci.md`, `feedback/2026-11-24-builder-072-oci-retro.md`) packages the standalone
+  executable + optional `/web` bundle into a deterministic, rootless `FROM scratch` OCI Image
+  Layout 1.0.0 (`0 KB` added to core or device builds). Runtime isolation stays out of `tj`:
+  `tj-core` already performs zero I/O outside its host, so container scheduling is left to
+  Docker/Kubernetes/Fly/systemd. For porting existing TypeScript/React apps, `tj migrate` and
+  `tj migrate compare` live in `docs/migrate.md`.
 
 ## Platforms
 
